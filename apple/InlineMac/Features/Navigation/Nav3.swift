@@ -1,0 +1,604 @@
+import Foundation
+import InlineKit
+import Invite
+import Observation
+import os.signpost
+
+enum Nav3Route: Hashable, Codable {
+  enum ChatInfoQuery: String, Hashable, Codable {
+    case files
+    case media
+    case voice
+    case links
+    case participants
+  }
+
+  case empty
+  case allChats
+  case archivedChats
+  case chat(peer: Peer)
+  case chatInfo(peer: Peer, query: ChatInfoQuery? = nil)
+  case profile(userId: Int64)
+  case createSpace
+  case newChat(spaceId: Int64?)
+  case invite(sessionID: UUID, spaceId: Int64?)
+  case inviteReview(sessionID: UUID, spaceId: Int64?)
+  case inviteOutcome(sessionID: UUID, spaceId: Int64?)
+  case members(spaceId: Int64)
+  case spaceSettings(spaceId: Int64)
+  case spaceIntegrations(spaceId: Int64)
+  case grid(spaceId: Int64)
+}
+
+extension Nav3Route {
+  var isInviteFlow: Bool {
+    switch self {
+    case .invite, .inviteReview, .inviteOutcome:
+      true
+    default:
+      false
+    }
+  }
+
+  var selectedPeer: Peer? {
+    switch self {
+    case let .chat(peer), let .chatInfo(peer, _):
+      peer
+    default:
+      nil
+    }
+  }
+
+  var selectedSpaceId: Int64? {
+    switch self {
+    case let .newChat(spaceId),
+         let .invite(_, spaceId),
+         let .inviteReview(_, spaceId),
+         let .inviteOutcome(_, spaceId):
+      spaceId
+    case let .members(spaceId), let .spaceSettings(spaceId), let .spaceIntegrations(spaceId), let .grid(spaceId):
+      spaceId
+    default:
+      nil
+    }
+  }
+
+}
+
+struct Nav3RouteState: Hashable, RawRepresentable {
+  var route: Nav3Route
+  var selectedSpaceId: Int64?
+  var replyThreadPeer: Peer?
+
+  static let empty = Nav3RouteState(route: .empty)
+
+  init(
+    route: Nav3Route = .empty,
+    selectedSpaceId: Int64? = nil,
+    replyThreadPeer: Peer? = nil
+  ) {
+    self.route = route
+    self.selectedSpaceId = selectedSpaceId
+    if case .chat = route {
+      self.replyThreadPeer = replyThreadPeer
+    } else {
+      self.replyThreadPeer = nil
+    }
+  }
+
+  init(nav: Nav3) {
+    self = nav.currentState
+  }
+
+  init?(rawValue: String) {
+    guard !rawValue.isEmpty else {
+      self = .empty
+      return
+    }
+    guard let data = rawValue.data(using: .utf8) else {
+      self = .empty
+      return
+    }
+
+    if let payload = try? JSONDecoder().decode(Payload.self, from: data) {
+      self = Self(
+        route: payload.route,
+        selectedSpaceId: payload.selectedSpaceId,
+        replyThreadPeer: payload.replyThreadPeer
+      )
+      return
+    }
+
+    if let route = try? JSONDecoder().decode(Nav3Route.self, from: data) {
+      self = Self(route: route, selectedSpaceId: route.selectedSpaceId)
+      return
+    }
+
+    self = .empty
+  }
+
+  var rawValue: String {
+    guard route != .empty || selectedSpaceId != nil else { return "" }
+    let payload = Payload(
+      route: route,
+      selectedSpaceId: selectedSpaceId,
+      replyThreadPeer: replyThreadPeer
+    )
+    guard let data = try? JSONEncoder().encode(payload) else { return "" }
+    return String(data: data, encoding: .utf8) ?? ""
+  }
+
+  private struct Payload: Codable {
+    var route: Nav3Route
+    var selectedSpaceId: Int64?
+    var replyThreadPeer: Peer?
+  }
+}
+
+struct Nav3HistoryMenuItem: Identifiable, Hashable {
+  let index: Int
+  let state: Nav3RouteState
+
+  var id: Int {
+    index
+  }
+}
+
+/// This nav class is per window
+@Observable
+class Nav3 {
+  @ObservationIgnored private let navigationSignpostLog = OSLog(subsystem: "InlineMac", category: "PointsOfInterest")
+  @ObservationIgnored private let persistsActiveSpace: Bool
+  @ObservationIgnored private var activeChatNavigation: (peer: Peer, id: OSSignpostID)?
+  @ObservationIgnored private var lastUsagePeer: Peer?
+  @ObservationIgnored var onRouteChange: (() -> Void)?
+  @ObservationIgnored private var isRestoringInitialState = true
+  @ObservationIgnored private var inviteSessions: [UUID: InviteFlowSession] = [:]
+  /// Message a side-pane thread was opened from, kept so the parent chat can anchor
+  /// and highlight it before the message's thread card syncs. Not persisted.
+  @ObservationIgnored private var replyThreadSourceMessage: (threadPeer: Peer, parentPeer: Peer, messageId: Int64)?
+
+  var history: [Nav3RouteState] = []
+  var historyIndex: Int = -1
+  var cmdKVisible = false
+  var newThreadComposeFocusRequested = false
+
+  var selectedSpaceId: Int64? {
+    currentState.selectedSpaceId
+  }
+
+  var currentState: Nav3RouteState {
+    guard history.indices.contains(historyIndex) else { return .empty }
+    return history[historyIndex]
+  }
+
+  var currentRoute: Nav3Route {
+    currentState.route
+  }
+
+  var currentReplyThreadPeer: Peer? {
+    currentState.replyThreadPeer
+  }
+
+  var canGoBack: Bool {
+    historyIndex > 0
+  }
+
+  var canGoForward: Bool {
+    historyIndex >= 0 && historyIndex < history.count - 1
+  }
+
+  var backHistoryMenuItems: [Nav3HistoryMenuItem] {
+    historyMenuItems(from: stride(from: historyIndex - 1, through: 0, by: -1))
+  }
+
+  var forwardHistoryMenuItems: [Nav3HistoryMenuItem] {
+    let lastIndex = history.count - 1
+    return historyMenuItems(from: stride(from: historyIndex + 1, through: lastIndex, by: 1))
+  }
+
+  /// Used for environment defaults and previews
+  public static let `default` = Nav3()
+
+  init(
+    routeState: String = "",
+    pendingRoute: Nav3Route? = nil,
+    persistsActiveSpace: Bool = false,
+    restoresActiveSpace: Bool = false
+  ) {
+    self.persistsActiveSpace = persistsActiveSpace
+    restoreIfNeeded(
+      from: routeState,
+      pendingRoute: pendingRoute,
+      fallbackSelectedSpaceId: restoresActiveSpace ? Nav3ActiveSpaceStore.selectedSpaceId : nil
+    )
+    lastUsagePeer = currentReplyThreadPeer ?? currentRoute.selectedPeer
+    isRestoringInitialState = false
+  }
+
+  func open(_ route: Nav3Route, tracksChatNavigation: Bool = true) {
+    open(state(for: route), tracksChatNavigation: tracksChatNavigation)
+  }
+
+  func openNewThreadComposer() {
+    open(.empty, tracksChatNavigation: false)
+    newThreadComposeFocusRequested = true
+  }
+
+  @MainActor
+  func beginInvite(spaceId: Int64?) {
+    let destination: InviteDestination = spaceId.map { .space(id: $0) } ?? .inline
+    let session = InviteFlowSession(destination: destination)
+    inviteSessions[session.id] = session
+    open(.invite(sessionID: session.id, spaceId: spaceId), tracksChatNavigation: false)
+  }
+
+  @MainActor
+  func inviteSession(id: UUID) -> InviteFlowSession? {
+    inviteSessions[id]
+  }
+
+  /// Opens a Grid route without changing the Home or Space sidebar context.
+  func openGrid(spaceId: Int64) {
+    open(
+      Nav3RouteState(
+        route: .grid(spaceId: spaceId),
+        selectedSpaceId: selectedSpaceId
+      ),
+      tracksChatNavigation: false
+    )
+  }
+
+  func replace(_ route: Nav3Route) {
+    let state = state(for: route)
+    guard history.indices.contains(historyIndex) else {
+      open(state)
+      return
+    }
+    guard history[historyIndex] != state else { return }
+    history[historyIndex] = state
+    notifyRouteChange()
+  }
+
+  @discardableResult
+  func openReplyThread(parentPeer: Peer, threadPeer: Peer, sourceMessageId: Int64? = nil) -> Bool {
+    guard threadPeer.isThread else { return false }
+    guard case .chat = currentRoute else { return false }
+    let opensFromPrimaryChat = currentRoute.selectedPeer == parentPeer
+    let opensFromCurrentPane = currentReplyThreadPeer == parentPeer
+    guard opensFromPrimaryChat || opensFromCurrentPane else { return false }
+
+    // Set before the route change so observers see it with the new pane peer.
+    replyThreadSourceMessage = sourceMessageId.map {
+      (threadPeer: threadPeer, parentPeer: parentPeer, messageId: $0)
+    }
+
+    open(
+      Nav3RouteState(
+        route: currentRoute,
+        selectedSpaceId: selectedSpaceId,
+        replyThreadPeer: threadPeer
+      ),
+      tracksChatNavigation: false
+    )
+    return true
+  }
+
+  /// The message in `parentPeer` that opened `threadPeer` in the side pane, when known.
+  func replyThreadSourceMessageId(threadPeer: Peer, parentPeer: Peer) -> Int64? {
+    guard let source = replyThreadSourceMessage,
+          source.threadPeer == threadPeer,
+          source.parentPeer == parentPeer
+    else { return nil }
+    return source.messageId
+  }
+
+  func closeReplyThread() {
+    guard currentReplyThreadPeer != nil else { return }
+    open(
+      Nav3RouteState(
+        route: currentRoute,
+        selectedSpaceId: selectedSpaceId
+      ),
+      tracksChatNavigation: false
+    )
+  }
+
+  @discardableResult
+  func removeChat(peer: Peer) -> Bool {
+    if currentRoute.selectedPeer == peer {
+      let spaceId = selectedSpaceId
+
+      if history.indices.contains(historyIndex), historyIndex < history.count - 1 {
+        history.removeSubrange((historyIndex + 1)...)
+      }
+
+      let oldCount = history.count
+      history.removeAll { $0.route.selectedPeer == peer }
+      history = history.map { $0.clearingReplyThread(peer) }
+      guard history.count != oldCount else { return false }
+
+      let emptyState = Nav3RouteState(route: .empty, selectedSpaceId: spaceId)
+      if history.last != emptyState {
+        history.append(emptyState)
+      }
+      historyIndex = history.count - 1
+      notifyRouteChange()
+      return true
+    }
+
+    let clearsReplyThread = history.contains { $0.replyThreadPeer == peer }
+    let indexedRoutes = history.enumerated().filter { _, state in
+      state.route.selectedPeer != peer
+    }
+    guard indexedRoutes.count != history.count || clearsReplyThread else { return false }
+
+    let oldIndex = historyIndex
+    let nextIndex = indexedRoutes.firstIndex { $0.offset == oldIndex }
+      ?? indexedRoutes.lastIndex { oldIndex > $0.offset }
+
+    history = indexedRoutes.map { $0.element.clearingReplyThread(peer) }
+    historyIndex = nextIndex ?? -1
+    notifyRouteChange()
+    return true
+  }
+
+  func reset() {
+    newThreadComposeFocusRequested = false
+    guard currentRoute != .empty || selectedSpaceId != nil || cmdKVisible else { return }
+    history = []
+    historyIndex = -1
+    cmdKVisible = false
+    notifyRouteChange()
+  }
+
+  func selectHome() {
+    guard selectedSpaceId != nil else { return }
+    openContextState(selectedSpaceId: nil)
+  }
+
+  func selectSpace(_ spaceId: Int64) {
+    guard selectedSpaceId != spaceId else { return }
+    openContextState(selectedSpaceId: spaceId)
+  }
+
+  func goBack() {
+    guard canGoBack else { return }
+    historyIndex -= 1
+    notifyRouteChange()
+  }
+
+  func goBackToAllChatsOriginIfNeeded() -> Bool {
+    guard case .chat = currentRoute else { return false }
+    guard canGoBack else { return false }
+
+    let previousRoute = history[historyIndex - 1].route
+    guard previousRoute.isAllChatsRoute else { return false }
+
+    goBack()
+    return true
+  }
+
+  func goForward() {
+    guard canGoForward else { return }
+    historyIndex += 1
+    notifyRouteChange()
+  }
+
+  func go(to item: Nav3HistoryMenuItem) {
+    guard history.indices.contains(item.index) else { return }
+    guard item.index != historyIndex else { return }
+    historyIndex = item.index
+    notifyRouteChange()
+  }
+
+  func openCommandBar() {
+    cmdKVisible = true
+  }
+
+  func toggleCommandBar() {
+    cmdKVisible.toggle()
+  }
+
+  func closeCommandBar() {
+    cmdKVisible = false
+  }
+
+  private func notifyRouteChange() {
+    newThreadComposeFocusRequested = false
+    persistActiveSpaceSelection()
+    recordVisibleChatSwitchIfNeeded()
+    onRouteChange?()
+  }
+
+  private func recordVisibleChatSwitchIfNeeded() {
+    guard isRestoringInitialState == false else { return }
+
+    let visiblePeer = currentReplyThreadPeer ?? currentRoute.selectedPeer
+    guard visiblePeer != lastUsagePeer else { return }
+    lastUsagePeer = visiblePeer
+    guard let visiblePeer else { return }
+
+    Task(priority: .utility) {
+      await QuickSearchUsageStore.shared.recordSwitch(to: visiblePeer)
+    }
+  }
+
+  func persistActiveSpaceSelection() {
+    guard persistsActiveSpace, isRestoringInitialState == false else { return }
+    Nav3ActiveSpaceStore.save(selectedSpaceId)
+  }
+
+  private func historyMenuItems<T: Sequence>(from indices: T) -> [Nav3HistoryMenuItem] where T.Element == Int {
+    Array(indices.lazy
+      .filter { history.indices.contains($0) }
+      .prefix(10)
+      .map { Nav3HistoryMenuItem(index: $0, state: history[$0]) })
+  }
+
+  private func state(for route: Nav3Route) -> Nav3RouteState {
+    Nav3RouteState(
+      route: route,
+      selectedSpaceId: route.selectedSpaceId ?? selectedSpaceId
+    )
+  }
+
+  private func openContextState(selectedSpaceId: Int64?) {
+    open(
+      Nav3RouteState(
+        route: currentRoute,
+        selectedSpaceId: selectedSpaceId,
+        replyThreadPeer: currentReplyThreadPeer
+      ),
+      tracksChatNavigation: false,
+      recordsImplicitBase: true
+    )
+  }
+
+  private func open(
+    _ state: Nav3RouteState,
+    tracksChatNavigation: Bool = true,
+    recordsImplicitBase: Bool = false
+  ) {
+    guard currentState != state else { return }
+
+    if recordsImplicitBase, historyIndex < 0 {
+      history.append(currentState)
+      historyIndex = history.count - 1
+    }
+
+    if tracksChatNavigation, case let .chat(peer) = state.route {
+      beginChatNavigationSignpost(peer: peer)
+    }
+    if canGoForward {
+      history.removeSubrange((historyIndex + 1)...)
+    }
+    history.append(state)
+    historyIndex = history.count - 1
+
+    if case let .chat(peer) = state.route {
+      os_signpost(
+        .event,
+        log: navigationSignpostLog,
+        name: "ChatRouteCommit",
+        "%{public}s",
+        String(describing: peer)
+      )
+    }
+
+    notifyRouteChange()
+  }
+
+  func beginChatNavigationSignpost(peer: Peer) {
+    if let activeChatNavigation {
+      os_signpost(
+        .end,
+        log: navigationSignpostLog,
+        name: "ChatNavigation",
+        signpostID: activeChatNavigation.id,
+        "%{public}s",
+        "superseded"
+      )
+    }
+
+    let signpostID = OSSignpostID(log: navigationSignpostLog)
+    activeChatNavigation = (peer, signpostID)
+    os_signpost(
+      .begin,
+      log: navigationSignpostLog,
+      name: "ChatNavigation",
+      signpostID: signpostID,
+      "%{public}s",
+      String(describing: peer)
+    )
+  }
+
+  func endChatNavigationSignpost(peer: Peer, reason: String) {
+    guard let activeChatNavigation, activeChatNavigation.peer == peer else { return }
+    os_signpost(
+      .end,
+      log: navigationSignpostLog,
+      name: "ChatNavigation",
+      signpostID: activeChatNavigation.id,
+      "%{public}s",
+      reason
+    )
+    self.activeChatNavigation = nil
+  }
+
+  func restoreIfNeeded(
+    from routeState: String,
+    pendingRoute: Nav3Route? = nil,
+    fallbackSelectedSpaceId: Int64? = nil
+  ) {
+    guard currentRoute == .empty else { return }
+
+    if let pendingRoute, pendingRoute != .empty {
+      open(Nav3RouteState(
+        route: pendingRoute,
+        selectedSpaceId: pendingRoute.selectedSpaceId ?? fallbackSelectedSpaceId
+      ))
+      return
+    }
+
+    if let state = Self.decodeRouteState(routeState) {
+      open(state)
+    } else if let fallbackSelectedSpaceId {
+      open(
+        Nav3RouteState(route: .empty, selectedSpaceId: fallbackSelectedSpaceId),
+        tracksChatNavigation: false
+      )
+    }
+  }
+
+  func encodedRouteState() -> String? {
+    if currentRoute.isInviteFlow {
+      return Nav3RouteState(route: .empty, selectedSpaceId: selectedSpaceId).rawValue
+    }
+    return currentState.rawValue
+  }
+
+  private static func decodeRouteState(_ routeState: String) -> Nav3RouteState? {
+    guard let state = Nav3RouteState(rawValue: routeState) else { return nil }
+    guard state.route != .empty || state.selectedSpaceId != nil else { return nil }
+    return state
+  }
+
+}
+
+private enum Nav3ActiveSpaceStore {
+  // Full route/history restoration stays per-window. This stores only the
+  // cross-window space context used to seed a fresh Nav3 instance.
+  private static let selectedSpaceIdKey = "macNavigationLastActiveSpaceId"
+
+  static var selectedSpaceId: Int64? {
+    guard let rawValue = UserDefaults.standard.string(forKey: selectedSpaceIdKey) else { return nil }
+    return Int64(rawValue)
+  }
+
+  static func save(_ selectedSpaceId: Int64?) {
+    if let selectedSpaceId {
+      UserDefaults.standard.set(String(selectedSpaceId), forKey: selectedSpaceIdKey)
+    } else {
+      UserDefaults.standard.removeObject(forKey: selectedSpaceIdKey)
+    }
+  }
+}
+
+private extension Nav3RouteState {
+  func clearingReplyThread(_ peer: Peer) -> Nav3RouteState {
+    guard replyThreadPeer == peer else { return self }
+    return Nav3RouteState(route: route, selectedSpaceId: selectedSpaceId)
+  }
+}
+
+private extension Nav3Route {
+  var isAllChatsRoute: Bool {
+    switch self {
+    case .allChats, .archivedChats:
+      true
+    default:
+      false
+    }
+  }
+}

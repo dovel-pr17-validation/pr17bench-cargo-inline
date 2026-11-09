@@ -1,0 +1,566 @@
+import Foundation
+import Testing
+@testable import InlineCLIInstaller
+
+@Suite("CLI agent setup app protocol")
+struct CLIAgentSetupRunnerTests {
+  @Test("preserves only an explicit CLI telemetry opt-out")
+  func preservesTelemetryOptOut() {
+    let optedOut = CLIAgentSetupRunner.sanitizedEnvironment([
+      "INLINE_CLI_TELEMETRY": "off",
+      "INLINE_CLI_SENTRY_DSN": "must-not-be-forwarded",
+      "INLINE_TOKEN": "must-not-be-forwarded",
+    ])
+    #expect(optedOut["INLINE_CLI_TELEMETRY"] == "off")
+    #expect(optedOut["INLINE_CLI_SENTRY_DSN"] == nil)
+    #expect(optedOut["INLINE_TOKEN"] == nil)
+    #expect(CLIAgentSetupRunner.sanitizedEnvironment(["INLINE_CLI_TELEMETRY": "on"])["INLINE_CLI_TELEMETRY"] == nil)
+  }
+
+  @Test("retains structured failures surrounded by diagnostic stderr")
+  func decodesFailureWithDiagnostics() throws {
+    let data = Data(("warning: provider probe retrying\n"
+      + #"{"protocolVersion":1,"status":"partial","failedPhase":"service","timedOut":true,"changes":["bot_configured"],"recoveryCommands":["inline bridge doctor --json"],"diagnosticReportPath":"/tmp/inline-diagnostics-test.log","error":{"code":"timeout","message":"certificate expired","hint":"Check system trust"}}"#
+      + "\ntrace: command finished\n").utf8)
+    let failure = try #require(CLIAgentSetupRunner.parseFailure(data, targetID: "codex"))
+    #expect(failure.message == "certificate expired")
+    #expect(failure.failedPhase == "service")
+    #expect(failure.hint == "Check system trust")
+    #expect(failure.completedChanges == ["bot_configured"])
+    #expect(failure.timedOut)
+    #expect(failure.recoveryCommands == ["inline bridge doctor --json"])
+    #expect(failure.diagnosticReportPath == "/tmp/inline-diagnostics-test.log")
+    #expect(failure.isPartial)
+  }
+
+  @Test("uses the released CLI argument contract")
+  func usesReleasedCLIArguments() {
+    #expect(CLIAgentSetupRunner.discoveryArguments == [
+      "--json", "--compact", "agents", "discover",
+    ])
+    #expect(CLIAgentSetupRunner.setupArguments(targetID: "codex", replaceExisting: false) == [
+      "--verbose", "--json", "--compact", "agents", "setup", "--target", "codex", "--non-interactive",
+      "--app-protocol", "1",
+    ])
+    #expect(CLIAgentSetupRunner.setupArguments(targetID: "hermes", replaceExisting: true) == [
+      "--verbose", "--json", "--compact", "agents", "setup", "--target", "hermes", "--non-interactive",
+      "--app-protocol", "1", "--replace",
+    ])
+    #expect(CLIAgentSetupRunner.setupArguments(
+      targetID: "codex",
+      replaceExisting: false,
+      appProtocol: true,
+      verbose: false
+    ) == [
+      "--json", "--compact", "agents", "setup", "--target", "codex", "--non-interactive",
+      "--app-protocol", "1",
+    ])
+    #expect(CLIAgentSetupRunner.setupArguments(
+      targetID: "codex",
+      replaceExisting: false,
+      appProtocol: false,
+      verbose: false
+    ) == [
+      "--json", "--compact", "agents", "setup", "--target", "codex", "--non-interactive",
+    ])
+  }
+
+  @Test("falls back only for an older CLI that rejects the app protocol flag")
+  func identifiesUnsupportedAppProtocol() {
+    #expect(CLIAgentSetupRunner.isUnsupportedAppProtocol(
+      status: 2,
+      standardError: Data("error: unexpected argument '--app-protocol'".utf8)
+    ))
+    #expect(!CLIAgentSetupRunner.isUnsupportedAppProtocol(
+      status: 1,
+      standardError: Data("setup failed after accepting --app-protocol".utf8)
+    ))
+    #expect(!CLIAgentSetupRunner.isUnsupportedAppProtocol(
+      status: 2,
+      standardError: Data("error: missing required argument '--target'".utf8)
+    ))
+  }
+
+  @Test("falls back when CLI 0.7.4 or 0.7.5 rejects verbose diagnostics")
+  func identifiesUnsupportedVerbose() {
+    #expect(CLIAgentSetupRunner.isUnsupportedVerbose(
+      status: 2,
+      standardError: Data("error: unexpected argument '--verbose' found".utf8)
+    ))
+    #expect(!CLIAgentSetupRunner.isUnsupportedVerbose(
+      status: 1,
+      standardError: Data("setup failed while --verbose was enabled".utf8)
+    ))
+    #expect(!CLIAgentSetupRunner.isUnsupportedVerbose(
+      status: 2,
+      standardError: Data("error: missing required argument '--target'\nUsage: inline [--verbose]".utf8)
+    ))
+  }
+
+  @Test("decodes installed harness discovery")
+  func decodesDiscovery() throws {
+    let data = Data(
+      #"{"protocolVersion":1,"action":"agents.discover","documentationUrl":"https://inline.chat/docs/agents","targets":[{"id":"codex","displayName":"Codex","family":"bridge","installed":true},{"id":"hermes","displayName":"Hermes","family":"gateway","installed":false}]}"#.utf8
+    )
+
+    let discovery = try CLIAgentSetupRunner.parseDiscovery(data)
+
+    #expect(discovery.targets.count == 2)
+    #expect(discovery.targets.first?.id == "codex")
+    #expect(discovery.targets.first?.installed == true)
+  }
+
+  @Test("decodes a ready setup result")
+  func decodesSetupResult() throws {
+    let data = Data(
+      #"{"protocolVersion":1,"ok":true,"action":"agents.setup","status":"ready","documentationUrl":"https://inline.chat/docs/agents","openUrl":"in://user/42","target":"codex","family":"bridge","instance":"codex-example","bot":{"id":42,"username":"codex_bot","name":"Codex"},"service":{"kind":"inline_bridge","action":"started","ready":true,"status":"running"},"integration":{"kind":"bridge_provider","action":"configured","version":"1"},"mapping":{"source":"bridge_account","action":"upserted"}}"#.utf8
+    )
+
+    let result = try CLIAgentSetupRunner.parseSetup(data)
+
+    #expect(result.target == "codex")
+    #expect(result.bot.id == 42)
+    #expect(result.service.ready)
+    #expect(result.readiness == nil)
+  }
+
+  @Test("accepts either production scheme for the bot link")
+  func acceptsProductionSchemesForBotLink() throws {
+    let setup = { (openURL: String) in
+      Data(
+        #"{"protocolVersion":1,"ok":true,"action":"agents.setup","status":"ready","documentationUrl":"https://inline.chat/docs/agents","openUrl":"\#(openURL)","target":"codex","family":"bridge","instance":"codex-example","bot":{"id":42,"username":"codex_bot","name":"Codex"},"service":{"kind":"inline_bridge","action":"started","ready":true,"status":"running"}}"#.utf8
+      )
+    }
+
+    #expect(try CLIAgentSetupRunner.parseSetup(setup("inline://user/42")).bot.id == 42)
+    #expect(throws: (any Error).self) { try CLIAgentSetupRunner.parseSetup(setup("inline-dev://user/42")) }
+    #expect(throws: (any Error).self) { try CLIAgentSetupRunner.parseSetup(setup("inline://user/43")) }
+  }
+
+  @Test("decodes progress events and the final streamed result")
+  func decodesStreamedSetup() throws {
+    let event = Data(
+      #"{"protocolVersion":1,"event":"phase.started","phase":"service","message":"Starting the local bridge service; this can take up to 90 seconds...","timeoutSeconds":90}"#.utf8
+    )
+    let output = Data(
+      (#"{"protocolVersion":1,"event":"phase.started","phase":"bot"}"# + "\n"
+        + #"{"protocolVersion":1,"event":"result","result":{"protocolVersion":1,"ok":true,"action":"agents.setup","status":"ready","documentationUrl":"https://inline.chat/docs/agents","openUrl":"in://user/42","target":"codex","family":"bridge","instance":"codex-example","bot":{"id":42,"username":"codex_bot","name":"Codex"},"service":{"kind":"inline_bridge","action":"started","ready":true,"status":"running"}}}"#
+        + "\n").data(using: .utf8)!
+    )
+
+    let progress = try #require(CLIAgentSetupRunner.parseProgressEvent(event))
+    let result = try CLIAgentSetupRunner.parseSetup(output)
+
+    #expect(progress.event == .phaseStarted)
+    #expect(progress.phase == .service)
+    #expect(progress.outcome == nil)
+    #expect(progress.message == "Starting the local bridge service; this can take up to 90 seconds...")
+    #expect(progress.timeoutSeconds == 90)
+    #expect(result.bot.id == 42)
+  }
+
+  @Test("rejects progress outcomes outside the fixed code alphabet")
+  func rejectsUnsafeProgressOutcome() {
+    let event = Data(
+      #"{"protocolVersion":1,"event":"phase.completed","phase":"bot","outcome":"bot 42 at /tmp/example"}"#.utf8
+    )
+
+    #expect(CLIAgentSetupRunner.parseProgressEvent(event) == nil)
+  }
+
+  @Test("decodes a configured result that still needs a model provider")
+  func decodesProviderRequiredResult() throws {
+    let data = Data(
+      #"{"protocolVersion":1,"ok":true,"action":"agents.setup","status":"configured","documentationUrl":"https://inline.chat/docs/agents","openUrl":"in://user/42","target":"hermes","family":"gateway","instance":"default","bot":{"id":42,"username":"hermes_bot","name":"Hermes"},"service":{"kind":"gateway","action":"reconciled","ready":true},"readiness":{"ready":false,"code":"provider_configuration_required","message":"Hermes is connected to Inline, but credentials for its selected model provider could not be resolved.","command":"hermes model","verified":false},"integration":{"kind":"plugin","action":"kept","version":"0.0.8"},"mapping":{"source":"inline_config","action":"upserted"}}"#.utf8
+    )
+
+    let result = try CLIAgentSetupRunner.parseSetup(data)
+
+    #expect(result.status == "configured")
+    #expect(result.service.ready)
+    #expect(result.readiness?.ready == false)
+    #expect(result.readiness?.code == "provider_configuration_required")
+    #expect(result.readiness?.command == "hermes model")
+    #expect(result.readiness?.verified == false)
+  }
+
+  @Test("rejects nonterminal success statuses")
+  func rejectsNonterminalSuccessStatuses() {
+    let ready = #"{"protocolVersion":1,"ok":true,"action":"agents.setup","status":"ready","documentationUrl":"https://inline.chat/docs/agents","openUrl":"in://user/42","target":"codex","family":"bridge","instance":"codex-example","bot":{"id":42,"username":"codex_bot","name":"Codex"},"service":{"kind":"inline_bridge","action":"started","ready":true,"status":"running"}}"#
+    for status in ["partial", "failed", "starting", "future"] {
+      let data = Data(
+        ready.replacingOccurrences(
+          of: #""status":"ready""#,
+          with: #""status":"\#(status)""#
+        ).utf8
+      )
+
+      #expect(throws: AgentSetupFailure.self) {
+        try CLIAgentSetupRunner.parseSetup(data)
+      }
+    }
+  }
+
+  @Test("decodes readiness metadata from an older producer without verification")
+  func decodesReadinessWithoutVerification() throws {
+    let data = Data(
+      #"{"protocolVersion":1,"ok":true,"action":"agents.setup","status":"configured","documentationUrl":"https://inline.chat/docs/agents","openUrl":"in://user/42","target":"hermes","family":"gateway","instance":"default","bot":{"id":42,"username":"hermes_bot","name":"Hermes"},"service":{"kind":"gateway","action":"reconciled","ready":true},"readiness":{"ready":false,"code":"inline_adapter_not_ready","message":"The Inline adapter did not connect.","command":"hermes logs"},"integration":{"kind":"plugin","action":"kept","version":"0.0.8"},"mapping":{"source":"inline_config","action":"upserted"}}"#.utf8
+    )
+
+    let result = try CLIAgentSetupRunner.parseSetup(data)
+
+    #expect(result.readiness?.code == "inline_adapter_not_ready")
+    #expect(result.readiness?.verified == nil)
+  }
+
+  @Test("rejects a future protocol version")
+  func rejectsFutureProtocol() {
+    let data = Data(
+      #"{"protocolVersion":2,"action":"agents.discover","documentationUrl":"https://inline.chat/docs/agents","targets":[]}"#.utf8
+    )
+
+    #expect(throws: AgentSetupFailure.self) {
+      try CLIAgentSetupRunner.parseDiscovery(data)
+    }
+  }
+
+  @Test("removes Inline overrides and relative PATH entries")
+  func sanitizesEnvironment() {
+    let environment = CLIAgentSetupRunner.sanitizedEnvironment([
+      "INLINE_TOKEN": "not-a-real-token",
+      "PATH": "relative-bin:/custom/bin",
+    ])
+
+    #expect(environment["INLINE_TOKEN"] == nil)
+    #expect(environment["PATH"]?.contains("relative-bin") == false)
+    #expect(environment["PATH"]?.contains("/custom/bin") == true)
+    #expect(environment["PATH"]?.contains("/.volta/bin") == true)
+    #expect(environment["PATH"]?.contains("/Library/pnpm") == true)
+  }
+
+  @Test("drains verbose output without retaining unbounded data")
+  func drainsVerboseOutputWithinLimit() async {
+    let standardOutput = Pipe()
+    let standardError = Pipe()
+    let payload = Data(repeating: 0x61, count: CLIAgentSetupRunner.maximumOutputBytes * 2)
+    async let output = drain(payload, through: standardOutput)
+    async let error = drain(payload, through: standardError)
+
+    #expect(await output.count == CLIAgentSetupRunner.maximumOutputBytes)
+    #expect(await error.count == CLIAgentSetupRunner.maximumOutputBytes)
+  }
+
+  @Test("redacts credentials and home paths in structured failures")
+  func redactsStructuredFailureText() {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let sanitized = CLIAgentSetupRunner.safeStructuredText(
+      "\(home)/agent token=secret-value Bearer abc.def \"token\":\"json-secret\" password: \"quoted-secret\" --api-key flag-secret",
+      maximumScalars: 1_000
+    )
+
+    #expect(!sanitized.contains(home))
+    #expect(!sanitized.contains("secret-value"))
+    #expect(!sanitized.contains("abc.def"))
+    #expect(!sanitized.contains("json-secret"))
+    #expect(!sanitized.contains("quoted-secret"))
+    #expect(!sanitized.contains("flag-secret"))
+  }
+
+  @Test("keeps non-secret structured failure prose")
+  func keepsNonSecretFailureProse() {
+    let prose = "Provider login is required before setup can continue."
+    #expect(CLIAgentSetupRunner.safeStructuredText(prose, maximumScalars: 1_000) == prose)
+  }
+
+  @Test("turns an incompatible OpenClaw probe into an update message")
+  func presentsOutdatedOpenClaw() {
+    let failure = AgentSetupFailure(
+      code: "plugin_probe_failed",
+      message: "could not inspect the OpenClaw Inline plugin: Invalid config; error: unknown command 'inspect'",
+      recoveryURL: URL(string: "https://inline.chat/docs/agents")!
+    )
+
+    #expect(failure.presentation.title == "OpenClaw Needs an Update")
+    #expect(failure.presentation.detail.contains("too old"))
+    #expect(failure.presentation.message.contains("installed more than once"))
+    #expect(!failure.presentation.message.contains("unknown command"))
+    #expect(failure.presentation.actionLabel == "Open Update Instructions")
+    #expect(failure.presentation.actionURL?.host == "docs.openclaw.ai")
+  }
+
+  @Test("explains a broken OpenClaw plugin without hiding the diagnostic")
+  func presentsBrokenOpenClawPlugin() {
+    let rawMessage = "OpenClaw Inline plugin failed to load: Cannot find module '/local/plugin.js'"
+    let failure = AgentSetupFailure(
+      code: "plugin_probe_failed",
+      message: rawMessage,
+      recoveryURL: URL(string: "https://inline.chat/docs/agents")!
+    )
+
+    #expect(failure.presentation.title == "OpenClaw Plugin Couldn’t Load")
+    #expect(failure.presentation.message.contains("Update OpenClaw and its Inline plugin"))
+    #expect(failure.message == rawMessage)
+  }
+
+  @Test("explains rejected OpenClaw configuration")
+  func presentsInvalidOpenClawConfiguration() {
+    let failure = AgentSetupFailure(
+      code: "plugin_probe_failed",
+      message: "OpenClaw returned Invalid config for channels.inline",
+      recoveryURL: URL(string: "https://inline.chat/docs/agents")!
+    )
+
+    #expect(failure.presentation.title == "OpenClaw Configuration Needs Attention")
+    #expect(failure.presentation.message.contains("Technical Details"))
+  }
+
+  @Test("turns an incompatible Amp provider probe into an update message")
+  func presentsOutdatedAmp() {
+    let failure = AgentSetupFailure(
+      code: "amp_cli_incompatible",
+      message: "The pinned Amp ACP adapter is incompatible with the installed Amp CLI; update Amp or Inline, then rerun setup",
+      recoveryURL: URL(string: "https://inline.chat/docs/agents")!
+    )
+
+    #expect(failure.presentation.title == "Amp Needs an Update")
+    #expect(failure.presentation.detail.contains("too old"))
+    #expect(failure.presentation.message.contains("selecting an older copy"))
+    #expect(failure.presentation.actionLabel == "Open Update Instructions")
+    #expect(failure.presentation.actionURL?.host == "ampcode.com")
+  }
+
+  @Test("distinguishes a verified Hermes adapter update from replacement")
+  func presentsHermesAdapterUpdate() {
+    let failure = AgentSetupFailure(
+      code: "plugin_update_required",
+      message: "The existing Hermes Inline bot identity was verified and will be preserved, but its legacy adapter must be updated.",
+      recoveryURL: URL(string: "https://inline.chat/docs/agents")!
+    )
+
+    #expect(failure.presentation.title == "Hermes Adapter Needs an Update")
+    #expect(failure.presentation.message.contains("bot identity will be preserved"))
+    #expect(failure.presentation.actionURL?.path == "/docs/hermes")
+  }
+
+  @Test("warns when a Hermes credential cannot be identified")
+  func presentsHermesReplacementConfirmation() {
+    let failure = AgentSetupFailure(
+      code: "setup_conflict",
+      message: "Hermes cannot verify whether an existing Inline credential needs to be preserved; install or update the Inline Hermes adapter, or rerun with --replace to explicitly allow replacement.",
+      recoveryURL: URL(string: "https://inline.chat/docs/agents")!
+    )
+
+    #expect(failure.presentation.title == "Hermes Found an Existing Connection")
+    #expect(failure.presentation.detail.contains("stopped before changing"))
+    #expect(failure.presentation.message.contains("Recommended: update"))
+    #expect(failure.presentation.actionLabel == "Open Update Steps (Recommended)")
+    #expect(failure.presentation.replacementActionLabel == "Replace Existing Connection…")
+    #expect(failure.presentation.replacementConfirmationTitle == "Replace Existing Hermes Connection?")
+    #expect(failure.presentation.replacementConfirmationMessage?.contains("previous bot will not be deleted") == true)
+    #expect(failure.presentation.replacementConfirmationActionLabel == "Replace and Continue")
+    #expect(failure.supportsConfirmedReplacement)
+  }
+
+  @Test("keeps unknown setup failures generic")
+  func presentsGenericFailure() {
+    let failure = AgentSetupFailure(
+      code: "unexpected_failure",
+      message: "The provider closed the connection.",
+      recoveryURL: URL(string: "https://inline.chat/docs/agents")!
+    )
+
+    #expect(failure.presentation.title == "Setup Couldn’t Finish")
+    #expect(failure.presentation.message == failure.message)
+    #expect(failure.presentation.label == "What Happened")
+    #expect(failure.presentation.actionLabel == nil)
+    #expect(failure.presentation.actionURL == nil)
+  }
+
+  @Test("accepts versionless released errors and rejects future error protocols")
+  func validatesStructuredErrorProtocol() throws {
+    let released = Data(
+      #"{"error":{"code":"not_authenticated","message":"Run inline login.","hint":"Sign in first.","examples":[]}}"#.utf8
+    )
+    let future = Data(
+      #"{"protocolVersion":2,"error":{"code":"future","message":"A future error."}}"#.utf8
+    )
+
+    let releasedFailure = try #require(CLIAgentSetupRunner.parseFailure(released, targetID: "codex"))
+    let futureFailure = try #require(CLIAgentSetupRunner.parseFailure(future, targetID: "codex"))
+
+    #expect(releasedFailure.code == "not_authenticated")
+    #expect(releasedFailure.retryCommand == "inline agents setup --target codex --non-interactive")
+    #expect(futureFailure.code == "invalid_cli_response")
+  }
+
+  @Test("cancellation cannot return during the process launch transition")
+  func cancellationWaitsForLaunchTransition() throws {
+    let state = AgentSetupProcessState()
+    let operationID = try #require(state.begin())
+    let launchEntered = DispatchSemaphore(value: 0)
+    let permitLaunch = DispatchSemaphore(value: 0)
+    let cancellationAttempted = DispatchSemaphore(value: 0)
+    let cancellationReturned = DispatchSemaphore(value: 0)
+    let launchFinished = DispatchSemaphore(value: 0)
+    let probe = LaunchProbe()
+
+    DispatchQueue.global(qos: .userInitiated).async {
+      let launched = try? state.launch(Process(), operationID: operationID) {
+        launchEntered.signal()
+        permitLaunch.wait()
+        probe.markStarted()
+      }
+      probe.markLaunchResult(launched == true)
+      launchFinished.signal()
+    }
+    #expect(launchEntered.wait(timeout: .now() + 2) == .success)
+
+    DispatchQueue.global(qos: .userInitiated).async {
+      cancellationAttempted.signal()
+      _ = state.requestCancellation()
+      probe.markCancellationReturned()
+      cancellationReturned.signal()
+    }
+    #expect(cancellationAttempted.wait(timeout: .now() + 2) == .success)
+    #expect(cancellationReturned.wait(timeout: .now() + 0.1) == .timedOut)
+
+    permitLaunch.signal()
+    #expect(launchFinished.wait(timeout: .now() + 2) == .success)
+    #expect(cancellationReturned.wait(timeout: .now() + 2) == .success)
+    #expect(probe.launchSucceeded)
+    #expect(probe.startedBeforeCancellationReturned)
+    state.finish(operationID)
+  }
+
+  @Test("a cancellation latched before launch prevents process start")
+  func cancellationBeforeLaunchPreventsStart() throws {
+    let state = AgentSetupProcessState()
+    let operationID = try #require(state.begin())
+    let probe = LaunchProbe()
+
+    _ = state.requestCancellation()
+    let launched = try state.launch(Process(), operationID: operationID) {
+      probe.markStarted()
+    }
+
+    #expect(!launched)
+    #expect(!probe.didStart)
+    state.finish(operationID)
+  }
+
+  @Test("refuses a non-Inline executable at the setup boundary")
+  func refusesNonInlineExecutable() {
+    let configuration = CLIInstallerConfiguration(
+      manifestURL: URL(string: "https://example.com/manifest.json")!,
+      documentationURL: URL(string: "https://example.com/docs")!,
+      expectedSigningIdentifier: "chat.inline.cli",
+      expectedTeamIdentifier: "2487AN8AL4",
+      installLocations: [],
+      searchesEnvironmentPath: false
+    )
+
+    #expect(throws: CLIInstallerFailure.self) {
+      try CLIExecutableVerifier.verify(
+        URL(fileURLWithPath: "/bin/echo"),
+        configuration: configuration
+      )
+    }
+  }
+
+  @Test("synchronous cancellation returns only after a stubborn child exits")
+  func synchronousCancellationWaitsForExit() throws {
+    let process = Process()
+    let readyPipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", "trap '' TERM; printf R; while :; do sleep 1; done"]
+    process.standardOutput = readyPipe
+    try process.run()
+    try? readyPipe.fileHandleForWriting.close()
+    let ready = try readyPipe.fileHandleForReading.read(upToCount: 1)
+    #expect(ready == Data("R".utf8))
+
+    let startedAt = ContinuousClock.now
+    CLIAgentSetupRunner.stopAndWait(process)
+
+    #expect(!process.isRunning)
+    #expect(ContinuousClock.now - startedAt < .seconds(3))
+  }
+
+  @Test("output drain remains bounded after closing pipe handles")
+  func outputDrainRemainsBounded() {
+    let group = DispatchGroup()
+    let pipe = Pipe()
+    group.enter()
+
+    let startedAt = ContinuousClock.now
+    let drained = CLIAgentSetupRunner.finishDraining(
+      group,
+      handles: [pipe.fileHandleForReading, pipe.fileHandleForWriting],
+      timeout: .milliseconds(20),
+      closeGrace: .milliseconds(20)
+    )
+
+    #expect(!drained)
+    #expect(ContinuousClock.now - startedAt < .seconds(1))
+    group.leave()
+  }
+
+  @Test("delivers streamed progress lines before the CLI closes stdout")
+  func streamsChunksBeforeEOF() throws {
+    let pipe = Pipe()
+    let firstChunk = DispatchSemaphore(value: 0)
+    let drained = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .utility).async {
+      _ = CLIAgentSetupRunner.boundedDrain(
+        pipe.fileHandleForReading,
+        onOverflow: nil,
+        onChunk: { _ in firstChunk.signal() }
+      )
+      drained.signal()
+    }
+    try pipe.fileHandleForWriting.write(contentsOf: Data("{\"event\":\"phase.started\"}\n".utf8))
+
+    // The writer is still open: a chunk must arrive without waiting for EOF.
+    #expect(firstChunk.wait(timeout: .now() + 2) == .success)
+
+    try pipe.fileHandleForWriting.close()
+    #expect(drained.wait(timeout: .now() + 2) == .success)
+  }
+
+  private func drain(_ payload: Data, through pipe: Pipe) async -> Data {
+    await withCheckedContinuation { continuation in
+      DispatchQueue.global(qos: .utility).async {
+        try? pipe.fileHandleForWriting.write(contentsOf: payload)
+        try? pipe.fileHandleForWriting.close()
+      }
+      DispatchQueue.global(qos: .utility).async {
+        continuation.resume(returning: CLIAgentSetupRunner.boundedDrain(pipe.fileHandleForReading))
+      }
+    }
+  }
+}
+
+private final class LaunchProbe: @unchecked Sendable {
+  private let lock = NSLock()
+  private var started = false
+  private var cancellationReturned = false
+  private var launchResult = false
+
+  var didStart: Bool { lock.withLock { started } }
+  var launchSucceeded: Bool { lock.withLock { launchResult } }
+  var startedBeforeCancellationReturned: Bool {
+    lock.withLock { started && cancellationReturned }
+  }
+
+  func markStarted() {
+    lock.withLock { started = true }
+  }
+
+  func markCancellationReturned() {
+    lock.withLock { cancellationReturned = true }
+  }
+
+  func markLaunchResult(_ value: Bool) {
+    lock.withLock { launchResult = value }
+  }
+}

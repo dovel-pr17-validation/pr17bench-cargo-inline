@@ -1,0 +1,26 @@
+name: Apple Lint
+
+on:
+  # Xcode Cloud's "Apple Package Tests" workflow owns automatic SwiftLint.
+  # Keep this workflow available only as a manual GitHub-hosted fallback.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swiftlint:
+    name: SwiftLint
+    runs-on: macos-26
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run SwiftLint
+        run: bash scripts/apple/swiftlint.sh --quiet --reporter summary

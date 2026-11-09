@@ -1,0 +1,108 @@
+import InlineKit
+import InlineProtocol
+import Logger
+import TextProcessing
+import UIKit
+
+extension ComposeView {
+  private static let draftLog = Log.scoped("ComposeView.DraftManagement")
+
+  func startDraftSaveTimer() {
+    draftManager.scheduleSave(peerId: peerId) { [weak self] in
+      self?.textView.attributedText ?? NSAttributedString()
+    }
+    Self.draftLog.debug("Draft auto-save scheduled")
+  }
+
+  func stopDraftSaveTimer() {
+    draftManager.cancelPendingSave()
+  }
+
+  func saveDraftIfNeeded() {
+    draftManager.save(peerId: peerId, attributedString: textView.attributedText ?? NSAttributedString())
+  }
+
+  // MARK: - Draft Management
+
+  @discardableResult
+  func loadDraft(from draftMessage: InlineProtocol.DraftMessage?) -> Bool {
+    guard let draftMessage, !draftMessage.text.isEmpty else { return false }
+    guard canRestoreDraft else { return false }
+    guard let draft = draftManager.load(draftMessage) else { return false }
+    applyDraft(draft.text, entities: draft.entities)
+    return true
+  }
+
+  func applyDraft(_ draft: String?, entities: MessageEntities? = nil) {
+    if let draft, !draft.isEmpty {
+      autocompleteManager?.dismissCompletion()
+      textView.text = draft
+      draftManager.markLoaded(text: draft, entities: entities)
+
+      if let entities {
+        // Use ProcessEntities to apply entities to text
+        let attributedText = ProcessEntities.toAttributedString(
+          text: draft,
+          entities: entities,
+          configuration: .init(
+            font: textView.font ?? UIFont.systemFont(ofSize: 17),
+            primaryColor: UIColor.label,
+            linkColor: ThemeManager.shared.selected.accent,
+            convertMentionsToLink: false
+          )
+        )
+
+        textView.attributedText = attributedText
+      }
+
+      textView.selectedRange = NSRange(location: textView.attributedText.length, length: 0)
+      textView.resetTypingAttributesToDefault()
+
+      textView.showPlaceholder(false)
+      updateSendButtonVisibility()
+      updateAgentDraftTarget()
+      updateHeight()
+
+      // Start timer since we now have text content
+      startDraftSaveTimer()
+    }
+  }
+
+  /// External compose requests use the live editor, so pending text and attachments are preserved.
+  func acceptExternalDraft(_ text: String, for peer: InlineKit.Peer) -> Bool {
+    guard peerId == peer else { return false }
+    if !text.isEmpty {
+      guard canRestoreDraft else { return false }
+      guard commandLaunchState() == .empty else { return false }
+      applyDraft(text)
+      saveDraft()
+    }
+    textView.becomeFirstResponder()
+    return true
+  }
+
+  private var canRestoreDraft: Bool {
+    let normalizedText = (textView.text ?? "").replacingOccurrences(of: "\u{FFFC}", with: "")
+    return normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+      attachmentItems.isEmpty &&
+      pendingVideoAttachments.isEmpty &&
+      !isVoiceActive
+  }
+
+  /// Set the initial draft from ChatView (call this after setting peerId and chatId)
+  public func setInitialDraft(from draftMessage: InlineProtocol.DraftMessage?) {
+    loadDraft(from: draftMessage)
+  }
+
+  func saveDraft() {
+    saveDraftIfNeeded()
+  }
+
+  func clearDraft() {
+    draftManager.clear(peerId: peerId)
+  }
+
+  @objc func saveCurrentDraft() {
+    saveDraft()
+  }
+}

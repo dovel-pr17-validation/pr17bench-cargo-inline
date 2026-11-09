@@ -1,0 +1,635 @@
+import { db } from "@in/server/db"
+import type { Transaction } from "@in/server/db/types"
+import {
+  oauthAccessTokens,
+  oauthAuthCodes,
+  oauthAuthRequests,
+  oauthClients,
+  oauthGrants,
+  oauthRefreshTokens,
+} from "@in/server/db/schema/oauth"
+import { and, eq, gt, isNotNull, isNull, lte, or } from "drizzle-orm"
+
+export type OauthRegisteredClient = {
+  clientId: string
+  redirectUris: string[]
+  clientName: string | null
+  createdAtMs: number
+}
+
+export type OauthAuthRequest = {
+  id: string
+  clientId: string
+  redirectUri: string
+  state: string
+  scope: string
+  resource: string
+  codeChallenge: string
+  csrfToken: string
+  deviceId: string
+  inlineUserId: number | null
+  authMethod: "email" | "phone" | "google" | "apple" | null
+  email: string | null
+  phoneNumber: string | null
+  challengeToken: string | null
+  inlineTokenEncrypted: Buffer | null
+  createdAtMs: number
+  expiresAtMs: number
+}
+
+export type OauthGrant = {
+  id: string
+  clientId: string
+  inlineUserId: number
+  scope: string
+  resource: string
+  spaceIds: bigint[]
+  allowDms: boolean
+  allowHomeThreads: boolean
+  inlineTokenEncrypted: Buffer | null
+  createdAtMs: number
+  revokedAtMs: number | null
+}
+
+export type OauthAuthCode = {
+  code: string
+  grantId: string
+  clientId: string
+  redirectUri: string
+  codeChallenge: string
+  usedAtMs: number | null
+  createdAtMs: number
+  expiresAtMs: number
+}
+
+export type OauthAccessToken = {
+  tokenHash: string
+  grantId: string
+  createdAtMs: number
+  expiresAtMs: number
+  revokedAtMs: number | null
+}
+
+export type OauthRefreshToken = {
+  tokenHash: string
+  grantId: string
+  replacedByHash: string | null
+  createdAtMs: number
+  expiresAtMs: number
+  revokedAtMs: number | null
+}
+
+function decodeJsonStringArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  return raw.filter((value): value is string => typeof value === "string")
+}
+
+function toMs(date: Date | null): number | null {
+  return date ? date.getTime() : null
+}
+
+function toDate(ms: number): Date {
+  return new Date(ms)
+}
+
+function mapClient(row: typeof oauthClients.$inferSelect): OauthRegisteredClient {
+  return {
+    clientId: row.clientId,
+    redirectUris: decodeJsonStringArray(JSON.parse(row.redirectUrisJson)),
+    clientName: row.clientName,
+    createdAtMs: row.date.getTime(),
+  }
+}
+
+function mapAuthRequest(row: typeof oauthAuthRequests.$inferSelect): OauthAuthRequest {
+  return {
+    id: row.id,
+    clientId: row.clientId,
+    redirectUri: row.redirectUri,
+    state: row.state,
+    scope: row.scope,
+    resource: row.resource,
+    codeChallenge: row.codeChallenge,
+    csrfToken: row.csrfToken,
+    deviceId: row.deviceId,
+    inlineUserId: row.inlineUserId,
+    authMethod: row.authMethod as OauthAuthRequest["authMethod"],
+    email: row.email,
+    phoneNumber: row.phoneNumber,
+    challengeToken: row.challengeToken,
+    inlineTokenEncrypted: row.inlineTokenEncrypted,
+    createdAtMs: row.date.getTime(),
+    expiresAtMs: row.expiresAt.getTime(),
+  }
+}
+
+function mapGrant(row: typeof oauthGrants.$inferSelect): OauthGrant {
+  const spaceIdsRaw = Array.isArray(row.spaceIdsJson) ? row.spaceIdsJson : []
+  return {
+    id: row.id,
+    clientId: row.clientId,
+    inlineUserId: row.inlineUserId,
+    scope: row.scope,
+    resource: row.resource,
+    spaceIds: spaceIdsRaw.map((value) => BigInt(value)),
+    allowDms: row.allowDms,
+    allowHomeThreads: row.allowHomeThreads,
+    inlineTokenEncrypted: row.inlineTokenEncrypted,
+    createdAtMs: row.date.getTime(),
+    revokedAtMs: toMs(row.revokedAt),
+  }
+}
+
+function mapAuthCode(row: typeof oauthAuthCodes.$inferSelect): OauthAuthCode {
+  return {
+    code: row.code,
+    grantId: row.grantId,
+    clientId: row.clientId,
+    redirectUri: row.redirectUri,
+    codeChallenge: row.codeChallenge,
+    usedAtMs: toMs(row.usedAt),
+    createdAtMs: row.date.getTime(),
+    expiresAtMs: row.expiresAt.getTime(),
+  }
+}
+
+function mapAccessToken(row: typeof oauthAccessTokens.$inferSelect): OauthAccessToken {
+  return {
+    tokenHash: row.tokenHash,
+    grantId: row.grantId,
+    createdAtMs: row.date.getTime(),
+    expiresAtMs: row.expiresAt.getTime(),
+    revokedAtMs: toMs(row.revokedAt),
+  }
+}
+
+function mapRefreshToken(row: typeof oauthRefreshTokens.$inferSelect): OauthRefreshToken {
+  return {
+    tokenHash: row.tokenHash,
+    grantId: row.grantId,
+    replacedByHash: row.replacedByHash,
+    createdAtMs: row.date.getTime(),
+    expiresAtMs: row.expiresAt.getTime(),
+    revokedAtMs: toMs(row.revokedAt),
+  }
+}
+
+export const OauthModel = {
+  async cleanupExpired(nowMs: number): Promise<void> {
+    const now = toDate(nowMs)
+    await Promise.all([
+      db.delete(oauthAuthRequests).where(lte(oauthAuthRequests.expiresAt, now)),
+      db.delete(oauthAuthCodes).where(lte(oauthAuthCodes.expiresAt, now)),
+      db.delete(oauthAccessTokens).where(lte(oauthAccessTokens.expiresAt, now)),
+      db.delete(oauthRefreshTokens).where(lte(oauthRefreshTokens.expiresAt, now)),
+    ])
+  },
+
+  async createClient(input: {
+    clientId: string
+    redirectUris: string[]
+    clientName: string | null
+    nowMs: number
+  }): Promise<OauthRegisteredClient> {
+    const [inserted] = await db
+      .insert(oauthClients)
+      .values({
+        clientId: input.clientId,
+        redirectUrisJson: JSON.stringify(input.redirectUris),
+        clientName: input.clientName,
+        date: toDate(input.nowMs),
+      })
+      .returning()
+
+    if (!inserted) {
+      throw new Error("failed to create oauth client")
+    }
+
+    return mapClient(inserted)
+  },
+
+  async getClient(clientId: string): Promise<OauthRegisteredClient | null> {
+    const row = await db._query.oauthClients.findFirst({ where: eq(oauthClients.clientId, clientId) })
+    return row ? mapClient(row) : null
+  },
+
+  async createAuthRequest(input: {
+    id: string
+    clientId: string
+    redirectUri: string
+    state: string
+    scope: string
+    resource: string
+    codeChallenge: string
+    csrfToken: string
+    deviceId: string
+    nowMs: number
+    expiresAtMs: number
+  }): Promise<OauthAuthRequest> {
+    const [inserted] = await db
+      .insert(oauthAuthRequests)
+      .values({
+        id: input.id,
+        clientId: input.clientId,
+        redirectUri: input.redirectUri,
+        state: input.state,
+        scope: input.scope,
+        resource: input.resource,
+        codeChallenge: input.codeChallenge,
+        csrfToken: input.csrfToken,
+        deviceId: input.deviceId,
+        date: toDate(input.nowMs),
+        expiresAt: toDate(input.expiresAtMs),
+      })
+      .returning()
+
+    if (!inserted) {
+      throw new Error("failed to create oauth auth request")
+    }
+
+    return mapAuthRequest(inserted)
+  },
+
+  async getAuthRequest(id: string, nowMs: number): Promise<OauthAuthRequest | null> {
+    const row = await db._query.oauthAuthRequests.findFirst({
+      where: and(eq(oauthAuthRequests.id, id), gt(oauthAuthRequests.expiresAt, toDate(nowMs))),
+    })
+    return row ? mapAuthRequest(row) : null
+  },
+
+  async setAuthRequestEmail(id: string, email: string, challengeToken: string): Promise<void> {
+    await db
+      .update(oauthAuthRequests)
+      .set({ email, phoneNumber: null, challengeToken })
+      .where(eq(oauthAuthRequests.id, id))
+  },
+
+  async setAuthRequestPhoneNumber(id: string, phoneNumber: string): Promise<void> {
+    await db
+      .update(oauthAuthRequests)
+      .set({ email: null, phoneNumber, challengeToken: null })
+      .where(eq(oauthAuthRequests.id, id))
+  },
+
+  async setAuthRequestInlineSession(input: {
+    id: string
+    inlineUserId: number
+    inlineTokenEncrypted?: Buffer
+    authMethod?: OauthAuthRequest["authMethod"]
+  }): Promise<void> {
+    await db
+      .update(oauthAuthRequests)
+      .set({
+        inlineUserId: input.inlineUserId,
+        inlineTokenEncrypted: input.inlineTokenEncrypted,
+        authMethod: input.authMethod,
+      })
+      .where(eq(oauthAuthRequests.id, input.id))
+  },
+
+  async deleteAuthRequest(id: string): Promise<void> {
+    await db.delete(oauthAuthRequests).where(eq(oauthAuthRequests.id, id))
+  },
+
+  async consumeAuthRequest(id: string, userId: number, nowMs: number, tx: Transaction): Promise<OauthAuthRequest | null> {
+    const [row] = await tx.delete(oauthAuthRequests).where(and(
+      eq(oauthAuthRequests.id, id),
+      eq(oauthAuthRequests.inlineUserId, userId),
+      isNotNull(oauthAuthRequests.inlineTokenEncrypted),
+      gt(oauthAuthRequests.expiresAt, toDate(nowMs)),
+    )).returning()
+    return row ? mapAuthRequest(row) : null
+  },
+
+  async createGrant(input: {
+    id: string
+    clientId: string
+    inlineUserId: number
+    scope: string
+    resource: string
+    spaceIds: bigint[]
+    allowDms: boolean
+    allowHomeThreads: boolean
+    inlineTokenEncrypted?: Buffer | null
+    nowMs: number
+  }, connection: Transaction | typeof db = db): Promise<OauthGrant> {
+    const [inserted] = await connection
+      .insert(oauthGrants)
+      .values({
+        id: input.id,
+        clientId: input.clientId,
+        inlineUserId: input.inlineUserId,
+        scope: input.scope,
+        resource: input.resource,
+        spaceIdsJson: input.spaceIds.map((spaceId) => Number(spaceId)),
+        allowDms: input.allowDms,
+        allowHomeThreads: input.allowHomeThreads,
+        inlineTokenEncrypted: input.inlineTokenEncrypted,
+        date: toDate(input.nowMs),
+      })
+      .returning()
+
+    if (!inserted) {
+      throw new Error("failed to create oauth grant")
+    }
+
+    return mapGrant(inserted)
+  },
+
+  async getGrant(grantId: string): Promise<OauthGrant | null> {
+    const row = await db._query.oauthGrants.findFirst({ where: eq(oauthGrants.id, grantId) })
+    return row ? mapGrant(row) : null
+  },
+
+  async revokeGrant(grantId: string, nowMs: number): Promise<void> {
+    await db
+      .update(oauthGrants)
+      .set({ revokedAt: toDate(nowMs) })
+      .where(and(eq(oauthGrants.id, grantId), isNull(oauthGrants.revokedAt)))
+  },
+
+  async createAuthCode(input: {
+    code: string
+    grantId: string
+    clientId: string
+    redirectUri: string
+    codeChallenge: string
+    nowMs: number
+    expiresAtMs: number
+  }, connection: Transaction | typeof db = db): Promise<OauthAuthCode> {
+    const [inserted] = await connection
+      .insert(oauthAuthCodes)
+      .values({
+        code: input.code,
+        grantId: input.grantId,
+        clientId: input.clientId,
+        redirectUri: input.redirectUri,
+        codeChallenge: input.codeChallenge,
+        date: toDate(input.nowMs),
+        expiresAt: toDate(input.expiresAtMs),
+      })
+      .returning()
+
+    if (!inserted) {
+      throw new Error("failed to create oauth authorization code")
+    }
+
+    return mapAuthCode(inserted)
+  },
+
+  async getAuthCode(code: string, nowMs: number): Promise<OauthAuthCode | null> {
+    const row = await db._query.oauthAuthCodes.findFirst({
+      where: and(eq(oauthAuthCodes.code, code), gt(oauthAuthCodes.expiresAt, toDate(nowMs))),
+    })
+    return row ? mapAuthCode(row) : null
+  },
+
+  async markAuthCodeUsed(code: string, nowMs: number): Promise<void> {
+    await db
+      .update(oauthAuthCodes)
+      .set({ usedAt: toDate(nowMs) })
+      .where(eq(oauthAuthCodes.code, code))
+  },
+
+  async createAccessToken(input: {
+    tokenHash: string
+    grantId: string
+    nowMs: number
+    expiresAtMs: number
+  }): Promise<void> {
+    await db.insert(oauthAccessTokens).values({
+      tokenHash: input.tokenHash,
+      grantId: input.grantId,
+      date: toDate(input.nowMs),
+      expiresAt: toDate(input.expiresAtMs),
+    })
+  },
+
+  async getAccessToken(tokenHash: string, nowMs: number): Promise<OauthAccessToken | null> {
+    const row = await db._query.oauthAccessTokens.findFirst({
+      where: and(
+        eq(oauthAccessTokens.tokenHash, tokenHash),
+        isNull(oauthAccessTokens.revokedAt),
+        gt(oauthAccessTokens.expiresAt, toDate(nowMs)),
+      ),
+    })
+    return row ? mapAccessToken(row) : null
+  },
+
+  async createRefreshToken(input: {
+    tokenHash: string
+    grantId: string
+    nowMs: number
+    expiresAtMs: number
+  }): Promise<void> {
+    await db.insert(oauthRefreshTokens).values({
+      tokenHash: input.tokenHash,
+      grantId: input.grantId,
+      date: toDate(input.nowMs),
+      expiresAt: toDate(input.expiresAtMs),
+    })
+  },
+
+  async consumeAuthCodeAndCreateTokens(input: {
+    code: string
+    grantId: string
+    nowMs: number
+    accessTokenHash: string
+    accessTokenExpiresAtMs: number
+    refreshTokenHash: string
+    refreshTokenExpiresAtMs: number
+  }): Promise<boolean> {
+    return await db.transaction(async (tx) => {
+      const consumed = await tx
+        .update(oauthAuthCodes)
+        .set({ usedAt: toDate(input.nowMs) })
+        .where(
+          and(
+            eq(oauthAuthCodes.code, input.code),
+            eq(oauthAuthCodes.grantId, input.grantId),
+            isNull(oauthAuthCodes.usedAt),
+            gt(oauthAuthCodes.expiresAt, toDate(input.nowMs)),
+          ),
+        )
+        .returning({ code: oauthAuthCodes.code })
+
+      if (consumed.length !== 1) {
+        return false
+      }
+
+      await tx.insert(oauthAccessTokens).values({
+        tokenHash: input.accessTokenHash,
+        grantId: input.grantId,
+        date: toDate(input.nowMs),
+        expiresAt: toDate(input.accessTokenExpiresAtMs),
+      })
+      await tx.insert(oauthRefreshTokens).values({
+        tokenHash: input.refreshTokenHash,
+        grantId: input.grantId,
+        date: toDate(input.nowMs),
+        expiresAt: toDate(input.refreshTokenExpiresAtMs),
+      })
+
+      return true
+    })
+  },
+
+  async rotateRefreshToken(input: {
+    currentTokenHash: string
+    replacementTokenHash: string
+    grantId: string
+    nowMs: number
+    accessTokenHash: string
+    accessTokenExpiresAtMs: number
+    refreshTokenExpiresAtMs: number
+  }): Promise<boolean> {
+    return await db.transaction(async (tx) => {
+      const consumed = await tx
+        .update(oauthRefreshTokens)
+        .set({
+          revokedAt: toDate(input.nowMs),
+          replacedByHash: input.replacementTokenHash,
+        })
+        .where(
+          and(
+            eq(oauthRefreshTokens.tokenHash, input.currentTokenHash),
+            eq(oauthRefreshTokens.grantId, input.grantId),
+            isNull(oauthRefreshTokens.revokedAt),
+            gt(oauthRefreshTokens.expiresAt, toDate(input.nowMs)),
+          ),
+        )
+        .returning({ tokenHash: oauthRefreshTokens.tokenHash })
+
+      if (consumed.length !== 1) {
+        return false
+      }
+
+      await tx.insert(oauthAccessTokens).values({
+        tokenHash: input.accessTokenHash,
+        grantId: input.grantId,
+        date: toDate(input.nowMs),
+        expiresAt: toDate(input.accessTokenExpiresAtMs),
+      })
+      await tx.insert(oauthRefreshTokens).values({
+        tokenHash: input.replacementTokenHash,
+        grantId: input.grantId,
+        date: toDate(input.nowMs),
+        expiresAt: toDate(input.refreshTokenExpiresAtMs),
+      })
+
+      return true
+    })
+  },
+
+  async getRefreshToken(tokenHash: string, nowMs: number): Promise<OauthRefreshToken | null> {
+    const row = await db._query.oauthRefreshTokens.findFirst({
+      where: and(
+        eq(oauthRefreshTokens.tokenHash, tokenHash),
+        isNull(oauthRefreshTokens.revokedAt),
+        gt(oauthRefreshTokens.expiresAt, toDate(nowMs)),
+      ),
+    })
+    return row ? mapRefreshToken(row) : null
+  },
+
+  async revokeRefreshToken(tokenHash: string, nowMs: number, replacedByHash: string | null): Promise<void> {
+    await db
+      .update(oauthRefreshTokens)
+      .set({ revokedAt: toDate(nowMs), replacedByHash })
+      .where(eq(oauthRefreshTokens.tokenHash, tokenHash))
+  },
+
+  async revokeRefreshTokensByGrant(grantId: string, nowMs: number): Promise<void> {
+    await db
+      .update(oauthRefreshTokens)
+      .set({ revokedAt: toDate(nowMs), replacedByHash: null })
+      .where(and(eq(oauthRefreshTokens.grantId, grantId), isNull(oauthRefreshTokens.revokedAt)))
+  },
+
+  async revokeAccessTokensByGrant(grantId: string, nowMs: number): Promise<void> {
+    await db
+      .update(oauthAccessTokens)
+      .set({ revokedAt: toDate(nowMs) })
+      .where(and(eq(oauthAccessTokens.grantId, grantId), isNull(oauthAccessTokens.revokedAt)))
+  },
+
+  async findGrantIdByTokenHash(tokenHash: string): Promise<string | null> {
+    const refresh = await db._query.oauthRefreshTokens.findFirst({ where: eq(oauthRefreshTokens.tokenHash, tokenHash) })
+    if (refresh) return refresh.grantId
+
+    const access = await db._query.oauthAccessTokens.findFirst({ where: eq(oauthAccessTokens.tokenHash, tokenHash) })
+    if (access) return access.grantId
+
+    return null
+  },
+
+  async getGrantByActiveAccessTokenHash(tokenHash: string, nowMs: number): Promise<{ grant: OauthGrant; accessToken: OauthAccessToken } | null> {
+    const row = (
+      await db
+        .select({ grant: oauthGrants, accessToken: oauthAccessTokens })
+        .from(oauthAccessTokens)
+        .innerJoin(oauthGrants, eq(oauthAccessTokens.grantId, oauthGrants.id))
+        .where(
+          and(
+            eq(oauthAccessTokens.tokenHash, tokenHash),
+            isNull(oauthAccessTokens.revokedAt),
+            gt(oauthAccessTokens.expiresAt, toDate(nowMs)),
+            isNull(oauthGrants.revokedAt),
+          ),
+        )
+        .limit(1)
+    )[0]
+
+    if (!row) return null
+    return {
+      grant: mapGrant(row.grant),
+      accessToken: mapAccessToken(row.accessToken),
+    }
+  },
+
+  async getGrantForRefreshTokenHash(tokenHash: string, nowMs: number): Promise<{ grant: OauthGrant; refreshToken: OauthRefreshToken } | null> {
+    const row = (
+      await db
+        .select({ grant: oauthGrants, refreshToken: oauthRefreshTokens })
+        .from(oauthRefreshTokens)
+        .innerJoin(oauthGrants, eq(oauthRefreshTokens.grantId, oauthGrants.id))
+        .where(
+          and(
+            eq(oauthRefreshTokens.tokenHash, tokenHash),
+            isNull(oauthRefreshTokens.revokedAt),
+            gt(oauthRefreshTokens.expiresAt, toDate(nowMs)),
+            isNull(oauthGrants.revokedAt),
+          ),
+        )
+        .limit(1)
+    )[0]
+
+    if (!row) return null
+    return {
+      grant: mapGrant(row.grant),
+      refreshToken: mapRefreshToken(row.refreshToken),
+    }
+  },
+
+  async revokeGrantByAnyTokenHash(tokenHash: string, nowMs: number): Promise<void> {
+    const grantId = await this.findGrantIdByTokenHash(tokenHash)
+    if (!grantId) return
+
+    await Promise.all([
+      this.revokeGrant(grantId, nowMs),
+      this.revokeRefreshTokensByGrant(grantId, nowMs),
+      this.revokeAccessTokensByGrant(grantId, nowMs),
+    ])
+  },
+
+  async pruneAuthDataForUser(userId: number, nowMs: number): Promise<void> {
+    await db
+      .delete(oauthAuthRequests)
+      .where(
+        and(
+          eq(oauthAuthRequests.inlineUserId, userId),
+          or(isNull(oauthAuthRequests.expiresAt), lte(oauthAuthRequests.expiresAt, toDate(nowMs))),
+        ),
+      )
+  },
+}

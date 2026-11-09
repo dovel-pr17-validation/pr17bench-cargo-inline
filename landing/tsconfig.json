@@ -1,0 +1,36 @@
+{
+  "include": ["**/*"],
+  "compilerOptions": {
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "types": ["node", "vite/client"],
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "rootDirs": ["."],
+    "paths": {
+      "~/*": ["./src/*"],
+      "@inline/client": ["./packages/client/src/index.ts"],
+      "@inline/client/*": ["./packages/client/src/*"],
+      "@inline/auth": ["./packages/auth/src/index.ts"],
+      "@inline/auth/*": ["./packages/auth/src/*"],
+      "@inline/ids": ["./packages/ids/src/index.ts"],
+      "@inline/ids/*": ["./packages/ids/src/*"],
+      "@inline/log": ["./packages/log/src/index.ts"],
+      "@inline/log/*": ["./packages/log/src/*"],
+      "@inline/config": ["./packages/config/src/index.ts"],
+      "@inline/config/*": ["./packages/config/src/*"],
+      "@inline-chat/protocol": ["../packages/protocol/src/index.ts"],
+      "@inline-chat/protocol/*": ["../packages/protocol/src/*"],
+      "@in/server": ["../server/src"],
+      "@in/server/*": ["../server/src/*"]
+    },
+    "esModuleInterop": true,
+    // Enabling verbatimModuleSyntax can result in server bundles leaking into client bundles. It is recommended to keep this option disabled.
+    "verbatimModuleSyntax": false,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true
+  }
+}

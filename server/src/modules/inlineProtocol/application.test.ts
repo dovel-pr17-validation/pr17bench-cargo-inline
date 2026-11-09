@@ -1,0 +1,810 @@
+import { describe, expect, spyOn, test } from "bun:test"
+import { Method, RealtimeV3Request, RealtimeV3Response, RpcCall, RpcError_Code, TransportPreference } from "@inline-chat/protocol/core"
+import { InlineProtocolApplicationOutputOverloaded, type LoadedServerAuthorizationKey } from "@inline-chat/protocol/server"
+import * as rpcHandlers from "@in/server/realtime/handlers/_rpc"
+import { ConnVersion, connectionManager } from "@in/server/ws/connections"
+import { InlineError } from "@in/server/types/errors"
+import { Log } from "@in/server/utils/log"
+import {
+  InlineProtocolApplicationLanes,
+  inlineProtocolRpcExecutionLane,
+  inlineProtocolTransferSocketAllows,
+  makeInlineProtocolApplicationDispatcher,
+} from "./application"
+import { inlineProtocolReplayPolicy } from "./replayPolicy"
+import { READ_ONLY_RPC_METHODS, REPLAY_EXEMPT_METHODS, TRANSFER_RPC_METHODS } from "@inline-chat/protocol/transfers"
+
+const deferred = () => {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+describe("Inline Protocol application ordering", () => {
+  test("reports actual V3 use once after successful ordinary RPCs, excluding preparation and rejected execution", async () => {
+    const authorization = {
+      authKeyId: new Uint8Array(8).fill(1), permanentAuthKeyId: new Uint8Array(8).fill(2),
+      permanent: false, temporaryBound: true, userId: 82_011, accountSessionId: 91_021,
+    }
+    const active: LoadedServerAuthorizationKey = {
+      key: new Uint8Array(256), keyId: authorization.authKeyId, temporary: true, currentServerSalt: 1n,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      binding: { permanentAuthKeyId: authorization.permanentAuthKeyId, temporarySessionId: 3n, nonce: 4n,
+        expiresAt: Math.floor(Date.now() / 1000) + 3600, userId: authorization.userId,
+        accountSessionId: authorization.accountSessionId },
+    }
+    const events: unknown[] = []
+    const entered = deferred(), release = deferred()
+    let stale = false, admitted = true, failRpc = false, executions = 0
+    const logger = spyOn(Log.prototype, "info").mockImplementation((message, metadata) => {
+      if (message === "realtime_protocol_used") events.push(metadata)
+    })
+    const handler = spyOn(rpcHandlers, "handleRpcCall").mockImplementation(async (rpc) => {
+      if (rpc.method === Method.GET_ME) return { oneofKind: "getMe", getMe: {} }
+      if (failRpc) throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+      entered.resolve()
+      await release.promise
+      return { oneofKind: "getUserSettings", getUserSettings: {} }
+    })
+    const dispatcher = makeInlineProtocolApplicationDispatcher({
+      connectionId: "migration-use-test",
+      authorizationKeys: { load: async () => stale ? undefined : active },
+      onAuthorized: () => admitted,
+      operations: {
+        authUpgradeSession: async () => { throw new Error("unexpected auth") },
+        authBegin: async () => { throw new Error("unexpected auth") },
+        authComplete: async () => { throw new Error("unexpected auth") },
+        authBeginBrowser: async () => { throw new Error("unexpected auth") },
+        authBrowserStatus: async () => { throw new Error("unexpected auth") },
+      },
+    })
+    const dispatch = async (method: Method = Method.GET_USER_SETTINGS) => {
+      const result = await dispatcher.dispatch({
+        payload: RealtimeV3Request.toBinary({ body: { oneofKind: "rpc", rpc: RpcCall.create({
+          method, input: method === Method.GET_ME
+            ? { oneofKind: "getMe", getMe: {} } : { oneofKind: "getUserSettings", getUserSettings: {} },
+        }) } }),
+        authorization, messageId: 1n, sessionId: 2n, signal: new AbortController().signal,
+        markExecutionStarted: () => { executions++ }, sendUpdate() {},
+      })
+      if (result.kind !== "result") throw new Error("Expected RPC result")
+      return RealtimeV3Response.fromBinary(result.payload)
+    }
+    const inFlight: Promise<unknown>[] = []
+    try {
+      expect((await dispatch(Method.GET_ME)).body.oneofKind).toBe("rpcResult")
+      expect(events).toEqual([])
+      stale = true
+      expect((await dispatch()).body.oneofKind).toBe("rpcError")
+      stale = false; admitted = false
+      expect((await dispatch()).body.oneofKind).toBe("rpcError")
+      expect(executions).toBe(1)
+      admitted = true; failRpc = true
+      expect((await dispatch()).body.oneofKind).toBe("rpcError")
+      failRpc = false
+      const first = dispatch(), second = dispatch()
+      inFlight.push(first, second)
+      await entered.promise
+      expect(events).toEqual([])
+      release.resolve()
+      expect((await first).body.oneofKind).toBe("rpcResult")
+      expect((await second).body.oneofKind).toBe("rpcResult")
+      expect(events).toEqual([{
+        protocol: "v3", outcome: "rpc_succeeded", userId: authorization.userId, sessionId: authorization.accountSessionId,
+      }])
+      expect(handler).toHaveBeenCalledTimes(4)
+      expect(executions).toBe(4)
+    } finally {
+      release.resolve()
+      await Promise.allSettled(inFlight)
+      handler.mockRestore()
+      logger.mockRestore()
+    }
+  })
+
+  test("negotiates working only on the exact authorized V3 socket and rejects stale bindings", async () => {
+    const authorization = {
+      authKeyId: new Uint8Array(8).fill(1), permanentAuthKeyId: new Uint8Array(8).fill(2),
+      permanent: false, temporaryBound: true, userId: 82_010, accountSessionId: 91_020,
+    }
+    const active: LoadedServerAuthorizationKey = {
+      key: new Uint8Array(256), keyId: authorization.authKeyId, temporary: true, currentServerSalt: 1n,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      binding: { permanentAuthKeyId: authorization.permanentAuthKeyId, temporarySessionId: 3n, nonce: 4n,
+        expiresAt: Math.floor(Date.now() / 1000) + 3600, userId: authorization.userId,
+        accountSessionId: authorization.accountSessionId },
+    }
+    const connectionId = "working-capability-v3"
+    const membershipReader = connectionManager as unknown as { getUserSpaceIds(userId: number): Promise<number[]> }
+    const memberships = spyOn(membershipReader, "getUserSpaceIds").mockResolvedValue([])
+    let stale = false, allowAdmission = true, executions = 0
+    connectionManager.addConnection({ id: connectionId, close() {}, subscribe() {} } as never, ConnVersion.REALTIME_V3)
+    const dispatcher = makeInlineProtocolApplicationDispatcher({
+      connectionId,
+      authorizationKeys: { load: async () => stale ? undefined : active },
+      operations: {
+        authUpgradeSession: async () => { throw new Error("unexpected auth") },
+        authBegin: async () => { throw new Error("unexpected auth") },
+        authComplete: async () => { throw new Error("unexpected auth") },
+        authBeginBrowser: async () => { throw new Error("unexpected auth") },
+        authBrowserStatus: async () => { throw new Error("unexpected auth") },
+      },
+      onAuthorized: () => allowAdmission && connectionManager.authenticateConnection(
+        connectionId, authorization.userId, authorization.accountSessionId, 3,
+      ),
+    })
+    const dispatch = async (supportsWorking: boolean | undefined) => {
+      const response = await dispatcher.dispatch({
+        payload: RealtimeV3Request.toBinary({ body: { oneofKind: "connectionInit", connectionInit: {
+          token: "ignored-v3-token", supportsWorking,
+        } } }),
+        authorization, messageId: 1n, sessionId: 2n, signal: new AbortController().signal,
+        markExecutionStarted: () => { executions++ }, sendUpdate() {},
+      })
+      if (response.kind !== "result") throw new Error("expected capability result")
+      return RealtimeV3Response.fromBinary(response.payload)
+    }
+    try {
+      const open = await dispatch(true)
+      expect(open.body.oneofKind).toBe("connectionOpen")
+      expect(open.body.oneofKind === "connectionOpen" && open.body.connectionOpen.upgradedSessionTransport)
+        .toBe(TransportPreference.V3)
+      expect(connectionManager.getConnection(connectionId)?.supportsWorking).toBe(true)
+      expect((await dispatch(undefined)).body.oneofKind).toBe("connectionOpen")
+      expect(connectionManager.getConnection(connectionId)?.supportsWorking).toBe(false)
+
+      // The operator rollback lever reaches every V3 open without a client release.
+      const previousTransport = process.env["INLINE_CONFIG_REALTIME_UPGRADED_SESSION_TRANSPORT"]
+      process.env["INLINE_CONFIG_REALTIME_UPGRADED_SESSION_TRANSPORT"] = "v2"
+      try {
+        const rolledBack = await dispatch(undefined)
+        expect(rolledBack.body.oneofKind === "connectionOpen" && rolledBack.body.connectionOpen.upgradedSessionTransport)
+          .toBe(TransportPreference.LEGACY)
+      } finally {
+        if (previousTransport === undefined) delete process.env["INLINE_CONFIG_REALTIME_UPGRADED_SESSION_TRANSPORT"]
+        else process.env["INLINE_CONFIG_REALTIME_UPGRADED_SESSION_TRANSPORT"] = previousTransport
+      }
+      expect(executions).toBe(3)
+
+      stale = true
+      expect((await dispatch(true)).body.oneofKind).toBe("rpcError")
+      expect(connectionManager.getConnection(connectionId)?.supportsWorking).toBe(false)
+      stale = false
+      allowAdmission = false
+      expect((await dispatch(true)).body.oneofKind).toBe("rpcError")
+      expect(connectionManager.getConnection(connectionId)?.supportsWorking).toBe(false)
+      expect(executions).toBe(3)
+    } finally {
+      connectionManager.removeConnection(connectionId)
+      await connectionManager.waitForBackgroundWork()
+      memberships.mockRestore()
+    }
+  })
+
+  test("lets an authorized permanent key collect its browser-login result", async () => {
+    let statusCalls = 0
+    const dispatcher = makeInlineProtocolApplicationDispatcher({
+      connectionId: "browser-status-after-auth-test",
+      authorizationKeys: { load: async () => undefined },
+      operations: {
+        authUpgradeSession: async () => { throw new Error("unexpected auth") },
+        authBegin: async () => { throw new Error("unexpected auth") },
+        authComplete: async () => { throw new Error("unexpected auth") },
+        authBeginBrowser: async () => { throw new Error("unexpected auth") },
+        authBrowserStatus: async () => {
+          statusCalls += 1
+          return { state: { oneofKind: "authorized", authorized: { accountSessionId: 9n } } }
+        },
+      },
+    })
+    const dispatched = await dispatcher.dispatch({
+      payload: RealtimeV3Request.toBinary({
+        body: {
+          oneofKind: "authBrowserStatus",
+          authBrowserStatus: { loginTransactionId: "transaction" },
+        },
+      }),
+      authorization: {
+        authKeyId: new Uint8Array(8),
+        permanent: true,
+        temporaryBound: false,
+        userId: 7,
+        accountSessionId: 9,
+      },
+      messageId: 1n,
+      sessionId: 2n,
+      signal: new AbortController().signal,
+      markExecutionStarted: () => {},
+      sendUpdate: () => {},
+    })
+
+    expect(statusCalls).toBe(1)
+    expect(dispatched.kind).toBe("result")
+    if (dispatched.kind !== "result") throw new Error("expected browser status result")
+    expect(RealtimeV3Response.fromBinary(dispatched.payload).body.oneofKind)
+      .toBe("authBrowserStatus")
+  })
+
+  test.each(["getFilePart", "transcribeVoiceDraft"] as const)("returns private %s content once; only a durable method keeps a compact replay response", async (methodName) => {
+    const authorization = {
+      authKeyId: new Uint8Array(8).fill(1),
+      permanentAuthKeyId: new Uint8Array(8).fill(2),
+      permanent: false, temporaryBound: true, userId: 1, accountSessionId: 2,
+    }
+    const active: LoadedServerAuthorizationKey = {
+      key: new Uint8Array(256),
+      keyId: authorization.authKeyId,
+      temporary: true,
+      currentServerSalt: 1n,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      binding: {
+        permanentAuthKeyId: authorization.permanentAuthKeyId,
+        temporarySessionId: 3n,
+        nonce: 4n,
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        userId: 1,
+        accountSessionId: 2,
+      },
+    }
+    const handler = spyOn(rpcHandlers, "handleRpcCall").mockImplementation(async () => methodName === "transcribeVoiceDraft" ? {
+      oneofKind: "transcribeVoiceDraft", transcribeVoiceDraft: { text: "private dictation" },
+    } : ({
+      oneofKind: "getFilePart",
+      getFilePart: {
+        offset: 0n,
+        totalSize: 3n,
+        data: Uint8Array.of(1, 2, 3),
+        sha256: new Uint8Array(32),
+      },
+    }))
+    try {
+      const dispatcher = makeInlineProtocolApplicationDispatcher({
+        connectionId: "file-part-replay-test",
+        authorizationKeys: { load: async () => active },
+        operations: {
+          authUpgradeSession: async () => { throw new Error("unexpected auth") },
+          authBegin: async () => { throw new Error("unexpected auth") },
+          authComplete: async () => { throw new Error("unexpected auth") },
+          authBeginBrowser: async () => { throw new Error("unexpected auth") },
+          authBrowserStatus: async () => { throw new Error("unexpected auth") },
+        },
+      })
+      const dispatched = await dispatcher.dispatch({
+        payload: RealtimeV3Request.toBinary({
+          body: { oneofKind: "rpc", rpc: RpcCall.create(methodName === "transcribeVoiceDraft" ? {
+            method: Method.TRANSCRIBE_VOICE_DRAFT,
+            input: { oneofKind: "transcribeVoiceDraft", transcribeVoiceDraft: { audio: Uint8Array.of(1), mimeType: "audio/mp4", duration: 1 } },
+          } : {
+            method: Method.GET_FILE_PART,
+            input: { oneofKind: "getFilePart", getFilePart: {
+              fileUniqueId: "IND_replay",
+              offset: 0n,
+              limit: 524_288,
+            } },
+          }) },
+        }),
+        authorization,
+        messageId: 11n,
+        sessionId: 3n,
+        signal: new AbortController().signal,
+        markExecutionStarted: () => {},
+        sendUpdate: () => {},
+      })
+      expect(dispatched.kind).toBe("result")
+      if (dispatched.kind !== "result") throw new Error("expected application result")
+      expect(RealtimeV3Response.fromBinary(dispatched.payload).body.oneofKind).toBe("rpcResult")
+      if (methodName === "getFilePart") {
+        // Session-tier replay never persists a file part, so it needs no tombstone.
+        expect(inlineProtocolReplayPolicy(RealtimeV3Request.toBinary({ body: { oneofKind: "rpc", rpc: RpcCall.create({
+          method: Method.GET_FILE_PART,
+        }) } }))).toBe("session")
+        expect(dispatched.replayPayload).toBeUndefined()
+        return
+      }
+      expect(dispatched.replayPayload).toBeDefined()
+      const replay = RealtimeV3Response.fromBinary(dispatched.replayPayload!)
+      expect(replay.body.oneofKind).toBe("rpcError")
+      if (replay.body.oneofKind === "rpcError") {
+        expect(replay.body.rpcError.reqMsgId).toBe(0n)
+        expect(replay.body.rpcError.errorCode).toBe(RpcError_Code.RATE_LIMIT)
+        expect(replay.body.rpcError.code).toBe(429)
+        expect(replay.body.rpcError.message).toBe(`Retry ${methodName} with a fresh request ID`)
+        expect(new TextDecoder().decode(dispatched.replayPayload)).not.toContain("private dictation")
+      }
+    } finally {
+      handler.mockRestore()
+    }
+  })
+
+  test.each(["revoked", "user", "session", "permanent"] as const)(
+    "does not execute queued RPCs after authority is %s",
+    async (change) => {
+      const entered = deferred()
+      const release = deferred()
+      const authorization = {
+        authKeyId: new Uint8Array(8).fill(1),
+        permanentAuthKeyId: new Uint8Array(8).fill(2),
+        permanent: false, temporaryBound: true, userId: 1, accountSessionId: 2,
+      }
+      const binding = {
+        permanentAuthKeyId: authorization.permanentAuthKeyId,
+        temporarySessionId: 3n, nonce: 4n, expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        userId: 1, accountSessionId: 2,
+      }
+      const active: LoadedServerAuthorizationKey = {
+        key: new Uint8Array(256), keyId: authorization.authKeyId,
+        temporary: true, currentServerSalt: 1n, expiresAt: binding.expiresAt, binding,
+      }
+      let current: LoadedServerAuthorizationKey | undefined = active
+      let executions = 0
+      let registrations = 0
+      const handler = spyOn(rpcHandlers, "handleRpcCall").mockImplementation(async () => {
+        executions++
+        entered.resolve()
+        await release.promise
+        return { oneofKind: "updateUserSettings", updateUserSettings: { updates: [] } }
+      })
+      const dispatcher = makeInlineProtocolApplicationDispatcher({
+        connectionId: "queued-auth-test",
+        authorizationKeys: { load: async () => current },
+        onAuthorized: () => { registrations++; return true },
+        operations: {
+          authUpgradeSession: async () => { throw new Error("unexpected auth") },
+          authBegin: async () => { throw new Error("unexpected auth") },
+          authComplete: async () => { throw new Error("unexpected auth") },
+          authBeginBrowser: async () => { throw new Error("unexpected auth") },
+          authBrowserStatus: async () => { throw new Error("unexpected auth") },
+        },
+      })
+      const marked: bigint[] = []
+      const dispatch = (messageId: bigint) => dispatcher.dispatch({
+        payload: RealtimeV3Request.toBinary({ body: { oneofKind: "rpc", rpc: RpcCall.create({
+          method: Method.UPDATE_USER_SETTINGS,
+          input: { oneofKind: "updateUserSettings", updateUserSettings: {} },
+        }) } }),
+        authorization, messageId, sessionId: 3n, signal: new AbortController().signal,
+        markExecutionStarted: () => { marked.push(messageId) }, sendUpdate: () => {},
+      })
+      const inFlight: Promise<unknown>[] = []
+      try {
+        const first = dispatch(1n)
+        inFlight.push(first)
+        await entered.promise
+        const second = dispatch(2n)
+        inFlight.push(second)
+        current = change === "revoked" ? undefined : {
+          ...active,
+          binding: {
+            ...binding,
+            ...(change === "user" ? { userId: 9 } : {}),
+            ...(change === "session" ? { accountSessionId: 9 } : {}),
+            ...(change === "permanent" ? { permanentAuthKeyId: new Uint8Array(8).fill(9) } : {}),
+          },
+        }
+        release.resolve()
+        await first
+        const denied = await second
+        expect(denied.kind).toBe("result")
+        if (denied.kind !== "result") throw new Error("expected settled RPC error")
+        const response = RealtimeV3Response.fromBinary(denied.payload)
+        expect(response.body.oneofKind).toBe("rpcError")
+        if (response.body.oneofKind === "rpcError") expect(response.body.rpcError.code).toBe(401)
+        expect(executions).toBe(1)
+        expect(registrations).toBe(1)
+        expect(marked).toEqual([1n])
+        current = active
+        await dispatch(3n)
+        expect(executions).toBe(2)
+        expect(marked).toEqual([1n, 3n])
+      } finally {
+        release.resolve()
+        await Promise.allSettled(inFlight)
+        handler.mockRestore()
+      }
+    },
+  )
+
+  test("does not execute the first RPC when realtime admission rejects a revoked session", async () => {
+    const authorization = {
+      authKeyId: new Uint8Array(8).fill(1),
+      permanentAuthKeyId: new Uint8Array(8).fill(2),
+      permanent: false,
+      temporaryBound: true,
+      userId: 1,
+      accountSessionId: 2,
+    }
+    const active: LoadedServerAuthorizationKey = {
+      key: new Uint8Array(256),
+      keyId: authorization.authKeyId,
+      temporary: true,
+      currentServerSalt: 1n,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      binding: {
+        permanentAuthKeyId: authorization.permanentAuthKeyId,
+        temporarySessionId: 3n,
+        nonce: 4n,
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        userId: authorization.userId,
+        accountSessionId: authorization.accountSessionId,
+      },
+    }
+    const handler = spyOn(rpcHandlers, "handleRpcCall")
+    let executionStarted = false
+    try {
+      const dispatcher = makeInlineProtocolApplicationDispatcher({
+        connectionId: "revoked-first-rpc-admission",
+        authorizationKeys: { load: async () => active },
+        // This is the result from V3 registration when the revoke event wins
+        // after temporary-key validation but before application execution.
+        onAuthorized: () => false,
+        operations: {
+          authUpgradeSession: async () => { throw new Error("unexpected auth") },
+          authBegin: async () => { throw new Error("unexpected auth") },
+          authComplete: async () => { throw new Error("unexpected auth") },
+          authBeginBrowser: async () => { throw new Error("unexpected auth") },
+          authBrowserStatus: async () => { throw new Error("unexpected auth") },
+        },
+      })
+      const result = await dispatcher.dispatch({
+        payload: RealtimeV3Request.toBinary({ body: { oneofKind: "rpc", rpc: RpcCall.create({
+          method: Method.UPDATE_USER_SETTINGS,
+          input: { oneofKind: "updateUserSettings", updateUserSettings: {} },
+        }) } }),
+        authorization,
+        messageId: 1n,
+        sessionId: 3n,
+        signal: new AbortController().signal,
+        markExecutionStarted: () => { executionStarted = true },
+        sendUpdate: () => {},
+      })
+
+      expect(result.kind).toBe("result")
+      if (result.kind !== "result") throw new Error("expected RPC error")
+      const response = RealtimeV3Response.fromBinary(result.payload)
+      expect(response.body.oneofKind).toBe("rpcError")
+      if (response.body.oneofKind === "rpcError") expect(response.body.rpcError.code).toBe(401)
+      expect(executionStarted).toBeFalse()
+      expect(handler).not.toHaveBeenCalled()
+    } finally {
+      handler.mockRestore()
+    }
+  })
+
+  test("marks execution at the application boundary and preserves output overload", async () => {
+    const dispatcher = makeInlineProtocolApplicationDispatcher({
+      connectionId: "test",
+      authorizationKeys: { load: async () => undefined },
+      operations: {
+        authUpgradeSession: async () => { throw new Error("unexpected auth") },
+        authBegin: async () => { throw new InlineProtocolApplicationOutputOverloaded() },
+        authComplete: async () => ({ state: { oneofKind: undefined } }),
+        authBeginBrowser: async () => ({ loginTransactionId: "", browserUrl: "", verificationCode: "", expiresAt: 0n }),
+        authBrowserStatus: async () => ({ state: { oneofKind: undefined } }),
+      },
+    })
+    let executionStarted = false
+    const dispatched = dispatcher.dispatch({
+      payload: RealtimeV3Request.toBinary({
+        body: {
+          oneofKind: "authBegin",
+          authBegin: { identifier: { oneofKind: undefined } },
+        },
+      }),
+      authorization: {
+        authKeyId: new Uint8Array(8),
+        permanent: true,
+        temporaryBound: false,
+      },
+      messageId: 1n,
+      sessionId: 2n,
+      signal: new AbortController().signal,
+      markExecutionStarted: () => { executionStarted = true },
+      sendUpdate: () => {},
+    })
+
+    await expect(dispatched).rejects.toBeInstanceOf(InlineProtocolApplicationOutputOverloaded)
+    expect(executionStarted).toBeTrue()
+  })
+
+  test("preserves an aborted handler for secure-session outcome classification", async () => {
+    const controller = new AbortController()
+    const reason = new DOMException("Application deadline exceeded", "AbortError")
+    const dispatcher = makeInlineProtocolApplicationDispatcher({
+      connectionId: "test",
+      authorizationKeys: { load: async () => undefined },
+      operations: {
+        authUpgradeSession: async () => { throw new Error("unexpected auth") },
+        authBegin: async () => {
+          controller.abort(reason)
+          throw reason
+        },
+        authComplete: async () => ({ state: { oneofKind: undefined } }),
+        authBeginBrowser: async () => ({ loginTransactionId: "", browserUrl: "", verificationCode: "", expiresAt: 0n }),
+        authBrowserStatus: async () => ({ state: { oneofKind: undefined } }),
+      },
+    })
+    let executionStarted = false
+
+    const dispatched = dispatcher.dispatch({
+      payload: RealtimeV3Request.toBinary({
+        body: {
+          oneofKind: "authBegin",
+          authBegin: { identifier: { oneofKind: undefined } },
+        },
+      }),
+      authorization: {
+        authKeyId: new Uint8Array(8),
+        permanent: true,
+        temporaryBound: false,
+      },
+      messageId: 1n,
+      sessionId: 2n,
+      signal: controller.signal,
+      markExecutionStarted: () => { executionStarted = true },
+      sendUpdate: () => {},
+    })
+
+    await expect(dispatched).rejects.toBe(reason)
+    expect(executionStarted).toBeTrue()
+  })
+
+  test("serializes one conversation while unrelated work bypasses it", async () => {
+    const lanes = new InlineProtocolApplicationLanes()
+    const controller = new AbortController()
+    const firstGate = deferred()
+    const order: string[] = []
+    const first = lanes.run("chat:1", controller.signal, async () => {
+      order.push("first:start")
+      await firstGate.promise
+      order.push("first:end")
+    })
+    const second = lanes.run("chat:1", controller.signal, async () => {
+      order.push("second")
+    })
+    const unrelated = lanes.run("chat:2", controller.signal, async () => {
+      order.push("unrelated")
+    })
+
+    await unrelated
+    expect(order).toEqual(["first:start", "unrelated"])
+    firstGate.resolve()
+    await Promise.all([first, second])
+    expect(order).toEqual(["first:start", "unrelated", "first:end", "second"])
+  })
+
+  test("an aborted waiter releases its place without running", async () => {
+    const lanes = new InlineProtocolApplicationLanes()
+    const firstGate = deferred()
+    const first = lanes.run("chat:1", new AbortController().signal, () => firstGate.promise)
+    const waitingController = new AbortController()
+    let ran = false
+    const waiting = lanes.run("chat:1", waitingController.signal, async () => { ran = true })
+    waitingController.abort()
+
+    await expect(waiting).rejects.toBeInstanceOf(DOMException)
+    expect(ran).toBe(false)
+    firstGate.resolve()
+    await first
+    await expect(lanes.run("chat:1", new AbortController().signal, async () => 42)).resolves.toBe(42)
+  })
+
+  test("an aborted waiter cannot let later work bypass the active owner", async () => {
+    const lanes = new InlineProtocolApplicationLanes()
+    const firstGate = deferred()
+    const order: string[] = []
+    const first = lanes.run("chat:1", new AbortController().signal, async () => {
+      order.push("first:start")
+      await firstGate.promise
+      order.push("first:end")
+    })
+    const waitingController = new AbortController()
+    const waiting = lanes.run("chat:1", waitingController.signal, async () => {
+      order.push("aborted")
+    })
+    waitingController.abort()
+    await expect(waiting).rejects.toBeInstanceOf(DOMException)
+
+    const later = lanes.run("chat:1", new AbortController().signal, async () => {
+      order.push("later")
+    })
+    await Bun.sleep(5)
+    expect(order).toEqual(["first:start"])
+
+    firstGate.resolve()
+    await Promise.all([first, later])
+    expect(order).toEqual(["first:start", "first:end", "later"])
+  })
+
+  test("maps ordering-sensitive conversation mutations onto the same narrow lane", () => {
+    const peerId = { type: { oneofKind: "chat" as const, chat: { chatId: 44n } } }
+    const send = RpcCall.create({
+      input: { oneofKind: "sendMessage", sendMessage: { peerId } },
+    })
+    const remove = RpcCall.create({
+      input: { oneofKind: "deleteMessages", deleteMessages: { peerId, messageIds: [9n] } },
+    })
+    const unrelated = RpcCall.create({
+      input: {
+        oneofKind: "sendMessage",
+        sendMessage: { peerId: { type: { oneofKind: "chat", chat: { chatId: 45n } } } },
+      },
+    })
+
+    expect(inlineProtocolRpcExecutionLane(send)).toBe("chat:44")
+    expect(inlineProtocolRpcExecutionLane(remove)).toBe("chat:44")
+    expect(inlineProtocolRpcExecutionLane(unrelated)).toBe("chat:45")
+  })
+
+  test("keeps dialog, forwarding, and attachment mutations on their conversation lane", () => {
+    const peerId = { type: { oneofKind: "chat" as const, chat: { chatId: 44n } } }
+    const calls = [
+      RpcCall.create({
+        input: {
+          oneofKind: "forwardMessages",
+          forwardMessages: { toPeerId: peerId, messageIds: [1n] },
+        },
+      }),
+      RpcCall.create({
+        input: {
+          oneofKind: "deleteMessageAttachment",
+          deleteMessageAttachment: { peerId, messageId: 9n, attachmentId: 3n },
+        },
+      }),
+      RpcCall.create({
+        input: { oneofKind: "updateDialogOpen", updateDialogOpen: { peerId, open: false } },
+      }),
+      RpcCall.create({
+        input: {
+          oneofKind: "updateDialogNotificationSettings",
+          updateDialogNotificationSettings: { peerId },
+        },
+      }),
+      RpcCall.create({
+        input: { oneofKind: "updateDialogArchived", updateDialogArchived: { peerId, archived: true } },
+      }),
+    ]
+
+    expect(calls.map(inlineProtocolRpcExecutionLane)).toEqual(Array(5).fill("chat:44"))
+  })
+
+  test("serializes account and space mutations without blocking unrelated conversations", () => {
+    const settings = RpcCall.create({
+      input: { oneofKind: "updateUserSettings", updateUserSettings: {} },
+    })
+    const member = RpcCall.create({
+      input: { oneofKind: "updateMemberAccess", updateMemberAccess: { spaceId: 8n, userId: 2n } },
+    })
+    const grid = RpcCall.create({
+      input: { oneofKind: "toggleSpaceGrid", toggleSpaceGrid: { spaceId: 8n, enabled: true } },
+    })
+
+    expect(inlineProtocolRpcExecutionLane(settings)).toBe("account:settings")
+    expect(inlineProtocolRpcExecutionLane(member)).toBe("space:8")
+    expect(inlineProtocolRpcExecutionLane(grid)).toBe("space:8")
+  })
+
+  test("serializes agent connection and sync mutations on their narrow owners", () => {
+    const peerId = { type: { oneofKind: "chat" as const, chat: { chatId: 44n } } }
+    const connect = RpcCall.create({
+      input: {
+        oneofKind: "connectAgentSession",
+        connectAgentSession: { relation: 0,
+          peerId,
+          botUserId: 2n,
+          provider: 1,
+          instanceRef: "instance",
+          sessionRef: "session",
+        },
+      },
+    })
+    const sync = RpcCall.create({
+      input: {
+        oneofKind: "syncAgentSessionMessages",
+        syncAgentSessionMessages: { agentSessionId: 91n, mode: 1, messages: [] },
+      },
+    })
+
+    expect(inlineProtocolRpcExecutionLane(connect)).toBe("chat:44")
+    expect(inlineProtocolRpcExecutionLane(sync)).toBe("agent-session:91")
+  })
+})
+
+describe("Inline Protocol replay policy", () => {
+  const rpcPayload = (method: Method): Uint8Array => RealtimeV3Request.toBinary({
+    body: { oneofKind: "rpc", rpc: RpcCall.create({ method }) },
+  })
+
+  test.each([
+    Method.GET_FILE_PART,
+    Method.SAVE_UPLOAD_PART,
+    Method.GET_UPLOAD_STATE,
+    Method.CREATE_UPLOAD,
+    Method.FINISH_UPLOAD,
+    Method.CANCEL_UPLOAD,
+    ...READ_ONLY_RPC_METHODS,
+  ])("keeps %s in the session receive window", (method) => {
+    expect(REPLAY_EXEMPT_METHODS.has(method)).toBeTrue()
+    expect(inlineProtocolReplayPolicy(rpcPayload(method))).toBe("session")
+  })
+
+  test.each([Method.SEND_MESSAGE, Method.DELETE_MESSAGES, Method.LOG_OUT, Method.TRANSCRIBE_VOICE_DRAFT])(
+    "keeps durable replay for %s",
+    (method) => {
+      expect(inlineProtocolReplayPolicy(rpcPayload(method))).toBe("durable")
+    },
+  )
+
+  test("treats connection init and undecodable payloads as durable", () => {
+    expect(inlineProtocolReplayPolicy(RealtimeV3Request.toBinary({
+      body: { oneofKind: "connectionInit", connectionInit: { token: "" } },
+    }))).toBe("durable")
+    expect(inlineProtocolReplayPolicy(Uint8Array.of(0xff, 0xff, 0xff))).toBe("durable")
+    expect([...TRANSFER_RPC_METHODS].every((method) => REPLAY_EXEMPT_METHODS.has(method))).toBeTrue()
+  })
+})
+
+describe("Inline Protocol transfer-only sockets", () => {
+  test("a transfer-only socket runs transfer RPCs and getMe but refuses everything else", async () => {
+    const authorization = {
+      authKeyId: new Uint8Array(8).fill(5), permanentAuthKeyId: new Uint8Array(8).fill(6),
+      permanent: false, temporaryBound: true, userId: 70_001, accountSessionId: 70_002,
+    }
+    const active: LoadedServerAuthorizationKey = {
+      key: new Uint8Array(256), keyId: authorization.authKeyId, temporary: true, currentServerSalt: 1n,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      binding: { permanentAuthKeyId: authorization.permanentAuthKeyId, temporarySessionId: 3n, nonce: 4n,
+        expiresAt: Math.floor(Date.now() / 1000) + 3600, userId: authorization.userId,
+        accountSessionId: authorization.accountSessionId },
+    }
+    const authorizedAs: boolean[] = []
+    const executed: Method[] = []
+    const handler = spyOn(rpcHandlers, "handleRpcCall").mockImplementation(async (rpc) => {
+      executed.push(rpc.method)
+      return { oneofKind: "getMe", getMe: {} }
+    })
+    const supportsWorking = spyOn(connectionManager, "setSupportsWorking")
+    try {
+      const dispatcher = makeInlineProtocolApplicationDispatcher({
+        connectionId: "transfer-only-test",
+        authorizationKeys: { load: async () => active },
+        onAuthorized: (_authorization, options) => {
+          authorizedAs.push(options.transferOnly)
+          return true
+        },
+        operations: {
+          authUpgradeSession: async () => { throw new Error("unexpected auth") },
+          authBegin: async () => { throw new Error("unexpected auth") },
+          authComplete: async () => { throw new Error("unexpected auth") },
+          authBeginBrowser: async () => { throw new Error("unexpected auth") },
+          authBrowserStatus: async () => { throw new Error("unexpected auth") },
+        },
+      })
+      const dispatch = async (body: RealtimeV3Request["body"]) => {
+        const result = await dispatcher.dispatch({
+          payload: RealtimeV3Request.toBinary({ body }), authorization, messageId: 1n, sessionId: 3n,
+          signal: new AbortController().signal, markExecutionStarted: () => {}, sendUpdate: () => {},
+        })
+        if (result.kind !== "result") throw new Error("expected result")
+        return RealtimeV3Response.fromBinary(result.payload).body
+      }
+      expect((await dispatch({
+        oneofKind: "connectionInit", connectionInit: { token: "", transferOnly: true, supportsWorking: true },
+      })).oneofKind).toBe("connectionOpen")
+      expect(supportsWorking).not.toHaveBeenCalled()
+      for (const method of [Method.GET_FILE_PART, Method.SAVE_UPLOAD_PART, Method.GET_ME]) {
+        expect((await dispatch({ oneofKind: "rpc", rpc: RpcCall.create({ method }) })).oneofKind).toBe("rpcResult")
+      }
+      const refused = await dispatch({ oneofKind: "rpc", rpc: RpcCall.create({ method: Method.SEND_MESSAGE }) })
+      expect(refused.oneofKind).toBe("rpcError")
+      if (refused.oneofKind === "rpcError") expect(refused.rpcError.code).toBe(401)
+      expect(executed).toEqual([Method.GET_FILE_PART, Method.SAVE_UPLOAD_PART, Method.GET_ME])
+      // The role is fixed: every later authorization reports the transfer socket.
+      expect(authorizedAs).toEqual([true, true, true, true])
+      expect(inlineProtocolTransferSocketAllows(Method.CREATE_UPLOAD)).toBeTrue()
+      expect(inlineProtocolTransferSocketAllows(Method.GET_CHAT_HISTORY)).toBeFalse()
+    } finally {
+      handler.mockRestore()
+      supportsWorking.mockRestore()
+    }
+  })
+})

@@ -1,0 +1,580 @@
+import Auth
+import Combine
+import CryptoKit
+import Foundation
+import InlineConfig
+import InlineKit
+import Logger
+import Security
+import Sentry
+import UIKit
+
+class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate, ObservableObject {
+  let notificationHandler = NotificationHandler()
+  let nav = Navigation()
+  let sceneRouterRegistry = IOSSceneRouterRegistry()
+  private var protectedDataObserver: NSObjectProtocol?
+  @MainActor @Published var spaceJoinErrorMessage: String?
+  @MainActor private var pendingSpaceJoin: SpaceJoinReference?
+  @MainActor private var spaceJoinTask: Task<Void, Never>?
+  @MainActor private var spaceJoinGeneration: UInt64 = 0
+  @MainActor private var chatLinkTask: Task<Void, Never>?
+  @MainActor private var chatLinkGeneration: UInt64 = 0
+
+  func application(
+    _ application: UIApplication,
+    willFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+  ) -> Bool {
+    // Set up notification delegate here to not miss anything
+    let notificationCenter = UNUserNotificationCenter.current()
+    notificationCenter.delegate = self
+    setupAppDataUpdater()
+    return true
+  }
+
+  func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> Bool {
+    AgentControlErrors.report = { ToastManager.shared.showToast($0, type: .error) }
+    // One-time refresh attempt on launch (covers normal unlocked launches).
+    Task {
+      await Auth.shared.refreshFromStorage()
+      await Analytics.identify()
+    }
+
+    // Keychain reads can return `nil` during background/early launch (e.g. notification tap while device locked).
+    // Refresh auth once protected data becomes available and when app becomes active so we can connect without restart.
+    protectedDataObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+      object: nil,
+      queue: .main
+    ) { _ in
+      Task {
+        await Auth.shared.refreshFromStorage()
+      }
+    }
+
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { _ in
+      Task {
+        await Auth.shared.refreshFromStorage()
+      }
+    }
+
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAuthenticationChange(_:)),
+      name: .authenticationChanged,
+      object: nil
+    )
+
+    TimeZoneSyncCoordinator.shared.start()
+
+    return true
+  }
+
+  @MainActor
+  func handleDeepLink(_ url: URL, router: Router) -> Bool {
+    guard let deepLink = InlineDeepLink(url: url) ?? InlineDeepLink(universalLink: url) else { return false }
+    cancelPendingChatLink()
+
+    let request: AppNavigationRequest
+    switch deepLink {
+    case let .user(id):
+      request = .chat(peer: .user(id: id))
+    case let .chat(id):
+      openChatLink(chatID: id, messageID: nil, router: router)
+      return true
+    case let .message(chatId, messageId):
+      openChatLink(chatID: chatId, messageID: messageId, router: router)
+      return true
+    case .publicSpace, .spaceInvite:
+      guard let reference = SpaceJoinReference(deepLink: deepLink) else { return false }
+      spaceJoinGeneration &+= 1
+      spaceJoinTask?.cancel()
+      spaceJoinTask = nil
+      pendingSpaceJoin = reference
+      resumePendingSpaceJoin(router: router)
+      return true
+    }
+    router.navigate(request)
+    openInInboxAfterExternalNavigation(request.peer)
+    return true
+  }
+
+  @MainActor
+  private func openChatLink(chatID: Int64, messageID: Int64?, router: Router) {
+    let generation = chatLinkGeneration
+    let auth = Auth.shared.handle
+    let admittedAccount = try? auth.beginAccountMutation()
+    let initialStatus = auth.snapshot().status
+    let snapshots = admittedAccount == nil ? auth.snapshots : nil
+    let initialTab = router.selectedTab
+    let initialPath = router.selectedTabPath
+    chatLinkTask = Task { @MainActor [weak self] in
+      var accountForError = admittedAccount
+      defer {
+        if self?.chatLinkGeneration == generation { self?.chatLinkTask = nil }
+      }
+      do {
+        let account: AuthAccountMutationToken
+        if let admittedAccount {
+          account = admittedAccount
+        } else {
+          guard let snapshots else { return }
+          guard let hydratedAccount = try await ChatLinkResolver.waitForAccount(
+            initialStatus: initialStatus, snapshots: snapshots, auth: auth
+          ) else { return }
+          account = hydratedAccount
+          accountForError = account
+        }
+        guard let peer = try await ChatLinkResolver.resolvePeer(chatID: chatID, account: account) else {
+          throw ChatLinkError.unavailable
+        }
+        try auth.validateAccountMutation(account)
+        guard !Task.isCancelled, self?.chatLinkGeneration == generation,
+              router.selectedTab == initialTab, router.selectedTabPath == initialPath
+        else { return }
+        let request: AppNavigationRequest = if let messageID {
+          .message(peer: peer, messageID: messageID)
+        } else {
+          .chat(peer: peer)
+        }
+        router.navigate(request)
+        self?.openInInboxAfterExternalNavigation(peer)
+      } catch is CancellationError {
+        return
+      } catch {
+        guard !Task.isCancelled, self?.chatLinkGeneration == generation,
+              router.selectedTab == initialTab, router.selectedTabPath == initialPath,
+              let accountForError,
+              (try? auth.validateAccountMutation(accountForError)) != nil
+        else { return }
+        ToastManager.shared.showToast("Couldn’t open chat link", type: .error)
+      }
+    }
+  }
+
+  @MainActor
+  private func cancelPendingChatLink() {
+    chatLinkGeneration &+= 1
+    chatLinkTask?.cancel()
+    chatLinkTask = nil
+  }
+
+  private enum ChatLinkError: Error {
+    case unavailable
+  }
+
+  @MainActor
+  func resumePendingSpaceJoin(router: Router) {
+    guard Auth.shared.getCurrentUserId() != nil,
+          let reference = pendingSpaceJoin,
+          spaceJoinTask == nil
+    else { return }
+
+    let generation = spaceJoinGeneration
+    spaceJoinTask = Task { @MainActor [weak self] in
+      defer {
+        if self?.spaceJoinGeneration == generation {
+          self?.spaceJoinTask = nil
+        }
+      }
+      do {
+        let spaceID = try await SpaceJoiner.join(reference)
+        guard !Task.isCancelled, self?.spaceJoinGeneration == generation else { return }
+        self?.pendingSpaceJoin = nil
+        router.resetTransientPresentation()
+        if IPadNavigationLane.isEnabled {
+          IPadNavigationLane.resetBoundary(in: router, path: [.space(id: spaceID)])
+        } else {
+          router.popToRoot(for: .spaces)
+          router.push(.space(id: spaceID), for: .spaces)
+          router.selectedTab = .spaces
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        guard self?.spaceJoinGeneration == generation else { return }
+        self?.pendingSpaceJoin = nil
+        self?.spaceJoinErrorMessage = "This invite is invalid, expired, or unavailable."
+      }
+    }
+  }
+
+  @MainActor
+  func cancelPendingSpaceJoin() {
+    spaceJoinGeneration &+= 1
+    spaceJoinTask?.cancel()
+    spaceJoinTask = nil
+    pendingSpaceJoin = nil
+    spaceJoinErrorMessage = nil
+  }
+
+  @MainActor
+  func dismissSpaceJoinError() {
+    spaceJoinErrorMessage = nil
+  }
+
+  private func applicationDidResignActive(_ notification: Notification) {
+//    Task {
+//      // Mark offline
+//      try? await DataManager.shared.updateStatus(online: false)
+//    }
+  }
+
+  private func applicationDidBecomeActive(_ notification: Notification) {
+//    Task {
+//      // Mark online
+//      try? await DataManager.shared.updateStatus(online: true)
+//    }
+  }
+
+  @objc private func handleAuthenticationChange(_ notification: Notification) {
+    if let authenticated = notification.object as? Bool, authenticated {
+      requestPushNotifications()
+    }
+  }
+
+  func requestPushNotifications() {
+    let notificationCenter = UNUserNotificationCenter.current()
+    notificationCenter.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+      guard granted else { return }
+      self.getNotificationSettings()
+    }
+  }
+
+  func getNotificationSettings() {
+    UNUserNotificationCenter.current().getNotificationSettings { settings in
+      guard settings.authorizationStatus == .authorized else { return }
+      DispatchQueue.main.async {
+        UIApplication.shared.registerForRemoteNotifications()
+      }
+    }
+  }
+
+  func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+  ) {
+    let deviceToken = deviceToken.map { String(format: "%02.2hhx", $0) }.joined()
+    let pushContentKey = Self.makePushContentEncryptionKeyMetadata()
+    let pushContentVersion: UInt32? = pushContentKey == nil ? nil : Self.pushContentVersion
+
+    Task.detached {
+      _ = await Api.realtime.sendQueued(
+        .updatePushNotificationDetails(
+          applePushToken: deviceToken,
+          pushContentEncryptionKey: pushContentKey,
+          pushContentVersion: pushContentVersion,
+          supportsFilteredSyncPushes: Self.supportsFilteredSyncPushes
+        )
+      )
+    }
+  }
+
+  func application(
+    _ application: UIApplication,
+    didFailToRegisterForRemoteNotificationsWithError error: Error
+  ) {
+    Log.shared.error("Failed to register for remote notifications", error: error)
+  }
+
+  func application(
+    _ application: UIApplication,
+    didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+    fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+  ) {
+    guard let account = MessageNotificationAccount.capture(userInfo: userInfo),
+          NotificationSyncCleaner.isSyncPush(userInfo)
+    else {
+      completionHandler(.noData)
+      return
+    }
+    Task {
+      let didRemoveAny = await NotificationSyncCleaner.applySyncPush(userInfo, account: account)
+      completionHandler(didRemoveAny ? .newData : .noData)
+    }
+  }
+
+  func userNotificationCenter(
+    _: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    let content = notification.request.content
+    guard let account = MessageNotificationAccount.capture(userInfo: content.userInfo) else {
+      completionHandler([])
+      return
+    }
+    let urgentOptions = UrgentNotificationPresentation.foregroundOptions(for: content)
+    if !urgentOptions.isEmpty {
+      completionHandler(urgentOptions)
+      return
+    }
+    let target = MessageNotificationTarget(userInfo: content.userInfo, threadIdentifier: content.threadIdentifier)
+    Task { @MainActor in
+      let peer = await target?.resolvePeer()
+      guard MessageNotificationAccount.isCurrent(account) else {
+        completionHandler([])
+        return
+      }
+      let isViewingChat = peer.map { sceneRouterRegistry.isViewingChat($0) } ?? false
+      completionHandler(MessageNotificationPresentation.foregroundOptions(
+        for: content,
+        isViewingConversation: isViewingChat
+      ))
+    }
+  }
+
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    didReceive response: UNNotificationResponse,
+    withCompletionHandler completionHandler: @escaping () -> Void
+  ) {
+    let content = response.notification.request.content
+    guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+          let target = MessageNotificationTarget(userInfo: content.userInfo, threadIdentifier: content.threadIdentifier),
+          let account = MessageNotificationAccount.capture(userInfo: content.userInfo)
+    else {
+      completionHandler()
+      return
+    }
+
+    cancelPendingChatLink()
+    let waitsForSceneActivation = UIApplication.shared.applicationState == .background
+      || !sceneRouterRegistry.hasActiveRouter()
+    let navigationReservation = sceneRouterRegistry.reserveNavigation(
+      waitForActivation: waitsForSceneActivation
+    )
+
+    if let peer = target.peer {
+      navigateFromNotification(
+        peerId: peer, messageID: target.focusMessageID, account: account,
+        waitsForSceneActivation: waitsForSceneActivation, navigationReservation: navigationReservation,
+        completionHandler: completionHandler
+      )
+    } else {
+      // The app is opening from a tap; do not keep the OS response callback
+      // outstanding while uncached encrypted-fallback metadata is fetched.
+      completionHandler()
+      Task { @MainActor in
+        guard let peer = await target.resolvePeer(fetchIfMissingFor: account) else { return }
+        navigateFromNotification(
+          peerId: peer, messageID: target.focusMessageID, account: account,
+          waitsForSceneActivation: waitsForSceneActivation, navigationReservation: navigationReservation,
+          completionHandler: {}
+        )
+      }
+    }
+  }
+
+  private func navigateFromNotification(
+    peerId: Peer,
+    messageID: Int64?,
+    account: AuthAccountMutationToken,
+    waitsForSceneActivation: Bool,
+    navigationReservation: UInt64,
+    completionHandler: @escaping () -> Void
+  ) {
+    guard MessageNotificationAccount.isCurrent(account) else {
+      completionHandler()
+      return
+    }
+    if waitsForSceneActivation {
+      let accepted = sceneRouterRegistry.navigate(
+        .externalChat(peer: peerId, contextSpaceID: nil, messageID: messageID),
+        reservation: navigationReservation
+      )
+      if accepted {
+        openInInboxAfterExternalNavigation(peerId)
+      }
+      completionHandler()
+
+      Task { @MainActor in
+        guard let contextSpaceID = await Self.localSpaceID(for: peerId),
+              MessageNotificationAccount.isCurrent(account) else { return }
+        sceneRouterRegistry.updatePendingRequest(
+          .externalChat(peer: peerId, contextSpaceID: contextSpaceID, messageID: messageID),
+          reservation: navigationReservation
+        )
+      }
+      return
+    }
+
+    Task { @MainActor in
+      defer { completionHandler() }
+      let contextSpaceID = await Self.localSpaceID(for: peerId)
+      guard MessageNotificationAccount.isCurrent(account) else { return }
+      completeNotificationNavigation(
+        peer: peerId,
+        contextSpaceID: contextSpaceID,
+        messageID: messageID,
+        reservation: navigationReservation
+      )
+    }
+  }
+
+  @MainActor
+  private func completeNotificationNavigation(
+    peer: Peer,
+    contextSpaceID: Int64?,
+    messageID: Int64?,
+    reservation: UInt64
+  ) {
+    let accepted = sceneRouterRegistry.navigate(
+      .externalChat(peer: peer, contextSpaceID: contextSpaceID, messageID: messageID),
+      reservation: reservation
+    )
+    if accepted {
+      openInInboxAfterExternalNavigation(peer)
+    }
+  }
+
+  private static func localSpaceID(for peer: Peer) async -> Int64? {
+    await Task.detached(priority: .userInitiated) {
+      do {
+        return try Chat.getByPeerId(peerId: peer)?.spaceId
+      } catch {
+        Log.shared.error("Failed to resolve notification chat context", error: error)
+        return nil
+      }
+    }.value
+  }
+
+  private func openInInboxAfterExternalNavigation(_ peer: Peer) {
+    Task {
+      do {
+        _ = try await InboxMembershipService.shared.open(peer: peer)
+      } catch {
+        Log.shared.error("Failed to open notification chat in Inbox", error: error)
+      }
+    }
+  }
+}
+
+extension AppDelegate {
+  /// Logout retires the device push key, so an alert still queued for the old session can no
+  /// longer be decrypted. The next sign-in registers a fresh key with its own session.
+  static func retirePushContentKeyForLogout() {
+    let status = SecItemDelete(basePushContentKeychainQuery() as CFDictionary)
+    if status != errSecSuccess, status != errSecItemNotFound {
+      Log.shared.error("Failed to delete push-content private key (status: \(status))")
+    }
+  }
+}
+
+private extension AppDelegate {
+  static let pushContentVersion: UInt32 = 1
+  /// Turn on together with `com.apple.developer.usernotifications.filtering` in
+  /// InlineNotificationExtension.entitlements once Apple grants it (request 66FMH87LA5).
+  /// While false the server keeps sending read/delete sync as background pushes.
+  static let supportsFilteredSyncPushes = false
+  static let pushContentKeychainService = "chat.inline.push-content"
+  static let pushContentPrivateKeyAccount = "private-key-v1"
+  static let pushContentKeyId = "ios-x25519-v1"
+  static let pushContentKeychainAccessGroup = "2487AN8AL4.keychainGroup"
+  static let pushContentAlgorithmRawValue = 1
+
+  static func makePushContentEncryptionKeyMetadata() -> PushContentEncryptionKeyMetadata? {
+    guard let privateKey = loadOrCreatePushContentPrivateKey() else {
+      return nil
+    }
+
+    return PushContentEncryptionKeyMetadata(
+      publicKey: privateKey.publicKey.rawRepresentation,
+      keyId: pushContentKeyId,
+      algorithmRawValue: pushContentAlgorithmRawValue
+    )
+  }
+
+  static func loadOrCreatePushContentPrivateKey() -> Curve25519.KeyAgreement.PrivateKey? {
+    if let existingData = loadPushContentPrivateKeyData() {
+      do {
+        return try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: existingData)
+      } catch {
+        Log.shared.error("Failed to decode existing push-content private key", error: error)
+      }
+    }
+
+    let privateKey = Curve25519.KeyAgreement.PrivateKey()
+    let didStore = storePushContentPrivateKeyData(privateKey.rawRepresentation)
+    if !didStore {
+      Log.shared.error("Failed to persist push-content private key")
+      return nil
+    }
+    return privateKey
+  }
+
+  static func basePushContentKeychainQuery() -> [String: Any] {
+    [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: pushContentKeychainService,
+      kSecAttrAccount as String: pushContentPrivateKeyAccount,
+      kSecAttrAccessGroup as String: pushContentKeychainAccessGroup,
+    ]
+  }
+
+  static func loadPushContentPrivateKeyData() -> Data? {
+    var query = basePushContentKeychainQuery()
+    query[kSecReturnData as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    if status == errSecSuccess, let data = item as? Data {
+      return data
+    }
+    if status == errSecItemNotFound {
+      return nil
+    }
+
+    Log.shared.error("Failed to read push-content private key (status: \(status))")
+    return nil
+  }
+
+  static func storePushContentPrivateKeyData(_ keyData: Data) -> Bool {
+    var insertQuery = basePushContentKeychainQuery()
+    insertQuery[kSecValueData as String] = keyData
+    insertQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+
+    let addStatus = SecItemAdd(insertQuery as CFDictionary, nil)
+    if addStatus == errSecSuccess {
+      return true
+    }
+
+    if addStatus == errSecDuplicateItem {
+      let updateQuery = basePushContentKeychainQuery()
+      let updateAttributes: [String: Any] = [kSecValueData as String: keyData]
+      let updateStatus = SecItemUpdate(updateQuery as CFDictionary, updateAttributes as CFDictionary)
+      if updateStatus == errSecSuccess {
+        return true
+      }
+      Log.shared.error("Failed to update push-content private key (status: \(updateStatus))")
+      return false
+    }
+
+    Log.shared.error("Failed to add push-content private key (status: \(addStatus))")
+    return false
+  }
+}
+
+public class NotificationHandler: ObservableObject {
+  @Published var authenticated: Bool = false
+
+  public func setAuthenticated(value: Bool) {
+    DispatchQueue.main.async {
+      self.authenticated = value
+      NotificationCenter.default.post(name: .authenticationChanged, object: value)
+    }
+  }
+}
+
+extension Notification.Name {
+  static let authenticationChanged = Notification.Name("authenticationChanged")
+  static let localDataCleared = Notification.Name("localDataCleared")
+}

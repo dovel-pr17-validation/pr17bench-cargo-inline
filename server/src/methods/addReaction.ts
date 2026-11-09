@@ -1,0 +1,61 @@
+import type { HandlerContext } from "@in/server/controllers/helpers"
+import { ReactionModel } from "@in/server/db/models/reactions"
+import { Log } from "@in/server/utils/log"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { Type } from "@sinclair/typebox"
+import type { Static } from "elysia"
+import { encodeReactionInfo, TReactionInfo } from "../api-types"
+import { InlineError } from "../types/errors"
+import { TInputId } from "../types/methods"
+import { getAuthorizedChat } from "@in/server/modules/authorization/legacyAccessGuards"
+
+export const Input = Type.Object({
+  messageId: TInputId,
+  chatId: TInputId,
+  emoji: Type.String(),
+})
+
+export const Response = Type.Object({
+  reaction: TReactionInfo,
+})
+
+export const handler = async (
+  input: Static<typeof Input>,
+  context: HandlerContext,
+): Promise<Static<typeof Response>> => {
+  try {
+    const chatId = Number(input.chatId)
+    if (isNaN(chatId)) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+    const messageId = Number(input.messageId)
+    if (isNaN(messageId)) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+
+    await getAuthorizedChat(chatId, context.currentUserId)
+
+    const reaction = await ReactionModel.insertReaction({
+      messageId,
+      chatId,
+      emoji: input.emoji,
+      userId: context.currentUserId,
+      date: new Date(),
+    })
+
+    if (!reaction) {
+      throw new InlineError(InlineError.ApiError.INTERNAL)
+    }
+
+    return {
+      reaction: encodeReactionInfo(reaction),
+    }
+  } catch (error) {
+    if (error instanceof RealtimeRpcError) throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    if (error instanceof InlineError) {
+      throw error
+    }
+    Log.shared.error("Failed to add reaction", error)
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+}

@@ -1,0 +1,93 @@
+---
+title: "Add Inline to Your Agent"
+description: "Add Inline tools to an existing agent."
+---
+
+Add Inline's skill and plugin to ChatGPT, Claude, etc. If you want to bring your bot/agent to Inline instead, use [Set Up an Agent](/docs/agents).
+
+## Setup Prompt
+
+```text
+Install Inline's plugin, skill, and MCP (if CLI is unavailable) based on the guides:
+https://inline.chat/docs/add-inline.md
+```
+
+## ChatGPT/Codex Plugin
+
+### ChatGPT
+
+[Install Inline from the ChatGPT plugin store](https://chatgpt.com/plugins/plugin_asdk_app_6a660963e7b481918e10c08dd1e0430f?q=inline).
+
+### Codex
+
+Add the Inline marketplace:
+
+```bash
+codex plugin marketplace add inline-chat/inline
+```
+
+Install the plugin:
+
+```bash
+codex plugin add inline@inline
+```
+
+Restart Codex.
+
+The plugin includes the Inline skill and MCP integration.
+
+With the CLI, this installs it into Codex and Claude Code, whichever you have:
+
+```bash
+inline plugin install
+```
+
+In Claude Code, start a new session and run `/mcp` to sign in.
+
+## Skill
+
+If you have the CLI, this installs the standalone skill for Codex:
+
+```bash
+inline skill install
+```
+
+Or use `npx skills`:
+
+```bash
+npx skills add inline-chat/inline --skill inline --global
+```
+
+You may need to restart the agent for it to show up.
+
+For manual install, download and copy the [`skills/inline` folder](https://github.com/inline-chat/inline/tree/main/skills/inline).
+
+- Codex: `~/.codex/skills/inline`
+- Claude Code: `~/.claude/skills/inline`
+
+## MCP
+
+Follow [Connect MCP](/docs/mcp).
+
+## CLI
+
+[Install the CLI](/docs/cli) if you haven't.
+
+Heads up: don't use `inline agents setup` when you only want the plugin, skill, MCP, etc.
+
+## Verify
+
+Ask the agent:
+
+```text
+Use Inline to list my chats.
+```
+
+---
+
+[Inline plugin](https://github.com/inline-chat/inline/tree/main/plugins/chatgpt) · [Inline skill](https://github.com/inline-chat/inline/tree/main/skills/inline) · [MCP](/docs/mcp) · [CLI](/docs/cli)
+
+## Source
+
+- [`skills/inline` folder](https://github.com/inline-chat/inline/tree/main/skills/inline)
+- [Inline plugin](https://github.com/inline-chat/inline/tree/main/plugins/chatgpt)

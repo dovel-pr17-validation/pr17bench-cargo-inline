@@ -1,0 +1,1162 @@
+use super::*;
+use inline_client::{
+    AuthCredential, AuthToken, ConnectRequest, DialogRecord, HistoryRequest, InMemoryBackend,
+    LosslessEventReceiver, MessageEntityRecord, MessageMetadata,
+};
+
+pub(super) fn route(provider: &str) -> InboundRoute {
+    let store = Arc::new(BridgeStore::open_in_memory().expect("bridge store"));
+    let installation_id = InstallationId::new(provider).expect("installation");
+    let provider_id = ProviderId::new(provider).expect("provider");
+    store
+        .put_installation(&InstallationRecord {
+            installation_id: installation_id.clone(),
+            provider_id: provider_id.clone(),
+            display_name: provider.to_string(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("installation");
+    store
+        .select_workspace(
+            &installation_id,
+            &WorkspaceId::new("project").expect("workspace"),
+            &std::env::current_dir().expect("cwd"),
+            1,
+        )
+        .expect("workspace");
+    InboundRoute {
+        store,
+        installation_id,
+        provider_id,
+        policy: Arc::new(RwLock::new(
+            OperatorPolicy::from_allowed(7, [8, 77]).expect("policy"),
+        )),
+        owner_user_id: 7,
+        host_label: "Test Mac".to_string(),
+        owner_dm_chat_id: 706,
+        bot_user_id: 17,
+        sibling_bot_user_ids: Arc::default(),
+        bot_username: "test_bot".to_string(),
+        bot_store: SqliteStore::open_in_memory().expect("bot store"),
+        attachment_cache_dir: PathBuf::from("unused-authorization-test-attachments"),
+        owner_control: None,
+        accept_messages_after: 0,
+        deferred_inbound_tx: tokio::sync::mpsc::channel(1).0,
+        pending_voice_messages: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        claude_history: None,
+        control_lane: Arc::new(tokio::sync::Semaphore::new(1)),
+        control_epoch: ControlTaskEpoch::new(),
+        bot_agent_resolver: BotAgentResolver::disabled(),
+    }
+}
+
+fn message(sender: i64, is_bot: Option<bool>, text: &str) -> MessageRecord {
+    MessageRecord {
+        chat_id: InlineId::new(706),
+        message_id: InlineId::new(9),
+        sender_id: InlineId::new(sender),
+        timestamp: 1,
+        is_outgoing: false,
+        content: MessageContent::Text {
+            text: text.to_string(),
+        },
+        reply_to_message_id: None,
+        metadata: MessageMetadata {
+            sender_is_bot: is_bot,
+            ..MessageMetadata::default()
+        },
+        transaction: None,
+    }
+}
+
+fn mention(message: &mut MessageRecord) {
+    message.metadata.entities.push(MessageEntityRecord {
+        kind: "TYPE_MENTION".to_string(),
+        offset: 0,
+        length: 4,
+        user_id: Some(InlineId::new(17)),
+        agent_id: None,
+        group_id: None,
+        chat_id: None,
+        value: None,
+    });
+}
+
+async fn client() -> (InlineClient, InMemoryBackend, LosslessEventReceiver) {
+    let backend = InMemoryBackend::new();
+    let bot = InlineClient::builder()
+        .backend(backend.clone())
+        .build()
+        .spawn();
+    let events = bot.take_lossless_events().expect("events");
+    bot.connect(ConnectRequest::new(AuthCredential::AccessToken {
+        token: AuthToken::try_new("local-test-only").expect("test credential"),
+    }))
+    .await
+    .expect("in-memory connect");
+    (bot, backend, events)
+}
+
+async fn delivery(events: &mut LosslessEventReceiver) -> LosslessEventDelivery {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv_delivery().await.expect("event delivery");
+            if matches!(
+                event.event(),
+                ClientEvent::MessageStored { message } if !message.is_outgoing
+            ) {
+                return event;
+            }
+            event.ack().await.expect("ack status");
+        }
+    })
+    .await
+    .expect("message delivery deadline")
+}
+
+async fn record_bound_dialog(route: &InboundRoute, model_id: &str) {
+    let mut dialog = DialogRecord::new(InlineId::new(706));
+    dialog.peer_user_id = Some(InlineId::new(7));
+    dialog.agent_context = Some(inline_client::AgentThreadContext {
+        bot_user_id: InlineId::new(17),
+        agent_id: None,
+        configuration: Some(inline_client::AgentThreadConfiguration {
+            project_id: Some("project".to_string()),
+            model_id: Some(model_id.to_string()),
+            reasoning_effort_id: None,
+        }),
+    });
+    route.bot_store.record_dialog(dialog).await.expect("dialog");
+}
+
+async fn record_bound_dialog_with_project(route: &InboundRoute, project_id: &str, model_id: &str) {
+    let mut dialog = DialogRecord::new(InlineId::new(706));
+    dialog.peer_user_id = Some(InlineId::new(7));
+    dialog.agent_context = Some(inline_client::AgentThreadContext {
+        bot_user_id: InlineId::new(17),
+        agent_id: None,
+        configuration: Some(inline_client::AgentThreadConfiguration {
+            project_id: Some(project_id.to_string()),
+            model_id: Some(model_id.to_string()),
+            reasoning_effort_id: None,
+        }),
+    });
+    route.bot_store.record_dialog(dialog).await.expect("dialog");
+}
+
+fn history_contains(history: &inline_client::HistoryPage, expected: &str) -> bool {
+    history.messages.iter().any(|message| {
+        matches!(&message.content, MessageContent::Text { text } if text.contains(expected))
+    })
+}
+
+#[tokio::test]
+async fn admitted_direction_keeps_the_request_and_stable_inline_links() {
+    let route = route("codex");
+    let (bot, backend, mut events) = client().await;
+    let mut dialog = DialogRecord::new(InlineId::new(706));
+    dialog.peer_user_id = Some(InlineId::new(7));
+    route.bot_store.record_dialog(dialog).await.expect("DM");
+    let text = "  @Mo’s Codex hi 😀 ask @Dena about Planning";
+    let mut message = message(7, Some(false), text);
+    message.metadata.entities = vec![
+        text_links::tests::entity(text, "@Mo’s Codex", "TYPE_MENTION", 17),
+        text_links::tests::entity(text, "@Dena", "TYPE_MENTION", 123),
+        text_links::tests::entity(text, "Planning", "TYPE_THREAD", 456),
+    ];
+    backend.push_event_batch(vec![ClientEvent::MessageStored { message }]);
+    let delivery = delivery(&mut events).await;
+    let record = inbound_from_delivery(&bot, &delivery, &route)
+        .await
+        .expect("admission")
+        .expect("direction");
+    let expected = "hi 😀 ask [@Dena](inline://user/123) about [Planning](inline://chat/456)";
+    assert_eq!(record.direction.text, expected);
+    route
+        .store
+        .accept_inbound(&record)
+        .expect("persist direction");
+    assert_eq!(
+        route
+            .store
+            .get_inbound(&record.event_id)
+            .expect("record")
+            .expect("persisted direction")
+            .direction
+            .text,
+        expected
+    );
+    // The authenticated source and its entities still drive routing and linking.
+    assert!(
+        matches!(delivery.event(), ClientEvent::MessageStored { message }
+        if matches!(&message.content, MessageContent::Text { text: original } if original == text)
+        && message.metadata.entities.len() == 3)
+    );
+    delivery.ack().await.expect("ack");
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn provider_unavailable_bound_context_without_catalog_handles_status_and_queues_work() {
+    let route = route("codex");
+    record_bound_dialog(&route, "gpt-test").await;
+    let (bot, backend, mut events) = client().await;
+
+    backend.push_event_batch(vec![ClientEvent::MessageStored {
+        message: message(7, Some(false), "/status"),
+    }]);
+    let status_delivery = delivery(&mut events).await;
+    accept_provider_unavailable_delivery(&bot, &status_delivery, &route)
+        .await
+        .expect("status delivery");
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(706),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("status history");
+    assert!(history_contains(&history, "local provider is restarting"));
+
+    let mut work = message(7, Some(false), "continue working");
+    work.message_id = InlineId::new(10);
+    backend.push_event_batch(vec![ClientEvent::MessageStored { message: work }]);
+    let work_delivery = delivery(&mut events).await;
+    accept_provider_unavailable_delivery(&bot, &work_delivery, &route)
+        .await
+        .expect("work delivery");
+    assert_eq!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .expect("queued work")
+            .len(),
+        1
+    );
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn stale_catalog_preserves_configuration_and_queues_the_delivery() {
+    let route = route("codex");
+    route
+        .bot_agent_resolver
+        .store_configuration_catalog(AgentConfigurationCatalog {
+            projects: Some(AgentProjectCatalog {
+                options: vec![AgentProjectOption {
+                    id: "project".to_string(),
+                    label: "Project".to_string(),
+                    description: None,
+                }],
+                can_select_folder: None,
+                default_project_id: None,
+            }),
+            models: Some(AgentModelCatalog {
+                options: vec![AgentModelOption {
+                    id: "gpt-test".to_string(),
+                    label: "GPT Test".to_string(),
+                    description: None,
+                    reasoning_effort_ids: Vec::new(),
+                    default_reasoning_effort_id: None,
+                }],
+                default_model_id: None,
+            }),
+            reasoning: None,
+        });
+    record_bound_dialog(&route, "missing-model").await;
+    let (bot, backend, mut events) = client().await;
+
+    backend.push_event_batch(vec![ClientEvent::MessageStored {
+        message: message(7, Some(false), "continue working"),
+    }]);
+    let delivery = delivery(&mut events).await;
+    accept_provider_unavailable_delivery(&bot, &delivery, &route)
+        .await
+        .expect("invalid configuration delivery");
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(706),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("failure history");
+    assert!(!history_contains(
+        &history,
+        "using this provider’s defaults"
+    ));
+    let record = route
+        .store
+        .get_inbound("inline-message-706-9")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        route
+            .store
+            .chat_settings(&record.binding, 2)
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("missing-model")
+    );
+    assert_eq!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .expect("queued work")
+            .len(),
+        1
+    );
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unavailable_bound_project_offers_retry_without_queueing() {
+    let route = route("codex");
+    record_bound_dialog_with_project(&route, "missing-project", "gpt-test").await;
+    let (bot, backend, mut events) = client().await;
+
+    backend.push_event_batch(vec![ClientEvent::MessageStored {
+        message: message(7, Some(false), "continue working"),
+    }]);
+    let delivery = delivery(&mut events).await;
+    accept_provider_unavailable_delivery(&bot, &delivery, &route)
+        .await
+        .expect("unavailable project delivery");
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(706),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("fallback history");
+    assert!(history_contains(&history, "project folder isn’t available"));
+    // InMemoryBackend omits action metadata; callback access and deduplication
+    // are covered by settings_retry_rechecks_access_and_admits_the_original_request_once.
+    assert_eq!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .expect("queued work")
+            .len(),
+        0
+    );
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unavailable_skilled_agent_defaults_to_the_provider_bot_and_queues() {
+    let route = route("codex");
+    let mut dialog = DialogRecord::new(InlineId::new(706));
+    dialog.peer_user_id = Some(InlineId::new(7));
+    dialog.agent_context = Some(inline_client::AgentThreadContext {
+        bot_user_id: InlineId::new(17),
+        agent_id: Some(InlineId::new(99)),
+        configuration: Some(inline_client::AgentThreadConfiguration {
+            project_id: Some("project".to_string()),
+            model_id: None,
+            reasoning_effort_id: None,
+        }),
+    });
+    route.bot_store.record_dialog(dialog).await.expect("dialog");
+    let (bot, backend, mut events) = client().await;
+
+    backend.push_event_batch(vec![ClientEvent::MessageStored {
+        message: message(7, Some(false), "continue working"),
+    }]);
+    let delivery = delivery(&mut events).await;
+    accept_provider_unavailable_delivery(&bot, &delivery, &route)
+        .await
+        .expect("unavailable Agent delivery");
+
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(706),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("fallback history");
+    assert!(history_contains(&history, "default behavior"));
+    assert_eq!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .expect("queued work")
+            .len(),
+        1
+    );
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn skilled_agent_owned_by_another_provider_fails_closed_without_queuing() {
+    let route = route("codex");
+    route.bot_agent_resolver.store(
+        99,
+        Some(proto::BotAgent {
+            id: 99,
+            bot_user_id: 98,
+            name: "Foreign Agent".to_string(),
+            ..proto::BotAgent::default()
+        }),
+    );
+    let mut dialog = DialogRecord::new(InlineId::new(706));
+    dialog.peer_user_id = Some(InlineId::new(7));
+    dialog.agent_context = Some(inline_client::AgentThreadContext {
+        bot_user_id: InlineId::new(17),
+        agent_id: Some(InlineId::new(99)),
+        configuration: None,
+    });
+    route.bot_store.record_dialog(dialog).await.expect("dialog");
+    let (bot, backend, mut events) = client().await;
+
+    backend.push_event_batch(vec![ClientEvent::MessageStored {
+        message: message(7, Some(false), "continue working"),
+    }]);
+    let delivery = delivery(&mut events).await;
+    accept_provider_unavailable_delivery(&bot, &delivery, &route)
+        .await
+        .expect("foreign Agent delivery");
+
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(706),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("foreign Agent history");
+    assert!(history_contains(
+        &history,
+        "does not belong to this provider"
+    ));
+    assert!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .expect("queued work")
+            .is_empty()
+    );
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn agent_context_for_another_provider_fails_closed_without_queuing() {
+    let route = route("codex");
+    let mut dialog = DialogRecord::new(InlineId::new(706));
+    dialog.peer_user_id = Some(InlineId::new(7));
+    dialog.agent_context = Some(inline_client::AgentThreadContext {
+        bot_user_id: InlineId::new(99),
+        agent_id: None,
+        configuration: None,
+    });
+    route.bot_store.record_dialog(dialog).await.expect("dialog");
+    let (bot, backend, mut events) = client().await;
+
+    backend.push_event_batch(vec![ClientEvent::MessageStored {
+        message: message(7, Some(false), "continue working"),
+    }]);
+    let delivery = delivery(&mut events).await;
+    accept_provider_unavailable_delivery(&bot, &delivery, &route)
+        .await
+        .expect("provider mismatch delivery");
+
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(706),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("mismatch history");
+    assert!(history_contains(&history, "different Agent provider"));
+    assert!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .expect("queued work")
+            .is_empty()
+    );
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn failed_delivery_is_settled_and_later_work_still_queues() {
+    let route = route("codex");
+    let (bot, backend, mut events) = client().await;
+
+    backend.push_event_batch(vec![ClientEvent::MessageStored {
+        message: message(7, Some(false), "poisoned request"),
+    }]);
+    let failed = delivery(&mut events).await;
+    recover_failed_delivery(
+        &bot,
+        &failed,
+        &route,
+        "test_delivery_recovery",
+        &std::io::Error::other("simulated deterministic failure"),
+    )
+    .await;
+
+    let mut next = message(7, Some(false), "continue working");
+    next.message_id = InlineId::new(10);
+    backend.push_event_batch(vec![ClientEvent::MessageStored { message: next }]);
+    let next = delivery(&mut events).await;
+    assert!(matches!(
+        next.event(),
+        ClientEvent::MessageStored { message } if message.message_id.get() == 10
+    ));
+    accept_provider_unavailable_delivery(&bot, &next, &route)
+        .await
+        .expect("later delivery");
+
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(706),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("recovery history");
+    assert!(history_contains(
+        &history,
+        "skipped it to keep later messages moving"
+    ));
+    assert_eq!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .expect("queued work")
+            .len(),
+        1
+    );
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unauthorized_messages_are_silent_before_admission_for_every_provider() {
+    for provider in ["codex", "claude", "opencode", "amp"] {
+        for case in ["dm", "command", "mention", "unknown", "voice", "revoked"] {
+            let route = route(provider);
+            let (bot, backend, mut events) = client().await;
+            let mut message = message(9, Some(false), "hello");
+            match case {
+                "command" => {
+                    message.content = MessageContent::Text {
+                        text: "/status@test_bot".to_string(),
+                    }
+                }
+                "mention" => mention(&mut message),
+                "unknown" => message.metadata.sender_is_bot = None,
+                "voice" => {
+                    message.content = MessageContent::Media {
+                        kind: inline_client::MediaKind::Voice,
+                        file_id: "voice-test".to_string(),
+                        url: None,
+                        mime_type: Some("audio/ogg".to_string()),
+                        file_name: None,
+                        caption: None,
+                        size_bytes: Some(42),
+                        width: None,
+                        height: None,
+                        duration_ms: Some(1_000),
+                    }
+                }
+                "revoked" => {
+                    message.sender_id = InlineId::new(8);
+                    route.replace_policy(OperatorPolicy::owner_only(7));
+                }
+                _ => {}
+            }
+            // A real DM shape exercises the old denial-reply path. Mentions
+            // also cover shared chats where group membership grants no access.
+            let mut dialog = DialogRecord::new(message.chat_id);
+            if case != "mention" {
+                dialog.peer_user_id = Some(message.sender_id);
+            }
+            route.bot_store.record_dialog(dialog).await.expect("dialog");
+            backend.push_event_batch(vec![ClientEvent::MessageStored { message }]);
+            let delivery = delivery(&mut events).await;
+            assert!(
+                inbound_from_delivery(&bot, &delivery, &route)
+                    .await
+                    .expect("admission")
+                    .is_none(),
+                "{provider}/{case}"
+            );
+            delivery.ack().await.expect("ack ignored message");
+            let history = bot
+                .history(HistoryRequest {
+                    chat_id: InlineId::new(706),
+                    limit: Some(10),
+                    before_message_id: None,
+                    after_message_id: None,
+                })
+                .await
+                .expect("outbound history");
+            assert!(
+                history.messages.is_empty(),
+                "unexpected reply: {provider}/{case}"
+            );
+            assert!(
+                route
+                    .store
+                    .bound_chat_workspace(&route.installation_id, 706)
+                    .expect("binding")
+                    .is_none()
+            );
+            assert!(
+                route
+                    .pending_voice_messages
+                    .lock()
+                    .expect("voice registry")
+                    .is_empty()
+            );
+            bot.shutdown().await.expect("shutdown");
+        }
+    }
+}
+
+#[tokio::test]
+async fn owner_and_explicitly_allowlisted_users_keep_access() {
+    for provider in ["codex", "claude", "opencode", "amp"] {
+        for sender in [7, 8, 77] {
+            let route = route(provider);
+            let (bot, backend, mut events) = client().await;
+            let mut message = message(sender, Some(sender == 77), "@bot help");
+            if sender != 7 {
+                mention(&mut message);
+            }
+            backend.push_event_batch(vec![ClientEvent::MessageStored { message }]);
+            let delivery = delivery(&mut events).await;
+            let record = inbound_from_delivery(&bot, &delivery, &route)
+                .await
+                .expect("admission")
+                .expect("authorized message");
+            assert_eq!(record.sender_user_id, sender);
+            delivery.ack().await.expect("ack message");
+            bot.shutdown().await.expect("shutdown");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unavailable_workspace_allows_only_owner_project_recovery_commands() {
+    for (sender, text, allowed) in [
+        (7, "/projects", true),
+        (7, "/folder 1", true),
+        (7, "/projects@test_bot", true),
+        (7, "/projects@other_bot", false),
+        (7, "continue working", false),
+        (7, "/compact", false),
+        (8, "/projects", false),
+    ] {
+        let route = route("codex");
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        let workspace_id = WorkspaceId::new("missing-project").unwrap();
+        route
+            .store
+            .select_workspace(&route.installation_id, &workspace_id, &workspace, 1)
+            .unwrap();
+        route
+            .store
+            .bind_chat_workspace(&route.installation_id, 706, &workspace_id, 1)
+            .unwrap();
+        fs::rename(&workspace, root.path().join("moved-project")).unwrap();
+        let (bot, backend, mut events) = client().await;
+        backend.push_event_batch(vec![ClientEvent::MessageStored {
+            message: message(sender, Some(false), text),
+        }]);
+        let delivery = delivery(&mut events).await;
+        let record = inbound_from_delivery(&bot, &delivery, &route)
+            .await
+            .unwrap();
+        assert_eq!(record.is_some(), allowed, "sender={sender} command={text}");
+        assert_eq!(
+            route
+                .store
+                .bound_chat_workspace(&route.installation_id, 706)
+                .unwrap()
+                .unwrap()
+                .workspace_id,
+            workspace_id
+        );
+        assert!(
+            conversation_for_chat(&route, 706).is_err(),
+            "recovery must not authorize ordinary execution"
+        );
+        delivery.ack().await.unwrap();
+        bot.shutdown().await.unwrap();
+    }
+}
+
+#[test]
+fn explicit_project_and_projectless_chats_never_follow_recent_workspaces() {
+    let route = route("codex");
+    let recent = tempfile::tempdir().expect("recent project");
+    route
+        .store
+        .select_workspace(
+            &route.installation_id,
+            &WorkspaceId::new("experiment").unwrap(),
+            recent.path(),
+            2,
+        )
+        .unwrap();
+    let context = |project: &str| proto::AgentThreadContext {
+        bot_user_id: route.bot_user_id,
+        agent_id: None,
+        configuration: Some(proto::AgentThreadConfiguration {
+            project_id: Some(project.to_string()),
+            model_id: Some("gpt-6-astra".to_string()),
+            reasoning_effort_id: Some("low".to_string()),
+        }),
+    };
+    let inline = conversation_for_chat_with_agent_context(
+        &route,
+        6336,
+        Some(&context("project")),
+        true,
+        UnboundChat::UseDefault,
+    )
+    .unwrap()
+    .snapshot();
+    assert_eq!(inline.binding.workspace_id.as_str(), "project");
+    let settings = route.store.chat_settings(&inline.binding, 3).unwrap();
+    assert_eq!(settings.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(settings.reasoning.as_deref(), Some("low"));
+    let choices =
+        projects::project_choices(&route.store, &route.installation_id, None, None).unwrap();
+    let no_project = choices
+        .iter()
+        .find(|choice| choice.display_name == "No project")
+        .unwrap();
+    let projectless = conversation_for_chat_with_agent_context(
+        &route,
+        6336,
+        Some(&context(no_project.workspace_id.as_str())),
+        true,
+        UnboundChat::UseDefault,
+    )
+    .unwrap()
+    .snapshot();
+    assert_eq!(
+        projectless.workspace,
+        resolve_setup_workspace(None).unwrap()
+    );
+    assert_ne!(projectless.binding.workspace_id.as_str(), "experiment");
+    // Resolution is repeatable across repeated route resolution; recents cannot undo clearing.
+    route
+        .store
+        .select_workspace(
+            &route.installation_id,
+            &WorkspaceId::new("experiment").unwrap(),
+            recent.path(),
+            4,
+        )
+        .unwrap();
+    let resumed = conversation_for_chat_with_agent_context(
+        &route,
+        6336,
+        Some(&context(no_project.workspace_id.as_str())),
+        true,
+        UnboundChat::UseDefault,
+    )
+    .unwrap()
+    .snapshot();
+    assert_eq!(resumed.binding, projectless.binding);
+    assert!(matches!(
+        conversation_for_chat_with_agent_context(
+            &route,
+            7000,
+            Some(&context("missing")),
+            true,
+            UnboundChat::UseDefault,
+        ),
+        Err(ConversationResolutionError::MissingWorkspace)
+    ));
+    assert!(
+        route
+            .store
+            .bound_chat_workspace(&route.installation_id, 7000)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn settings_retry_rechecks_access_and_admits_the_original_request_once() {
+    let mut route = route("codex");
+    record_bound_dialog_with_project(&route, "project", "gpt-6-astra").await;
+    let (bot, _, _) = client().await;
+    let source = message(7, Some(false), "continue working");
+    route.bot_store.insert_message(source.clone()).unwrap();
+    let mut card = message(
+        route.bot_user_id,
+        Some(true),
+        "Choose a project, then retry.",
+    );
+    card.message_id = InlineId::new(20);
+    card.reply_to_message_id = Some(source.message_id);
+    card.metadata.actions = vec![inline_client::MessageActionRecord {
+        action_id: "bridge_settings_retry".to_string(),
+        label: "Retry".to_string(),
+        kind: "callback".to_string(),
+    }];
+    route.bot_store.insert_message(card.clone()).unwrap();
+    let action = |actor| ClientEvent::MessageActionInvoked {
+        interaction_id: InlineId::new(90),
+        chat_id: source.chat_id,
+        message_id: card.message_id,
+        actor_user_id: InlineId::new(actor),
+        action_id: "bridge_settings_retry".to_string(),
+        data: b"bridge-settings-retry-v1".to_vec(),
+    };
+    // Restart cutoffs must not prevent an explicitly retried old request.
+    route.accept_messages_after = 100;
+    assert!(
+        handle_settings_retry(&bot, &action(8), &route)
+            .await
+            .unwrap()
+    );
+    assert!(
+        route
+            .store
+            .get_inbound("inline-message-706-9")
+            .unwrap()
+            .is_none()
+    );
+    for _ in 0..2 {
+        assert!(
+            handle_settings_retry(&bot, &action(7), &route)
+                .await
+                .unwrap()
+        );
+    }
+    let record = route
+        .store
+        .get_inbound("inline-message-706-9")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.binding.workspace_id.as_str(), "project");
+    assert_eq!(
+        route
+            .store
+            .pending_inbound_bindings(&route.installation_id, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        route
+            .store
+            .chat_settings(&record.binding, 3)
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("gpt-6-astra")
+    );
+    bot.shutdown().await.unwrap();
+}
+
+const ORDINARY_CHAT: i64 = 4242;
+
+async fn admit_in_ordinary_chat(
+    route: &InboundRoute,
+    sender: i64,
+    is_bot: Option<bool>,
+) -> (Option<InboundRecord>, inline_client::HistoryPage) {
+    let (bot, backend, mut events) = client().await;
+    let mut message = message(sender, is_bot, "@bot run the tests");
+    message.chat_id = InlineId::new(ORDINARY_CHAT);
+    mention(&mut message);
+    route
+        .bot_store
+        .record_dialog(DialogRecord::new(message.chat_id))
+        .await
+        .expect("ordinary chat");
+    backend.push_event_batch(vec![ClientEvent::MessageStored { message }]);
+    let delivery = delivery(&mut events).await;
+    let record = inbound_from_delivery(&bot, &delivery, route)
+        .await
+        .expect("admission");
+    delivery.ack().await.expect("ack");
+    let history = bot
+        .history(HistoryRequest {
+            chat_id: InlineId::new(ORDINARY_CHAT),
+            limit: Some(10),
+            before_message_id: None,
+            after_message_id: None,
+        })
+        .await
+        .expect("outbound history");
+    bot.shutdown().await.expect("shutdown");
+    (record, history)
+}
+
+fn ordinary_chat_binding(route: &InboundRoute) -> Option<WorkspaceRecord> {
+    route
+        .store
+        .bound_chat_workspace(&route.installation_id, ORDINARY_CHAT)
+        .expect("binding")
+}
+
+fn bind_ordinary_chat(route: &InboundRoute) {
+    route
+        .store
+        .bind_chat_workspace(
+            &route.installation_id,
+            ORDINARY_CHAT,
+            &WorkspaceId::new("project").expect("workspace"),
+            1,
+        )
+        .expect("bind ordinary chat");
+}
+
+#[tokio::test]
+async fn a_foreign_bot_mention_is_not_admitted_in_any_chat() {
+    // Any Inline user can create a bot, open a Home thread with this bot and
+    // mention it exactly. The mention addresses this bot; it is not authority.
+    for provider in ["codex", "claude"] {
+        for bound in [false, true] {
+            for is_bot in [Some(true), None] {
+                let route = route(provider);
+                if bound {
+                    bind_ordinary_chat(&route);
+                }
+                let (record, history) = admit_in_ordinary_chat(&route, 99, is_bot).await;
+                let case = format!("{provider}/bound={bound}/is_bot={is_bot:?}");
+                assert!(record.is_none(), "{case}");
+                assert!(history.messages.is_empty(), "unexpected reply: {case}");
+                assert_eq!(ordinary_chat_binding(&route).is_some(), bound, "{case}");
+                assert!(
+                    route
+                        .store
+                        .pending_inbound_bindings(&route.installation_id, 10)
+                        .expect("queued work")
+                        .is_empty(),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// The owner's most recent selection becomes home ("No project"), which is
+/// never handed to another operator.
+fn select_home_as_most_recent(route: &InboundRoute) {
+    let home = resolve_setup_workspace(None).expect("home");
+    let home_id = workspace_id(&home).expect("home id");
+    route
+        .store
+        .select_workspace(&route.installation_id, &home_id, &home, 2)
+        .expect("select home");
+}
+
+#[tokio::test]
+async fn an_allowlisted_bot_gets_the_owners_project_but_never_home() {
+    let route = route("codex");
+    select_home_as_most_recent(&route);
+    let (record, history) = admit_in_ordinary_chat(&route, 77, Some(true)).await;
+    assert!(
+        record.is_none(),
+        "an unbound chat must not default to home for a bot"
+    );
+    assert!(history.messages.is_empty(), "bots get no notice");
+    assert!(ordinary_chat_binding(&route).is_none());
+
+    bind_ordinary_chat(&route);
+    let (record, _) = admit_in_ordinary_chat(&route, 77, Some(true)).await;
+    let record = record.expect("allowlisted bot in a bound chat");
+    assert_eq!(record.sender_user_id, 77);
+    assert_eq!(record.binding.workspace_id.as_str(), "project");
+
+    // With a real project as the owner's most recent selection, a new chat binds to it.
+    let route = self::route("codex");
+    let (record, _) = admit_in_ordinary_chat(&route, 77, Some(true)).await;
+    let record = record.expect("allowlisted bot gets the owner's project");
+    assert_eq!(record.binding.workspace_id.as_str(), "project");
+    assert_eq!(
+        ordinary_chat_binding(&route).map(|workspace| workspace.workspace_id),
+        Some(WorkspaceId::new("project").expect("workspace"))
+    );
+}
+
+#[tokio::test]
+async fn an_allowlisted_person_gets_the_owners_project_or_a_notice() {
+    let route = route("codex");
+    select_home_as_most_recent(&route);
+    let (record, history) = admit_in_ordinary_chat(&route, 8, Some(false)).await;
+    assert!(record.is_none());
+    assert!(history_contains(&history, "The bot owner can choose one"));
+    assert!(ordinary_chat_binding(&route).is_none());
+
+    bind_ordinary_chat(&route);
+    let (record, _) = admit_in_ordinary_chat(&route, 8, Some(false)).await;
+    assert_eq!(record.expect("bound chat").sender_user_id, 8);
+
+    let route = self::route("codex");
+    let (record, history) = admit_in_ordinary_chat(&route, 8, Some(false)).await;
+    let record = record.expect("allowlisted person gets the owner's project");
+    assert_eq!(record.binding.workspace_id.as_str(), "project");
+    assert!(!history_contains(&history, "The bot owner can choose one"));
+}
+
+#[tokio::test]
+async fn owner_and_bridge_bot_handoffs_still_open_new_chats() {
+    let mut route = route("codex");
+    let (record, _) = admit_in_ordinary_chat(&route, 7, Some(false)).await;
+    let record = record.expect("owner in a new chat");
+    assert_eq!(record.binding.chat_id, ORDINARY_CHAT);
+    assert!(ordinary_chat_binding(&route).is_some());
+
+    // Another provider bot of this same bridge needs no allowlist entry and
+    // may open a new delegated chat with the default project.
+    route = self::route("codex");
+    route.sibling_bot_user_ids = Arc::new(HashSet::from([18]));
+    assert!(!route.allows(18));
+    let (record, _) = admit_in_ordinary_chat(&route, 18, Some(true)).await;
+    assert_eq!(record.expect("sibling handoff").sender_user_id, 18);
+    assert!(ordinary_chat_binding(&route).is_some());
+}
+
+#[test]
+fn replay_and_tools_share_the_admission_sender_gate() {
+    let mut route = route("codex");
+    route.sibling_bot_user_ids = Arc::new(HashSet::from([18]));
+    assert!(route.admits_sender(7), "owner");
+    assert!(route.admits_sender(8), "allowlisted person");
+    assert!(route.admits_sender(77), "allowlisted bot");
+    assert!(route.admits_sender(17), "this bot");
+    assert!(route.admits_sender(18), "sibling provider bot");
+    assert!(!route.admits_sender(99), "foreign bot");
+    route.replace_policy(OperatorPolicy::owner_only(7));
+    assert!(!route.admits_sender(77), "revoked bot");
+    assert!(!route.admits_sender(8), "revoked person");
+}
+
+#[tokio::test]
+async fn a_foreign_bot_turn_cannot_use_inline_tools() {
+    let mut route = route("codex");
+    route.sibling_bot_user_ids = Arc::new(HashSet::from([18]));
+    let (bot, _, _) = client().await;
+    let host = InlineToolHost::new(bot.clone(), route.clone(), String::new(), String::new());
+    for (sender, allowed) in [(99, false), (18, true)] {
+        let mut message = message(sender, Some(true), "@bot handoff");
+        message.chat_id = InlineId::new(ORDINARY_CHAT);
+        message.message_id = InlineId::new(100 + sender);
+        mention(&mut message);
+        route
+            .bot_store
+            .insert_message(message.clone())
+            .expect("source message");
+        let record = InboundRecord {
+            event_id: format!("inline-message-{ORDINARY_CHAT}-{}", message.message_id),
+            binding: BindingKey {
+                installation_id: route.installation_id.clone(),
+                chat_id: ORDINARY_CHAT,
+                workspace_id: WorkspaceId::new("project").expect("workspace"),
+            },
+            message_id: message.message_id.get(),
+            delivery_chat_id: ORDINARY_CHAT,
+            sender_user_id: sender,
+            direction: Direction::new(DirectionId::new("handoff").expect("id"), "handoff"),
+            state: InboundState::Accepted,
+            accepted_at: 1,
+            started_at: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            provider_turn_id: None,
+            stream_message_id: None,
+            failure: None,
+        };
+        assert_eq!(
+            host.explicit_bot_turn_may_use_tools(&record).await,
+            allowed,
+            "sender={sender}"
+        );
+    }
+    bot.shutdown().await.expect("shutdown");
+}
+
+#[test]
+fn projectless_agent_threads_give_operators_a_parent_or_the_owners_project_never_home() {
+    let route = route("codex");
+    let context = |project: Option<&str>| proto::AgentThreadContext {
+        bot_user_id: route.bot_user_id,
+        agent_id: None,
+        configuration: project.map(|project| proto::AgentThreadConfiguration {
+            project_id: Some(project.to_string()),
+            model_id: None,
+            reasoning_effort_id: None,
+        }),
+    };
+    let resolve = |chat_id: i64, project: Option<&str>, inherited: Option<WorkspaceRecord>| {
+        conversation_for_chat_with_agent_context(
+            &route,
+            chat_id,
+            Some(&context(project)),
+            true,
+            UnboundChat::Operator { inherited },
+        )
+    };
+    let project = WorkspaceId::new("project").expect("workspace");
+    // The owner's most recent selection is home ("No project"): nothing to hand out.
+    let home = resolve_setup_workspace(None).unwrap();
+    let home_id = workspace_id(&home).unwrap();
+    route
+        .store
+        .select_workspace(&route.installation_id, &home_id, &home, 2)
+        .unwrap();
+    assert!(matches!(
+        resolve(6400, None, None),
+        Err(ConversationResolutionError::UnapprovedChat)
+    ));
+    assert!(
+        route
+            .store
+            .bound_chat_workspace(&route.installation_id, 6400)
+            .unwrap()
+            .is_none()
+    );
+    // A bound parent chat is inherited even then.
+    let parent = route
+        .store
+        .bind_chat_workspace(&route.installation_id, 6300, &project, 3)
+        .unwrap();
+    let inherited = resolve(6401, None, Some(parent)).unwrap().snapshot();
+    assert_eq!(inherited.binding.workspace_id, project);
+    // Once the owner selects a project again, operators get that project.
+    route
+        .store
+        .select_workspace(
+            &route.installation_id,
+            &project,
+            &std::env::current_dir().unwrap(),
+            4,
+        )
+        .unwrap();
+    let defaulted = resolve(6402, None, None).unwrap().snapshot();
+    assert_eq!(defaulted.binding.workspace_id, project);
+    // An explicit project names a workspace the owner registered on this host.
+    let explicit = resolve(6403, Some("project"), None).unwrap().snapshot();
+    assert_eq!(explicit.binding.workspace_id, project);
+    // Once bound, a projectless context keeps that binding.
+    assert_eq!(
+        resolve(6403, None, None).unwrap().snapshot().binding,
+        explicit.binding
+    );
+}

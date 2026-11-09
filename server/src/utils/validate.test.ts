@@ -1,0 +1,98 @@
+import { it, expect, describe, test } from "bun:test"
+import { isValid6DigitCode, isValidEmail, validateCliVersion, validateIanaTimezone, validateUpToFourSegementSemver } from "./validate"
+
+test("CLI SemVer accepts channel releases without relaxing numeric version fields", () => {
+  for (const version of ["0.7.18", "0.7.19-alpha.7", "1.2.3-rc.1+build.2"]) expect(validateCliVersion(version)).toBe(true)
+  for (const version of ["1", "1.2.3.4", "01.2.3", "1.2.3-alpha.01", "1.2.3\n", "v1.2.3", "1.2.3;command"]) expect(validateCliVersion(version)).toBe(false)
+  expect(validateUpToFourSegementSemver("0.7.19-alpha.7")).toBe(false)
+})
+
+describe("validate timezones", () => {
+  it("validates iana timezone", async () => {
+    expect(validateIanaTimezone("UTC")).toBe(true)
+    expect(validateIanaTimezone("GMT")).toBe(true)
+    expect(validateIanaTimezone("America/New_York")).toBe(true)
+    expect(validateIanaTimezone("Europe/Paris")).toBe(true)
+    expect(validateIanaTimezone("Asia/Tokyo")).toBe(true)
+    expect(validateIanaTimezone("Asia/Tokyo")).toBe(true)
+  })
+
+  test.each([
+    ["America/New_York", true, "Valid timezone with one level"],
+    ["Europe/London", true, "Another valid timezone with one level"],
+    ["Asia/Tokyo", true, "Valid timezone for Asia"],
+    ["America/Argentina/Buenos_Aires", true, "Valid timezone with two levels"],
+    ["Africa/Porto-Novo", true, "Valid timezone with hyphen"],
+    ["America/Blanc-Sablon", true, "Valid timezone with hyphen"],
+    ["America/Port-au-Prince", true, "Valid timezone with multiple hyphens"],
+    ["Asia/Ust-Nera", true, "Valid timezone with hyphen"],
+    ["UTC", true, "UTC is valid"],
+    ["GMT", true, "GMT is valid"],
+    ["Etc/GMT+5", true, "Valid Etc timezone"],
+    ["Invalid/Timezone", false, "Invalid timezone format"],
+    ["America/New York", false, "Invalid timezone with space"],
+    ["America/New-York", false, "Invalid timezone with hyphen"],
+    ["", false, "Empty string"],
+    ["VeryLongTimezoneThatExceedsSixtyFourCharactersAndShouldBeInvalid", false, "Too long timezone"],
+    ["America/UPPERCASE", false, "Non-existent timezone"],
+    ["Pacific/Pago_Pago", true, "Valid timezone with underscore"],
+    ["Europe", false, "Incomplete timezone"],
+    ["Atlantis/Underwater", false, "Non-existent top-level category"],
+  ])("%s should return %s (%s)", (input: string, expected: boolean, _label: string) => {
+    expect(validateIanaTimezone(input)).toBe(expected)
+  })
+})
+
+describe("validate 1-4 segment semver", () => {
+  it("validates semver", async () => {
+    expect(validateUpToFourSegementSemver("1.0.0")).toBe(true)
+  })
+
+  test.each([
+    ["1.0.0", true, "Valid semver"],
+    ["1.0", true, "Valid semver with two segments"],
+    ["1", true, "Valid semver with one segment"],
+    ["1.0.0.0", true, "Invalid semver, but valid here with four segments"],
+  ])("%s should return %s (%s)", (input: string, expected: boolean, _label: string) => {
+    expect(validateUpToFourSegementSemver(input)).toBe(expected)
+  })
+})
+
+describe("validate 6 digit code", () => {
+  it("validates 6 digit code", async () => {
+    expect(isValid6DigitCode("123456")).toBe(true)
+  })
+
+  test.each([
+    ["123456", true, "Valid 6 digit code"],
+    ["12345", false, "Invalid 5 digit code"],
+    ["1234567", false, "Invalid 7 digit code"],
+    ["", false, "Empty string"],
+  ])("%s should return %s (%s)", (input: string, expected: boolean, _label: string) => {
+    expect(isValid6DigitCode(input)).toBe(expected)
+  })
+})
+
+describe("validate email", () => {
+  it("validates email", async () => {
+    expect(isValidEmail("test@test.com")).toBe(true)
+  })
+
+  test.each([
+    ["test@test.com", true, "Valid email"],
+    ["Person+work@sub.example.com", true, "Valid email with uppercase, plus, and subdomain"],
+    ["δοκιμή@παράδειγμα.δοκιμή", true, "Unicode email"],
+    ["\"person@work\"@example.com", true, "Quoted local part containing an at sign"],
+    ["person..name@example", true, "Unusual syntax is left to the delivery provider"],
+    ["person@other@example.com", true, "Additional at signs are left to the delivery provider"],
+    ["test", false, "Missing at sign"],
+    ["@example.com", false, "Missing local part"],
+    ["person@", false, "Missing domain"],
+    ["person@example.com\0", false, "Null byte"],
+    ["person@example.com\r\nBcc:other@example.com", false, "Header injection characters"],
+    [`${"a".repeat(310)}@example.com`, false, "Address longer than 320 bytes"],
+    ["", false, "Empty string"],
+  ])("%s should return %s (%s)", (input: string, expected: boolean, _label: string) => {
+    expect(isValidEmail(input)).toBe(expected)
+  })
+})

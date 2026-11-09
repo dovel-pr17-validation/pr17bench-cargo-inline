@@ -1,0 +1,2442 @@
+import AsyncAlgorithms
+import Auth
+import Combine
+import Foundation
+import InlineProtocol
+import Logger
+
+public enum RealtimeDirectRpcError: Error, PrivacySafeErrorCategoryProviding {
+  case notAuthorized
+  case notConnected
+  case timeout
+  case commitOutcomeUnknown
+  case capacityExceeded
+  case rpcError(errorCode: InlineProtocol.RpcError.Code, message: String?, code: Int)
+  case unknown(Error)
+
+  public var privacySafeErrorCategory: String {
+    switch self {
+      case .notAuthorized:
+        "realtime_rpc:not_authorized"
+      case .notConnected:
+        "realtime_rpc:not_connected"
+      case .timeout:
+        "realtime_rpc:timeout"
+      case .commitOutcomeUnknown:
+        "realtime_rpc:commit_outcome_unknown"
+      case .capacityExceeded:
+        "realtime_rpc:capacity_exceeded"
+      case let .rpcError(errorCode, _, code):
+        "realtime_rpc:application:\(errorCode.rawValue):\(code)"
+      case .unknown:
+        "realtime_rpc:unknown"
+    }
+  }
+}
+
+private final class TransactionSendCancellationState: @unchecked Sendable {
+  private let lock = NSLock()
+  private var cancelled = false
+  private var completed = false
+
+  func requestCancellation() -> Bool {
+    lock.withLock {
+      guard !completed else { return false }
+      cancelled = true
+      return true
+    }
+  }
+
+  func isCancellationRequested() -> Bool {
+    lock.withLock { cancelled }
+  }
+
+  func finish() {
+    lock.withLock { completed = true }
+  }
+}
+
+private struct PendingTransactionContinuation {
+  let continuation: CheckedContinuation<InlineProtocol.RpcResult.OneOf_Result?, any Error>
+  let cancellationState: TransactionSendCancellationState
+}
+
+private enum TransactionDispatchOutcome {
+  case dispatched
+  case deferred
+}
+
+private enum TransactionDispatchPreparationError: Error {
+  case persistenceUnavailable
+}
+
+struct RealtimeConnectionLifecycleEdge: Sendable, Equatable {
+  let connectionLost: Bool
+  let connectionOpened: Bool
+
+  init(
+    previousState: ConnectionState,
+    previousSessionID: UInt64,
+    snapshot: ConnectionSnapshot
+  ) {
+    let sessionChanged = snapshot.sessionID != previousSessionID
+    connectionLost = previousState == .open && (snapshot.state != .open || sessionChanged)
+    connectionOpened = snapshot.state == .open && (previousState != .open || sessionChanged)
+  }
+}
+
+private struct RealtimeTransactionDiagnosticCounters {
+  var windowSaturations = 0
+  var ephemeralSuperseded = 0
+  var ephemeralExpired = 0
+  var capacityRejections = 0
+
+  var isEmpty: Bool {
+    windowSaturations == 0
+      && ephemeralSuperseded == 0
+      && ephemeralExpired == 0
+      && capacityRejections == 0
+  }
+}
+
+/// This root actor manages the connection, sync, transactions, queries, etc.
+///
+/// later we will rename the main module to `Realtime`
+public actor RealtimeV2 {
+  // MARK: - Core Components
+
+  private var auth: AuthHandle
+  private let authDiagnosticSnapshots: AsyncStream<AuthSnapshot>
+  private var session: ProtocolSession
+  private var connectionManager: ConnectionManager
+  private var sync: Sync
+  private var transactions: Transactions
+
+  /// Public
+  public nonisolated let stateObject: RealtimeState
+
+  // MARK: - Private Properties
+
+  private let log = Log.scoped("RealtimeV2", level: .debug)
+  private var cancellables = Set<AnyCancellable>()
+  private var tasks: Set<Task<Void, Never>> = []
+  private var authAdapter: AuthConnectionAdapter?
+  private var lifecycleAdapter: LifecycleConnectionAdapter?
+  private var networkAdapter: NetworkConnectionAdapter?
+  private let maxLimitedRpcErrorRetries = 2
+  /// Keep application transactions below the carrier's 64-request ceiling so
+  /// sync, probes, and direct control RPCs retain admission capacity.
+  private let maximumOutstandingTransactions = 32
+  private let transactionDiagnosticInterval: TimeInterval = 60
+  private var transactionDiagnosticCounters = RealtimeTransactionDiagnosticCounters()
+  private var lastTransactionDiagnosticAt = Date.distantPast
+  private var lastTransactionWarningDiagnosticAt = Date.distantPast
+
+  // Connection state channel for cross-task consumption and the latest cached state
+  private var connectionStateContinuations: [UUID: AsyncStream<RealtimeConnectionState>.Continuation] = [:]
+  private var gridEventContinuations: [UUID: AsyncStream<InlineProtocol.GridEvent>.Continuation] = [:]
+  private var transportConnectionState: RealtimeConnectionState = .connecting
+  private var currentConnectionState: RealtimeConnectionState = .connecting
+  private var syncActivityInProgress = false
+  private var lastSnapshotState: ConnectionState = .stopped
+  private var lastSnapshotSessionID: UInt64 = 0
+  private var didNotifyConnectionInitFailure = false
+  private var notifiedAuthInvalidation: AuthInvalidationReceipt?
+  private let authRecoveryDiagnostics = RealtimeAuthRecoveryDiagnostics()
+  private let authObservationProbe = AuthObservationProbe()
+  private var authRecoverySequence: UInt64 = 0
+  private var authRecoveryTask: Task<Void, Never>?
+  private var transactionOwner: TransactionOwner?
+  private var transactionGeneration: UInt64 = 0
+  private var transactionOwnerTransitionTask: Task<Void, Never>?
+  private var transactionOwnerTransitionID: UUID?
+  private var acceptsTransactions: Bool
+  private var isPreparingForTermination = false
+  private var mediaRetentionRevision: UInt64 = 0
+  private var transactionRetryTask: Task<Void, Never>?
+  private struct HistoryCompletion {
+    let transactionID: TransactionId
+    let task: Task<Void, Never>
+  }
+
+  private var historyCompletions: [UUID: HistoryCompletion] = [:]
+  private var transactionOperationsInProgress = 0
+  private var transactionDrainWaiters: [CheckedContinuation<Void, Never>] = []
+  private var directRPCOperationsInProgress = 0
+  private var directRPCDrainWaiters: [CheckedContinuation<Void, Never>] = []
+
+  // Transaction execution
+  private var transactionContinuations: [TransactionId: PendingTransactionContinuation] = [:]
+  private var dependencyTimeoutTasks: [TransactionId: Task<Void, Never>] = [:]
+  private let storageIsReady: @Sendable () -> Bool
+  private var didStart = false
+
+  // MARK: - Initialization
+
+  public init(
+    transport: Transport,
+    auth: AuthHandle,
+    applyUpdates: ApplyUpdates,
+    syncStorage: SyncStorage,
+    persistenceHandler: TransactionPersistenceHandler? = nil,
+    blockerResolver: (any TransactionBlockerResolver)? = nil,
+    storageIsReady: @escaping @Sendable () -> Bool = { true }
+  ) {
+    self.auth = auth
+    self.storageIsReady = storageIsReady
+    acceptsTransactions = auth.userId() != nil
+      && auth.hasPendingAccountTransition() == false
+      && storageIsReady()
+    authDiagnosticSnapshots = auth.snapshots
+    session = ProtocolSession(transport: transport, auth: auth)
+    #if canImport(UIKit)
+    let initiallyAppActive = false
+    #else
+    let initiallyAppActive = true
+    #endif
+    let initialConstraints = ConnectionConstraints(
+      // Realtime handshake requires a token; userId alone is not enough.
+      authAvailable: auth.snapshot().isLoggedIn,
+      networkAvailable: true,
+      appActive: initiallyAppActive,
+      userWantsConnection: true
+    )
+    connectionManager = ConnectionManager(session: session, constraints: initialConstraints)
+    let transactionStore = Transactions(persistenceHandler: persistenceHandler, blockerResolver: blockerResolver)
+    transactions = transactionStore
+    let syncConfig = RealtimeConfigStore.initialSyncConfig()
+    sync = Sync(
+      applyUpdates: applyUpdates,
+      syncStorage: syncStorage,
+      client: session,
+      config: syncConfig,
+      acceptsWork: false,
+      auth: auth,
+      historyAdmission: { key, explicitChatID in
+        var keys: Set<TransactionExecutionKey> = []
+        let chatID: Int64? = if let explicitChatID {
+          explicitChatID
+        } else {
+          try? await syncStorage.getHistoryChatID(for: key)
+        }
+        if let chatID {
+          keys.insert(.init(namespace: "chat-mutation", value: "thread:\(chatID)"))
+        }
+        if case let .chat(peer) = key, case let .user(user) = peer.type {
+          keys.insert(.init(namespace: "chat-mutation", value: "user:\(user.userID)"))
+        }
+        return await transactionStore.canAdmitHistory(keys: keys)
+      }
+    )
+    stateObject = RealtimeState()
+    authAdapter = AuthConnectionAdapter(
+      auth: auth,
+      manager: connectionManager,
+      observationProbe: authObservationProbe
+    )
+    lifecycleAdapter = LifecycleConnectionAdapter(manager: connectionManager)
+    networkAdapter = NetworkConnectionAdapter(manager: connectionManager)
+
+    Task {
+      // Initialize everything and start
+      await self.start()
+    }
+  }
+
+  // MARK: - Deinitialization
+
+  deinit {
+    // Cancel all associated tasks
+    for task in tasks {
+      task.cancel()
+    }
+    tasks.removeAll()
+    authRecoveryTask?.cancel()
+    authRecoveryTask = nil
+    for task in dependencyTimeoutTasks.values { task.cancel() }
+    // Stop the transport and terminate its infinite event collector. Capture
+    // only the manager so cleanup cannot extend RealtimeV2's lifetime.
+    Task { [connectionManager] in
+      await connectionManager.stop()
+      await connectionManager.finishSessionEventForwarding()
+    }
+  }
+
+  // MARK: - Lifecycle
+
+  /// Start core components, register listeners and start run loops.
+  private func start() async {
+    guard !didStart, !isPreparingForTermination, storageIsReady() else { return }
+    didStart = true
+    acceptsTransactions = auth.userId() != nil && auth.hasPendingAccountTransition() == false
+    if auth.hasPendingAccountTransition() == false {
+      _ = await ensureTransactionOwnerIfNeeded()
+    }
+    guard !isPreparingForTermination else { return }
+    await sync.setSyncActivityListener { [weak self] isActive in
+      await self?.syncActivityChanged(isActive)
+    }
+    guard !isPreparingForTermination else { return }
+    await stateObject.start(realtime: self)
+    guard !isPreparingForTermination else {
+      await stateObject.stop()
+      return
+    }
+    await startListeners()
+    guard !isPreparingForTermination else { return }
+
+    await session.start()
+    guard !isPreparingForTermination else {
+      await connectionManager.stop()
+      return
+    }
+    await connectionManager.start()
+    guard !isPreparingForTermination else {
+      await connectionManager.stop()
+      return
+    }
+    lifecycleAdapter?.start()
+    networkAdapter?.start()
+    authAdapter?.start()
+    if auth.snapshot().isLoggedIn, auth.hasPendingAccountTransition() == false {
+      await connectionManager.setAuthAvailable(true)
+      guard !isPreparingForTermination else {
+        await connectionManager.stop()
+        return
+      }
+      await connectionManager.connectNow()
+      if isPreparingForTermination {
+        await connectionManager.stop()
+      }
+    }
+  }
+
+  /// Starts the existing realtime owner after the app has admitted its
+  /// persistent database. Calling this repeatedly is harmless. A temporary
+  /// launch writer never receives account sync or queued transaction work.
+  @discardableResult
+  public func admitPersistentStorage() async -> Bool {
+    guard storageIsReady() else { return false }
+    await start()
+    return didStart
+  }
+
+  /// Called when log out happens
+  /// Reset all state to their initial values.
+  /// Stop transport. But do not kill the listeners and tasks. This is state is recoverable via a transport start.
+  public func loggedOut() async {
+    log.info("Stopping realtime account generation")
+    mediaRetentionRevision &+= 1
+    await connectionManager.setMediaRetention(eligible: false, revision: mediaRetentionRevision)
+    acceptsTransactions = false
+    authRecoveryTask?.cancel()
+    authRecoveryTask = nil
+    transactionRetryTask?.cancel()
+    let retryTask = transactionRetryTask
+    transactionRetryTask = nil
+
+    let ownerTransitionTask = transactionOwnerTransitionTask
+    await ownerTransitionTask?.value
+
+    let endingOwner = transactionOwner
+    transactionOwner = nil
+    resumeAllTransactionContinuations(throwing: CancellationError())
+
+    await connectionManager.stop()
+    await session.waitForDirectDispatches()
+    await retryTask?.value
+    await cancelHistoryCompletions()
+    await waitForTransactionOperationsToFinish()
+    await waitForDirectRPCOperationsToFinish()
+
+    if let endingOwner {
+      await transactions.reset(owner: endingOwner, deletePersisted: true)
+    }
+    await sync.clearSyncState(acceptNewWork: false)
+    await updateTransportConnectionState(.connecting)
+    log.info("Stopped realtime account generation")
+  }
+
+  /// Restarts account work after an in-place local-data reset that preserved authentication.
+  public func resumeAfterLocalDataReset() async {
+    guard !isPreparingForTermination else { return }
+    guard let mutationToken = try? auth.beginAccountMutation() else {
+      log.warning("Local-data reset resume skipped because authentication is unavailable")
+      return
+    }
+    guard let accountID = auth.userId(), accountID == mutationToken.userID
+    else {
+      log.warning("Local-data reset resume skipped because authentication is unavailable")
+      return
+    }
+
+    acceptsTransactions = true
+    await transitionTransactionOwner(to: accountID)
+    guard (try? auth.validateAccountMutation(mutationToken)) != nil else {
+      acceptsTransactions = false
+      return
+    }
+    await connectionManager.setAuthAvailable(true)
+    await startTransport()
+    log.info("Resumed realtime account generation after local-data reset")
+  }
+
+  /// Stops process-owned work before application teardown without deleting
+  /// durable transactions or sync checkpoints needed by the next launch.
+  public func prepareForTermination() async {
+    log.info("Quiescing realtime for application termination")
+    isPreparingForTermination = true
+    acceptsTransactions = false
+    let endingAuthAdapter = authAdapter
+    let endingLifecycleAdapter = lifecycleAdapter
+    let endingNetworkAdapter = networkAdapter
+    authAdapter = nil
+    lifecycleAdapter = nil
+    networkAdapter = nil
+    await endingAuthAdapter?.stop()
+    await endingLifecycleAdapter?.stop()
+    await endingNetworkAdapter?.stop()
+    await stateObject.stop()
+    authRecoveryTask?.cancel()
+    authRecoveryTask = nil
+    transactionRetryTask?.cancel()
+    let retryTask = transactionRetryTask
+    transactionRetryTask = nil
+
+    let ownerTransitionTask = transactionOwnerTransitionTask
+    await ownerTransitionTask?.value
+
+    let endingOwner = transactionOwner
+    transactionOwner = nil
+    resumeAllTransactionContinuations(throwing: CancellationError())
+
+    let listenerTasks = tasks
+    tasks.removeAll()
+    for task in listenerTasks {
+      task.cancel()
+    }
+
+    async let syncTermination: Void = sync.prepareForTermination()
+    await connectionManager.stop()
+    // A caller may already have timed out while its transport write is still in progress.
+    // Drain that session-owned write before SQLCipher or other app owners can tear down.
+    await session.waitForDirectDispatches()
+    await retryTask?.value
+    for task in listenerTasks {
+      await task.value
+    }
+    await cancelHistoryCompletions()
+    await waitForTransactionOperationsToFinish()
+    await waitForDirectRPCOperationsToFinish()
+    // An admitted operation can enqueue lifecycle cleanup while the drains above suspend.
+    // Reassert the terminal constraint before ending event forwarding.
+    await connectionManager.stop()
+    await connectionManager.finishSessionEventForwarding()
+
+    if let endingOwner {
+      // Durable transactions and their optimistic database projections belong
+      // to the next launch. Detach process-owned execution without invoking the
+      // rollback-style cancellation hooks used by logout/account replacement.
+      await transactions.reset(
+        owner: endingOwner,
+        deletePersisted: false,
+        invokeCancellationHandlers: false
+      )
+    } else {
+      await transactions.waitForPersistence()
+    }
+    await syncTermination
+    log.info("Realtime quiesced for application termination")
+  }
+
+  /// Listen for auth events, transport events, sync events, etc.
+  private func startListeners() async {
+    let authDiagnosticSnapshots = authDiagnosticSnapshots
+    Task {
+      for await snapshot in authDiagnosticSnapshots {
+        guard !Task.isCancelled else { return }
+        await self.authDiagnosticSnapshotReceived(snapshot)
+      }
+    }.store(in: &tasks)
+
+    // Connection snapshots
+    Task {
+      self.log.trace("Starting connection snapshot listener")
+      for await snapshot in await self.connectionManager.snapshots() {
+        guard !Task.isCancelled else { return }
+
+        let lifecycleEdge = RealtimeConnectionLifecycleEdge(
+          previousState: self.lastSnapshotState,
+          previousSessionID: self.lastSnapshotSessionID,
+          snapshot: snapshot
+        )
+        // The accepted protocol session, not the coalesced UI label, owns the
+        // wake edge. Publish its identity before any cross-actor suspension.
+        self.lastSnapshotState = snapshot.state
+        self.lastSnapshotSessionID = snapshot.sessionID
+        let mapped = self.mapConnectionState(snapshot.state)
+        if !lifecycleEdge.connectionOpened {
+          await self.updateTransportConnectionState(mapped)
+        }
+
+        if lifecycleEdge.connectionLost {
+          let expired = await self.transactions.connectionLost()
+          await self.expireEphemeralTransactions(expired)
+        }
+
+        if lifecycleEdge.connectionOpened {
+          guard let mutationToken = try? self.auth.beginAccountMutation(),
+                await self.isCurrentOpenSession(snapshot.sessionID, mutationToken: mutationToken)
+          else { continue }
+          await self.sync.acceptedSessionOpened(
+            sessionID: snapshot.sessionID,
+            mutationToken: mutationToken
+          )
+          // Sync admission suspends. Logout, termination, or a replacement
+          // session must not let this old edge publish readiness afterward.
+          guard await self.isCurrentOpenSession(snapshot.sessionID, mutationToken: mutationToken)
+          else { continue }
+          self.didNotifyConnectionInitFailure = false
+          self.notifiedAuthInvalidation = nil
+          // Register catch-up activity before showing the transport as ready,
+          // so an accepted open cannot flash Connected before Updating.
+          await self.updateTransportConnectionState(mapped)
+          await self.restartTransactions()
+        }
+      }
+    }.store(in: &tasks)
+
+    // Session events (RPC + updates)
+    Task {
+      self.log.trace("Starting session events listener")
+      for await envelope in await self.connectionManager.sessionEvents() {
+        guard !Task.isCancelled else {
+          await envelope.markProcessed()
+          return
+        }
+        let event = envelope.event
+
+        switch event {
+          case let .ack(msgId):
+            self.log.trace("Received ACK for message \(msgId)")
+            await self.ackTransaction(msgId: msgId)
+
+          case let .rpcResult(msgId, rpcResult):
+            self.log.trace("Received RPC result for message \(msgId)")
+            if let transactionID = await self.transactions.historyReadTransactionID(rpcMsgId: msgId) {
+              self.scheduleHistoryCompletion(msgId: msgId, result: rpcResult, transactionID: transactionID)
+            } else {
+              await self.completeTransaction(msgId: msgId, rpcResult: rpcResult)
+            }
+
+          case let .rpcError(msgId, rpcError):
+            self.log.trace("Received RPC error for message \(msgId)")
+            await self.completeTransaction(msgId: msgId, error: TransactionError.rpcError(rpcError))
+
+          case let .rpcCommitOutcomeUnknown(msgId):
+            self.log.warning("Received carrier commit-unknown result for message \(msgId)")
+            await self.completeTransaction(
+              msgId: msgId,
+              error: TransactionError.commitOutcomeUnknownAfterReconnect
+            )
+
+          case let .rpcRejectedBeforeExecution(msgId):
+            self.log.warning("Received carrier pre-execution rejection for message \(msgId)")
+            await self.completeTransaction(
+              msgId: msgId,
+              error: TransactionError.rejectedBeforeExecution
+            )
+
+          case let .updates(updates):
+            self.log.trace("Received updates \(updates)")
+            // The connection snapshot stream is independent from the ordered session-event stream.
+            // Consult the manager-owned generation directly so the first update after protocolOpen
+            // cannot be dropped merely because the UI snapshot listener has not caught up yet.
+            let currentSessionID = await self.connectionManager.currentSnapshot().sessionID
+            guard envelope.originatingSessionID == currentSessionID,
+                  let mutationToken = try? self.auth.beginAccountMutation()
+            else { break }
+            await self.sync.process(
+              updates: updates.updates,
+              mutationToken: mutationToken
+            )
+
+          case let .grid(event):
+            self.publishGridEvent(event)
+
+          case .authFailed:
+            self.log.error("Realtime handshake failed due to missing auth token")
+            await self.handleMissingAuthTokenHandshakeFailure()
+
+          case let .connectionError(reason):
+            self.log.error("Received server connection error during handshake reason=\(reason)")
+            await self.handleConnectionErrorDuringHandshake(reason: reason)
+
+          case let .authInvalidated(receipt):
+            self.handleAuthInvalidated(receipt)
+
+          default:
+            break
+        }
+        await envelope.markProcessed()
+      }
+    }.store(in: &tasks)
+
+    // Transactions
+    Task { [weak self] in
+      guard let self else { return }
+      log.trace("Starting transactions listener")
+      for await _ in await transactions.queueStream {
+        guard await canExecuteTransactions(), let owner = await activeTransactionOwner() else {
+          log.trace("Skipping transaction queue stream because its connection or account owner is unavailable")
+          continue
+        }
+
+        transactionDrain: while await canExecuteTransactions(),
+                                await isCurrentTransactionOwner(owner),
+                                let dequeueResult = await transactions.dequeue(
+                                  owner: owner,
+                                  maximumOutstanding: maximumOutstandingTransactions
+                                )
+        {
+          switch dequeueResult {
+            case let .ready(transaction):
+              log.trace("Dequeued transaction \(transaction.id)")
+              if await runTransaction(transaction, owner: owner) == .deferred {
+                break transactionDrain
+              }
+            case let .failed(transaction):
+              log.trace("Dropping blocked transaction \(transaction.id) after dependency failure")
+              await failQueuedTransaction(transaction, error: .dependencyFailed)
+            case let .expired(transaction):
+              log.trace("Discarding expired ephemeral transaction \(transaction.id)")
+              await recordTransactionDiagnostics(ephemeralExpired: 1)
+              await failQueuedTransaction(transaction, error: .timeout)
+            case let .capacityLimited(pressure):
+              await recordTransactionDiagnostics(
+                windowSaturations: 1,
+                pressure: pressure
+              )
+              break transactionDrain
+          }
+        }
+      }
+    }.store(in: &tasks)
+  }
+
+  private func authDiagnosticSnapshotReceived(_ snapshot: AuthSnapshot) async {
+    guard !isPreparingForTermination else { return }
+    authRecoverySequence = authRecoverySequence &+ 1
+    let sequence = authRecoverySequence
+    authRecoveryDiagnostics.recordSnapshot(sequence: sequence, snapshot: snapshot)
+
+    authRecoveryTask?.cancel()
+    authRecoveryTask = nil
+
+    guard storageIsReady(),
+          auth.hasPendingAccountTransition() == false,
+          auth.snapshot() == snapshot
+    else {
+      acceptsTransactions = false
+      return
+    }
+
+    guard snapshot.isLoggedIn else {
+      acceptsTransactions = false
+      return
+    }
+
+    acceptsTransactions = true
+    _ = await ensureTransactionOwnerIfNeeded()
+    guard !isPreparingForTermination else { return }
+
+    authRecoveryTask = Task { [weak self] in
+      do {
+        try await Task.sleep(for: .seconds(2))
+      } catch {
+        return
+      }
+      await self?.runAuthRecoveryCheck(sequence: sequence, expectedSnapshot: snapshot)
+    }
+  }
+
+  private func runAuthRecoveryCheck(sequence: UInt64, expectedSnapshot: AuthSnapshot) async {
+    guard sequence == authRecoverySequence, !Task.isCancelled else { return }
+
+    var connection = await connectionManager.currentSnapshot()
+    let propagationOutcome = authRecoveryDiagnostics.check(
+      sequence: sequence,
+      authAvailable: auth.snapshot().isLoggedIn,
+      observerObserved: authObservationProbe.hasObserved(expectedSnapshot),
+      observerApplied: authObservationProbe.hasApplied(expectedSnapshot),
+      connection: connection,
+      stage: .propagation
+    )
+    guard propagationOutcome == .pending || propagationOutcome == .deferred else {
+      if sequence == authRecoverySequence {
+        authRecoveryTask = nil
+      }
+      return
+    }
+
+    do {
+      try await Task.sleep(for: .seconds(12))
+    } catch {
+      return
+    }
+    guard sequence == authRecoverySequence, !Task.isCancelled else { return }
+
+    connection = await connectionManager.currentSnapshot()
+    _ = authRecoveryDiagnostics.check(
+      sequence: sequence,
+      authAvailable: auth.snapshot().isLoggedIn,
+      observerObserved: authObservationProbe.hasObserved(expectedSnapshot),
+      observerApplied: authObservationProbe.hasApplied(expectedSnapshot),
+      connection: connection,
+      stage: .deadline
+    )
+    if sequence == authRecoverySequence {
+      authRecoveryTask = nil
+    }
+  }
+
+  private func startTransport() async {
+    guard !isPreparingForTermination else { return }
+    guard let mutationToken = try? auth.beginAccountMutation() else {
+      await connectionManager.setAuthAvailable(false)
+      return
+    }
+    // The snapshot listener owns transport state. Starting an already-open manager is a
+    // no-op, so forcing `.connecting` here would strand subsequent system work and sends.
+    await connectionManager.start()
+    guard !isPreparingForTermination,
+          (try? auth.validateAccountMutation(mutationToken)) != nil
+    else {
+      await connectionManager.setAuthAvailable(false)
+      await connectionManager.stop()
+      return
+    }
+    await connectionManager.connectNow()
+  }
+
+  private func stopTransport() async {
+    await connectionManager.stop()
+  }
+
+  /// Ensure the transport is started when credentials are available.
+  /// This is intentionally light-weight so callers can pre-warm the connection without using transactions.
+  public func connectIfNeeded() async {
+    guard !isPreparingForTermination else { return }
+    guard let mutationToken = try? auth.beginAccountMutation() else { return }
+    await connectionManager.setAuthAvailable(true)
+    guard !isPreparingForTermination,
+          (try? auth.validateAccountMutation(mutationToken)) != nil
+    else {
+      await connectionManager.setAuthAvailable(false)
+      return
+    }
+    await startTransport()
+  }
+
+  private func runTransaction(
+    _ transactionWrapper: TransactionWrapper,
+    owner expectedOwner: TransactionOwner
+  ) async -> TransactionDispatchOutcome {
+    guard isCurrentTransactionOwner(expectedOwner) else {
+      await transactions.requeue(transactionId: transactionWrapper.id, signal: false)
+      return .deferred
+    }
+    log.trace("Running transaction \(transactionWrapper.id) with method \(transactionWrapper.transaction.method)")
+    var transaction = transactionWrapper.transaction
+    let queueDurationMilliseconds = max(0, Int(Date().timeIntervalSince(transactionWrapper.date) * 1_000))
+    log.debug(
+      "Transaction dispatch started transaction_id=\(transactionWrapper.id) method=\(transaction.method) queue_ms=\(queueDurationMilliseconds)"
+    )
+    beginTransactionOperation()
+    defer { endTransactionOperation() }
+
+    do {
+      transaction = try await transaction.preparingForDispatch()
+      guard isCurrentTransactionOwner(expectedOwner),
+            await transactions.installPreparedTransaction(
+              transaction, transactionId: transactionWrapper.id, owner: expectedOwner
+            ) else { return .deferred }
+      if transaction.historyReadBucket != nil,
+         await !transactions.canAdmitHistory(keys: transaction.historyReadExecutionKeys)
+      {
+        await transactions.requeue(transactionId: transactionWrapper.id, signal: false)
+        scheduleTransactionQueueRetry()
+        return .deferred
+      }
+    } catch {
+      await transactions.cancel(transactionId: transactionWrapper.id)
+      resumeTransactionContinuation(for: transactionWrapper.id, throwing: error)
+      return .dispatched
+    }
+
+    do {
+      guard isCurrentTransactionOwner(expectedOwner) else {
+        await transactions.requeue(transactionId: transactionWrapper.id, signal: false)
+        return .deferred
+      }
+      try await session.sendRpc(
+        method: transaction.method,
+        input: transaction.input
+      ) { [transactions] msgId in
+        switch await transactions.prepareForDispatch(
+          transactionId: transactionWrapper.id,
+          rpcMsgId: msgId,
+          owner: expectedOwner
+        ) {
+          case .prepared:
+            break
+          case .ownerUnavailable:
+            throw ProtocolSessionError.stopped
+          case .persistenceUnavailable:
+            throw TransactionDispatchPreparationError.persistenceUnavailable
+        }
+      }
+      guard isCurrentTransactionOwner(expectedOwner) else { return .dispatched }
+      return .dispatched
+    } catch TransactionDispatchPreparationError.persistenceUnavailable {
+      log.warning("Transaction dispatch deferred method=\(transaction.method) reason=persistence_unavailable")
+      await transactions.requeue(transactionId: transactionWrapper.id, signal: false)
+      scheduleTransactionQueueRetry()
+      return .deferred
+    } catch ProtocolSessionError.stopped {
+      log.warning("Transaction dispatch deferred method=\(transaction.method) reason=not_dispatched")
+      await transactions.requeue(transactionId: transactionWrapper.id, signal: false)
+      scheduleTransactionQueueRetry()
+      return .deferred
+    } catch ProtocolSessionError.notConnected {
+      // The transport rejected the write before accepting bytes. The durable
+      // dispatch marker was intentionally conservative, but this boundary is
+      // still known-unsent and may safely return to the queue, including for
+      // non-replayable mutations.
+      log.warning("Transaction dispatch deferred method=\(transaction.method) reason=transport_not_connected")
+      await transactions.requeueBeforeDispatch(transactionId: transactionWrapper.id, signal: false)
+      scheduleTransactionQueueRetry()
+      return .deferred
+    } catch ProtocolSessionError.capacityExceeded {
+      // Carrier admission rejected this request before accepting bytes. Hold it
+      // behind the bounded transaction window instead of reporting uncertainty.
+      recordTransactionDiagnostics(capacityRejections: 1)
+      await transactions.requeueBeforeDispatch(transactionId: transactionWrapper.id, signal: false)
+      scheduleTransactionQueueRetry()
+      return .deferred
+    } catch {
+      if let unresolved = await transactions.recoverAfterUncertainDispatch(
+        transactionId: transactionWrapper.id
+      ) {
+        log.error(
+          "Transaction commit outcome unknown after transport failure method=\(transaction.method)",
+          error: error
+        )
+        await transaction.commitOutcomeUnknown()
+        await transactions.deletePersisted(transactionId: unresolved.id, owner: expectedOwner)
+        await transactions.finishExecution(for: unresolved)
+        resumeTransactionContinuation(
+          for: transactionWrapper.id,
+          throwing: TransactionError.commitOutcomeUnknownAfterReconnect
+        )
+        await transactions.signalQueue()
+        return .dispatched
+      }
+      log.warning("Replaying application-idempotent transaction method=\(transaction.method)")
+      scheduleTransactionQueueRetry()
+      return .deferred
+    }
+  }
+
+  private func ackTransaction(msgId: UInt64) async {
+    log.debug("Acknowledging transaction with message ID \(msgId)")
+    await transactions.ack(rpcMsgId: msgId)
+  }
+
+  /// A page witness may need later envelopes on this same ordered carrier.
+  private func scheduleHistoryCompletion(
+    msgId: UInt64, result: InlineProtocol.RpcResult.OneOf_Result?, transactionID: TransactionId
+  ) {
+    guard let owner = transactionOwner else { return }
+    let id = UUID()
+    beginTransactionOperation()
+    let task = Task<Void, Never> { [weak self] in
+      await self?.performHistoryCompletion(id: id, owner: owner, msgId: msgId, result: result)
+    }
+    historyCompletions[id] = HistoryCompletion(transactionID: transactionID, task: task)
+  }
+
+  private func performHistoryCompletion(
+    id: UUID, owner: TransactionOwner, msgId: UInt64, result: InlineProtocol.RpcResult.OneOf_Result?
+  ) async {
+    defer {
+      historyCompletions.removeValue(forKey: id)
+      endTransactionOperation()
+    }
+    guard isCurrentTransactionOwner(owner) else { return }
+    await completeTransaction(msgId: msgId, rpcResult: result)
+  }
+
+  private func cancelHistoryCompletions() async {
+    let ending = historyCompletions.values.map(\.task)
+    for task in ending {
+      task.cancel()
+    }
+    for task in ending {
+      await task.value
+    }
+  }
+
+  private func historySnapshotSequence(_ result: InlineProtocol.RpcResult.OneOf_Result?) -> Int64? {
+    switch result {
+      case let .getChatHistory(page): page.hasSeq ? page.seq : nil
+      case let .searchMessages(page): page.hasSeq ? page.seq : nil
+      case let .getMessages(page): page.hasSeq ? page.seq : nil
+      case let .getChat(page): page.hasChat && page.chat.hasSeq ? Int64(page.chat.seq) : nil
+      default: nil
+    }
+  }
+
+  private func historySnapshotBucket(
+    _ result: InlineProtocol.RpcResult.OneOf_Result?, requestedKey: BucketKey
+  ) throws(TransactionExecutionError) -> BucketKey {
+    guard case let .getChat(page) = result else { return requestedKey }
+    guard case let .chat(requestedPeer) = requestedKey,
+          page.hasChat, page.hasDialog, page.chat.id > 0,
+          page.dialog.peer.type == page.chat.peerID.type,
+          !page.dialog.hasChatID || page.dialog.chatID == page.chat.id
+    else { throw .invalid }
+    // A raw DM chat ID resolves to a user bucket. Validate that identity before
+    // asking sync to catch up; the writer repeats validation before saving.
+    switch requestedPeer.type {
+      case let .chat(chat):
+        guard chat.chatID == page.chat.id else { throw .invalid }
+        switch page.chat.peerID.type {
+          case let .chat(peer) where peer.chatID == chat.chatID: break
+          case let .user(peer) where peer.userID > 0: break
+          default: throw .invalid
+        }
+      case let .user(user):
+        guard user.userID > 0, page.chat.peerID.type == requestedPeer.type else { throw .invalid }
+      default: throw .invalid
+    }
+    return .chat(peer: page.chat.peerID)
+  }
+
+  private func completeTransaction(msgId: UInt64, rpcResult: InlineProtocol.RpcResult.OneOf_Result?) async {
+    guard let completingOwner = transactionOwner else { return }
+    beginTransactionOperation()
+    defer { endTransactionOperation() }
+
+    guard let transactionWrapper = await transactions.complete(
+      rpcMsgId: msgId,
+      owner: completingOwner,
+      deletePersisted: false
+    ) else {
+      return
+    }
+
+    let transaction = transactionWrapper.transaction
+    let transactionId = transactionWrapper.id
+
+    guard completingOwner == transactionOwner else {
+      await transaction.cancelled()
+      await transactions.finishExecution(for: transactionWrapper)
+      return
+    }
+
+    log.trace("Transaction \(transactionId) completed with result")
+    let totalDurationMilliseconds = max(0, Int(Date().timeIntervalSince(transactionWrapper.date) * 1_000))
+    log.debug(
+      "Transaction completed transaction_id=\(transactionId) method=\(transaction.method) total_ms=\(totalDurationMilliseconds)"
+    )
+
+    var historyUnavailableReason = HistoryUnavailableReason.admission
+    do {
+      if let bucket = transaction.historyReadBucket {
+        guard let seq = historySnapshotSequence(rpcResult) else {
+          historyUnavailableReason = .missingSequence
+          throw TransactionExecutionError.historyUnavailable
+        }
+        let snapshotBucket = try historySnapshotBucket(rpcResult, requestedKey: bucket)
+        do {
+          try await sync.reachHistorySnapshot(snapshotBucket, seq: seq)
+        } catch let reason as HistoryUnavailableReason {
+          historyUnavailableReason = reason
+          throw TransactionExecutionError.historyUnavailable
+        }
+        try Task.checkCancellation()
+        guard isCurrentTransactionOwner(completingOwner) else { throw CancellationError() }
+        guard await transactions.canAdmitHistory(keys: transaction.historyReadExecutionKeys) else {
+          throw TransactionExecutionError.staleHistory
+        }
+      }
+      try await transaction.apply(rpcResult)
+      guard completingOwner == transactionOwner else {
+        await transaction.cancelled()
+        await transactions.finishExecution(for: transactionWrapper)
+        return
+      }
+      await transactions.deletePersisted(transactionId: transactionId, owner: completingOwner)
+      await transactions.finishExecution(for: transactionWrapper)
+      SendTelemetry.record(transactionWrapper, .sent)
+      await transactions.satisfy(blockers: transaction.satisfiedBlockersOnSuccess)
+      resumeTransactionContinuation(for: transactionId, returning: rpcResult)
+      await transactions.signalQueue()
+    } catch {
+      guard completingOwner == transactionOwner else {
+        await transaction.cancelled()
+        await transactions.finishExecution(for: transactionWrapper)
+        return
+      }
+      switch TransactionCompletionFailure(error, historyUnavailable: historyUnavailableReason) {
+        case .superseded:
+          await transaction.cancelled()
+          SendTelemetry.record(transactionWrapper, .canceled)
+        case let .failed(reported):
+          await transaction.failed(error: reported)
+          SendTelemetry.record(transactionWrapper, .failed, error: reported)
+      }
+      await transactions.deletePersisted(transactionId: transactionId, owner: completingOwner)
+      await transactions.finishExecution(for: transactionWrapper)
+      await transactions.signalQueue()
+      resumeTransactionContinuation(for: transactionId, throwing: error)
+    }
+  }
+
+  private func completeTransaction(msgId: UInt64, error: TransactionError) async {
+    guard let completingOwner = transactionOwner else { return }
+    beginTransactionOperation()
+    defer { endTransactionOperation() }
+
+    let rejectedBeforeExecution = isRejectedBeforeExecution(error)
+    let shouldRetry = rejectedBeforeExecution || isLimitedRetryRpcError(error)
+    guard let transactionWrapper = await transactions.complete(
+      rpcMsgId: msgId,
+      owner: completingOwner,
+      deletePersisted: false
+    ) else {
+      return
+    }
+
+    let transaction = transactionWrapper.transaction
+    let transactionId = transactionWrapper.id
+
+    guard completingOwner == transactionOwner else {
+      await transaction.cancelled()
+      await transactions.finishExecution(for: transactionWrapper)
+      return
+    }
+
+    if case .commitOutcomeUnknownAfterReconnect = error {
+      log.warning("Transaction commit outcome is unknown transaction_id=\(transactionId)")
+      await transaction.commitOutcomeUnknown()
+      SendTelemetry.record(transactionWrapper, .commitUnknown)
+      await transactions.deletePersisted(transactionId: transactionId, owner: completingOwner)
+      await transactions.finishExecution(for: transactionWrapper)
+      guard completingOwner == transactionOwner else { return }
+      resumeTransactionContinuation(for: transactionId, throwing: error)
+      await transactions.signalQueue()
+      return
+    }
+
+    if shouldRetry {
+      let requeued = await transactions.retryAfterRpcError(
+        transactionWrapper,
+        owner: completingOwner,
+        maxRetries: maxLimitedRpcErrorRetries,
+        signalQueue: !rejectedBeforeExecution
+      )
+      guard completingOwner == transactionOwner else {
+        if !requeued {
+          await transaction.cancelled()
+          await transactions.finishExecution(for: transactionWrapper)
+        }
+        return
+      }
+      if requeued {
+        log.warning(
+          "Retrying transaction \(transactionId) after RPC error \(transactionWrapper.rpcErrorRetryCount + 1)/\(maxLimitedRpcErrorRetries): \(error)"
+        )
+        if rejectedBeforeExecution {
+          // The server proved this request did not execute. Back off before
+          // redelivery so overload does not turn into an immediate retry burst.
+          scheduleTransactionQueueRetry()
+        }
+        return
+      }
+    }
+
+    log.error("Transaction \(transactionId) failed with error", error: error)
+
+    guard completingOwner == transactionOwner else {
+      await transaction.cancelled()
+      await transactions.finishExecution(for: transactionWrapper)
+      return
+    }
+    await transaction.failed(error: error)
+    SendTelemetry.record(transactionWrapper, .failed, error: error)
+    await transactions.deletePersisted(transactionId: transactionId, owner: completingOwner)
+    await transactions.finishExecution(for: transactionWrapper)
+    guard completingOwner == transactionOwner else { return }
+    resumeTransactionContinuation(for: transactionId, throwing: error)
+    await transactions.signalQueue()
+  }
+
+  private func failQueuedTransaction(_ transactionWrapper: TransactionWrapper, error: TransactionError) async {
+    guard let completingOwner = transactionOwner else { return }
+    let transaction = transactionWrapper.transaction
+    let transactionId = transactionWrapper.id
+
+    beginTransactionOperation()
+    defer { endTransactionOperation() }
+    await transaction.failed(error: error)
+    SendTelemetry.record(transactionWrapper, .failed, error: error)
+    guard completingOwner == transactionOwner else { return }
+    resumeTransactionContinuation(for: transactionId, throwing: error)
+  }
+
+  private func cancelSupersededEphemeralTransactions(_ wrappers: [TransactionWrapper]) async {
+    guard !wrappers.isEmpty else { return }
+    recordTransactionDiagnostics(ephemeralSuperseded: wrappers.count)
+    for wrapper in wrappers {
+      await wrapper.transaction.cancelled()
+      resumeTransactionContinuation(for: wrapper.id, throwing: CancellationError())
+    }
+  }
+
+  private func expireEphemeralTransactions(_ wrappers: [TransactionWrapper]) async {
+    guard !wrappers.isEmpty else { return }
+    recordTransactionDiagnostics(ephemeralExpired: wrappers.count)
+    for wrapper in wrappers {
+      await wrapper.transaction.failed(error: .timeout)
+      resumeTransactionContinuation(for: wrapper.id, throwing: TransactionError.timeout)
+    }
+    await transactions.signalQueue()
+  }
+
+  private func getAndRemoveContinuation(for transactionId: TransactionId) -> PendingTransactionContinuation? {
+    dependencyTimeoutTasks.removeValue(forKey: transactionId)?.cancel()
+    return transactionContinuations.removeValue(forKey: transactionId)
+  }
+
+  private func restartTransactions() async {
+    guard let restartingOwner = transactionOwner else { return }
+    // FIXME: probably wait a little before requeuing the inflight list as ack may come soon after a quick intermittent connection loss
+    guard let dropped = await transactions.requeueAll(owner: restartingOwner),
+          restartingOwner == transactionOwner
+    else { return }
+
+    // Queue signals emitted while disconnected are consumed and skipped. On reconnect,
+    // wake the transaction loop so previously queued work (e.g. chat history refetches)
+    // is drained even if no in-flight transactions were requeued.
+    await transactions.signalQueue()
+
+    guard !dropped.isEmpty else { return }
+
+    for wrapper in dropped {
+      let transaction = wrapper.transaction
+      let transactionId = wrapper.id
+      log.warning(
+        "Failing non-replayable transaction with unknown commit outcome after reconnect method=\(transaction.method)"
+      )
+      beginTransactionOperation()
+      await transaction.commitOutcomeUnknown()
+      await transactions.deletePersisted(transactionId: transactionId, owner: restartingOwner)
+      await transactions.finishExecution(for: wrapper)
+      endTransactionOperation()
+      guard restartingOwner == transactionOwner else { return }
+      resumeTransactionContinuation(
+        for: transactionId,
+        throwing: TransactionError.commitOutcomeUnknownAfterReconnect
+      )
+    }
+
+    await transactions.signalQueue()
+  }
+
+  /// Store the continuation for a transaction from actor context
+  private func storeContinuation(for transactionId: TransactionId, continuation: CheckedContinuation<
+    RpcResult.OneOf_Result?,
+    any Error
+  >, cancellationState: TransactionSendCancellationState) {
+    transactionContinuations[transactionId] = PendingTransactionContinuation(
+      continuation: continuation,
+      cancellationState: cancellationState
+    )
+  }
+
+  private func registerAndEnqueue(
+    _ transaction: any Transaction2,
+    transactionId: TransactionId,
+    owner: TransactionOwner,
+    continuation: CheckedContinuation<RpcResult.OneOf_Result?, any Error>,
+    cancellationState: TransactionSendCancellationState
+  ) async {
+    defer { endTransactionSubmission(transaction, owner: owner) }
+
+    if cancellationState.isCancellationRequested() {
+      cancellationState.finish()
+      await transaction.cancelled()
+      continuation.resume(throwing: CancellationError())
+      return
+    }
+
+    guard isCurrentTransactionOwner(owner) else {
+      cancellationState.finish()
+      await transaction.cancelled()
+      continuation.resume(throwing: CancellationError())
+      return
+    }
+
+    if cancellationState.isCancellationRequested() {
+      cancellationState.finish()
+      await transaction.cancelled()
+      continuation.resume(throwing: CancellationError())
+      return
+    }
+
+    storeContinuation(
+      for: transactionId,
+      continuation: continuation,
+      cancellationState: cancellationState
+    )
+
+    let admission = await transactions.enqueue(
+      transaction: transaction,
+      transactionId: transactionId,
+      owner: owner
+    )
+    switch admission {
+      case let .accepted(superseded):
+        await cancelSupersededEphemeralTransactions(superseded)
+      case .ownerUnavailable:
+        resumeTransactionContinuation(for: transactionId, throwing: CancellationError())
+        await transaction.cancelled()
+        return
+      case .persistenceFailed:
+        resumeTransactionContinuation(for: transactionId, throwing: TransactionError.persistenceFailed)
+        await transaction.cancelled()
+        return
+    }
+
+    guard isCurrentTransactionOwner(owner) else {
+      resumeTransactionContinuation(for: transactionId, throwing: CancellationError())
+      if !shouldPreserveAdmittedTransactionDuringTermination(owner: owner) {
+        await transactions.cancel(transactionId: transactionId)
+      }
+      return
+    }
+
+    guard transactionContinuations[transactionId] != nil else {
+      await transactions.cancel(transactionId: transactionId)
+      return
+    }
+
+    if cancellationState.isCancellationRequested() {
+      await cancelTransaction(transactionId: transactionId)
+      return
+    }
+
+    log.trace("Queued transaction method=\(transaction.method)")
+    scheduleDependencyTimeout(for: transaction, transactionId: transactionId, owner: owner)
+    await transactions.signalQueue()
+  }
+
+  private func cancelTransaction(transactionId: TransactionId) async {
+    for completion in historyCompletions.values where completion.transactionID == transactionId {
+      completion.task.cancel()
+    }
+    resumeTransactionContinuation(for: transactionId, throwing: CancellationError())
+    await transactions.cancel(transactionId: transactionId)
+  }
+
+  private func resumeTransactionContinuation(
+    for transactionId: TransactionId,
+    returning result: RpcResult.OneOf_Result?
+  ) {
+    guard let pending = getAndRemoveContinuation(for: transactionId) else { return }
+    pending.cancellationState.finish()
+    pending.continuation.resume(returning: result)
+  }
+
+  private func resumeTransactionContinuation(for transactionId: TransactionId, throwing error: any Error) {
+    guard let pending = getAndRemoveContinuation(for: transactionId) else { return }
+    pending.cancellationState.finish()
+    pending.continuation.resume(throwing: error)
+  }
+
+  private func resumeAllTransactionContinuations(throwing error: any Error) {
+    for task in dependencyTimeoutTasks.values { task.cancel() }
+    dependencyTimeoutTasks.removeAll()
+    let pending = Array(transactionContinuations.values)
+    transactionContinuations.removeAll()
+    for item in pending {
+      item.cancellationState.finish()
+      item.continuation.resume(throwing: error)
+    }
+  }
+
+  private func ensureTransactionOwnerIfNeeded(
+    expectedAccount: AuthAccountMutationToken? = nil
+  ) async -> TransactionOwner? {
+    // System work holds the owner drain. Reject a stale nested send before joining an
+    // owner replacement that must wait for that same system operation to finish.
+    if let expectedAccount {
+      do { try auth.validateAccountMutation(expectedAccount) }
+      catch { return nil }
+    }
+    guard !isPreparingForTermination, acceptsTransactions,
+          auth.hasPendingAccountTransition() == false,
+          let accountID = auth.userId(),
+          expectedAccount == nil || expectedAccount?.userID == accountID
+    else { return nil }
+
+    if let transactionOwner, transactionOwner.accountID == accountID {
+      return transactionOwner
+    }
+
+    if let transactionOwnerTransitionTask {
+      await transactionOwnerTransitionTask.value
+      guard !isPreparingForTermination, acceptsTransactions,
+            auth.hasPendingAccountTransition() == false,
+            auth.userId() == accountID,
+            let transactionOwner,
+            transactionOwner.accountID == accountID
+      else { return nil }
+      return transactionOwner
+    }
+
+    let transitionID = UUID()
+    transactionOwnerTransitionID = transitionID
+    let transitionTask = Task<Void, Never> { [weak self] in
+      guard let self else { return }
+      await transitionTransactionOwner(to: accountID)
+    }
+    transactionOwnerTransitionTask = transitionTask
+    await transitionTask.value
+    if transactionOwnerTransitionID == transitionID {
+      transactionOwnerTransitionID = nil
+      transactionOwnerTransitionTask = nil
+    }
+
+    guard !isPreparingForTermination, acceptsTransactions,
+          auth.hasPendingAccountTransition() == false,
+          auth.userId() == accountID,
+          let transactionOwner,
+          transactionOwner.accountID == accountID
+    else { return nil }
+    return transactionOwner
+  }
+
+  private func transitionTransactionOwner(to accountID: Int64) async {
+    guard !isPreparingForTermination, acceptsTransactions,
+          auth.hasPendingAccountTransition() == false,
+          auth.userId() == accountID
+    else { return }
+
+    if let previousOwner = transactionOwner {
+      transactionOwner = nil
+      resumeAllTransactionContinuations(throwing: CancellationError())
+      let endingRetryTask = transactionRetryTask
+      transactionRetryTask = nil
+      endingRetryTask?.cancel()
+      await endingRetryTask?.value
+      await cancelHistoryCompletions()
+      await waitForTransactionOperationsToFinish()
+      await transactions.reset(owner: previousOwner, deletePersisted: true)
+      await sync.clearSyncState(acceptNewWork: false)
+    }
+
+    guard !isPreparingForTermination, acceptsTransactions,
+          auth.hasPendingAccountTransition() == false,
+          auth.userId() == accountID,
+          transactionOwner == nil
+    else { return }
+
+    transactionGeneration = transactionGeneration &+ 1
+    let newOwner = TransactionOwner(accountID: accountID, generation: transactionGeneration)
+    transactionOwner = newOwner
+    await transactions.activate(owner: newOwner)
+    await sync.activateGeneration()
+
+    guard !isPreparingForTermination, acceptsTransactions,
+          auth.hasPendingAccountTransition() == false,
+          auth.userId() == accountID,
+          transactionOwner == newOwner
+    else {
+      if transactionOwner == newOwner {
+        transactionOwner = nil
+      }
+      await transactions.reset(owner: newOwner, deletePersisted: true)
+      await sync.clearSyncState(acceptNewWork: false)
+      return
+    }
+  }
+
+  private func beginTransactionSubmission(
+    invalidatesHistory: Bool = false,
+    expectedAccount: AuthAccountMutationToken? = nil
+  ) async -> TransactionOwner? {
+    guard auth.hasPendingAccountTransition() == false,
+          let owner = await ensureTransactionOwnerIfNeeded(expectedAccount: expectedAccount),
+          auth.hasPendingAccountTransition() == false,
+          isCurrentTransactionOwner(owner)
+    else {
+      return nil
+    }
+    beginTransactionOperation()
+    if invalidatesHistory, await !transactions.beginHistoryMutationSubmission(owner: owner) {
+      endTransactionOperation()
+      return nil
+    }
+    return owner
+  }
+
+  private func endTransactionSubmission(_ transaction: any Transaction2, owner: TransactionOwner) {
+    if transaction.invalidatesHistory {
+      Task { await transactions.endHistoryMutationSubmission(owner: owner) }
+    }
+    endTransactionOperation()
+  }
+
+  private func isCurrentTransactionOwner(_ owner: TransactionOwner) -> Bool {
+    !isPreparingForTermination && acceptsTransactions
+      && auth.hasPendingAccountTransition() == false
+      && transactionOwner == owner
+      && auth.userId() == owner.accountID
+  }
+
+  private func shouldPreserveAdmittedTransactionDuringTermination(
+    owner: TransactionOwner
+  ) -> Bool {
+    isPreparingForTermination && auth.userId() == owner.accountID
+  }
+
+  private func hasActiveTransactionOwner() -> Bool {
+    guard let transactionOwner else { return false }
+    return isCurrentTransactionOwner(transactionOwner)
+  }
+
+  private func activeTransactionOwner() -> TransactionOwner? {
+    guard let transactionOwner, isCurrentTransactionOwner(transactionOwner) else { return nil }
+    return transactionOwner
+  }
+
+  private func beginTransactionOperation() {
+    transactionOperationsInProgress += 1
+  }
+
+  private func endTransactionOperation() {
+    transactionOperationsInProgress = max(0, transactionOperationsInProgress - 1)
+    guard transactionOperationsInProgress == 0 else { return }
+    let waiters = transactionDrainWaiters
+    transactionDrainWaiters.removeAll()
+    for waiter in waiters {
+      waiter.resume()
+    }
+  }
+
+  private func waitForTransactionOperationsToFinish() async {
+    guard transactionOperationsInProgress > 0 else { return }
+    await withCheckedContinuation { continuation in
+      transactionDrainWaiters.append(continuation)
+    }
+  }
+
+  private func beginDirectRPCOperation() {
+    directRPCOperationsInProgress += 1
+  }
+
+  private func endDirectRPCOperation() {
+    directRPCOperationsInProgress = max(0, directRPCOperationsInProgress - 1)
+    guard directRPCOperationsInProgress == 0 else { return }
+    let waiters = directRPCDrainWaiters
+    directRPCDrainWaiters.removeAll()
+    for waiter in waiters {
+      waiter.resume()
+    }
+  }
+
+  private func waitForDirectRPCOperationsToFinish() async {
+    guard directRPCOperationsInProgress > 0 else { return }
+    await withCheckedContinuation { continuation in
+      directRPCDrainWaiters.append(continuation)
+    }
+  }
+
+  private func scheduleTransactionQueueRetry() {
+    guard transactionRetryTask == nil,
+          acceptsTransactions,
+          let expectedOwner = transactionOwner
+    else { return }
+    transactionRetryTask = Task { [weak self] in
+      do {
+        try await Task.sleep(for: .seconds(1))
+      } catch {
+        return
+      }
+      guard !Task.isCancelled else { return }
+      await self?.retryTransactionQueueIfCurrent(owner: expectedOwner)
+    }
+  }
+
+  private func scheduleDependencyTimeout(
+    for transaction: any Transaction, transactionId: TransactionId, owner: TransactionOwner
+  ) {
+    guard isCurrentTransactionOwner(owner), let timeout = transaction.dependencyTimeout,
+          !transaction.blockers.isEmpty, dependencyTimeoutTasks[transactionId] == nil else { return }
+    dependencyTimeoutTasks[transactionId] = Task { [weak self] in
+      do { try await Task.sleep(for: timeout) } catch { return }
+      guard !Task.isCancelled else { return }
+      await self?.dependencyTimeoutReached(transactionId: transactionId, owner: owner)
+    }
+  }
+
+  private func dependencyTimeoutReached(transactionId: TransactionId, owner: TransactionOwner) async {
+    dependencyTimeoutTasks.removeValue(forKey: transactionId)
+    guard isCurrentTransactionOwner(owner),
+          let failure = await transactions.failUnresolvedDependency(transactionId: transactionId, owner: owner),
+          isCurrentTransactionOwner(owner) else { return }
+    await failQueuedTransaction(failure.wrapper, error: failure.error)
+  }
+
+  private func retryTransactionQueueIfCurrent(owner expectedOwner: TransactionOwner) async {
+    transactionRetryTask = nil
+    guard acceptsTransactions, transactionOwner == expectedOwner, canExecuteTransactions() else { return }
+    await transactions.signalQueue()
+  }
+
+  // MARK: - Public API
+
+  private func validateExpectedAccount(_ expected: AuthAccountMutationToken, owner: TransactionOwner) throws {
+    try auth.validateAccountMutation(expected)
+    guard owner.accountID == expected.userID, isCurrentTransactionOwner(owner) else {
+      throw RealtimeDirectRpcError.notAuthorized
+    }
+  }
+
+  /// Send a transaction and wait for the result
+  /// Uses nonisolated func to allow use from MainActor for faster optimistic updates
+  @discardableResult
+  public nonisolated func send(
+    _ transaction: any Transaction2,
+    expectedAccount: AuthAccountMutationToken? = nil
+  ) async throws -> InlineProtocol.RpcResult.OneOf_Result? {
+    let transactionId = TransactionId.generate()
+    let cancellationState = TransactionSendCancellationState()
+
+    return try await withTaskCancellationHandler {
+      guard let owner = await beginTransactionSubmission(
+        invalidatesHistory: transaction.invalidatesHistory,
+        expectedAccount: expectedAccount
+      ) else {
+        cancellationState.finish()
+        await transaction.cancelled()
+        throw CancellationError()
+      }
+
+      // Callers that resolve a target before presenting system UI must retain that account lease.
+      // Once admitted, the existing transaction owner fences all later dispatch and projection.
+      if let expectedAccount {
+        do {
+          try await validateExpectedAccount(expectedAccount, owner: owner)
+        } catch {
+          cancellationState.finish()
+          await transaction.cancelled()
+          await endTransactionSubmission(transaction, owner: owner)
+          throw error
+        }
+      }
+
+      guard await admitEphemeralTransactionWhileConnected(transaction) else {
+        cancellationState.finish()
+        await transaction.failed(error: .timeout)
+        await endTransactionSubmission(transaction, owner: owner)
+        throw TransactionError.timeout
+      }
+
+      guard !Task.isCancelled, !cancellationState.isCancellationRequested() else {
+        cancellationState.finish()
+        await transaction.cancelled()
+        await endTransactionSubmission(transaction, owner: owner)
+        throw CancellationError()
+      }
+
+      // Keep optimistic work on the caller's executor and await it directly so
+      // remote execution can never overtake the local projection.
+      await transaction.optimistic()
+
+      guard await transaction.validateOptimisticState() else {
+        cancellationState.finish()
+        await transaction.cancelled()
+        await endTransactionSubmission(transaction, owner: owner)
+        throw TransactionError.rejectedBeforeExecution
+      }
+
+      return try await withCheckedThrowingContinuation { continuation in
+        Task {
+          await registerAndEnqueue(
+            transaction,
+            transactionId: transactionId,
+            owner: owner,
+            continuation: continuation,
+            cancellationState: cancellationState
+          )
+        }
+      }
+    } onCancel: {
+      guard cancellationState.requestCancellation() else { return }
+      Task {
+        await self.cancelTransaction(transactionId: transactionId)
+      }
+    }
+  }
+
+  /// Send a transaction without waiting for a result.
+  /// Optimistic updates still run immediately, and the transaction is queued in order.
+  @discardableResult
+  public nonisolated func sendQueued(_ transaction: any Transaction2) async -> TransactionId {
+    let transactionId = TransactionId.generate()
+    _ = await admitQueuedTransaction(
+      transaction,
+      transactionId: transactionId,
+      validateOptimisticState: false
+    )
+    return transactionId
+  }
+
+  /// Send a transaction without waiting for its remote result, while reporting
+  /// whether local optimistic work and durable queue admission succeeded.
+  ///
+  /// Use this when the caller transfers ownership of recoverable user content
+  /// to the transaction and therefore must not clear its fallback on rejection.
+  @discardableResult
+  public nonisolated func sendQueuedIfAccepted(
+    _ transaction: any Transaction2
+  ) async -> TransactionId? {
+    let transactionId = TransactionId.generate()
+    guard await admitQueuedTransaction(
+      transaction,
+      transactionId: transactionId,
+      validateOptimisticState: true
+    ) else {
+      return nil
+    }
+    return transactionId
+  }
+
+  private nonisolated func admitQueuedTransaction(
+    _ transaction: any Transaction2,
+    transactionId: TransactionId,
+    validateOptimisticState: Bool
+  ) async -> Bool {
+    guard !Task.isCancelled,
+          let owner = await beginTransactionSubmission(invalidatesHistory: transaction.invalidatesHistory)
+    else {
+      await transaction.cancelled()
+      return false
+    }
+
+    guard await admitEphemeralTransactionWhileConnected(transaction) else {
+      await transaction.failed(error: .timeout)
+      await endTransactionSubmission(transaction, owner: owner)
+      return false
+    }
+
+    guard !Task.isCancelled else {
+      await transaction.cancelled()
+      await endTransactionSubmission(transaction, owner: owner)
+      return false
+    }
+
+    await transaction.optimistic()
+
+    if validateOptimisticState {
+      guard await transaction.validateOptimisticState() else {
+        log.error("Rejected queued transaction with missing optimistic state method=\(transaction.method)")
+        await transaction.cancelled()
+        await endTransactionSubmission(transaction, owner: owner)
+        return false
+      }
+    }
+
+    guard !Task.isCancelled, await isCurrentTransactionOwner(owner) else {
+      await transaction.cancelled()
+      await endTransactionSubmission(transaction, owner: owner)
+      return false
+    }
+
+    let admission = await transactions.enqueue(
+      transaction: transaction,
+      transactionId: transactionId,
+      owner: owner
+    )
+    switch admission {
+      case let .accepted(superseded):
+        await cancelSupersededEphemeralTransactions(superseded)
+      case .ownerUnavailable, .persistenceFailed:
+        await transaction.cancelled()
+        await endTransactionSubmission(transaction, owner: owner)
+        return false
+    }
+
+    guard await isCurrentTransactionOwner(owner) else {
+      let preserveForNextLaunch = await shouldPreserveAdmittedTransactionDuringTermination(owner: owner)
+      if !preserveForNextLaunch {
+        await transactions.cancel(transactionId: transactionId)
+      }
+      await endTransactionSubmission(transaction, owner: owner)
+      return preserveForNextLaunch
+    }
+
+    await endTransactionSubmission(transaction, owner: owner)
+    log.trace("Queued transaction method=\(transaction.method)")
+    await scheduleDependencyTimeout(for: transaction, transactionId: transactionId, owner: owner)
+    await transactions.signalQueue()
+    return true
+  }
+
+  /// Returns a stream of connection state changes that can be consumed from any task.
+  public func connectionStates() -> AsyncStream<RealtimeConnectionState> {
+    let id = UUID()
+    let stream = AsyncStream.makeStream(
+      of: RealtimeConnectionState.self,
+      bufferingPolicy: .bufferingNewest(1)
+    )
+    stream.continuation.onTermination = { [weak self] _ in
+      Task { await self?.removeConnectionStateContinuation(id) }
+    }
+    addConnectionStateContinuation(id: id, continuation: stream.continuation)
+    return stream.stream
+  }
+
+  public func gridEvents() -> AsyncStream<InlineProtocol.GridEvent> {
+    let id = UUID()
+    let stream = AsyncStream.makeStream(
+      of: InlineProtocol.GridEvent.self,
+      // Grid events are ephemeral invalidations/targeted hints; snapshots and
+      // target-scoped credential retries repair any observer suspension.
+      bufferingPolicy: .bufferingNewest(128)
+    )
+    stream.continuation.onTermination = { [weak self] _ in
+      Task { await self?.removeGridEventContinuation(id) }
+    }
+    addGridEventContinuation(id: id, continuation: stream.continuation)
+    return stream.stream
+  }
+
+  public func applyUpdates(_ updates: [InlineProtocol.Update]) {
+    guard let mutationToken = try? auth.beginAccountMutation() else {
+      log.warning("Rejected direct-result update projection during account transition")
+      return
+    }
+    Task { await sync.process(updates: updates, mutationToken: mutationToken) }
+  }
+
+  /// Applies transaction-result updates before returning when subsequent
+  /// reconciliation depends on their database state.
+  public func applyUpdatesAndWait(_ updates: [InlineProtocol.Update]) async {
+    guard let mutationToken = try? auth.beginAccountMutation() else {
+      log.warning("Rejected direct-result update projection during account transition")
+      return
+    }
+    await sync.process(updates: updates, mutationToken: mutationToken)
+  }
+
+  public func satisfyTransactionBlockers(_ blockers: [TransactionBlocker]) async {
+    await transactions.satisfy(blockers: blockers)
+  }
+
+  /// Applies an external command's response only to the account generation that sent it.
+  public func applyUpdatesAndWait(
+    _ updates: [InlineProtocol.Update], accountToken: AuthAccountMutationToken
+  ) async throws {
+    try auth.validateAccountMutation(accountToken)
+    await sync.process(updates: updates, mutationToken: accountToken)
+  }
+
+  /// Low-level RPC call that bypasses the transaction system.
+  /// Used by short-lived contexts (e.g. share extension) that must send media before full transaction support.
+  public func callRpcDirect(
+    method: InlineProtocol.Method,
+    input: RpcCall.OneOf_Input?,
+    timeout: Duration? = .seconds(15),
+    accountToken: AuthAccountMutationToken? = nil
+  ) async throws -> InlineProtocol.RpcResult.OneOf_Result? {
+    guard !isPreparingForTermination else { throw RealtimeDirectRpcError.notConnected }
+    // External integrations may have resolved their destination before hopping to this actor.
+    // Validate at admission so an old request cannot be sent using a replacement account.
+    if let accountToken {
+      try auth.validateAccountMutation(accountToken)
+    }
+    try auth.requireAccountMutationAllowed(allowDuringLogout: method == .logOut)
+    beginDirectRPCOperation()
+    defer { endDirectRPCOperation() }
+    do {
+      return try await session.callRpc(
+        method: method,
+        input: input,
+        timeout: timeout,
+        beforeDispatch: { [self] in
+          try await validateDirectRPCDispatch(accountToken, allowDuringLogout: method == .logOut)
+        }
+      )
+    } catch let error as RealtimeDirectRpcError {
+      throw error
+    } catch let error as ProtocolSessionError {
+      switch error {
+        case .notAuthorized:
+          throw RealtimeDirectRpcError.notAuthorized
+        case .notConnected:
+          throw RealtimeDirectRpcError.notConnected
+        case .timeout:
+          throw RealtimeDirectRpcError.timeout
+        case .commitOutcomeUnknown:
+          throw RealtimeDirectRpcError.commitOutcomeUnknown
+        case .capacityExceeded:
+          throw RealtimeDirectRpcError.capacityExceeded
+        case let .rpcError(errorCode, message, code):
+          throw RealtimeDirectRpcError.rpcError(errorCode: errorCode, message: message, code: code)
+        case .stopped:
+          throw RealtimeDirectRpcError.notConnected
+      }
+    } catch is CancellationError {
+      throw CancellationError()
+    } catch {
+      throw RealtimeDirectRpcError.unknown(error)
+    }
+  }
+
+  /// Keeps the existing transport eligible while an admitted media owner actually plays/captures.
+  /// This neither changes UIKit lifecycle state nor grants background execution.
+  public func setGridMediaRetention(
+    eligible: Bool,
+    accountToken: AuthAccountMutationToken
+  ) async {
+    guard !isPreparingForTermination,
+          (try? auth.validateAccountMutation(accountToken)) != nil else { return }
+    mediaRetentionRevision &+= 1
+    await connectionManager.setMediaRetention(eligible: eligible, revision: mediaRetentionRevision)
+  }
+
+  /// Bounded user-requested work (for example system automation) on the existing account owner.
+  /// This does not claim the app is foreground, create a second connection, or enqueue offline work.
+  public func withUserInitiatedConnection<Value: Sendable>(
+    accountToken: AuthAccountMutationToken,
+    timeout: Duration = .seconds(20),
+    operation: @escaping @Sendable (RealtimeV2) async throws -> Value
+  ) async throws -> Value {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    // A URL can arrive before persistent storage promotion or the auth observer.
+    // Retain that request while the existing owners admit it, without opening
+    // transaction admission or projecting into the temporary launch database.
+    while !storageIsReady() || !acceptsTransactions {
+      try Task.checkCancellation()
+      try auth.validateAccountMutation(accountToken)
+      guard !isPreparingForTermination else { throw CancellationError() }
+      guard clock.now < deadline else { throw RealtimeDirectRpcError.timeout }
+      try await Task.sleep(for: min(.milliseconds(50), clock.now.duration(to: deadline)))
+    }
+    guard clock.now < deadline else { throw RealtimeDirectRpcError.timeout }
+    try validateUserInitiatedOperation(accountToken)
+    // Finish any previous-owner drain before admitting this operation into that same drain.
+    guard let owner = await ensureTransactionOwnerIfNeeded(), isCurrentTransactionOwner(owner) else {
+      throw CancellationError()
+    }
+    try validateUserInitiatedOperation(accountToken)
+    // Include the whole operation (also gaps between RPCs and local reads) in the existing drain.
+    // Termination must not close SQLCipher underneath work admitted by a system action.
+    beginTransactionOperation()
+    defer { endTransactionOperation() }
+    await connectionManager.beginUserInitiatedOperation()
+    let manager = connectionManager
+    do {
+      let value = try await withThrowingTaskGroup(of: Value.self) { group in
+        group.addTask {
+          await self.connectIfNeeded()
+          while true {
+            let transportIsOpen = await manager.currentSnapshot().state == .open
+            let transactionsAreReady = try await self.isUserInitiatedOperationReady(accountToken)
+            if transportIsOpen, transactionsAreReady {
+              break
+            }
+            try Task.checkCancellation()
+            try await self.validateUserInitiatedOperation(accountToken)
+            try await Task.sleep(for: .milliseconds(50))
+          }
+          try await self.validateUserInitiatedOperation(accountToken)
+          guard clock.now < deadline else { throw RealtimeDirectRpcError.timeout }
+          let result = try await operation(self)
+          try await self.validateUserInitiatedOperation(accountToken)
+          return result
+        }
+        group.addTask {
+          while clock.now < deadline {
+            try await self.validateUserInitiatedOperation(accountToken)
+            try await Task.sleep(for: min(.milliseconds(50), clock.now.duration(to: deadline)))
+          }
+          throw RealtimeDirectRpcError.timeout
+        }
+        defer { group.cancelAll() }
+        guard let value = try await group.next() else { throw CancellationError() }
+        return value
+      }
+      await connectionManager.endUserInitiatedOperation()
+      return value
+    } catch {
+      await connectionManager.endUserInitiatedOperation()
+      throw error
+    }
+  }
+
+  private func validateUserInitiatedOperation(_ account: AuthAccountMutationToken) throws {
+    try Task.checkCancellation()
+    guard acceptsTransactions, !isPreparingForTermination else { throw CancellationError() }
+    try auth.validateAccountMutation(account)
+  }
+
+  private func isUserInitiatedOperationReady(_ account: AuthAccountMutationToken) throws -> Bool {
+    try validateUserInitiatedOperation(account)
+    return canExecuteTransactions()
+  }
+
+  private func validateDirectRPCDispatch(
+    _ account: AuthAccountMutationToken?,
+    allowDuringLogout: Bool
+  ) throws {
+    guard !isPreparingForTermination else { throw RealtimeDirectRpcError.notConnected }
+    do {
+      if let account {
+        try auth.validateAccountMutation(account)
+      }
+      try auth.requireAccountMutationAllowed(allowDuringLogout: allowDuringLogout)
+    } catch {
+      throw RealtimeDirectRpcError.notAuthorized
+    }
+  }
+
+  public func revokeSession(_ sessionID: Int64) async throws -> InlineProtocol.RevokeSessionResult {
+    let result = try await callRpcDirect(
+      method: .revokeSession,
+      input: .revokeSession(.with {
+        $0.sessionID = sessionID
+      })
+    )
+
+    guard case let .revokeSession(revokeResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return revokeResult
+  }
+
+  public func getSessions() async throws -> InlineProtocol.GetSessionsResult {
+    let result = try await callRpcDirect(
+      method: .getSessions,
+      input: .getSessions(.with { _ in })
+    )
+
+    guard case let .getSessions(sessionsResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return sessionsResult
+  }
+
+  public func createCliSession(
+    deviceID: String,
+    deviceName: String?,
+    clientVersion: String,
+    osVersion: String?
+  ) async throws -> InlineProtocol.CreateCliSessionResult {
+    let result = try await callRpcDirect(
+      method: .createCliSession,
+      input: .createCliSession(.with {
+        $0.deviceID = deviceID
+        if let deviceName {
+          $0.deviceName = deviceName
+        }
+        $0.clientVersion = clientVersion
+        if let osVersion {
+          $0.osVersion = osVersion
+        }
+      })
+    )
+
+    guard case let .createCliSession(createResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return createResult
+  }
+
+  public func checkUsername(_ username: String) async throws -> InlineProtocol.CheckUsernameResult {
+    let result = try await callRpcDirect(
+      method: .checkUsername,
+      input: .checkUsername(.with {
+        $0.username = username
+      })
+    )
+
+    guard case let .checkUsername(usernameResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return usernameResult
+  }
+
+  public func changeUsername(_ username: String) async throws -> InlineProtocol.ChangeUsernameResult {
+    let result = try await callRpcDirect(
+      method: .changeUsername,
+      input: .changeUsername(.with {
+        $0.username = username
+      })
+    )
+
+    guard case let .changeUsername(usernameResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return usernameResult
+  }
+
+  public func updateProfile(
+    firstName: String?,
+    lastName: String?,
+    bio: String?
+  ) async throws -> InlineProtocol.UpdateProfileResult {
+    let result = try await callRpcDirect(
+      method: .updateProfile,
+      input: .updateProfile(.with {
+        if let firstName {
+          $0.firstName = firstName
+        }
+        if let lastName {
+          $0.lastName = lastName
+        }
+        if let bio {
+          $0.bio = bio
+        }
+      })
+    )
+
+    guard case let .updateProfile(profileResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return profileResult
+  }
+
+  public func setProfilePhoto(fileUniqueID: String?) async throws -> InlineProtocol.SetProfilePhotoResult {
+    let result = try await callRpcDirect(
+      method: .setProfilePhoto,
+      input: .setProfilePhoto(.with {
+        $0.fileUniqueID = fileUniqueID ?? ""
+      })
+    )
+
+    guard case let .setProfilePhoto(profileResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return profileResult
+  }
+
+  public func getExternalProfilePhoto(
+    provider: InlineProtocol.ExternalProfileProvider,
+    username: String
+  ) async throws -> InlineProtocol.GetExternalProfilePhotoResult {
+    let result = try await callRpcDirect(
+      method: .getExternalProfilePhoto,
+      input: .getExternalProfilePhoto(.with {
+        $0.provider = provider
+        $0.username = username
+      })
+    )
+
+    guard case let .getExternalProfilePhoto(profilePhotoResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    return profilePhotoResult
+  }
+
+  public func collapseHistory(
+    peer: InlineProtocol.InputPeer,
+    maxID: Int64?
+  ) async throws -> Int64? {
+    let mutationToken = try auth.beginAccountMutation()
+    let result = try await callRpcDirect(
+      method: .collapseHistory,
+      input: .collapseHistory(.with {
+        $0.peerID = peer
+        if let maxID {
+          $0.maxID = maxID
+        }
+      })
+    )
+
+    guard case let .collapseHistory(collapseResult)? = result else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+    guard let boundaryUpdate = collapseResult.updates.first(where: {
+      if case .dialogCollapsedMaxID = $0.update {
+        return true
+      }
+      return false
+    }), case let .dialogCollapsedMaxID(boundary) = boundaryUpdate.update else {
+      throw RealtimeDirectRpcError.rpcError(errorCode: .internalError, message: nil, code: 500)
+    }
+
+    try auth.validateAccountMutation(mutationToken)
+    await sync.process(updates: collapseResult.updates, mutationToken: mutationToken)
+    return boundary.hasMaxID ? boundary.maxID : nil
+  }
+
+  public func cancelTransaction(where predicate: @escaping @Sendable (TransactionWrapper) -> Bool) {
+    guard let owner = activeTransactionOwner() else { return }
+    beginTransactionOperation()
+    Task { [predicate] in
+      await transactions.cancel(where: predicate, owner: owner)
+      endTransactionOperation()
+    }
+  }
+
+  public func updateSyncConfig(_ config: SyncConfig) {
+    Task { await sync.updateConfig(config) }
+  }
+
+  public func getSyncStats() async -> SyncStats {
+    await sync.getStats()
+  }
+
+  public func clearSyncState() async {
+    await sync.clearSyncState()
+  }
+
+  /// Reconciles already-created in-memory bucket actors with cursors committed by
+  /// an authoritative account snapshot.
+  public func installSnapshotBucketStates(_ states: [BucketKey: BucketState]) async {
+    await sync.installSnapshotBucketStates(states)
+  }
+
+  /// Reconciles a committed snapshot under the account lease that admitted it.
+  /// Only explicit child targets are woken; cached bucket inventory is never scanned.
+  @discardableResult
+  public func installSnapshotOutcome(
+    seededStates: [BucketKey: BucketState],
+    catchUpTargets: [BucketKey: Int64],
+    expectedAccount: AuthAccountMutationToken
+  ) async throws -> [BucketKey: UserRepairTargetResolution] {
+    guard !isPreparingForTermination else { throw RealtimeDirectRpcError.notConnected }
+    try auth.validateAccountMutation(expectedAccount)
+    let resolutions = try await sync.installSnapshotOutcome(
+      seededStates: seededStates,
+      catchUpTargets: catchUpTargets,
+      expectedAccount: expectedAccount
+    )
+    guard !isPreparingForTermination else { throw RealtimeDirectRpcError.notConnected }
+    try auth.validateAccountMutation(expectedAccount)
+    return resolutions
+  }
+
+  #if DEBUG || DEBUG_BUILD
+  public func runSyncDebugScenario(_ scenario: SyncDebugScenario) async -> SyncDebugScenarioResult {
+    await sync.runDebugScenario(scenario)
+  }
+
+  public func runSyncDebugBucketScenario(
+    _ scenario: SyncDebugBucketScenario,
+    key: BucketKey
+  ) async -> SyncDebugActionResult {
+    await sync.runDebugBucketScenario(scenario, key: key)
+  }
+
+  public func cycleConnectionForSyncDebug() async -> SyncDebugActionResult {
+    guard auth.snapshot().isLoggedIn else {
+      return SyncDebugActionResult(
+        succeeded: false,
+        summary: "Sign in before cycling the realtime connection."
+      )
+    }
+
+    await connectionManager.stop()
+    await connectionManager.start()
+    await connectionManager.setAuthAvailable(true)
+    await connectionManager.connectNow()
+
+    let clock = ContinuousClock()
+    let deadline = clock.now + .seconds(15)
+    while clock.now < deadline {
+      let snapshot = await connectionManager.currentSnapshot()
+      if snapshot.state == .open {
+        return SyncDebugActionResult(
+          succeeded: true,
+          summary: "Cycled the real connection owner and reached authenticated open; reconnect discovery is running normally."
+        )
+      }
+      do {
+        try await Task.sleep(for: .milliseconds(100))
+      } catch {
+        return SyncDebugActionResult(
+          succeeded: false,
+          summary: "Connection-cycle observation was cancelled."
+        )
+      }
+    }
+
+    let snapshot = await connectionManager.currentSnapshot()
+    return SyncDebugActionResult(
+      succeeded: false,
+      summary: "Connection cycle did not reopen within 15 seconds (state: \(snapshot.state))."
+    )
+  }
+  #endif
+
+  // MARK: - Helpers
+
+  private func isCurrentOpenSession(
+    _ sessionID: UInt64,
+    mutationToken: AuthAccountMutationToken
+  ) async -> Bool {
+    let current = await connectionManager.currentSnapshot()
+    return !Task.isCancelled
+      && !isPreparingForTermination
+      && current.state == .open
+      && current.sessionID == sessionID
+      && (try? auth.validateAccountMutation(mutationToken)) != nil
+  }
+
+  private func mapConnectionState(_ state: ConnectionState) -> RealtimeConnectionState {
+    switch state {
+      case .open:
+        .connected
+      case .connectingTransport, .authenticating, .backoff, .waitingForConstraints, .backgroundSuspended, .stopped:
+        .connecting
+    }
+  }
+
+  private func updateTransportConnectionState(_ newState: RealtimeConnectionState) async {
+    guard newState != transportConnectionState else { return }
+    transportConnectionState = newState
+    await publishConnectionStateIfNeeded()
+  }
+
+  private func syncActivityChanged(_ isActive: Bool) async {
+    guard isActive != syncActivityInProgress else { return }
+    syncActivityInProgress = isActive
+    await publishConnectionStateIfNeeded()
+  }
+
+  private func publishConnectionStateIfNeeded() async {
+    let nextState: RealtimeConnectionState = if transportConnectionState == .connected, syncActivityInProgress {
+      .updating
+    } else {
+      transportConnectionState
+    }
+
+    guard nextState != currentConnectionState else { return }
+    currentConnectionState = nextState
+    for continuation in connectionStateContinuations.values {
+      continuation.yield(nextState)
+    }
+  }
+
+  private func canExecuteTransactions() -> Bool {
+    switch currentConnectionState {
+      case .connected, .updating:
+        true
+      case .connecting:
+        false
+    }
+  }
+
+  private func admitEphemeralTransactionWhileConnected(_ transaction: any Transaction) -> Bool {
+    let accepted = transaction.ephemeralConfig == nil || canExecuteTransactions()
+    if !accepted {
+      recordTransactionDiagnostics(ephemeralExpired: 1)
+    }
+    return accepted
+  }
+
+  private func recordTransactionDiagnostics(
+    windowSaturations: Int = 0,
+    ephemeralSuperseded: Int = 0,
+    ephemeralExpired: Int = 0,
+    capacityRejections: Int = 0,
+    pressure: TransactionQueuePressure? = nil
+  ) {
+    transactionDiagnosticCounters.windowSaturations += windowSaturations
+    transactionDiagnosticCounters.ephemeralSuperseded += ephemeralSuperseded
+    transactionDiagnosticCounters.ephemeralExpired += ephemeralExpired
+    transactionDiagnosticCounters.capacityRejections += capacityRejections
+
+    let now = Date()
+    let incomingWarning = windowSaturations > 0 || capacityRejections > 0
+    let lastRelevantDiagnosticAt = incomingWarning
+      ? lastTransactionWarningDiagnosticAt
+      : lastTransactionDiagnosticAt
+    guard now.timeIntervalSince(lastRelevantDiagnosticAt) >= transactionDiagnosticInterval,
+          !transactionDiagnosticCounters.isEmpty
+    else { return }
+
+    let counters = transactionDiagnosticCounters
+    transactionDiagnosticCounters = RealtimeTransactionDiagnosticCounters()
+    lastTransactionDiagnosticAt = now
+
+    var data: [String: Any] = [
+      "window_saturations": counters.windowSaturations,
+      "ephemeral_superseded": counters.ephemeralSuperseded,
+      "ephemeral_expired": counters.ephemeralExpired,
+      "capacity_rejections": counters.capacityRejections,
+    ]
+    if let pressure {
+      data["queued"] = pressure.queued
+      data["outstanding"] = pressure.outstanding
+      data["oldest_queue_age_ms"] = pressure.oldestQueueAgeMilliseconds
+    }
+
+    let isWarning = counters.windowSaturations > 0 || counters.capacityRejections > 0
+    if isWarning {
+      lastTransactionWarningDiagnosticAt = now
+    }
+    PerformanceTrace.breadcrumb(
+      "realtime_transaction_pressure",
+      category: "realtime.transaction",
+      level: isWarning ? .warning : .info,
+      data: data
+    )
+    if isWarning {
+      log.warning(
+        "Realtime transaction pressure queued=\(pressure?.queued ?? 0) outstanding=\(pressure?.outstanding ?? 0) saturations=\(counters.windowSaturations) capacity_rejections=\(counters.capacityRejections)"
+      )
+    }
+  }
+
+  private func addConnectionStateContinuation(
+    id: UUID,
+    continuation: AsyncStream<RealtimeConnectionState>.Continuation
+  ) {
+    connectionStateContinuations[id] = continuation
+    continuation.yield(currentConnectionState)
+  }
+
+  private func removeConnectionStateContinuation(_ id: UUID) {
+    connectionStateContinuations.removeValue(forKey: id)
+  }
+
+  private func addGridEventContinuation(
+    id: UUID,
+    continuation: AsyncStream<InlineProtocol.GridEvent>.Continuation
+  ) {
+    gridEventContinuations[id] = continuation
+  }
+
+  private func removeGridEventContinuation(_ id: UUID) {
+    gridEventContinuations.removeValue(forKey: id)
+  }
+
+  private func publishGridEvent(_ event: InlineProtocol.GridEvent) {
+    for continuation in gridEventContinuations.values {
+      continuation.yield(event)
+    }
+  }
+
+  private func notifyConnectionInitFailureIfNeeded() {
+    guard !didNotifyConnectionInitFailure else { return }
+    didNotifyConnectionInitFailure = true
+    NotificationCenter.default.post(name: .realtimeV2ConnectionInitFailed, object: nil)
+  }
+
+  private func handleConnectionErrorDuringHandshake(reason: InlineProtocol.ConnectionError.Reason) async {
+    if reason == .sessionRevoked {
+      // Terminal revocation must arrive as authInvalidated with its original authority.
+      log.warning("Ignoring unscoped terminal connection error")
+      return
+    }
+
+    if reason == .invalidAuth {
+      // A missing token lookup is not proof that the server revoked this session. Keep the
+      // stored authority so a later handshake can retry after server state recovers.
+      log.warning("Realtime handshake did not recognize stored auth; retaining credentials")
+    }
+
+    await auth.refreshFromStorage()
+
+    guard isMissingAuthToken() else { return }
+
+    log.error("Realtime handshake connectionError mapped to missing auth token")
+    await handleMissingAuthTokenHandshakeFailure()
+  }
+
+  private func handleAuthInvalidated(_ receipt: AuthInvalidationReceipt) {
+    guard auth.isCurrent(receipt) else {
+      log.info("Realtime ignored stale account revocation")
+      return
+    }
+    guard notifiedAuthInvalidation != receipt else { return }
+    // Platform logout atomically revalidates this receipt before closing admission. Do not
+    // disable a replacement account while an asynchronous notification is still in flight.
+    if RealtimeAuthInvalidationNotification.post(receipt, auth: auth) {
+      notifiedAuthInvalidation = receipt
+    }
+  }
+
+  private func handleMissingAuthTokenHandshakeFailure() async {
+    await connectionManager.setAuthAvailable(false)
+    notifyConnectionInitFailureIfNeeded()
+  }
+
+  private func isMissingAuthToken() -> Bool {
+    switch auth.snapshot().status {
+      case .reauthRequired:
+        true
+      case let .authenticated(credentials):
+        credentials.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      case .hydrating, .unauthenticated, .locked, .loggingOut, .authenticatedV3:
+        false
+    }
+  }
+
+  private func isLimitedRetryRpcError(_ error: TransactionError) -> Bool {
+    guard case let .rpcError(rpcError) = error else { return false }
+
+    switch rpcError.errorCode {
+      case .badRequest,
+           .peerIDInvalid,
+           .messageIDInvalid,
+           .userIDInvalid,
+           .userAlreadyMember,
+           .spaceIDInvalid,
+           .chatIDInvalid,
+           .emailInvalid,
+           .phoneNumberInvalid,
+           .spaceAdminRequired,
+           .spaceOwnerRequired,
+           .usernameInvalid,
+           .usernameTaken,
+           .firstNameInvalid,
+           .urlPreviewUnavailable,
+           .agentSessionMessageImmutable,
+           .spaceInviteInvalid,
+           .mediaNotOwned,
+           .agentGrantRequired:
+        return true
+      case .unknown,
+           .unauthenticated,
+           .rateLimit,
+           .internalError,
+           .UNRECOGNIZED:
+        return false
+    }
+  }
+
+  private func isRejectedBeforeExecution(_ error: TransactionError) -> Bool {
+    if case .rejectedBeforeExecution = error {
+      return true
+    }
+    return false
+  }
+}

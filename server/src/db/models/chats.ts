@@ -1,0 +1,506 @@
+import { syncChatAccess } from "@in/server/modules/authorization/chatAccessSync"
+import { db } from "@in/server/db"
+import { eq, and, desc, gte, isNull } from "drizzle-orm"
+import {
+  chatParticipantGroups,
+  chats,
+  dialogs,
+  members,
+  messages,
+  spaces,
+  userGroupMembers,
+  userGroups,
+  userNotDeleted,
+  users,
+  type DbChat,
+  type DbDialog,
+} from "@in/server/db/schema"
+import { UsersModel } from "@in/server/db/models/users"
+import { InlineError } from "@in/server/types/errors"
+import { TPeerInfo } from "@in/server/api-types"
+import { ModelError } from "@in/server/db/models/_errors"
+import type { InputPeer } from "@inline-chat/protocol/core"
+import { Log } from "@in/server/utils/log"
+import {
+  defaultDialogOpenPlacement,
+  dialogOpenDefaultsForChat,
+  dialogOrderForPlacement,
+} from "@in/server/modules/dialogOpen"
+import { messageActivityPredicate } from "@in/server/modules/message/activity"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import type { Transaction } from "@in/server/db/types"
+
+const log = new Log("chats")
+
+export const ChatModel = {
+  getChatFromPeer: getChatFromPeer,
+  getLastMessageId: getLastMessageId,
+  nextMessageId: nextMessageId,
+  refreshLastMessageId: refreshLastMessageId,
+  refreshLastMessageIdTransaction: refreshLastMessageIdTransaction,
+  getChatIdFromInputPeer: getChatIdFromInputPeer,
+  getAuthorizedChatFromInputPeer: getAuthorizedChatFromInputPeer,
+  getChatFromInputPeerUnchecked: getChatFromInputPeerUnchecked,
+  createUserChatAndDialog: createUserChatAndDialog,
+  getUserChats,
+}
+
+/**
+ * Return the next message id without ever moving backwards after history is deleted.
+ * `lastMsgId` is the current surviving-message pointer, while `messageIdCounter`
+ * is the durable allocation high-water mark. The lastMsgId fallback keeps older
+ * rows and test fixtures safe until the forward migration has populated the counter.
+ */
+export function nextMessageId(chat: Pick<DbChat, "lastMsgId" | "messageIdCounter">): number {
+  return Math.max(chat.lastMsgId ?? 0, chat.messageIdCounter ?? 0) + 1
+}
+
+/**
+ * Creates a chat and dialog for a target user
+ *
+ * @param input - The input
+ * @returns The chat and dialog
+ */
+async function createUserChatAndDialog(input: {
+  peerUserId: number
+  currentUserId: number
+}): Promise<{ chat: DbChat; dialog: DbDialog; createdChat: boolean }> {
+  const activeUserIds = await UsersModel.getActiveUserIds([input.peerUserId, input.currentUserId])
+  const requiredUserCount = new Set([input.peerUserId, input.currentUserId]).size
+  if (activeUserIds.length !== requiredUserCount) {
+    throw ModelError.ChatInvalid
+  }
+
+  const minUserId = Math.min(input.peerUserId, input.currentUserId)
+  const maxUserId = Math.max(input.peerUserId, input.currentUserId)
+
+  const result = await db.transaction(async (tx) => {
+    let chat: DbChat | undefined
+    let createdChat = false
+
+    chat = await tx._query.chats.findFirst({
+      where: and(eq(chats.type, "private"), eq(chats.minUserId, minUserId), eq(chats.maxUserId, maxUserId)),
+    })
+
+    if (!chat) {
+      const [insertedChat] = await tx
+        .insert(chats)
+        .values({
+          type: "private",
+          minUserId,
+          maxUserId,
+        })
+        .onConflictDoNothing({ target: [chats.minUserId, chats.maxUserId] })
+        .returning()
+
+      chat = insertedChat
+      createdChat = insertedChat !== undefined
+      if (insertedChat) await syncChatAccess(tx, { kind: "chats", chatIds: [insertedChat.id] })
+    }
+
+    if (!chat) {
+      chat = await tx._query.chats.findFirst({
+        where: and(eq(chats.type, "private"), eq(chats.minUserId, minUserId), eq(chats.maxUserId, maxUserId)),
+      })
+    }
+
+    if (!chat) {
+      log.error("Failed to create chat", { input })
+      throw ModelError.Failed
+    }
+
+    // check if dialog already exists
+    let dialog = await tx._query.dialogs.findFirst({
+      where: and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, input.currentUserId)),
+    })
+
+    if (!dialog) {
+      const openDefaults = dialogOpenDefaultsForChat(chat)
+      const order =
+        openDefaults.open === true
+          ? await dialogOrderForPlacement(tx, input.currentUserId, defaultDialogOpenPlacement)
+          : undefined
+      const [insertedDialog] = await tx
+        .insert(dialogs)
+        .values({
+          chatId: chat.id,
+          userId: input.currentUserId,
+          peerUserId: input.peerUserId,
+          ...openDefaults,
+          order,
+        })
+        .onConflictDoNothing({ target: [dialogs.chatId, dialogs.userId] })
+        .returning()
+
+      dialog = insertedDialog
+    }
+
+    if (!dialog) {
+      dialog = await tx._query.dialogs.findFirst({
+        where: and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, input.currentUserId)),
+      })
+    }
+
+    if (!dialog) {
+      log.error("Failed to create dialog", { input })
+      throw ModelError.Failed
+    }
+
+    return { chat, dialog, createdChat }
+  })
+
+  return result
+}
+
+async function getChatIdFromInputPeer(peer: InputPeer, context: { currentUserId: number }): Promise<number> {
+  switch (peer.type.oneofKind) {
+    case "user":
+      let userId = peer.type.user.userId
+
+      // For self-chat, both minUserId and maxUserId will be currentUserId
+      const minUserId = Math.min(context.currentUserId, Number(userId))
+      const maxUserId = Math.max(context.currentUserId, Number(userId))
+
+      let chat = await db
+        .select({ id: chats.id })
+        .from(chats)
+        .where(and(eq(chats.type, "private"), eq(chats.minUserId, minUserId), eq(chats.maxUserId, maxUserId)))
+        .then((result) => result[0])
+
+      if (!chat) {
+        throw ModelError.ChatInvalid
+      }
+
+      return chat.id
+
+    case "chat":
+      let chatId = peer.type.chat.chatId
+      return Number(chatId)
+
+    case "self":
+      return getChatIdFromInputPeer(
+        { type: { oneofKind: "user", user: { userId: BigInt(context.currentUserId) } } },
+        context,
+      )
+  }
+
+  throw new InlineError(InlineError.ApiError.PEER_INVALID)
+}
+
+/**
+ * Resolves a peer and requires the caller's current access to that chat.
+ * Use this for every operation that reads or affects a caller-named chat.
+ */
+async function getAuthorizedChatFromInputPeer(
+  peer: InputPeer,
+  context: { currentUserId: number },
+  query?: Pick<Transaction, "select">,
+): Promise<DbChat> {
+  const chat = await getChatFromInputPeerUnchecked(peer, context)
+  await AccessGuards.ensureChatAccess(chat, context.currentUserId, query)
+  return chat
+}
+
+/**
+ * Resolves a peer WITHOUT checking access: a chat ID peer returns any chat.
+ * Callers must authorize the result themselves (see the allowlist in
+ * __tests__/guardrails/chatLookupAuthorization.test.ts).
+ */
+async function getChatFromInputPeerUnchecked(peer: InputPeer, context: { currentUserId: number }): Promise<DbChat> {
+  switch (peer.type.oneofKind) {
+    case "user": {
+      let userId = peer.type.user.userId
+
+      // For self-chat, both minUserId and maxUserId will be currentUserId
+      const minUserId = Math.min(context.currentUserId, Number(userId))
+      const maxUserId = Math.max(context.currentUserId, Number(userId))
+
+      let chat = await db
+        .select()
+        .from(chats)
+        .where(and(eq(chats.type, "private"), eq(chats.minUserId, minUserId), eq(chats.maxUserId, maxUserId)))
+        .then((result) => result[0])
+
+      if (!chat) {
+        throw ModelError.ChatInvalid
+      }
+
+      return chat
+    }
+
+    case "chat": {
+      let chatId = peer.type.chat.chatId
+      let chat = await db
+        .select()
+        .from(chats)
+        .where(eq(chats.id, Number(chatId)))
+        .then((result) => result[0])
+      if (!chat) {
+        throw ModelError.ChatInvalid
+      }
+      return chat
+    }
+
+    case "self": {
+      return getChatFromInputPeerUnchecked(
+        { type: { oneofKind: "user", user: { userId: BigInt(context.currentUserId) } } },
+        context,
+      )
+    }
+  }
+
+  throw new InlineError(InlineError.ApiError.PEER_INVALID)
+}
+
+export async function getChatFromPeer(peer: TPeerInfo, context: { currentUserId: number }): Promise<DbChat> {
+  if ("userId" in peer) {
+    const userId = peer.userId
+    if (!userId || isNaN(userId)) {
+      throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    }
+
+    // For self-chat, both minUserId and maxUserId will be currentUserId
+    const minUserId = Math.min(context.currentUserId, userId)
+    const maxUserId = Math.max(context.currentUserId, userId)
+
+    let chat = await db
+      .select()
+      .from(chats)
+      .where(and(eq(chats.type, "private"), eq(chats.minUserId, minUserId), eq(chats.maxUserId, maxUserId)))
+      .then((result) => result[0])
+
+    if (!chat) {
+      throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    }
+
+    return chat
+  } else if ("threadId" in peer) {
+    const threadId = peer.threadId
+    if (!threadId || isNaN(threadId)) {
+      throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    }
+    let chat = await db
+      .select()
+      .from(chats)
+      .where(eq(chats.id, threadId))
+      .then((result) => result[0])
+
+    if (!chat) {
+      throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    }
+
+    return chat
+  }
+
+  throw new InlineError(InlineError.ApiError.PEER_INVALID)
+}
+
+// todo: optimize to only select lastMsgId
+export async function getLastMessageId(
+  peer: TPeerInfo,
+  context: { currentUserId: number },
+): Promise<number | undefined> {
+  let chat = await getChatFromPeer(peer, context)
+  return chat.lastMsgId ?? undefined
+}
+
+/** Updates lastMsgId for a chat by selecting the highest messageId */
+async function refreshLastMessageId(chatId: number) {
+  // Use a transaction with FOR UPDATE to lock the row while we're working with it
+  return await db.transaction(async (tx) => {
+    let [chat] = await tx.select().from(chats).where(eq(chats.id, chatId)).for("update")
+    if (!chat) {
+      throw ModelError.ChatInvalid
+    }
+
+    let [message] = await tx
+      .select()
+      .from(messages)
+      .where(and(eq(messages.chatId, chatId), messageActivityPredicate()))
+      .orderBy(desc(messages.messageId))
+      .limit(1)
+
+    const newLastMsgId = message?.messageId ?? null
+    await tx.update(chats).set({ lastMsgId: newLastMsgId }).where(eq(chats.id, chatId))
+
+    return newLastMsgId
+  })
+}
+
+/** Updates lastMsgId for a chat by selecting the highest messageId */
+async function refreshLastMessageIdTransaction(chatId: number, transaction: (tx: any) => Promise<void>) {
+  // Use a transaction with FOR UPDATE to lock the row while we're working with it
+  return await db.transaction(async (tx) => {
+    let [chat] = await tx.select().from(chats).where(eq(chats.id, chatId)).for("update")
+    if (!chat) {
+      throw ModelError.ChatInvalid
+    }
+
+    // clear first
+    await tx.update(chats).set({ lastMsgId: null }).where(eq(chats.id, chatId))
+
+    await transaction(tx)
+
+    let [message] = await tx
+      .select()
+      .from(messages)
+      .where(and(eq(messages.chatId, chatId), messageActivityPredicate()))
+      .orderBy(desc(messages.messageId))
+      .limit(1)
+
+    const newLastMsgId = message?.messageId ?? null
+    await tx.update(chats).set({ lastMsgId: newLastMsgId }).where(eq(chats.id, chatId))
+
+    return newLastMsgId
+  })
+}
+
+// type DrizzleTx = PgTransaction<
+//   PostgresJsQueryResultHKT,
+//   typeof import("../schema/index"),
+//   ExtractTablesWithRelations<typeof import("../schema/index")>
+// >
+
+type GetUserChatsInput = {
+  userId: number
+  where?: {
+    lastUpdateAtGreaterThanEqual: Date
+  }
+}
+
+type GetUserChatsOutput = {
+  chats: DbChat[]
+}
+
+export async function getUserChats(input: GetUserChatsInput): Promise<GetUserChatsOutput> {
+  let { userId, where } = input
+
+  // Root threads are discoverable through access, even before a dialog exists.
+  const baseChats = await db.query.chats.findMany({
+    where: {
+      ...(where && "lastUpdateAtGreaterThanEqual" in where
+        ? {
+            lastUpdateDate: {
+              gte: where.lastUpdateAtGreaterThanEqual,
+            },
+          }
+        : {}),
+
+      OR: [
+        // DMs
+        {
+          type: "private",
+          // that are between this user and another user
+          OR: [
+            {
+              minUserId: userId,
+            },
+            {
+              maxUserId: userId,
+            },
+          ],
+        },
+
+        // Public threads
+        {
+          type: "thread",
+          parentChatId: {
+            isNull: true,
+          },
+          publicThread: true,
+          // that we are a participant in
+          space: {
+            deleted: {
+              isNull: true,
+            },
+            members: {
+              userId,
+            },
+          },
+        },
+
+        // Private Home threads have no owning space or membership row.
+        {
+          type: "thread",
+          parentChatId: {
+            isNull: true,
+          },
+          spaceId: {
+            isNull: true,
+          },
+          publicThread: false,
+          participants: {
+            userId,
+          },
+        },
+
+        // Private space threads
+        {
+          type: "thread",
+          parentChatId: {
+            isNull: true,
+          },
+          publicThread: false,
+          // that we are a participant in
+          participants: {
+            userId,
+          },
+          // extra safety check until we clean up our database so if it's removed from space we remove from participants
+          space: {
+            deleted: {
+              isNull: true,
+            },
+            members: {
+              userId,
+            },
+          },
+        },
+
+        // Linked subthreads only surface once a dialog exists for this user.
+        {
+          type: "thread",
+          parentChatId: {
+            isNotNull: true,
+          },
+          dialogs: {
+            userId,
+          },
+        },
+      ],
+    },
+  })
+
+  const groupRows = await db
+    .select({ chat: chats })
+    .from(chats)
+    .innerJoin(chatParticipantGroups, eq(chatParticipantGroups.chatId, chats.id))
+    .innerJoin(userGroups, eq(userGroups.id, chatParticipantGroups.groupId))
+    .innerJoin(userGroupMembers, eq(userGroupMembers.groupId, userGroups.id))
+    .innerJoin(members, and(eq(members.spaceId, userGroups.spaceId), eq(members.userId, userGroupMembers.userId)))
+    .innerJoin(users, eq(users.id, userGroupMembers.userId))
+    .innerJoin(spaces, eq(spaces.id, userGroups.spaceId))
+    .where(
+      and(
+        eq(chats.type, "thread"),
+        isNull(chats.parentChatId),
+        eq(chats.publicThread, false),
+        eq(chats.spaceId, userGroups.spaceId),
+        eq(userGroupMembers.userId, userId),
+        isNull(spaces.deleted),
+        userNotDeleted(),
+        where && "lastUpdateAtGreaterThanEqual" in where
+          ? gte(chats.lastUpdateDate, where.lastUpdateAtGreaterThanEqual)
+          : undefined,
+      ),
+    )
+
+  const chatsById = new Map<number, DbChat>()
+  for (const chat of baseChats) {
+    chatsById.set(chat.id, chat)
+  }
+  for (const row of groupRows) {
+    chatsById.set(row.chat.id, row.chat)
+  }
+
+  return { chats: Array.from(chatsById.values()) }
+}

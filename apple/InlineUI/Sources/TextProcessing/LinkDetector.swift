@@ -1,0 +1,448 @@
+import Foundation
+import InlineKit
+import Logger
+
+#if os(macOS)
+import AppKit
+#elseif os(iOS)
+import UIKit
+#endif
+
+public struct LinkMatch {
+  public let range: NSRange
+  public let url: URL
+  public let isWhitelistedTLD: Bool
+}
+
+public final class LinkDetector: Sendable {
+  private let log = Log.scoped("LinkDetector")
+
+  // MARK: - Static Properties
+
+  /// Shared instance for performance
+  public static let shared = LinkDetector()
+
+  // We removed the built-in `NSDataDetector` to rely fully on our own regular-expression-based detectors for
+  // both performance and flexibility.
+
+  /// Generic regex for detecting URLs with an explicit scheme (supports app deep links).
+  /// RFC 3986 unreserved + reserved characters are allowed after the scheme delimiter until a whitespace
+  private static let explicitSchemeURLRegex: NSRegularExpression = {
+    // This pattern matches RFC 3986 URL schemes followed by "://", then any combination of
+    // unreserved (A–Z a–z 0–9 -._~) and reserved characters (:/?#[]@!$&'()*+,;=%) until it hits
+    // a whitespace character. This intentionally excludes angle brackets and other punctuation
+    // that typically terminates URLs in plain text. Parentheses are allowed within URLs.
+    // Anchor once per scheme-shaped token so a failed match cannot retry every suffix. Group 1
+    // excludes any leading digits/punctuation and preserves the range returned by the old pattern.
+    let pattern = "(?<![A-Za-z0-9+.-])[0-9+.-]*([A-Za-z][A-Za-z0-9+.-]*://[^\\s<>\\[\\]{}\"']+)"
+    return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+  }()
+
+  private static let unsupportedLinkSchemes: Set<String> = [
+    "data",
+    "file",
+    "ftp",
+    "javascript",
+    "mailto",
+    "tel",
+    "vbscript",
+    "x-apple-data-detectors",
+  ]
+
+  /// Whitelisted TLDs that should be detected as links
+  /// These are modern TLDs that might not be recognized by NSDataDetector
+  private static let whitelistedTLDs: Set<String> = [
+    // Common legacy gTLDs
+    "com", "net", "org", "edu", "gov", "mil", "int",
+
+    // Popular generic + brand-new gTLDs
+    "app", "blog", "biz", "cloud", "club", "dev", "digital", "live", "news", "online", "page", "site", "shop", "store",
+    "tech", "top", "xyz", "chat",
+
+    // Frequently used two-letter ccTLDs (selection)
+    "ac", "ad", "ae", "af", "ag", "ai", "al", "am", "ao", "ar", "as", "at", "au", "aw", "az",
+    "ba", "bb", "bd", "be", "bf", "bg", "bh", "bi", "bj", "bm", "bn", "bo", "br", "bs", "bt", "bw", "by", "bz",
+    "ca", "cat", "cc", "cd", "cf", "cg", "ch", "ci", "ck", "cl", "cm", "cn", "co", "cr", "cu", "cv", "cw", "cx", "cy",
+    "cz",
+    "de", "dj", "dk", "dm", "do", "dz",
+    "ec", "ee", "eg", "er", "es", "et", "eu",
+    "fi", "fj", "fk", "fm", "fo", "fr",
+    "ga", "gb", "gd", "ge", "gf", "gg", "gh", "gi", "gl", "gm", "gn", "gp", "gq", "gr", "gs", "gt", "gu", "gw", "gy",
+    "hk", "hm", "hn", "hr", "ht", "hu",
+    "id", "ie", "il", "im", "in", "io", "iq", "ir", "is", "it",
+    "je", "jm", "jo", "jp",
+    "ke", "kg", "kh", "ki", "km", "kn", "kp", "kr", "kw", "ky", "kz",
+    "la", "lb", "lc", "li", "lk", "lr", "ls", "lt", "lu", "lv", "ly",
+    "ma", "mc", "md", "me", "mg", "mh", "mk", "ml", "mm", "mn", "mo", "mp", "mq", "mr", "ms", "mt", "mu", "mv", "mw",
+    "mx",
+    "my", "mz",
+    "na", "nc", "ne", "nf", "ng", "ni", "nl", "no", "np", "nr", "nu", "nz",
+    "om",
+    "pa", "pe", "pf", "pg", "ph", "pk", "pl", "pm", "pn", "pr", "ps", "pt", "pw", "py",
+    "qa",
+    "re", "ro", "rs", "ru", "rw",
+    "sa", "sb", "sc", "sd", "se", "sg", "sh", "si", "sk", "sl", "sm", "sn", "so", "sr", "ss", "st", "su", "sv", "sx",
+    "sy",
+    "sz",
+    "tc", "td", "tf", "tg", "th", "tj", "tk", "tl", "tm", "tn", "to", "tr", "tt", "tv", "tw", "tz",
+    "ua", "ug", "uk", "us", "uy", "uz",
+    "va", "vc", "ve", "vg", "vi", "vn", "vu",
+    "wf", "ws",
+    "ye", "yt",
+    "za", "zm", "zw",
+    // Short thematic gTLDs that can overlap with English words (risk of false positives is acceptable)
+    "ai", "io", "me", "fm", "ly", "to",
+  ]
+
+  /// Bare-domain TLDs to skip to reduce common false positives in chat text.
+  /// `.md` is intentionally excluded because markdown file names like `README.md`
+  /// are frequently shared and should not be auto-linkified as web domains.
+  /// The same goes for source file names like `lib.rs` and identifiers like `user.id`.
+  /// `.so` stays linkable for `notion.so`.
+  private static let excludedBareDomainTLDs: Set<String> = [
+    "md",
+    "cc", "ml", "mm", "pl", "pm", "ps", "py", "rs", "sh", "tf",
+    "as", "id",
+  ]
+
+  // Note: With the introduction of `fullURLRegex`, we no longer need a dedicated whitelisted TLD
+  // regex for URLs that already include a protocol. We still keep bare-domain detection below.
+
+  /// Regex pattern for detecting bare domains with whitelisted TLDs (without protocol)
+  /// This pattern matches domains like "shopline.shop" or "inline.chat" or "x.ai"
+  private static let bareDomainRegex: NSRegularExpression = {
+    // Sort TLDs by length in descending order so that longer ones like "team" match before shorter ones like "ai" or
+    // "co"
+    let tlds = whitelistedTLDs.sorted { $0.count > $1.count }.joined(separator: "|")
+    // Support multiple sub-domain components (e.g. bot.x.shop)
+    // Capture optional path and query segments that immediately follow the domain
+    // Example matches: "inline.chat/path", "google.com/path?query=1", "bot.x.shop" (no path)
+    // Require a word boundary (\b) immediately after the TLD so we don't match partial overlaps like
+    // "test.srt" where "sr" would incorrectly satisfy the "sr" TLD. The boundary still allows
+    // valid URL continuations such as whitespace or path/query characters (e.g. "/", "?", "#").
+    // The preceding-character policy below already rejects matches that start after a dot or hyphen.
+    // Enforce that boundary in the regex so an invalid dotted token is scanned only once.
+    let pattern = "(?<![\\w.-])\\b[\\w-]+(?:\\.[\\w-]+)*\\.(\(tlds))\\b(?:/[^\\s<>()\\[\\]{}\"']*)?"
+    return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+  }()
+
+  // MARK: - Initialization
+
+  private init() {}
+
+  // MARK: - Public Interface
+
+  /// Detects all links in the given text and returns them as LinkMatch objects
+  /// - Parameter text: The text to scan for links
+  /// - Returns: Array of LinkMatch objects containing range, URL, and whether it's a whitelisted TLD
+  public func detectLinks(in text: String) -> [LinkMatch] {
+    guard !text.isEmpty else { return [] }
+
+    log.trace("Starting link detection length=\(text.utf16.count)")
+
+    var matches: [LinkMatch] = []
+    var handledRanges: Set<NSRange> = []
+
+    // First, detect explicit-scheme URLs using custom regex (handles very long or exotic URLs).
+    let fullURLMatches = detectExplicitSchemeLinks(in: text, excluding: handledRanges)
+    log.trace("Explicit-scheme URL detector found \(fullURLMatches.count) matches")
+    matches.append(contentsOf: fullURLMatches)
+    for match in fullURLMatches {
+      handledRanges.insert(match.range)
+    }
+
+    // Finally, detect bare domains with whitelisted TLDs (e.g. "inline.chat")
+    let bareDomainMatches = detectBareDomainLinks(in: text, excluding: handledRanges)
+    log.trace("Bare domain detector found \(bareDomainMatches.count) matches")
+    matches.append(contentsOf: bareDomainMatches)
+
+    // Sort matches by range location to maintain order
+    matches.sort { $0.range.location < $1.range.location }
+
+    log.trace("Total detected links: \(matches.count)")
+    return matches
+  }
+
+  /// Detects links outside inline code and code blocks.
+  public func detectLinks(in attributedString: NSAttributedString) -> [LinkMatch] {
+    detectLinks(in: attributedString.string).filter { match in
+      var isCode = false
+      attributedString.enumerateAttributes(in: match.range) { attributes, _, stop in
+        if attributes[.inlineCode] != nil || attributes[.preCode] != nil {
+          isCode = true
+          stop.pointee = true
+        }
+      }
+      return !isCode
+    }
+  }
+
+  /// Removes links and their underline, for text that acts as a single control.
+  public func removeLinks(from attributedString: NSMutableAttributedString) {
+    let fullRange = NSRange(location: 0, length: attributedString.length)
+    attributedString.enumerateAttribute(.link, in: fullRange) { link, range, _ in
+      guard link != nil else { return }
+      attributedString.removeAttribute(.link, range: range)
+      attributedString.removeAttribute(.underlineStyle, range: range)
+      attributedString.removeAttribute(.underlineColor, range: range)
+      #if os(macOS)
+      attributedString.removeAttribute(.cursor, range: range)
+      #endif
+    }
+  }
+
+  /// Applies link styling to an attributed string
+  /// - Parameters:
+  ///   - attributedString: The attributed string to style
+  ///   - linkColor: The color to use for links
+  ///   - cursor: The cursor to use for links (macOS only)
+  /// - Returns: Array of detected links with their ranges
+  public func applyLinkStyling(
+    to attributedString: NSMutableAttributedString,
+    linkColor: PlatformColor,
+    cursor: Any? = nil
+  ) -> [LinkMatch] {
+    let matches = detectLinks(in: attributedString)
+    let underlineColor = linkColor
+
+    for match in matches {
+      var attributes: [NSAttributedString.Key: Any] = [
+        .foregroundColor: linkColor,
+        .underlineStyle: NSUnderlineStyle.single.rawValue,
+        .underlineColor: underlineColor,
+        .link: match.url,
+      ]
+
+      #if os(macOS)
+      if let cursor {
+        attributes[.cursor] = cursor
+      }
+      #endif
+
+      attributedString.addAttributes(attributes, range: match.range)
+    }
+
+    return matches
+  }
+
+  // MARK: - Private Methods
+
+  public static func isSupportedLinkURLString(_ urlString: String) -> Bool {
+    guard let url = URL(string: urlString) else { return false }
+    return isSupportedLinkURL(url)
+  }
+
+  public static func isSupportedLinkURL(_ url: URL) -> Bool {
+    guard let scheme = url.scheme?.lowercased(),
+          !unsupportedLinkSchemes.contains(scheme)
+    else { return false }
+
+    return url.absoluteString.range(
+      of: #"^[A-Za-z][A-Za-z0-9+.-]*://"#,
+      options: .regularExpression
+    ) != nil
+  }
+
+  // Detects explicit-scheme URLs using custom regex (covers app deep links and long query strings)
+  private func detectExplicitSchemeLinks(in text: String, excluding handledRanges: Set<NSRange>) -> [LinkMatch] {
+    guard text.contains("://") else { return [] }
+    let nsText = text as NSString
+    let searchRange = NSRange(location: 0, length: nsText.length)
+    let matches = Self.explicitSchemeURLRegex.matches(in: text, options: [], range: searchRange)
+
+    return matches.compactMap { match in
+      let linkRange = match.range(at: 1)
+
+      // Skip overlaps with already handled ranges
+      let overlaps = handledRanges.contains { NSIntersectionRange($0, linkRange).length > 0 }
+      guard !overlaps else { return nil }
+
+      var urlString = nsText.substring(with: linkRange)
+
+      // Trim common trailing punctuation that should not be part of the URL (e.g. ",", ".", "!")
+      // For parentheses, only trim unmatched closing ones
+      urlString = trimTrailingPunctuation(from: urlString)
+
+      // Adjust range length if we trimmed characters
+      let trimmedCount = linkRange.length - urlString.utf16.count
+      let adjustedRange = NSRange(location: linkRange.location, length: linkRange.length - trimmedCount)
+
+      guard let url = URL(string: urlString), Self.isSupportedLinkURL(url) else {
+        return nil
+      }
+
+      // Determine if this URL ends with a whitelisted TLD
+      var isWhitelisted = false
+      if let host = url.host?.lowercased(),
+         let tld = host.components(separatedBy: ".").last
+      {
+        isWhitelisted = Self.whitelistedTLDs.contains(tld)
+      }
+
+      return LinkMatch(range: adjustedRange, url: url, isWhitelistedTLD: isWhitelisted)
+    }
+  }
+
+  // Removed `detectStandardLinks` because we no longer rely on `NSDataDetector`.
+
+  /// Detects URLs with whitelisted TLDs that might have been missed by NSDataDetector
+  // NOTE: Obsolete – kept for potential future specialised handling. Currently unused.
+  private func detectWhitelistedTLDLinks(in text: String, excluding handledRanges: Set<NSRange>) -> [LinkMatch] { [] }
+
+  /// Detects bare domains with whitelisted TLDs (without protocol)
+  private func detectBareDomainLinks(in text: String, excluding handledRanges: Set<NSRange>) -> [LinkMatch] {
+    // Every whitelisted TLD starts with a letter after a literal period. Avoid
+    // an ICU scan for prose with only sentence-ending dots. Non-ASCII bytes
+    // remain candidates so ICU's Unicode case folding keeps its exact behavior.
+    var followsPeriod = false
+    let hasCandidate = text.utf8.contains { byte in
+      defer { followsPeriod = byte == 46 }
+      return followsPeriod && ((65 ... 90).contains(byte) || (97 ... 122).contains(byte) || byte >= 128)
+    }
+    guard hasCandidate else { return [] }
+    let range = NSRange(location: 0, length: text.utf16.count)
+    let matches = Self.bareDomainRegex.matches(in: text, options: [], range: range)
+
+    log.trace("Bare domain regex found \(matches.count) matches")
+
+    return matches.compactMap { match in
+      // Skip if this range overlaps with already handled ranges
+      let overlaps = handledRanges.contains { NSIntersectionRange($0, match.range).length > 0 }
+      guard !overlaps else {
+        log.trace("Skipping overlapping range: \(match.range)")
+        return nil
+      }
+
+      // Skip domains that are part of an email address (preceded by "@")
+      if match.range.location > 0 {
+        let precedingRange = NSRange(location: match.range.location - 1, length: 1)
+        let precedingChar = (text as NSString).substring(with: precedingRange)
+        if precedingChar == "@" {
+          log.trace("Skipping domain preceded by @ (likely an email address): \(match.range)")
+          return nil
+        }
+      }
+
+      // NEW: Skip domains that are immediately preceded by a protocol delimiter (e.g. "://")
+      if match.range.location >= 3 {
+        let protocolCheckRange = NSRange(location: match.range.location - 3, length: 3)
+        let precedingThree = (text as NSString).substring(with: protocolCheckRange)
+        if precedingThree == "://" {
+          log.trace("Skipping domain preceded by :// (likely part of another URL scheme): \(match.range)")
+          return nil
+        }
+      }
+
+      // NEW: Ensure the character right before the match is either whitespace/newline or opening punctuation.
+      if match.range.location > 0 {
+        let precedingRange = NSRange(location: match.range.location - 1, length: 1)
+        let precedingScalar = (text as NSString).substring(with: precedingRange).unicodeScalars.first!
+        let allowedPreceding = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "([{\"'"))
+        if !allowedPreceding.contains(precedingScalar) {
+          log.trace("Skipping domain due to invalid preceding character: \(precedingScalar)")
+          return nil
+        }
+      }
+
+      var urlSubstring = (text as NSString).substring(with: match.range)
+
+      // Trim common trailing punctuation that should not be part of the URL (e.g. ",", ".", "!")
+      // For parentheses, only trim unmatched closing ones
+      urlSubstring = trimTrailingPunctuation(from: urlSubstring)
+
+      // Adjust range length if we trimmed characters
+      let trimmedCount = match.range.length - urlSubstring.utf16.count
+      let adjustedRange = NSRange(location: match.range.location, length: match.range.length - trimmedCount)
+
+      let hostCandidate = urlSubstring
+        .split(whereSeparator: { $0 == "/" || $0 == "?" || $0 == "#" })
+        .first
+        .map(String.init)?
+        .lowercased()
+      let tld = hostCandidate?.split(separator: ".").last.map(String.init)
+      if let tld, Self.excludedBareDomainTLDs.contains(tld) {
+        log.trace("Skipping bare domain due to excluded TLD: \(tld)")
+        return nil
+      }
+
+      log.trace("Found bare domain at range \(adjustedRange)")
+
+      // Add https:// protocol to make it a valid URL
+      let urlString = "https://\(urlSubstring)"
+      guard let url = URL(string: urlString) else {
+        log.trace("Failed to create URL from detected range")
+        return nil
+      }
+
+      return LinkMatch(
+        range: adjustedRange,
+        url: url,
+        isWhitelistedTLD: true
+      )
+    }
+  }
+
+  /// Trims trailing punctuation from URLs while preserving balanced parentheses
+  private func trimTrailingPunctuation(from urlString: String) -> String {
+    var result = urlString
+
+    // Basic punctuation that should always be trimmed
+    let basicPunctuation = CharacterSet(charactersIn: ",.!?:;'\"")
+
+    // Trim basic punctuation
+    while let lastScalar = result.unicodeScalars.last,
+          basicPunctuation.contains(lastScalar)
+    {
+      result.removeLast()
+    }
+
+    // Only trim unmatched closing parentheses, brackets, or braces
+    let closingChars = [")", "]", "}"]
+    let openingChars = ["(", "[", "{"]
+
+    while !result.isEmpty {
+      let lastChar = String(result.last!)
+
+      if let index = closingChars.firstIndex(of: lastChar) {
+        let openingChar = openingChars[index]
+        let openCount = result.count(where: { String($0) == openingChar })
+        let closeCount = result.count(where: { String($0) == lastChar })
+
+        // Only trim if there are more closing than opening
+        if closeCount > openCount {
+          result.removeLast()
+        } else {
+          break
+        }
+      } else {
+        break
+      }
+    }
+
+    return result
+  }
+
+  // MARK: - Testing
+
+  /// Test method to verify regexes are working
+  public func testRegexes() {
+    let testCases = [
+      "https://example.shop",
+      "http://test.chat",
+      "shopline.shop",
+      "inline.chat",
+      "https://example.com",
+      "Regular text without links",
+    ]
+
+    log.trace("Testing regexes...")
+
+    for testCase in testCases {
+      let matches = detectLinks(in: testCase)
+      log.trace("Test case '\(testCase)': \(matches.count) links detected")
+      for match in matches {
+        log.trace("  - URL: \(match.url), range: \(match.range), whitelisted: \(match.isWhitelistedTLD)")
+      }
+    }
+  }
+}

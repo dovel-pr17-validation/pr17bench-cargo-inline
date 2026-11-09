@@ -1,0 +1,181 @@
+import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
+import { createHash, randomUUID } from "node:crypto"
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { createRequire } from "node:module"
+import os from "node:os"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+import { assertLocalTestDatabaseUrl, prepareTestDatabaseTemplate } from "../../server/scripts/test-database-template.ts"
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
+const serverRoot = path.join(repoRoot, "server")
+const postgresModule = createRequire(path.join(serverRoot, "package.json"))("postgres")
+const postgres = postgresModule.default ?? postgresModule
+const artifactDir = path.resolve(process.argv[2] ?? "")
+if (!process.argv[2]) throw new Error("usage: local-bot-flow.mjs ARTIFACT_DIR")
+const publishedHermes = process.env.INLINE_E2E_PUBLISHED_HERMES === "1"
+const hermesBin = process.env.HERMES_BIN
+const hermesPython = process.env.HERMES_PYTHON_BIN
+if (!hermesBin || !hermesPython) throw new Error("HERMES_BIN and HERMES_PYTHON_BIN are required for the real Hermes transport test")
+const provisioningUrl = process.env.TEST_DATABASE_URL
+if (!provisioningUrl) throw new Error("TEST_DATABASE_URL is required")
+assertLocalTestDatabaseUrl(provisioningUrl)
+const template = await prepareTestDatabaseTemplate(provisioningUrl)
+const databaseName = `test_db_${template.name.slice(-32)}_${randomUUID().replaceAll("-", "").slice(0, 12)}`
+const databaseUrl = new URL(provisioningUrl)
+databaseUrl.pathname = `/${databaseName}`
+const adminUrl = new URL(provisioningUrl)
+adminUrl.pathname = "/postgres"
+const admin = postgres(adminUrl.toString(), { max: 1, connect_timeout: 5, onnotice: () => {} })
+let child
+let output = ""
+let closeDb
+const withTimeout = async (promise, milliseconds, message) => {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), milliseconds) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+const stopServer = async () => {
+  if (!child || child.exitCode !== null) return
+  child.kill("SIGTERM")
+  try {
+    await withTimeout(child.exited, 10_000, "server shutdown timed out")
+  } catch {
+    child.kill("SIGKILL")
+    await child.exited
+  }
+}
+try {
+  await admin.unsafe(`CREATE DATABASE "${databaseName}" TEMPLATE "${template.name}"`)
+  process.env.DATABASE_URL = databaseUrl.toString()
+  process.env.TEST_DATABASE_URL = databaseUrl.toString()
+  process.env.ENCRYPTION_KEY = "0".repeat(64)
+  const { makeCoreProductionSmokeEnvironment } = await import("../../server/scripts/core-production-smoke.ts")
+  const environment = { ...makeCoreProductionSmokeEnvironment(process.env, true), NODE_ENV: "test" }
+  Object.assign(process.env, environment)
+
+  const database = await import("../../server/src/db/index.ts")
+  closeDb = database.closeDb
+  const { db } = database
+  const { users } = await import("../../server/src/db/schema/users.ts")
+  const { generateToken, hashToken } = await import("../../server/src/utils/auth.ts")
+  const { SessionsModel } = await import("../../server/src/db/models/sessions.ts")
+  const [bot, human] = await db.insert(users).values([
+    { firstName: "CI Bot", username: `ci_bot_${process.pid}`, bot: true, emailVerified: false, phoneVerified: false, pendingSetup: false },
+    { firstName: "CI Human", username: `ci_human_${process.pid}`, bot: false, emailVerified: false, phoneVerified: false, pendingSetup: false },
+  ]).returning()
+  assert.ok(bot && human)
+  const { token } = await generateToken(bot.id)
+  await SessionsModel.create({ userId: bot.id, tokenHash: hashToken(token), personalData: {}, clientType: "api" })
+
+  const { token: humanToken } = await generateToken(human.id)
+  await SessionsModel.create({ userId: human.id, tokenHash: hashToken(humanToken), personalData: {}, clientType: "api" })
+
+  let ready
+  const readyPromise = new Promise((resolve) => { ready = resolve })
+  child = Bun.spawn({
+    cmd: [process.execPath, "--no-env-file", "src/index.ts"], cwd: serverRoot, env: environment,
+    stdout: "pipe", stderr: "pipe", stdin: "ignore",
+  })
+  const drain = async (stream, inspectReady) => {
+    for await (const part of stream) {
+      output = (output + new TextDecoder().decode(part)).slice(-8_000)
+      if (inspectReady) {
+        const match = output.match(/SERVER_READY ([0-9]+)/)
+        if (match) ready(Number(match[1]))
+      }
+    }
+  }
+  const stdout = drain(child.stdout, true)
+  const stderr = drain(child.stderr, false)
+  const port = await withTimeout(Promise.race([
+    readyPromise,
+    child.exited.then((code) => { throw new Error(`server exited before readiness (${code})`) }),
+  ]), 30_000, "server readiness timed out")
+  const baseUrl = `http://127.0.0.1:${port}`
+  const health = await fetch(`${baseUrl}/readyz`, { signal: AbortSignal.timeout(10_000) })
+  assert.equal(health.status, 200, `server readiness ${health.status}`)
+
+  const manifest = JSON.parse(await readFile(path.join(artifactDir, "manifest.json"), "utf8"))
+  assert.equal(manifest.sourceSha, execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim(), "candidate source SHA")
+  assert.equal(manifest.packages.length, 7, "candidate inventory")
+  for (const pkg of manifest.packages) {
+    assert.equal(path.basename(pkg.file), pkg.file, "artifact filename must stay within candidate directory")
+    assert.equal(createHash("sha256").update(await readFile(path.join(artifactDir, pkg.file))).digest("hex"), pkg.sha256, `${pkg.name} candidate hash`)
+  }
+  const names = ["@inline-chat/protocol", "@inline-chat/bot-api-types", "@inline-chat/bot-client", "@inline-chat/realtime-sdk", "@inline-chat/chat-sdk", "@inline-chat/hermes-agent-adapter"]
+  const dependencies = { chat: "4.40.0", "@chat-adapter/state-memory": "4.40.0" }
+  for (const name of names) {
+    const pkg = manifest.packages.find((entry) => entry.name === name)
+    assert.ok(pkg, `missing ${name} candidate`)
+    dependencies[name] = publishedHermes && name === "@inline-chat/hermes-agent-adapter"
+      ? "1.0.0"
+      : `file:${path.join(artifactDir, pkg.file)}`
+  }
+  const consumer = await mkdtemp(path.join(os.tmpdir(), "inline-local-bot-flow-"))
+  await writeFile(path.join(consumer, "package.json"), JSON.stringify({ type: "module", private: true, dependencies }))
+  execFileSync("npm", ["install", "--ignore-scripts", "--legacy-peer-deps", "--no-audit", "--no-fund"], {
+    cwd: consumer, stdio: "inherit", timeout: 180_000,
+  })
+  const hermesVersion = JSON.parse(await readFile(path.join(consumer, "node_modules/@inline-chat/hermes-agent-adapter/package.json"), "utf8")).version
+  if (publishedHermes) assert.equal(hermesVersion, "1.0.0", "published Hermes compatibility version")
+  const flow = path.join(consumer, "flow.mjs")
+  await writeFile(flow, await readFile(path.join(repoRoot, "scripts/ci/local-packed-flow.mjs")))
+  execFileSync("bun", ["--no-env-file", flow], {
+    cwd: consumer, stdio: "inherit", timeout: 60_000,
+    env: { ...process.env, INLINE_E2E_BASE_URL: baseUrl, INLINE_E2E_TOKEN: token, INLINE_E2E_HUMAN_ID: String(human.id),
+      INLINE_E2E_BOT_ID: String(bot.id), INLINE_E2E_HUMAN_TOKEN: humanToken,
+      INLINE_E2E_RECEIPT: path.join(artifactDir, "local-flow-receipt.json"), INLINE_E2E_SOURCE_SHA: manifest.sourceSha },
+  })
+  const flowReceipt = JSON.parse(await readFile(path.join(artifactDir, "local-flow-receipt.json"), "utf8"))
+  execFileSync("bun", ["--no-env-file", path.join(repoRoot, "scripts/ci/check-mcp-assembled.mjs")], {
+    cwd: repoRoot, stdio: "inherit", timeout: 60_000,
+    env: { ...process.env, INLINE_E2E_BASE_URL: baseUrl, INLINE_E2E_TOKEN: token,
+      INLINE_E2E_BOT_ID: String(bot.id), INLINE_E2E_CHAT_ID: String(flowReceipt.chatId),
+      INLINE_E2E_RECEIPT: path.join(artifactDir, "mcp-flow-receipt.json") },
+  })
+  const hermesHome = path.join(consumer, "hermes-home")
+  await mkdir(hermesHome)
+  const hermesEnv = {
+    ...process.env, HERMES_HOME: hermesHome, HOME: consumer,
+    INLINE_NODE_BIN: execFileSync("node", ["-p", "process.execPath"], { encoding: "utf8" }).trim(), INLINE_BASE_URL: baseUrl, INLINE_TOKEN: token,
+    INLINE_E2E_BASE_URL: baseUrl, INLINE_E2E_HUMAN_TOKEN: humanToken,
+    INLINE_E2E_HUMAN_ID: String(human.id), INLINE_E2E_BOT_ID: String(bot.id),
+    INLINE_E2E_CONSUMER: consumer,
+  }
+  // Never allow the mock sidecar transport to make this lane pass accidentally.
+  delete hermesEnv.INLINE_SIDECAR_TEST_MOCK
+  const runHermes = (bin, args) => execFileSync(bin, args, {
+    cwd: consumer, env: hermesEnv, stdio: "inherit", timeout: 90_000,
+  })
+  runHermes(path.join(consumer, "node_modules/.bin/inline-hermes"), ["install", "--hermes-home", hermesHome, "--force", "--json"])
+  runHermes(hermesBin, ["plugins", "enable", "inline-platform"])
+  await writeFile(path.join(consumer, "hermes-human.mjs"), await readFile(path.join(repoRoot, "scripts/ci/hermes-local-human.mjs")))
+  runHermes(hermesPython, [path.join(repoRoot, "scripts/ci/hermes-local-flow.py")])
+  await writeFile(path.join(artifactDir, publishedHermes ? "published-hermes-flow-receipt.json" : "hermes-flow-receipt.json"), JSON.stringify({ sourceSha: manifest.sourceSha, adapterVersion: hermesVersion,
+    scenarios: [{ scenario: "hermes-real-host-inbound-and-persisted-reply", status: "passed" }] }, null, 2) + "\n")
+  await closeDb()
+  closeDb = undefined
+  await stopServer()
+  await Promise.allSettled([stdout, stderr])
+  console.log(`Local server round trip passed for ${manifest.sourceSha}`)
+} catch (error) {
+  if (child) console.error(`Server output (last 8 KB): ${output}`)
+  console.error(error)
+  throw error
+} finally {
+  await stopServer()
+  await closeDb?.()
+  try {
+    await template.dispose()
+  } finally {
+    await admin.end({ timeout: 5 })
+  }
+}

@@ -1,0 +1,1238 @@
+//! Optional allowlisted error reporting with bounded, scrubbed failure text.
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::errors::JsonCliError;
+use inline_agent_bridge::{ProcessHostError, StoreError};
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const BRIDGE_RUNTIME_MESSAGE: &str = "Inline CLI bridge runtime failed";
+const COMMAND_FAILURE_MESSAGE: &str = "Inline CLI command failed";
+const PANIC_MESSAGE: &str = "Inline CLI process panicked";
+static PANIC_HOOK: Once = Once::new();
+/// A failure class is reported at most once per window per install, across
+/// every CLI process (service restarts, provider hosts, commands).
+const REPORT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const MAX_REPORT_LEDGER_ENTRIES: usize = 256;
+const REPORT_LEDGER_FILE: &str = "telemetry-reports.json";
+static REPORT_LEDGER: OnceLock<PathBuf> = OnceLock::new();
+static REPORTED_IN_PROCESS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+pub(crate) struct TelemetryGuard(Option<sentry::ClientInitGuard>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BridgeRuntimeLimit {
+    actual: u64,
+    maximum: u64,
+    unit: &'static str,
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        let Some(guard) = self.0.take() else { return };
+        // The SDK's transport destructor joins its worker even after flush
+        // times out. Keep that join off the command's exit path. If spawning
+        // fails, leave SDK teardown to process exit rather than blocking here.
+        let guard = std::mem::ManuallyDrop::new(guard);
+        let (done, completion) = std::sync::mpsc::sync_channel(1);
+        if std::thread::Builder::new()
+            .name("inline-telemetry-shutdown".into())
+            .spawn(move || {
+                drop(std::mem::ManuallyDrop::into_inner(guard));
+                let _ = done.send(());
+            })
+            .is_ok()
+        {
+            let _ = completion.recv_timeout(SHUTDOWN_TIMEOUT);
+        }
+    }
+}
+
+pub(crate) fn init() -> Option<TelemetryGuard> {
+    if std::env::var("INLINE_CLI_TELEMETRY").is_ok_and(|value| telemetry_disabled(&value)) {
+        return None;
+    }
+    let dsn = std::env::var("INLINE_CLI_SENTRY_DSN")
+        .ok()
+        .or_else(|| option_env!("INLINE_CLI_SENTRY_DSN").map(str::to_owned))?;
+    if dsn.trim().is_empty() {
+        return None;
+    }
+    let Ok(dsn) = dsn.parse::<sentry::types::Dsn>() else {
+        log::warn!("CLI error reporting disabled: invalid INLINE_CLI_SENTRY_DSN.");
+        return None;
+    };
+    // Sentry's reqwest 0.13 no-provider feature does not auto-select ring.
+    // Initialize it before Sentry, independently of API client startup order.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut options = sentry::ClientOptions::default();
+    options.dsn = Some(dsn);
+    options.release = Some(format!("inline-cli@{}", env!("CARGO_PKG_VERSION")).into());
+    options.default_integrations = false;
+    options.send_default_pii = false;
+    options.auto_session_tracking = false;
+    options.max_breadcrumbs = 0;
+    options.shutdown_timeout = SHUTDOWN_TIMEOUT;
+    options.before_send = Some(Arc::new(|event| Some(allowlisted_event(event))));
+    let guard = TelemetryGuard(Some(sentry::init(options)));
+    let _ = REPORT_LEDGER.set(
+        crate::config::Config::load()
+            .data_dir
+            .join(REPORT_LEDGER_FILE),
+    );
+    install_panic_hook();
+    Some(guard)
+}
+
+fn telemetry_disabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "off" | "0" | "false"
+    )
+}
+
+pub(crate) fn report(
+    error: &JsonCliError,
+    target: Option<&str>,
+    phase: Option<&str>,
+    command: Option<&str>,
+    failure: Option<&str>,
+) {
+    if matches!(
+        error.code.as_str(),
+        "invalid_args" | "not_authenticated" | "setup_cancelled" | "confirmation_required"
+    ) {
+        return;
+    }
+    let mut event = sentry::protocol::Event {
+        message: Some(COMMAND_FAILURE_MESSAGE.into()),
+        level: sentry::Level::Error,
+        ..Default::default()
+    };
+    event
+        .tags
+        .insert("error_code".into(), safe_code(&error.code));
+    if let Some(target) = target {
+        event.tags.insert("target".into(), safe_code(target));
+    }
+    if let Some(phase) = phase {
+        event.tags.insert("phase".into(), safe_code(phase));
+    }
+    if let Some(command) = command {
+        event.tags.insert("command".into(), safe_code(command));
+    }
+    if let Some(failure) = failure.or_else(|| command_failure_kind(error)) {
+        event.tags.insert("failure".into(), safe_code(failure));
+    }
+    event
+        .extra
+        .insert("failure_text".into(), command_failure_text(error).into());
+    let key = report_key(&event);
+    capture_once_per_window(key, event);
+}
+
+pub(crate) fn provider_host_target(provider_id: &str) -> &'static str {
+    match provider_id {
+        "codex" => "codex",
+        "claude" => "claude",
+        "opencode" => "opencode",
+        "amp" => "amp",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn process_host_failure_code(error: &ProcessHostError) -> String {
+    match error {
+        ProcessHostError::Io(_) => "host_io".into(),
+        ProcessHostError::ProviderExited(status) => {
+            if let Some(code) = status.code().filter(|code| (0..=255).contains(code)) {
+                return format!("exit_{code}");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(signal) = status.signal().filter(|signal| (1..=64).contains(signal)) {
+                    return format!("signal_{signal}");
+                }
+            }
+            "exit_unknown".into()
+        }
+    }
+}
+
+fn command_failure_kind(error: &JsonCliError) -> Option<&'static str> {
+    // Setup retains its existing public error code. Fixed metadata remains
+    // useful when Sentry's privacy rules filter the accompanying failure text.
+    (error.code == "provider_integration_failed"
+        && error
+            .message
+            .starts_with("Claude authentication probe timed out after "))
+    .then_some("provider_auth_timeout")
+}
+
+fn command_failure_text(error: &JsonCliError) -> String {
+    let mut text = error.message.clone();
+    if let Some(status) = error.status {
+        text.push_str(&format!(" Status: {status}."));
+    }
+    if let Some(hint) = &error.hint {
+        text.push_str(&format!(" Hint: {hint}"));
+    }
+    crate::diagnostics::safe_text(&text)
+}
+
+/// Reports a recovered bridge failure using fixed grouping metadata plus the
+/// bounded, scrubbed display text. Source chains, backtraces, and surrounding
+/// runtime state are not attached. Repeated restart loops are sampled at attempts
+/// 1, 2, 3 and powers of two so one poisoned delivery cannot flood Sentry.
+pub(crate) fn report_bridge_runtime_error(
+    target: &str,
+    phase: &str,
+    error: &(dyn std::error::Error + 'static),
+    attempt: Option<u32>,
+) {
+    if attempt.is_some_and(|attempt| !should_report_bridge_attempt(attempt)) {
+        return;
+    }
+    let failure = classify_bridge_runtime_failure(error);
+    capture_bridge_runtime_event(
+        target,
+        phase,
+        failure,
+        attempt,
+        Some(&error.to_string()),
+        bridge_runtime_limit(error),
+    );
+}
+
+pub(crate) fn report_bridge_provider_exit(target: &str) {
+    capture_bridge_runtime_event(
+        target,
+        "provider_process",
+        "provider_process_exited",
+        None,
+        None,
+        None,
+    );
+}
+
+pub(crate) fn report_bridge_configuration_fallback(target: &str, failure: &'static str) {
+    capture_bridge_runtime_event(target, "agent_configuration", failure, None, None, None);
+}
+
+/// A terminal needs-setup stop of the account service or of one agent.
+pub(crate) fn report_bridge_setup_required(target: &str, failure: &'static str) {
+    capture_bridge_runtime_event(target, "setup_required", failure, None, None, None);
+}
+
+/// Inline refused a bridge v2 message or edit (`kind`: answer, card, edit).
+/// Sampled like restart loops, since an open message may be refused on every
+/// edit until it ends.
+pub(crate) fn report_bridge_output_refused(kind: &'static str) {
+    static REFUSALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let count = REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if !should_report_bridge_attempt(count) {
+        return;
+    }
+    capture_bridge_runtime_event(
+        "inline::bridge::v2",
+        "output_refused",
+        kind,
+        Some(count),
+        None,
+        None,
+    );
+}
+
+pub(crate) fn report_bridge_owner_dm_event(
+    target: &str,
+    phase: &'static str,
+    failure: &'static str,
+) {
+    capture_bridge_runtime_event(target, phase, failure, None, None, None);
+}
+
+pub(crate) fn bridge_error_requires_provider_restart(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    matches!(
+        classify_bridge_runtime_failure(error),
+        "ambiguous_provider_timeout" | "provider_epoch_ended" | "provider_process_exited"
+    )
+}
+
+fn capture_bridge_runtime_event(
+    target: &str,
+    phase: &str,
+    failure: &'static str,
+    attempt: Option<u32>,
+    failure_text: Option<&str>,
+    limit: Option<BridgeRuntimeLimit>,
+) {
+    let mut event = sentry::protocol::Event {
+        message: Some(BRIDGE_RUNTIME_MESSAGE.into()),
+        level: sentry::Level::Error,
+        ..Default::default()
+    };
+    event.tags.insert("surface".into(), "bridge".into());
+    event
+        .tags
+        .insert("error_code".into(), "bridge_runtime_failure".into());
+    event.tags.insert("target".into(), safe_code(target));
+    event.tags.insert("phase".into(), safe_code(phase));
+    event.tags.insert("failure".into(), failure.into());
+    if let Some(attempt) = attempt {
+        event.tags.insert("attempt".into(), attempt.to_string());
+    }
+    if let Some(failure_text) = failure_text {
+        event.extra.insert(
+            "failure_text".into(),
+            crate::diagnostics::safe_text(failure_text).into(),
+        );
+    }
+    if let Some(limit) = limit {
+        event.tags.insert("limit_unit".into(), limit.unit.into());
+        event
+            .extra
+            .insert("limit_actual".into(), limit.actual.into());
+        event
+            .extra
+            .insert("limit_maximum".into(), limit.maximum.into());
+    }
+    let key = report_key(&event);
+    capture_once_per_window(key, event);
+}
+
+/// Groups by the same fields as the Sentry fingerprint, plus the release, so a
+/// restart loop yields one event per day instead of one per attempt.
+fn report_key(event: &sentry::protocol::Event<'static>) -> String {
+    let mut key = format!("inline-cli@{}", env!("CARGO_PKG_VERSION"));
+    for name in [
+        "surface",
+        "command",
+        "error_code",
+        "target",
+        "phase",
+        "failure",
+    ] {
+        key.push('|');
+        if let Some(value) = event.tags.get(name) {
+            key.push_str(&safe_code(value));
+        }
+    }
+    key
+}
+
+fn capture_once_per_window(key: String, event: sentry::protocol::Event<'static>) {
+    if sentry::Hub::current().client().is_none() {
+        return;
+    }
+    let admitted = match REPORT_LEDGER.get() {
+        Some(path) => {
+            admit_report(path, &key, unix_now()).unwrap_or_else(|_| admit_in_process(&key))
+        }
+        None => admit_in_process(&key),
+    };
+    if admitted {
+        sentry::capture_event(event);
+    }
+}
+
+/// Fallback when the shared ledger is unavailable: once per process.
+fn admit_in_process(key: &str) -> bool {
+    REPORTED_IN_PROCESS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.to_string())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Records `key` and returns true unless it was already reported within the
+/// window. An exclusive lock serializes concurrent CLI processes.
+fn admit_report(path: &Path, key: &str, now: u64) -> io::Result<bool> {
+    let lock = open_private(&path.with_extension("lock"), false)?;
+    lock.lock()?;
+    let mut reported: BTreeMap<String, u64> = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    // Entries from the future mean the clock moved back; let them report again.
+    reported.retain(|_, at| *at <= now && now - *at < REPORT_WINDOW_SECONDS);
+    if reported.contains_key(key) {
+        return Ok(false);
+    }
+    while reported.len() >= MAX_REPORT_LEDGER_ENTRIES {
+        let Some(oldest) = reported
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        reported.remove(&oldest);
+    }
+    reported.insert(key.to_string(), now);
+    let temporary = path.with_extension("json.tmp");
+    let mut file = open_private(&temporary, true)?;
+    file.write_all(&serde_json::to_vec(&reported)?)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    Ok(true)
+}
+
+fn open_private(path: &Path, truncate: bool) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn should_report_bridge_attempt(attempt: u32) -> bool {
+    attempt <= 3 || attempt.is_power_of_two()
+}
+
+fn classify_bridge_runtime_failure(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionAborted)
+    {
+        return "provider_epoch_ended";
+    }
+    if let Some(error) = error.downcast_ref::<StoreError>() {
+        return match error {
+            StoreError::ProgressLedgerBytesExceeded { .. } => "progress_ledger_size_limit",
+            StoreError::InboundFinalTextBytesExceeded { .. } => "terminal_text_byte_limit",
+            StoreError::InboundFinalTextUtf16Exceeded { .. } => "terminal_text_utf16_limit",
+            StoreError::InboundOutputAttachmentCountExceeded { .. } => {
+                "terminal_attachment_count_limit"
+            }
+            StoreError::InboundOutputAttachmentBytesExceeded { .. } => {
+                "terminal_attachment_metadata_limit"
+            }
+            StoreError::InvalidProgressLedger => "progress_ledger_invalid",
+            StoreError::InvalidInboundFinalText => "terminal_text_invalid",
+            _ => "local_store",
+        };
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("agent configuration is unavailable") {
+        "agent_configuration_catalog_unavailable"
+    } else if message.contains("project selection is no longer available") {
+        "agent_project_unavailable"
+    } else if message.contains("model selection is no longer available") {
+        "agent_model_unavailable"
+    } else if message.contains("reasoning selection is no longer available") {
+        "agent_reasoning_unavailable"
+    } else if message.contains("bound to a different agent provider")
+        || message.contains("belongs to provider")
+    {
+        "provider_mismatch"
+    } else if message.contains("timed out with an unknown provider outcome") {
+        "ambiguous_provider_timeout"
+    } else if message.contains("authentication") && message.contains("failed") {
+        "provider_authentication_failed"
+    } else if message.contains("authentication is required") {
+        "provider_authentication_required"
+    } else if message.contains("active elsewhere") || message.contains("active writer") {
+        "provider_session_busy"
+    } else if message.contains("bad request") && message.contains("http 400") {
+        "remote_bad_request"
+    } else if message.contains("epoch ended") {
+        "provider_epoch_ended"
+    } else if message.contains("app-server disconnected")
+        || message.contains("process exited")
+        || message.contains("exited during")
+    {
+        "provider_process_exited"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "timeout"
+    } else if message.contains("websocket")
+        || message.contains("realtime connection")
+        || message.contains("event stream closed")
+        || message.contains("no route to host")
+        || message.contains("lookup address")
+    {
+        "inline_network"
+    } else if message.contains("protocol") || message.contains("malformed") {
+        "provider_protocol"
+    } else if message.contains("database") || message.contains("sqlite") {
+        "local_store"
+    } else {
+        "unknown"
+    }
+}
+
+fn bridge_runtime_limit(error: &(dyn std::error::Error + 'static)) -> Option<BridgeRuntimeLimit> {
+    let error = error.downcast_ref::<StoreError>()?;
+    let (actual, maximum, unit) = match error {
+        StoreError::ProgressLedgerBytesExceeded {
+            actual_bytes,
+            limit_bytes,
+        }
+        | StoreError::InboundFinalTextBytesExceeded {
+            actual_bytes,
+            limit_bytes,
+        }
+        | StoreError::InboundOutputAttachmentBytesExceeded {
+            actual_bytes,
+            limit_bytes,
+        } => (*actual_bytes, *limit_bytes, "bytes"),
+        StoreError::InboundFinalTextUtf16Exceeded {
+            actual_utf16,
+            limit_utf16,
+        } => (*actual_utf16, *limit_utf16, "utf16_units"),
+        StoreError::InboundOutputAttachmentCountExceeded {
+            actual_count,
+            limit_count,
+        } => (*actual_count, *limit_count, "attachments"),
+        _ => return None,
+    };
+    Some(BridgeRuntimeLimit {
+        actual: u64::try_from(actual).unwrap_or(u64::MAX),
+        maximum: u64::try_from(maximum).unwrap_or(u64::MAX),
+        unit,
+    })
+}
+
+fn install_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            let mut event = sentry::protocol::Event {
+                message: Some(PANIC_MESSAGE.into()),
+                level: sentry::Level::Fatal,
+                ..Default::default()
+            };
+            event.tags.insert("surface".into(), "process".into());
+            event.tags.insert("error_code".into(), "panic".into());
+            event.tags.insert("phase".into(), "panic".into());
+            if let Some(location) = panic.location() {
+                event.tags.insert(
+                    "panic_location".into(),
+                    panic_location_code(location.file(), location.line()),
+                );
+            }
+            sentry::capture_event(event);
+            previous(panic);
+        }));
+    });
+}
+
+/// Names a panic site without the payload or the path above the crate: the
+/// crate directory, its `src` path and the line, e.g. `cli_src_main_rs_42`.
+/// Checkout and registry prefixes can name the user, so they are dropped.
+fn panic_location_code(file: &str, line: u32) -> String {
+    let parts: Vec<&str> = file
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let tail = match parts.iter().rposition(|part| *part == "src") {
+        Some(index) => &parts[index.saturating_sub(1)..],
+        None => &parts[parts.len().saturating_sub(1)..],
+    };
+    let mut code = String::new();
+    for ch in format!("{}_{line}", tail.join("_")).chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            code.push(ch);
+        } else if !code.is_empty() && !code.ends_with('_') {
+            code.push('_');
+        }
+    }
+    // Deep paths keep their most specific end within the tag limit.
+    code[code.len().saturating_sub(80)..]
+        .trim_start_matches('_')
+        .to_owned()
+}
+
+fn safe_code(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        value.to_owned()
+    } else {
+        "unknown".to_owned()
+    }
+}
+
+fn update_event(
+    outcome: &str,
+    channel: &str,
+    from: &str,
+    to: &str,
+    stage: &str,
+) -> sentry::protocol::Event<'static> {
+    let mut event = sentry::protocol::Event {
+        level: if matches!(outcome, "failed" | "rolled_back" | "repair_required") {
+            sentry::Level::Error
+        } else {
+            sentry::Level::Info
+        },
+        ..Default::default()
+    };
+    for (name, value) in [
+        ("surface", "update"),
+        ("outcome", outcome),
+        ("channel", channel),
+        ("stage", stage),
+        ("from_version", from),
+        ("to_version", to),
+    ] {
+        event.tags.insert(name.into(), value.into());
+    }
+    event.tags.insert(
+        "target".into(),
+        format!("{}_{}", std::env::consts::ARCH, std::env::consts::OS),
+    );
+    event
+}
+
+pub(crate) fn report_update(outcome: &str, channel: &str, from: &str, to: &str, stage: &str) {
+    let event = update_event(outcome, channel, from, to, stage);
+    let key = format!(
+        "update_{}_{}_{}_{}",
+        safe_code(outcome),
+        safe_code(stage),
+        safe_code(channel),
+        to
+    );
+    capture_once_per_window(key, event);
+}
+
+fn allowlisted_event(event: sentry::protocol::Event<'static>) -> sentry::protocol::Event<'static> {
+    // Reconstruct instead of blacklisting: future integrations/scope changes
+    // cannot silently add usernames, request bodies, breadcrumbs, or stacks.
+    let surface = event
+        .tags
+        .get("surface")
+        .map(String::as_str)
+        .filter(|surface| matches!(*surface, "bridge" | "process" | "update"));
+    let message = match surface {
+        Some("bridge") => BRIDGE_RUNTIME_MESSAGE,
+        Some("process") => PANIC_MESSAGE,
+        Some("update") => "Inline CLI update",
+        _ => COMMAND_FAILURE_MESSAGE,
+    };
+    let mut safe = sentry::protocol::Event {
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+        message: Some(message.into()),
+        level: if surface == Some("process") {
+            sentry::Level::Fatal
+        } else if surface == Some("update") && event.level == sentry::Level::Info {
+            sentry::Level::Info
+        } else {
+            sentry::Level::Error
+        },
+        release: Some(format!("inline-cli@{}", env!("CARGO_PKG_VERSION")).into()),
+        ..Default::default()
+    };
+    for name in [
+        "surface",
+        "error_code",
+        "target",
+        "phase",
+        "failure",
+        "attempt",
+        "command",
+        "limit_unit",
+        "panic_location",
+        "outcome",
+        "channel",
+        "stage",
+    ] {
+        if let Some(value) = event.tags.get(name) {
+            safe.tags.insert(name.into(), safe_code(value));
+        }
+    }
+    if surface == Some("update") {
+        for name in ["from_version", "to_version"] {
+            if let Some(value) = event
+                .tags
+                .get(name)
+                .filter(|value| value.len() <= 64 && semver::Version::parse(value).is_ok())
+            {
+                safe.tags.insert(name.into(), value.clone());
+            }
+        }
+    }
+    if let Some(failure_text) = event
+        .extra
+        .get("failure_text")
+        .and_then(|value| value.as_str())
+    {
+        let failure_text = crate::diagnostics::safe_text(failure_text);
+        if !failure_text.is_empty() {
+            safe.extra
+                .insert("failure_text".into(), failure_text.into());
+        }
+    }
+    for name in ["limit_actual", "limit_maximum"] {
+        if let Some(value) = event.extra.get(name).and_then(|value| value.as_u64()) {
+            safe.extra.insert(name.into(), value.into());
+        }
+    }
+    safe.tags.insert("os".into(), std::env::consts::OS.into());
+    safe.tags
+        .insert("arch".into(), std::env::consts::ARCH.into());
+    safe.fingerprint = if surface == Some("update") {
+        vec![
+            "inline_cli_update".into(),
+            safe.tags.get("outcome").cloned().unwrap_or_default().into(),
+            safe.tags.get("stage").cloned().unwrap_or_default().into(),
+        ]
+        .into()
+    } else if surface.is_some() {
+        let mut fingerprint = vec![
+            "inline-cli".into(),
+            safe.tags.get("surface").cloned().unwrap_or_default().into(),
+            safe.tags
+                .get("error_code")
+                .cloned()
+                .unwrap_or_default()
+                .into(),
+            safe.tags.get("target").cloned().unwrap_or_default().into(),
+            safe.tags.get("phase").cloned().unwrap_or_default().into(),
+            safe.tags.get("failure").cloned().unwrap_or_default().into(),
+        ];
+        if let Some(location) = safe.tags.get("panic_location") {
+            fingerprint.push(location.clone().into());
+        }
+        fingerprint.into()
+    } else {
+        let mut fingerprint = vec![
+            "inline-cli".into(),
+            safe.tags.get("command").cloned().unwrap_or_default().into(),
+            safe.tags
+                .get("error_code")
+                .cloned()
+                .unwrap_or_default()
+                .into(),
+            safe.tags.get("target").cloned().unwrap_or_default().into(),
+            safe.tags.get("phase").cloned().unwrap_or_default().into(),
+        ];
+        if safe
+            .tags
+            .get("command")
+            .is_some_and(|command| command == "bridge_provider_host")
+        {
+            fingerprint.push(safe.tags.get("failure").cloned().unwrap_or_default().into());
+        }
+        fingerprint.into()
+    };
+    safe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_events_keep_success_levels_and_semver_but_strip_private_scope() {
+        for (outcome, level) in [
+            ("staged", sentry::Level::Info),
+            ("activated", sentry::Level::Info),
+            ("rolled_back", sentry::Level::Error),
+        ] {
+            let mut event = update_event(
+                outcome,
+                "alpha",
+                "0.7.19-alpha.7",
+                "0.7.19-alpha.8+build.1",
+                "committed",
+            );
+            event.message = Some("private chat and /Users/someone/path".into());
+            event
+                .tags
+                .insert("private_path".into(), "/Users/someone/path".into());
+            event.extra.insert("auth_token".into(), "secret".into());
+            let safe = allowlisted_event(event);
+            assert_eq!(safe.level, level);
+            assert_eq!(safe.tags["to_version"], "0.7.19-alpha.8+build.1");
+            assert_eq!(safe.tags["from_version"], "0.7.19-alpha.7");
+            let encoded = serde_json::to_string(&safe).unwrap();
+            assert!(!encoded.contains("private"));
+            assert!(!encoded.contains("secret"));
+            assert_eq!(safe.message.as_deref(), Some("Inline CLI update"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly injected Sentry DSN; sends three qualification events"]
+    fn live_update_outcomes() {
+        let _guard = init().expect("inject INLINE_CLI_SENTRY_DSN for live qualification");
+        let version = format!("0.0.0-qualification.{}", unix_now());
+        for (outcome, stage) in [
+            ("staged", "verified"),
+            ("activated", "committed"),
+            ("rolled_back", "candidate_exit"),
+        ] {
+            let id = sentry::capture_event(update_event(
+                outcome,
+                "alpha",
+                env!("CARGO_PKG_VERSION"),
+                &version,
+                stage,
+            ));
+            assert!(!id.is_nil());
+            println!("sentry update qualification {outcome} {id}");
+        }
+        assert!(
+            sentry::Hub::current()
+                .client()
+                .unwrap()
+                .flush(Some(Duration::from_secs(15)))
+        );
+    }
+
+    #[test]
+    fn explicit_opt_out_is_case_and_whitespace_insensitive() {
+        for value in ["OFF", " off ", "0", "false", "False"] {
+            assert!(telemetry_disabled(value));
+        }
+        assert!(!telemetry_disabled("on"));
+    }
+
+    #[test]
+    fn a_failure_class_is_admitted_once_per_day_across_processes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(REPORT_LEDGER_FILE);
+        let day = REPORT_WINDOW_SECONDS;
+        assert!(admit_report(&path, "bridge_run|io_error", 1_000).unwrap());
+        assert!(!admit_report(&path, "bridge_run|io_error", 1_010).unwrap());
+        assert!(!admit_report(&path, "bridge_run|io_error", 1_000 + day - 1).unwrap());
+        assert!(admit_report(&path, "provider_host|exit_1", 1_010).unwrap());
+        assert!(admit_report(&path, "bridge_run|io_error", 1_000 + day).unwrap());
+        // A clock moved backwards cannot silence a class for longer than a day.
+        assert!(admit_report(&path, "bridge_run|io_error", 500).unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_report_ledger_is_rebuilt() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(REPORT_LEDGER_FILE);
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(admit_report(&path, "key", 10).unwrap());
+        assert!(!admit_report(&path, "key", 11).unwrap());
+    }
+
+    #[test]
+    fn the_report_ledger_stays_bounded() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join(REPORT_LEDGER_FILE);
+        for index in 0..(MAX_REPORT_LEDGER_ENTRIES as u64 + 10) {
+            assert!(admit_report(&path, &format!("key-{index}"), 100 + index).unwrap());
+        }
+        let reported: BTreeMap<String, u64> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(reported.len(), MAX_REPORT_LEDGER_ENTRIES);
+        assert!(!reported.contains_key("key-0"));
+    }
+
+    #[test]
+    fn report_keys_follow_grouping_tags_and_ignore_attempts() {
+        let mut first = sentry::protocol::Event::default();
+        first
+            .tags
+            .insert("command".into(), "bridge_provider_host".into());
+        first
+            .tags
+            .insert("error_code".into(), "provider_child_exit".into());
+        first.tags.insert("failure".into(), "exit_1".into());
+        first.tags.insert("attempt".into(), "1".into());
+        let mut second = first.clone();
+        second.tags.insert("attempt".into(), "64".into());
+        assert_eq!(report_key(&first), report_key(&second));
+        second.tags.insert("failure".into(), "exit_2".into());
+        assert_ne!(report_key(&first), report_key(&second));
+    }
+
+    #[test]
+    fn sentry_features_do_not_break_the_existing_tls_client() {
+        // Enabling a second rustls crypto provider can make this panic, even
+        // when telemetry is disabled. No network request is made here.
+        assert!(reqwest::Client::builder().build().is_ok());
+    }
+
+    #[test]
+    fn auth_timeout_metadata_survives_without_failure_text() {
+        let mut error = JsonCliError::new(
+            "provider_integration_failed",
+            "Claude authentication probe timed out after 30 seconds",
+        );
+        let mut event = sentry::protocol::Event::default();
+        event.tags.insert(
+            "failure".into(),
+            command_failure_kind(&error).unwrap().into(),
+        );
+        let safe = allowlisted_event(event);
+        assert_eq!(
+            safe.tags.get("failure").map(String::as_str),
+            Some("provider_auth_timeout")
+        );
+        assert!(safe.extra.is_empty());
+        error.message = "Claude is not authenticated".into();
+        assert_eq!(command_failure_kind(&error), None);
+        error.message = "private provider details".into();
+        assert_eq!(command_failure_kind(&error), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_host_exit_metadata_is_typed_and_allowlisted() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let exited = ProcessHostError::ProviderExited(std::process::ExitStatus::from_raw(1 << 8));
+        let signaled =
+            ProcessHostError::ProviderExited(std::process::ExitStatus::from_raw(libc::SIGTERM));
+        let io = ProcessHostError::Io(std::io::Error::other("private /Users/example/path"));
+        assert_eq!(process_host_failure_code(&exited), "exit_1");
+        assert_eq!(process_host_failure_code(&signaled), "signal_15");
+        assert_eq!(process_host_failure_code(&io), "host_io");
+        assert_eq!(provider_host_target("claude"), "claude");
+        assert_eq!(provider_host_target("private-provider-name"), "unknown");
+
+        let mut event = sentry::protocol::Event::default();
+        event
+            .tags
+            .insert("command".into(), "bridge_provider_host".into());
+        event
+            .tags
+            .insert("error_code".into(), "provider_child_exit".into());
+        event
+            .tags
+            .insert("target".into(), provider_host_target("claude").into());
+        event
+            .tags
+            .insert("failure".into(), process_host_failure_code(&exited));
+        let safe = allowlisted_event(event);
+        assert_eq!(safe.tags.get("target").map(String::as_str), Some("claude"));
+        assert_eq!(safe.tags.get("failure").map(String::as_str), Some("exit_1"));
+        assert_eq!(
+            safe.fingerprint,
+            vec![
+                "inline-cli",
+                "bridge_provider_host",
+                "provider_child_exit",
+                "claude",
+                "",
+                "exit_1",
+            ]
+        );
+    }
+
+    #[test]
+    fn outbound_event_cannot_include_arbitrary_diagnostics_or_pii() {
+        let mut event = sentry::protocol::Event {
+            message: Some("private-token".into()),
+            server_name: Some("private-host".into()),
+            user: Some(sentry::protocol::User {
+                email: Some("private@example.com".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        event.extra.insert("secret".into(), "private-token".into());
+        event.tags.insert("phase".into(), "integration".into());
+        event.tags.insert("path".into(), "/Users/private".into());
+        let encoded = serde_json::to_string(&allowlisted_event(event)).unwrap();
+        assert!(encoded.contains("integration"));
+        assert!(!encoded.contains("private"));
+    }
+
+    #[test]
+    fn bridge_events_keep_only_bounded_failure_metadata() {
+        let mut event = sentry::protocol::Event {
+            message: Some("private prompt and /Users/private/project".into()),
+            server_name: Some("private-host".into()),
+            ..Default::default()
+        };
+        event.tags.insert("surface".into(), "bridge".into());
+        event
+            .tags
+            .insert("error_code".into(), "bridge_runtime_failure".into());
+        event.tags.insert("target".into(), "codex".into());
+        event.tags.insert("phase".into(), "provider_cycle".into());
+        event.tags.insert(
+            "failure".into(),
+            "agent_configuration_catalog_unavailable".into(),
+        );
+        event.tags.insert("attempt".into(), "8".into());
+        event.tags.insert("limit_unit".into(), "bytes".into());
+        event
+            .tags
+            .insert("session_id".into(), "private-session".into());
+        event.extra.insert(
+            "failure_text".into(),
+            "Claude login failed at /Users/private/project\nTOKEN=private-value".into(),
+        );
+        event.extra.insert("limit_actual".into(), 700_000.into());
+        event
+            .extra
+            .insert("limit_maximum".into(), 16_777_216.into());
+
+        let safe = allowlisted_event(event);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert_eq!(safe.message.as_deref(), Some(BRIDGE_RUNTIME_MESSAGE));
+        assert_eq!(
+            safe.fingerprint,
+            vec![
+                "inline-cli",
+                "bridge",
+                "bridge_runtime_failure",
+                "codex",
+                "provider_cycle",
+                "agent_configuration_catalog_unavailable",
+            ]
+        );
+        assert!(encoded.contains("agent_configuration_catalog_unavailable"));
+        assert!(encoded.contains("Claude login failed"));
+        assert_eq!(
+            safe.tags.get("limit_unit").map(String::as_str),
+            Some("bytes")
+        );
+        assert_eq!(
+            safe.extra
+                .get("limit_actual")
+                .and_then(|value| value.as_u64()),
+            Some(700_000)
+        );
+        assert_eq!(
+            safe.extra
+                .get("limit_maximum")
+                .and_then(|value| value.as_u64()),
+            Some(16_777_216)
+        );
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("session_id"));
+    }
+
+    #[test]
+    fn owner_dm_repair_events_keep_only_fixed_grouping_metadata() {
+        let mut event = sentry::protocol::Event {
+            message: Some("private chat and user identifiers".into()),
+            ..Default::default()
+        };
+        event.tags.insert("surface".into(), "bridge".into());
+        event
+            .tags
+            .insert("error_code".into(), "bridge_runtime_failure".into());
+        event.tags.insert("target".into(), "opencode".into());
+        event.tags.insert("phase".into(), "owner_dm_startup".into());
+        event
+            .tags
+            .insert("failure".into(), "owner_dm_repaired".into());
+        event.tags.insert("chat_id".into(), "7108".into());
+
+        let safe = allowlisted_event(event);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert_eq!(
+            safe.fingerprint,
+            vec![
+                "inline-cli",
+                "bridge",
+                "bridge_runtime_failure",
+                "opencode",
+                "owner_dm_startup",
+                "owner_dm_repaired",
+            ]
+        );
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("7108"));
+        assert!(!encoded.contains("chat_id"));
+    }
+
+    #[test]
+    fn bridge_store_limits_have_stable_groups_and_numeric_diagnostics() {
+        let progress = StoreError::ProgressLedgerBytesExceeded {
+            actual_bytes: 16_777_217,
+            limit_bytes: 16_777_216,
+        };
+        assert_eq!(
+            classify_bridge_runtime_failure(&progress),
+            "progress_ledger_size_limit"
+        );
+        assert_eq!(
+            bridge_runtime_limit(&progress),
+            Some(BridgeRuntimeLimit {
+                actual: 16_777_217,
+                maximum: 16_777_216,
+                unit: "bytes",
+            })
+        );
+
+        let terminal = StoreError::InboundFinalTextUtf16Exceeded {
+            actual_utf16: 100_001,
+            limit_utf16: 100_000,
+        };
+        assert_eq!(
+            classify_bridge_runtime_failure(&terminal),
+            "terminal_text_utf16_limit"
+        );
+        assert_eq!(
+            bridge_runtime_limit(&terminal),
+            Some(BridgeRuntimeLimit {
+                actual: 100_001,
+                maximum: 100_000,
+                unit: "utf16_units",
+            })
+        );
+
+        let invalid = StoreError::InvalidProgressLedger;
+        assert_eq!(
+            classify_bridge_runtime_failure(&invalid),
+            "progress_ledger_invalid"
+        );
+        assert_eq!(bridge_runtime_limit(&invalid), None);
+    }
+
+    #[test]
+    fn bridge_failure_classification_never_returns_the_source_text() {
+        let configuration = std::io::Error::other(
+            "This thread's Agent configuration is unavailable on this provider.",
+        );
+        let unknown = std::io::Error::other("private prompt /Users/private/project token-123");
+        let bad_request = std::io::Error::other("Internal: Bad request (HTTP 400)");
+        assert_eq!(
+            classify_bridge_runtime_failure(&configuration),
+            "agent_configuration_catalog_unavailable"
+        );
+        assert_eq!(classify_bridge_runtime_failure(&unknown), "unknown");
+        assert_eq!(
+            classify_bridge_runtime_failure(&bad_request),
+            "remote_bad_request"
+        );
+        assert!(should_report_bridge_attempt(1));
+        assert!(should_report_bridge_attempt(3));
+        assert!(should_report_bridge_attempt(8));
+        assert!(!should_report_bridge_attempt(5));
+    }
+
+    #[test]
+    fn only_provider_epoch_failures_request_a_restart() {
+        let local_delivery = std::io::Error::other("database write failed");
+        let provider_epoch = std::io::Error::other("local agent connection epoch ended");
+        let typed_provider_epoch = std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "private turn cleanup diagnostic",
+        );
+        let ambiguous_start =
+            std::io::Error::other("thread/start timed out with an unknown provider outcome");
+
+        assert!(!bridge_error_requires_provider_restart(&local_delivery));
+        assert!(bridge_error_requires_provider_restart(&provider_epoch));
+        assert!(bridge_error_requires_provider_restart(
+            &typed_provider_epoch
+        ));
+        assert_eq!(
+            classify_bridge_runtime_failure(&typed_provider_epoch),
+            "provider_epoch_ended"
+        );
+        assert!(bridge_error_requires_provider_restart(&ambiguous_start));
+    }
+
+    #[test]
+    fn panic_events_keep_only_the_fixed_process_metadata() {
+        let mut event = sentry::protocol::Event {
+            message: Some("private panic payload and /Users/private/project".into()),
+            level: sentry::Level::Fatal,
+            server_name: Some("private-host".into()),
+            ..Default::default()
+        };
+        event.tags.insert("surface".into(), "process".into());
+        event.tags.insert("error_code".into(), "panic".into());
+        event.tags.insert("phase".into(), "panic".into());
+        event
+            .tags
+            .insert("session_id".into(), "private-session".into());
+
+        let safe = allowlisted_event(event);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert_eq!(safe.message.as_deref(), Some(PANIC_MESSAGE));
+        assert_eq!(safe.level, sentry::Level::Fatal);
+        assert_eq!(
+            safe.fingerprint,
+            vec!["inline-cli", "process", "panic", "", "panic", ""]
+        );
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("session_id"));
+    }
+
+    #[test]
+    fn panic_locations_keep_the_crate_path_and_drop_user_prefixes() {
+        assert_eq!(
+            panic_location_code("cli/src/main.rs", 42),
+            "cli_src_main_rs_42"
+        );
+        assert_eq!(
+            panic_location_code(
+                "/Users/private/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/park.rs",
+                7
+            ),
+            "tokio_1_47_1_src_runtime_park_rs_7"
+        );
+        assert_eq!(
+            panic_location_code(r"C:\Users\Private\inline\crates\bridge\src\Run.rs", 3),
+            "bridge_src_run_rs_3"
+        );
+        assert_eq!(panic_location_code("/private/build.rs", 9), "build_rs_9");
+        let deep = format!("cli/src/{}/leaf.rs", "nested/".repeat(20));
+        let code = panic_location_code(&deep, 123);
+        assert!(code.len() <= 80);
+        assert!(code.ends_with("leaf_rs_123"));
+        assert_eq!(safe_code(&code), code);
+    }
+
+    #[test]
+    fn panic_events_group_by_their_location() {
+        let mut event = sentry::protocol::Event {
+            level: sentry::Level::Fatal,
+            ..Default::default()
+        };
+        event.tags.insert("surface".into(), "process".into());
+        event.tags.insert("error_code".into(), "panic".into());
+        event.tags.insert("phase".into(), "panic".into());
+        event
+            .tags
+            .insert("panic_location".into(), "cli_src_main_rs_42".into());
+
+        let safe = allowlisted_event(event);
+        assert_eq!(
+            safe.tags.get("panic_location").map(String::as_str),
+            Some("cli_src_main_rs_42")
+        );
+        assert_eq!(
+            safe.fingerprint,
+            vec![
+                "inline-cli",
+                "process",
+                "panic",
+                "",
+                "panic",
+                "",
+                "cli_src_main_rs_42"
+            ]
+        );
+    }
+}

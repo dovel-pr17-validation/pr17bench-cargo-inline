@@ -1,0 +1,5409 @@
+// MessageView.swift
+import AppKit
+import Auth
+import Combine
+import Foundation
+import GRDB
+import InlineKit
+import struct InlineProtocol.MessageAction
+import struct InlineProtocol.MessageActionRow
+import struct InlineProtocol.MessageEntities
+import struct InlineProtocol.MessageEntity
+import InlineMacUI
+import InlineUI
+import Logger
+import Nuke
+import NukeUI
+import SwiftUI
+import TextProcessing
+import Throttler
+import Translation
+
+private enum MessageActionInvokeError: Error {
+  case invalidResponse
+}
+
+private enum ReplyThreadOpenError: Error {
+  case invalidResponse
+}
+
+private enum ReplyThreadOpenSource {
+  case menu
+  case threadSummary
+}
+
+class MessageViewAppKit: NSView {
+  private let feature_relayoutOnBoundsChange = true
+  private let log = Log.scoped("MessageView", enableTracing: false)
+  static let avatarSize: CGFloat = Theme.messageAvatarSize
+  private let acknowledgementView = MessageAcknowledgementView()
+  private(set) var fullMessage: FullMessage
+  private let dependencies: AppDependencies?
+  private var props: MessageViewProps
+  private var translationStateCancellable: AnyCancellable?
+  private var messageActionLoadingCancellable: AnyCancellable?
+  private var messageActionAnsweredCancellable: AnyCancellable?
+  private var messageActionGrantsCancellable: AnyCancellable?
+  private var didResolveMessageSpaceId = false
+  private var isResolvingMessageSpaceId = false
+  private var resolvedMessageSpaceId: Int64?
+  private var from: User {
+    fullMessage.from ?? User.deletedInstance
+  }
+
+  private var message: Message {
+    fullMessage.message
+  }
+
+  private var canCopyMessageWithEntities: Bool {
+    if Self.isDebugBuild {
+      return true
+    }
+    guard let currentUserId = Auth.shared.getCurrentUserId() else { return false }
+    return currentUserId == 1_900 || currentUserId == 1_600
+  }
+
+  private static var isDebugBuild: Bool {
+    #if DEBUG
+    return true
+    #else
+    return false
+    #endif
+  }
+
+  private func isMessagePinned() -> Bool {
+    message.pinned == true
+  }
+
+  private var isDM: Bool {
+    props.isDM
+  }
+
+  private var chatHasAvatar: Bool {
+    !isDM
+  }
+
+  private var showsAvatar: Bool {
+    chatHasAvatar && props.layout.hasAvatar && !outgoing
+  }
+
+  private var showsInlineAvatar: Bool {
+    showsAvatar && !usesAvatarOverlay
+  }
+
+  private var usesAvatarOverlay: Bool {
+    props.usesAvatarOverlay && props.renderStyle == .bubble && AppConfig.macMessageAvatarOverlayEnabled
+  }
+
+  private var showsName: Bool {
+    chatHasAvatar && props.layout.hasName
+  }
+
+  private var hasReactions: Bool {
+    props.layout.hasReactions
+  }
+
+  private var hasAttachments: Bool {
+    props.layout.hasAttachments
+  }
+
+  private var outgoing: Bool {
+    message.out == true
+  }
+
+  private var isAnchorMessage: Bool {
+    props.interactionMode == .threadAnchor
+  }
+
+  private var hasLegacyPhoto: Bool {
+    if let file = fullMessage.file, file.fileType == .photo {
+      return true
+    }
+    return false
+  }
+
+  private var hasPhoto: Bool {
+    props.layout.hasPhoto
+  }
+
+  private var hasVideo: Bool {
+    props.layout.hasVideo
+  }
+
+  private var hasDocument: Bool {
+    props.layout.hasDocument
+  }
+
+  private var hasVoiceInDocumentSlot: Bool {
+    message.hasVoice
+  }
+
+  private var canSaveLoadedVoice: Bool {
+    hasVoiceInDocumentSlot && VoiceMessageAudioSaver.canSave(message)
+  }
+
+  private var hasActualDocument: Bool {
+    fullMessage.documentInfo != nil
+  }
+
+  private var hasReply: Bool {
+    props.layout.hasReply
+  }
+
+  private var hasReplyThreadSummary: Bool {
+    props.layout.hasReplyThreadSummary
+  }
+
+  private var hasForwardHeader: Bool {
+    props.layout.hasForwardHeader
+  }
+
+  private var hasText: Bool {
+    props.layout.hasText
+  }
+
+  private var hasVisibleText: Bool {
+    guard let text = message.text else { return false }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+  }
+
+  private var reactionsOutsideBubble: Bool {
+    props.layout.reactionsOutsideBubble
+  }
+
+  private var hasAcknowledgement: Bool {
+    props.layout.hasAcknowledgement
+  }
+
+  private var shouldUseTransparentOutgoingReactions: Bool {
+    outgoing && (emojiMessage || reactionsOutsideBubble)
+  }
+
+  private var usesOutgoingBubbleStyle: Bool {
+    usesOutgoingBubbleStyle(for: props)
+  }
+
+  private var bubbleTailSide: MessageBubbleTailView.Side {
+    guard props.renderStyle == .bubble, props.lastInGroup, props.layout.hasBubbleColor else {
+      return .none
+    }
+
+    return outgoing ? .trailing : .leading
+  }
+
+  private func usesOutgoingBubbleStyle(for props: MessageViewProps) -> Bool {
+    outgoing && props.layout.hasBubbleColor
+  }
+
+  private var textWidth: CGFloat {
+    props.layout.text?.size.width ?? 1.0
+  }
+
+  private var contentWidth: CGFloat {
+    props.layout.bubble.size.width
+  }
+
+  private var textColor: NSColor {
+    Self.textColor(usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+  }
+
+  private var forwardHeaderTextColor: NSColor {
+    usesOutgoingBubbleStyle ? .white : .controlAccentColor
+  }
+
+  private var forwardHeaderTitle: String {
+    if message.forwardFromPeerThreadId != nil {
+      return fullMessage.forwardFromChatInfo?.humanReadableTitle ?? "Untitled"
+    }
+
+    if message.forwardFromPeerUserId != nil {
+      if let forwardUserInfo = fullMessage.forwardFromUserInfo {
+        return forwardUserInfo.user.shortDisplayName
+      }
+
+      if let peerUserInfo = fullMessage.forwardFromPeerUserInfo {
+        return peerUserInfo.user.shortDisplayName
+      }
+    }
+
+    return "User"
+  }
+
+  private var forwardHeaderIsPrivate: Bool {
+    if message.forwardFromPeerThreadId != nil {
+      return fullMessage.forwardFromChatInfo == nil
+    }
+
+    if message.forwardFromPeerUserId != nil {
+      if fullMessage.forwardFromUserInfo != nil {
+        return false
+      }
+
+      if fullMessage.forwardFromPeerUserInfo != nil {
+        return false
+      }
+      return true
+    }
+
+    return true
+  }
+
+  private var forwardHeaderText: String {
+    if forwardHeaderIsPrivate {
+      return "Forwarded from a private chat"
+    }
+    return "Forwarded from: \(forwardHeaderTitle)"
+  }
+
+  static func textColor(usesOutgoingBubbleStyle: Bool) -> NSColor {
+    usesOutgoingBubbleStyle ? .white : Theme.messageBubbleSecondaryTextColor
+  }
+
+  static func textColor(outgoing: Bool) -> NSColor {
+    textColor(usesOutgoingBubbleStyle: outgoing)
+  }
+
+  static func linkColor(usesOutgoingBubbleStyle: Bool) -> NSColor {
+    usesOutgoingBubbleStyle ? .white : Theme.messageBubbleSecondaryLinkColor
+  }
+
+  static func linkColor(outgoing: Bool) -> NSColor {
+    linkColor(usesOutgoingBubbleStyle: outgoing)
+  }
+
+  static func secondaryColor(usesOutgoingBubbleStyle: Bool) -> NSColor {
+    usesOutgoingBubbleStyle ? .white.withAlphaComponent(0.7) : .secondaryLabelColor
+  }
+
+  private var emojiMessage: Bool {
+    props.layout.emojiMessage
+  }
+
+  private var bubbleBackgroundColor: NSColor {
+    if !props.layout.hasBubbleColor {
+      NSColor.clear
+    } else if outgoing {
+      Theme.messageBubblePrimaryBgColor
+    } else {
+      Theme.messageBubbleSecondaryBgColor
+    }
+  }
+
+  /// Behind a quoted line the list points at: a deeper shade of this bubble, so the text stays
+  /// clear and the mark reads as part of the bubble. Without a bubble, a faint shade of the text.
+  var quoteHighlightColor: CGColor {
+    var color = NSColor.labelColor.withAlphaComponent(0.1).cgColor
+    effectiveAppearance.performAsCurrentDrawingAppearance {
+      let bubble = bubbleBackgroundColor.usingColorSpace(.sRGB) ?? bubbleBackgroundColor
+      guard bubble.alphaComponent > 0 else {
+        color = NSColor.labelColor.withAlphaComponent(0.1).cgColor
+        return
+      }
+      let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+      // A near-black bubble can't get visibly darker; it gets a little lighter instead.
+      let shade = outgoing || !isDark
+        ? bubble.blended(withFraction: outgoing ? 0.22 : 0.12, of: .black)
+        : bubble.blended(withFraction: 0.14, of: .white)
+      color = (shade ?? bubble).cgColor
+    }
+    return color
+  }
+
+  private func syncBubbleTail(animated: Bool = false) {
+    let side = bubbleTailSide
+    let mediaBleed = mediaBubbleBleed
+    if props.layout.photo != nil {
+      photoView.bubbleBleed = mediaBleed
+    } else if props.layout.video != nil {
+      videoView.bubbleBleed = mediaBleed
+    }
+    bubbleTailView.configure(
+      side: side,
+      color: bubbleBackgroundColor,
+      // The media's own tail leaves with its mask; a fading colored tail would flash behind it.
+      animated: animated && mediaBleed == nil
+    )
+    syncBubbleTailSideConstraint(side)
+  }
+
+  /// Media reaching the bubble's bottom corners continues into the tail.
+  private var mediaBubbleBleed: MessageBubbleTailGeometry.MediaBleed? {
+    let layout = props.layout
+    guard props.renderStyle == .bubble, layout.hasBubbleColor else { return nil }
+    let media: (plan: MessageSizeCalculator.LayoutPlan, top: CGFloat)? = if let photo = layout.photo {
+      (photo, layout.photoContentViewTop)
+    } else if let video = layout.video {
+      (video, layout.videoContentViewTop)
+    } else {
+      nil
+    }
+    guard let media,
+          abs(media.top + media.plan.size.height - layout.bubble.size.height) < 0.5,
+          abs(media.plan.size.width - layout.bubble.size.width) < 0.5
+    else { return nil }
+    return MessageBubbleTailGeometry.MediaBleed(
+      side: outgoing ? .trailing : .leading,
+      cornerRadius: Theme.messageBubbleCornerRadius,
+      hasTail: bubbleTailSide != .none,
+      roundsTop: media.top < 0.5
+    )
+  }
+
+  private func syncBubbleTailSideConstraint(_ side: MessageBubbleTailView.Side) {
+    bubbleTailLeadingConstraint?.isActive = side == .leading
+    bubbleTailTrailingConstraint?.isActive = side == .trailing
+  }
+
+  private var linkColor: NSColor {
+    Self.linkColor(usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+  }
+
+  private var secondaryTextColor: NSColor {
+    Self.secondaryColor(usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+  }
+
+  private var richTextPalette: ProcessEntities.Configuration.Palette {
+    .init(
+      primaryColor: textColor,
+      linkColor: linkColor,
+      secondaryColor: secondaryTextColor
+    )
+  }
+
+  private var richBlockPalette: RichBlockPalette {
+    .init(
+      primary: textColor,
+      secondary: secondaryTextColor,
+      tertiary: usesOutgoingBubbleStyle ? .white.withAlphaComponent(0.5) : .tertiaryLabelColor,
+      link: linkColor
+    )
+  }
+
+  private var richTextStyleKey: String {
+    usesOutgoingBubbleStyle ? "bubble-outgoing" : "bubble-default"
+  }
+
+  private var senderFont: NSFont {
+    .systemFont(
+      ofSize: 12,
+      weight: .semibold
+    )
+  }
+
+  private var isTimeOverlay: Bool {
+    // If we have a document and the message is empty, we don't want to show the time overlay
+    if props.layout.hasDocument, !props.layout.hasText {
+      false
+    } else if emojiMessage {
+      true
+    } else {
+      // for photos, we want to show the time overlay if the message is empty
+      !props.layout.hasText
+    }
+  }
+
+  // State
+  private var isMouseInside = false
+
+  // Add gesture recognizer property
+  private var longPressGesture: NSPressGestureRecognizer?
+  private var doubleClickGesture: NSClickGestureRecognizer?
+
+  // MARK: Views
+
+  private lazy var bubbleView: MessageBubbleBackgroundView = {
+    let view = MessageBubbleBackgroundView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.cornerRadius = Theme.messageBubbleCornerRadius
+    view.backgroundColor = bubbleBackgroundColor
+    let alphas = bubbleGradientOverlayAlphas
+    view.configureContinuousGradient(topAlpha: alphas.top, bottomAlpha: alphas.bottom)
+    return view
+  }()
+
+  private lazy var bubbleTailView: MessageBubbleTailView = {
+    let view = MessageBubbleTailView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    let alphas = bubbleGradientOverlayAlphas
+    view.configureContinuousGradient(topAlpha: alphas.top, bottomAlpha: alphas.bottom)
+    return view
+  }()
+
+  private var bubbleGradientOverlayAlphas: (top: CGFloat, bottom: CGFloat) {
+    Theme.messageBubbleGradientOverlayAlphas(
+      appearance: effectiveAppearance,
+      outgoing: outgoing
+    )
+  }
+
+  private func configureContinuousBubbleGradientLighting() {
+    let alphas = bubbleGradientOverlayAlphas
+    bubbleView.configureContinuousGradient(topAlpha: alphas.top, bottomAlpha: alphas.bottom)
+    bubbleTailView.configureContinuousGradient(topAlpha: alphas.top, bottomAlpha: alphas.bottom)
+  }
+
+  private var shineEffectView: ShineEffectView?
+
+  private lazy var avatarView: UserAvatarView = {
+    let view = UserAvatarView(userInfo: fullMessage.senderInfo ?? .deleted)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var nameLabel: NSTextField = {
+    let label = MessageSenderNameLabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = senderFont
+    label.lineBreakMode = .byTruncatingTail
+    let clickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleNameClick))
+    clickGesture.delaysPrimaryMouseButtonEvents = false
+    label.addGestureRecognizer(clickGesture)
+
+    return label
+  }()
+
+  private lazy var forwardHeaderLabel: NSTextField = {
+    let label = NSTextField(labelWithString: "")
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = .preferredFont(forTextStyle: .callout)
+    label.textColor = forwardHeaderTextColor
+    label.lineBreakMode = .byTruncatingTail
+    label.maximumNumberOfLines = 1
+    label.cell?.usesSingleLineMode = true
+    label.heightAnchor.constraint(equalToConstant: Theme.messageNameLabelHeight).isActive = true
+    let clickGesture = NSClickGestureRecognizer(
+      target: self,
+      action: #selector(handleForwardHeaderClick)
+    )
+    label.addGestureRecognizer(clickGesture)
+    return label
+  }()
+
+  private lazy var contentView: NSView = {
+    let view = NSView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var timeAndStateView: MessageTimeAndState = {
+    let view = MessageTimeAndState(
+      fullMessage: fullMessage,
+      overlay: isTimeOverlay,
+      usesOutgoingBubbleStyle: usesOutgoingBubbleStyle
+    )
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.wantsLayer = true
+    return view
+  }()
+
+  private lazy var photoView: NewPhotoView = {
+    let view = NewPhotoView(fullMessage, scrollState: scrollState)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var videoView: NewVideoView = {
+    let view = NewVideoView(fullMessage, scrollState: scrollState)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var documentContainerView: NSView = {
+    let view = NSView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var documentView: DocumentView? = {
+    guard let documentInfo = fullMessage.documentInfo else { return nil }
+
+    let view = DocumentView(
+      documentInfo: documentInfo,
+      fullMessage: self.fullMessage,
+      white: usesOutgoingBubbleStyle
+    )
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var voiceMessageView: NSHostingView<VoiceMessageBubble>? = {
+    guard hasVoiceInDocumentSlot else { return nil }
+
+    let view = NSHostingView(rootView: VoiceMessageBubble(
+      message: fullMessage.message,
+      outgoing: usesOutgoingBubbleStyle,
+      maxWidth: props.layout.document?.size.width ?? Theme.voiceMessageViewWidth,
+      mode: .embeddedBubble
+    ))
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  /// Attachments
+  ///
+  /// Will do tasks, Loom embeds, etc.
+  private var attachmentsView: MessageAttachmentsView?
+  private var messageActionRowsView: MessageActionRowsView?
+  private var uploadProgressView: PhotoUploadProgressView?
+
+  /// A sending photo's upload bar sits in the list's bottom inset under the newest message, so
+  /// it never changes the row's height and the list doesn't move when it leaves.
+  private func syncUploadProgressView(props: MessageViewProps) {
+    guard fullMessage.showsPhotoUploadProgress, props.isLastMessage,
+          let photoLocalId = fullMessage.photoInfo?.photo.id
+    else {
+      // Sent: the bar fills, then fades. Otherwise it only fades.
+      uploadProgressView?.dismiss(filling: !fullMessage.showsPhotoUploadProgress)
+      uploadProgressView = nil
+      return
+    }
+
+    let view = uploadProgressView ?? PhotoUploadProgressView()
+    if view.superview == nil {
+      addSubview(view)
+    }
+    view.configure(photoLocalId: photoLocalId)
+    uploadProgressView = view
+    needsLayout = true
+  }
+
+  private func layoutUploadProgressView() {
+    guard let uploadProgressView else { return }
+    let bubble = bubbleView.convert(bubbleView.bounds, to: self)
+    let size = PhotoUploadProgressView.size
+    // The bar ends under where the bubble's tail leaves the body.
+    let radius = MessageBubbleTailGeometry.effectiveRadius(
+      cornerRadius: MessageBubbleTailView.maxCornerRadius,
+      size: bubble.size
+    )
+    let tailStartInset = MessageBubbleTailGeometry.tailStartInset(radius: radius)
+    uploadProgressView.frame = CGRect(
+      x: outgoing
+        ? bubble.maxX - size.width - tailStartInset
+        : bubble.minX + tailStartInset,
+      y: isFlipped
+        ? bubble.maxY + PhotoUploadProgressView.topSpacing
+        : bubble.minY - PhotoUploadProgressView.topSpacing - size.height,
+      width: size.width,
+      height: size.height
+    )
+  }
+
+  private func createAttachmentsView() -> MessageAttachmentsView? {
+    let view = MessageAttachmentsView(
+      attachments: fullMessage.attachments,
+      message: message,
+      usesOutgoingBubbleStyle: usesOutgoingBubbleStyle,
+      itemPlans: props.layout.attachmentItems
+    )
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }
+
+  private var renderableMessageActionRows: [MessageActionRow] {
+    guard let actions = message.actions else { return [] }
+
+    return actions.rows.compactMap { row in
+      let filtered = row.actions.filter { action in
+        !action.actionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+          !action.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+          action.action != nil
+      }
+      guard !filtered.isEmpty else { return nil }
+
+      var next = MessageActionRow()
+      next.actions = filtered
+      return next
+    }
+  }
+
+  private func loadingActionIdsForCurrentMessage() -> Set<String> {
+    MessageActionInteractionState.shared.loadingActionIds(
+      peerId: message.peerId,
+      messageId: message.messageId,
+      rev: message.rev
+    )
+  }
+
+  private func syncMessageActionRowsView(message: FullMessage, props: MessageViewProps) {
+    guard props.layout.hasActionsRows, !renderableMessageActionRows.isEmpty else {
+      messageActionRowsView?.removeFromSuperview()
+      messageActionRowsView = nil
+      messageActionLoadingCancellable?.cancel()
+      messageActionLoadingCancellable = nil
+      messageActionAnsweredCancellable?.cancel()
+      messageActionAnsweredCancellable = nil
+      messageActionGrantsCancellable?.cancel()
+      messageActionGrantsCancellable = nil
+      clearMessageActionRowsConstraints()
+      return
+    }
+
+    ensureMessageActionStateObservation()
+
+    let view = messageActionRowsView ?? MessageActionRowsView()
+    if view.superview == nil {
+      addSubview(view)
+    }
+
+    view.onActionTap = { [weak self] action in
+      self?.handleMessageActionTap(action)
+    }
+
+    view.configure(
+      rows: renderableMessageActionRows,
+      loadingActionIds: loadingActionIdsForCurrentMessage(),
+      outgoing: usesOutgoingBubbleStyle(for: props),
+      rowHeight: 28,
+      messageFontSize: props.layout.fontSize,
+      presentation: { [message = message.message] action in MessageActionPerformer.presentation(for: action, message: message) }
+    )
+
+    messageActionRowsView = view
+  }
+
+  private func ensureMessageActionStateObservation() {
+    guard messageActionLoadingCancellable == nil || messageActionAnsweredCancellable == nil else { return }
+
+    messageActionLoadingCancellable?.cancel()
+    messageActionAnsweredCancellable?.cancel()
+
+    messageActionLoadingCancellable = MessageActionInteractionState.shared.loadingPublisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.refreshMessageActionRowsView()
+      }
+
+    // Grants load once per bot; re-render so buttons the viewer cannot use
+    // turn disabled with their reason.
+    messageActionGrantsCancellable = AgentGrantStore.shared.$accessByBotUserID
+      .map { [botUserID = message.fromId] in $0[botUserID] }
+      .removeDuplicates()
+      .dropFirst()
+      .sink { [weak self] _ in
+        self?.refreshMessageActionRowsView()
+      }
+
+    messageActionAnsweredCancellable = MessageActionInteractionState.shared.answeredPublisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] event in
+        guard let self else { return }
+        guard event.key.peerId == message.peerId, event.key.messageId == message.messageId else { return }
+
+        refreshMessageActionRowsView()
+
+        if let toastText = event.toastText {
+          ToastCenter.shared.showInfo(toastText)
+        }
+        if let alert = event.alert {
+          MessageActionPerformer.presentAlert(alert, in: window)
+        }
+      }
+  }
+
+  private func refreshMessageActionRowsView() {
+    guard let messageActionRowsView else { return }
+    messageActionRowsView.configure(
+      rows: renderableMessageActionRows,
+      loadingActionIds: loadingActionIdsForCurrentMessage(),
+      outgoing: usesOutgoingBubbleStyle,
+      rowHeight: 28,
+      messageFontSize: props.layout.fontSize,
+      presentation: { [message] action in MessageActionPerformer.presentation(for: action, message: message) }
+    )
+  }
+
+  private func handleMessageActionTap(_ action: MessageAction) {
+    let presentation = MessageActionPerformer.presentation(for: action, message: message)
+    MessageGestureTrace.debug(
+      "MessageView.handleMessageActionTap messageId=\(message.messageId) actionIdBytes=\(action.actionID.utf8.count) intent=\(presentation.intent) enabled=\(presentation.isEnabled)"
+    )
+    MessageActionPerformer.run(presentation, in: window) { [weak self] in
+      guard let self else { return }
+      if presentation.intent == .callback {
+        invokeMessageCallbackAction(action)
+      } else {
+        MessageActionPerformer.performLocal(presentation.intent) { [weak self] peer in
+          self?.openChat(peer: peer)
+        }
+      }
+    }
+  }
+
+  private func invokeMessageCallbackAction(_ action: MessageAction) {
+    let actionId = action.actionID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !actionId.isEmpty else { return }
+
+    let loadingKey = MessageActionInteractionState.LoadingKey(
+      peerId: message.peerId,
+      messageId: message.messageId,
+      rev: message.rev,
+      actionId: actionId
+    )
+
+    guard MessageActionInteractionState.shared.begin(key: loadingKey) else { return }
+    refreshMessageActionRowsView()
+
+    Task {
+      do {
+        let result = try await Api.realtime.send(
+          .invokeMessageAction(
+            peerId: message.peerId,
+            messageId: message.messageId,
+            actionId: actionId
+          )
+        )
+
+        guard case let .invokeMessageAction(response) = result else {
+          throw MessageActionInvokeError.invalidResponse
+        }
+
+        await MainActor.run {
+          MessageActionInteractionState.shared.attachInteractionId(
+            response.interactionID,
+            for: loadingKey
+          )
+          refreshMessageActionRowsView()
+        }
+      } catch {
+        await MainActor.run {
+          MessageActionInteractionState.shared.fail(key: loadingKey)
+          refreshMessageActionRowsView()
+          ToastCenter.shared.showError("Action failed")
+        }
+      }
+    }
+  }
+
+  private func syncForwardHeaderView(for props: MessageViewProps) {
+    guard props.layout.hasForwardHeader else {
+      if forwardHeaderLabel.superview != nil {
+        forwardHeaderLabel.removeFromSuperview()
+      }
+      NSLayoutConstraint.deactivate([
+        forwardHeaderTopConstraint,
+        forwardHeaderLeadingConstraint,
+        forwardHeaderTrailingConstraint,
+      ].compactMap { $0 })
+      forwardHeaderTopConstraint = nil
+      forwardHeaderLeadingConstraint = nil
+      forwardHeaderTrailingConstraint = nil
+      return
+    }
+
+    forwardHeaderLabel.textColor = forwardHeaderTextColor
+    forwardHeaderLabel.stringValue = forwardHeaderText
+
+    if forwardHeaderLabel.superview == nil {
+      contentView.addSubview(forwardHeaderLabel)
+    }
+  }
+
+  private func syncDocumentSlotView() {
+    guard hasDocument else {
+      documentContainerView.subviews.forEach { $0.removeFromSuperview() }
+      return
+    }
+
+    let desiredView: NSView?
+    if hasVoiceInDocumentSlot {
+      voiceMessageView?.rootView = VoiceMessageBubble(
+        message: fullMessage.message,
+        outgoing: usesOutgoingBubbleStyle,
+        maxWidth: props.layout.document?.size.width ?? Theme.voiceMessageViewWidth,
+        mode: .embeddedBubble
+      )
+      desiredView = voiceMessageView
+    } else {
+      if let documentInfo = fullMessage.documentInfo {
+        documentView?.update(with: documentInfo, fullMessage: fullMessage)
+      }
+      desiredView = documentView
+    }
+
+    for subview in documentContainerView.subviews where subview !== desiredView {
+      subview.removeFromSuperview()
+    }
+
+    guard let desiredView else { return }
+    documentContainerView.menu = menu
+    desiredView.menu = menu
+
+    if desiredView.superview !== documentContainerView {
+      desiredView.removeFromSuperview()
+      documentContainerView.addSubview(desiredView)
+      NSLayoutConstraint.activate([
+        desiredView.topAnchor.constraint(equalTo: documentContainerView.topAnchor),
+        desiredView.leadingAnchor.constraint(equalTo: documentContainerView.leadingAnchor),
+        desiredView.trailingAnchor.constraint(equalTo: documentContainerView.trailingAnchor),
+        desiredView.bottomAnchor.constraint(equalTo: documentContainerView.bottomAnchor),
+      ])
+    }
+  }
+
+  /// Reply
+  private var embeddedReplyStyle: EmbeddedMessageView.EmbeddedMessageStyle {
+    embeddedReplyStyle(for: props)
+  }
+
+  private func embeddedReplyStyle(for props: MessageViewProps) -> EmbeddedMessageView.EmbeddedMessageStyle {
+    let appearance = EmbeddedReplyStyleResolver.appearance(
+      isOutgoing: outgoing,
+      hasPhoto: props.layout.hasPhoto,
+      hasText: hasVisibleText,
+      hasBubbleColor: props.layout.hasBubbleColor
+    )
+
+    switch appearance {
+    case .colored:
+      return .colored
+    case .white:
+      return .white
+    }
+  }
+
+  private lazy var replyView: EmbeddedMessageView = {
+    let view = EmbeddedMessageView(style: embeddedReplyStyle)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.setRelatedMessage(fullMessage.message)
+    if let embeddedMessage = fullMessage.repliedToMessage {
+      view.update(with: embeddedMessage, kind: .replyInMessage, quote: fullMessage.leadingReplyQuote?.text)
+    }
+    return view
+  }()
+
+  private lazy var replyThreadSummaryView: ReplyThreadSummaryView = {
+    let view = ReplyThreadSummaryView(style: embeddedReplyStyle)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.isHidden = true
+    view.onTap = { [weak self] flags in
+      if let self {
+        MessageGestureTrace.debug(
+          "MessageView.replyThreadSummaryTap messageId=\(self.message.messageId) modifiers=\(flags.rawValue)"
+        )
+      }
+      self?.openReplyThreadFlow(
+        source: .threadSummary,
+        action: ReplyThreadOpenAction(
+          modifierFlags: flags,
+          opensInSidePane: AppSettings.shared.openReplyThreadsInSidePane
+        )
+      )
+    }
+    view.menuProvider = { [weak self] in
+      self?.makeReplyThreadSummaryMenu()
+    }
+    return view
+  }()
+
+  private func shouldShowReplyThreadSummary(for props: MessageViewProps) -> Bool {
+    props.layout.hasReplyThreadSummary
+      && props.interactionMode != .threadAnchor
+      && message.hasReplyThreadSummary
+  }
+
+  private func updateReplyThreadSummaryView(for props: MessageViewProps) {
+    replyThreadSummaryView.setStyle(embeddedReplyStyle(for: props))
+    guard shouldShowReplyThreadSummary(for: props) else {
+      replyThreadSummaryView.clear()
+      return
+    }
+    guard let summary = message.threadCard else {
+      replyThreadSummaryView.clear()
+      return
+    }
+
+    replyThreadSummaryView.update(
+      kind: summary.kind,
+      messageCount: summary.messageCount,
+      recentAuthors: recentReplyThreadAuthors(),
+      hasUnread: summary.hasUnread,
+      title: props.replyThreadTitle
+    )
+    replyThreadSummaryView.isHidden = false
+  }
+
+  private func recentReplyThreadAuthors() -> [UserInfo] {
+    let userIds = message.replyThreadRecentReplierUserIds
+    let users = ObjectCache.shared.get(userIds.map(ObjectID.user))
+    return userIds.map { userId in
+      users.user(userId) ?? UserInfo(
+        user: User(id: userId, email: nil, firstName: nil)
+      )
+    }
+  }
+
+  private var useTextKit2: Bool = true
+
+  private var prevDelegate: NSTextViewportLayoutControllerDelegate?
+
+  private lazy var textView: NSTextView = {
+    if useTextKit2 {
+      let textView = MessageTextView(usingTextLayoutManager: true)
+      textView.translatesAutoresizingMaskIntoConstraints = false
+      textView.isEditable = false
+      textView.isSelectable = true
+      textView.backgroundColor = .clear
+      textView.drawsBackground = false
+      // Clips to bounds = false fucks up performance so badly. what!?
+      // textView.clipsToBounds = true
+      textView.textContainerInset = MessageTextConfiguration.containerInset
+      textView.font = ChatTypography.current.font(sized: props.layout.fontSize)
+      textView.textColor = textColor
+      textView.wantsLayer = true
+      textView.layerContentsRedrawPolicy = .onSetNeedsDisplay
+      textView.layer?.drawsAsynchronously = true
+      textView.layer?.needsDisplayOnBoundsChange = true
+
+      let textContainer = textView.textContainer
+      textContainer?.widthTracksTextView = false
+      textContainer?.heightTracksTextView = false
+
+      // Configure basic text view behavior
+      textView.allowsImageEditing = false
+      textView.isGrammarCheckingEnabled = false
+      textView.isContinuousSpellCheckingEnabled = false
+      textView.isAutomaticQuoteSubstitutionEnabled = false
+      textView.isAutomaticDashSubstitutionEnabled = false
+      textView.isAutomaticTextReplacementEnabled = false
+
+      textView.isVerticallyResizable = false
+      textView.isHorizontallyResizable = false
+      textView.delegate = self
+
+      if MessageTextConfiguration.useTextKit2ViewportWorkarounds {
+        // Avoid our custom TextKit 2 viewport delegate on macOS 27; crash reports show
+        // AppKit throwing while configuring viewport surfaces during NSTableView row install.
+        prevDelegate = textView.textLayoutManager?.textViewportLayoutController.delegate
+        textView.textLayoutManager?.textViewportLayoutController.delegate = self
+      }
+
+      // In NSTextView you need to customize link colors here otherwise the attributed string for links
+      // does not have any effect.
+      textView.linkTextAttributes = [
+        .foregroundColor: linkColor,
+        // .underlineStyle: NSUnderlineStyle.single.rawValue,
+        .cursor: NSCursor.pointingHand,
+      ]
+
+      // Match the sizes and spacing with the size calculator we use to calculate cell height
+      MessageTextConfiguration.configureTextContainer(textContainer!)
+      MessageTextConfiguration.configureTextView(textView)
+
+      return textView
+    } else {
+      let textContainer = NSTextContainer(size: props.layout.text?.size ?? .zero)
+      let layoutManager = NSLayoutManager()
+      let textStorage = NSTextStorage()
+
+      textStorage.addLayoutManager(layoutManager)
+      layoutManager.addTextContainer(textContainer)
+
+      let textView = MessageTextView(frame: .zero, textContainer: textContainer)
+
+      // Essential TextKit 1 optimizations
+      textContainer.lineFragmentPadding = 0
+      textContainer.maximumNumberOfLines = 0
+      textContainer.widthTracksTextView = false
+      textContainer.heightTracksTextView = false
+      textContainer.lineBreakMode = .byClipping
+      textContainer.maximumNumberOfLines = 0
+      textContainer.containerSize = props.layout.text?.size ?? .zero
+      textContainer.size = props.layout.text?.size ?? .zero
+
+      //    layoutManager.showsControlCharacters = true
+      //    layoutManager.showsInvisibleCharacters = true
+
+      layoutManager.usesDefaultHyphenation = false
+      layoutManager.allowsNonContiguousLayout = true
+      layoutManager.backgroundLayoutEnabled = true
+
+      // Match your existing configuration
+      textView.isEditable = false
+      textView.isSelectable = true
+      textView.usesFontPanel = false
+      textView.textContainerInset = MessageTextConfiguration.containerInset
+      textView.linkTextAttributes = [
+        .foregroundColor: linkColor,
+        .underlineStyle: NSUnderlineStyle.single.rawValue,
+        .cursor: NSCursor.pointingHand,
+      ]
+      textView.delegate = self
+      textView.wantsLayer = true
+      textView.layer?.drawsAsynchronously = true
+      textView.layerContentsRedrawPolicy = .onSetNeedsDisplay
+      textView.layer?.contentsGravity = .topLeft
+      textView.layer?.needsDisplayOnBoundsChange = true
+      textView.drawsBackground = false
+      textView.isVerticallyResizable = false
+      textView.isHorizontallyResizable = false
+      textView.translatesAutoresizingMaskIntoConstraints = false
+      return textView
+    }
+  }()
+
+  private var richBlockContentView: RichBlockContentView?
+
+  private var reactionsView: MessageReactionsView?
+  // The second mouse-down event is a reliable double-click boundary even when
+  // AppKit admits NSClickGestureRecognizer but never calls its target action.
+  private var handledDoubleClickEventNumber: Int?
+  private var handledEntityClickEventNumber: Int?
+
+  // MARK: - Link Detection
+
+  /// Stores detected links for tap handling
+  private var detectedLinks: [(range: NSRange, url: URL)] = []
+
+  /// Handles link clicks by opening the URL in the default browser
+  private func handleLinkClick(at characterIndex: Int) {
+    guard let url = linkURL(at: characterIndex, in: textView.attributedString()) else {
+      MessageGestureTrace.debug(
+        "MessageView.handleLinkClick messageId=\(message.messageId) char=\(characterIndex) result=noURL"
+      )
+      return
+    }
+    MessageGestureTrace.debug("MessageView.handleLinkClick messageId=\(message.messageId) char=\(characterIndex) url=\(MessageGestureTrace.url(url))")
+    openTextURL(url)
+  }
+
+  private func linkURLForContextMenu(at characterIndex: Int) -> URL? {
+    linkURL(at: characterIndex, in: textView.attributedString())
+  }
+
+  private func linkURL(at characterIndex: Int, in attributedString: NSAttributedString) -> URL? {
+    guard characterIndex != NSNotFound else { return nil }
+
+    if let match = detectedLinks.first(where: { NSLocationInRange(characterIndex, $0.range) }) {
+      return match.url
+    }
+
+    guard characterIndex < attributedString.length else { return nil }
+
+    if let value = attributedString.attribute(.link, at: characterIndex, effectiveRange: nil) {
+      if let url = value as? URL {
+        return url
+      }
+      if let urlString = value as? String, let url = URL(string: urlString) {
+        return url
+      }
+    }
+
+    return nil
+  }
+
+  private func openTextURL(_ url: URL) {
+    if let deepLink = InlineDeepLink(url: url) ?? InlineDeepLink(universalLink: url) {
+      if case let .user(userId) = deepLink {
+        MessageGestureTrace.debug("MessageView.openTextURL messageId=\(message.messageId) action=openInlineUser userId=\(userId)")
+      }
+      Task { @MainActor in
+        await openInlineDeepLink(deepLink)
+      }
+      return
+    }
+    if InlineDeepLink.isSupportedScheme(url.scheme) {
+      if url.host?.lowercased() == "user" {
+        MessageGestureTrace.debug("MessageView.openTextURL messageId=\(message.messageId) action=unresolvedInlineUser")
+      }
+      return
+    }
+    if let fileLink = LocalFileLink(url: url) {
+      MessageGestureTrace.debug("MessageView.openTextURL messageId=\(message.messageId) action=openLocalFile")
+      let sender = fullMessage.from
+      Task { @MainActor in
+        await LocalFileLinkOpener.open(fileLink, from: sender)
+      }
+      return
+    }
+    guard url.scheme != nil else { return }
+
+    log.debug("Link clicked: \(MessageGestureTrace.url(url))")
+    MessageGestureTrace.debug("MessageView.openTextURL messageId=\(message.messageId) action=openExternal url=\(MessageGestureTrace.url(url))")
+    NSWorkspace.shared.open(url)
+  }
+
+  @MainActor private func openInlineDeepLink(_ deepLink: InlineDeepLink) async {
+    switch deepLink {
+    case let .user(id):
+      openChat(peer: .user(id: id))
+    case let .chat(id):
+      if let dependencies {
+        await dependencies.requestOpenChat(chatId: id)
+      } else if let url = deepLink.url() {
+        NSWorkspace.shared.open(url)
+      }
+    case let .message(chatId, messageId):
+      if let dependencies {
+        await dependencies.requestOpenChat(chatId: chatId, targetMessageId: messageId)
+      } else if let url = deepLink.url() {
+        NSWorkspace.shared.open(url)
+      }
+    case .publicSpace, .spaceInvite:
+      if let url = deepLink.url() {
+        NSWorkspace.shared.open(url)
+      }
+    }
+  }
+
+  // MARK: - Initialization
+
+  init(
+    fullMessage: FullMessage,
+    props: MessageViewProps,
+    dependencies: AppDependencies? = nil,
+    isScrolling: Bool = false
+  ) {
+    self.fullMessage = fullMessage
+    self.props = props
+    self.dependencies = dependencies
+    scrollState = isScrolling ? .scrolling : .idle
+    super.init(frame: .zero)
+    setupView()
+  }
+
+  @available(*, unavailable)
+  required init?(coder _: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  // MARK: - Lifecycle
+
+  override func layout() {
+    super.layout()
+    syncContinuousBubbleGradient()
+    layoutAcknowledgement()
+    layoutUploadProgressView()
+  }
+
+  private func layoutAcknowledgement() {
+    guard hasAcknowledgement else {
+      if !acknowledgementView.isAnimatingRemoval {
+        acknowledgementView.isHidden = true
+      }
+      return
+    }
+    acknowledgementView.isHidden = false
+    let content = contentView.convert(contentView.bounds, to: self)
+    let width = min(fullMessage.acknowledgementPillWidth, max(fullMessage.acknowledgementMinimumPillWidth, content.width))
+    let x = content.maxX - MessageSizeCalculator.acknowledgementTrailingInset - width
+    let targetRect = timeAndStateView.convert(timeAndStateView.bounds, to: self)
+    let y = isFlipped
+      ? targetRect.maxY - 16
+      : targetRect.minY
+    acknowledgementView.frame = CGRect(x: x, y: y, width: width, height: 16)
+  }
+
+  override func viewDidMoveToSuperview() {
+    super.viewDidMoveToSuperview()
+    setupBoundsChangeObserver()
+    setupScrollStateObserver()
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.mouseDown messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.mouseDown(with: event)
+  }
+
+  override func mouseUp(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.mouseUp messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.mouseUp(with: event)
+  }
+
+  override func mouseDragged(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.mouseDragged messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.mouseDragged(with: event)
+  }
+
+  override func rightMouseDown(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.rightMouseDown messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.rightMouseDown(with: event)
+  }
+
+  override func rightMouseUp(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.rightMouseUp messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.rightMouseUp(with: event)
+  }
+
+  override func rightMouseDragged(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.rightMouseDragged messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.rightMouseDragged(with: event)
+  }
+
+  override func otherMouseDragged(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.otherMouseDragged messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.otherMouseDragged(with: event)
+  }
+
+  override func otherMouseDown(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.otherMouseDown messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.otherMouseDown(with: event)
+  }
+
+  override func otherMouseUp(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.otherMouseUp messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.otherMouseUp(with: event)
+  }
+
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    let localPoint = convert(point, from: superview)
+    if !isHidden, bounds.contains(localPoint), let result = interactiveHitTestResult(localPoint) {
+      MessageGestureTrace.trace(
+        "MessageView.hitTest messageId=\(message.messageId) point=\(MessageGestureTrace.point(point)) interactive=\(result.name) view=\(type(of: result.view))"
+      )
+      return result.view
+    }
+
+    let hit = super.hitTest(point)
+    MessageGestureTrace.trace(
+      "MessageView.hitTest messageId=\(message.messageId) point=\(MessageGestureTrace.point(point)) superHit=\(String(describing: hit.map { type(of: $0) }))"
+    )
+    return hit
+  }
+
+  // MARK: - Setup
+
+  deinit {
+    NotificationCenter.default.removeObserver(self)
+    if let observer = notificationObserver {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    if let observer = boundsChangeObserver {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    translationStateCancellable?.cancel()
+    messageActionLoadingCancellable?.cancel()
+    messageActionAnsweredCancellable?.cancel()
+  }
+
+  private func setupView() {
+    acknowledgementView.onToggle = { [weak self] in
+      self?.acknowledgeMessage()
+    }
+    acknowledgementView.configure(
+      isAnchorMessage ? fullMessage.withoutAcknowledgements : fullMessage,
+      fallbackRTL: props.isRtl || userInterfaceLayoutDirection == .rightToLeft,
+      action: currentAcknowledgementAction()
+    )
+    // For performance of animations
+    wantsLayer = true
+    layerContentsRedrawPolicy = .onSetNeedsDisplay
+    layer?.drawsAsynchronously = true
+
+    addSubview(bubbleTailView)
+    addSubview(bubbleView)
+    syncBubbleTail()
+
+    if showsInlineAvatar {
+      addSubview(avatarView)
+    }
+
+    if showsName {
+      addSubview(nameLabel)
+      let sender = outgoing ? (dependencies?.rootData?.currentUserInfo?.user ?? from) : from
+      let name = sender.shortDisplayName
+      let nameForInitials = UserAvatar.getNameForInitials(user: sender)
+      // Previous outgoing label behavior, kept as reference for quick revert.
+      // nameLabel.stringValue = outgoing ? "You" : name
+      nameLabel.stringValue = name
+      nameLabel.textColor = NSColor(
+        InitialsCircle.ColorPalette
+          .color(for: nameForInitials)
+      )
+    }
+
+    addSubview(contentView)
+
+    syncForwardHeaderView(for: props)
+
+    if hasReply {
+      contentView.addSubview(replyView)
+    }
+
+    contentView.addSubview(replyThreadSummaryView)
+
+    if hasPhoto {
+      contentView.addSubview(photoView)
+    }
+
+    if hasVideo {
+      contentView.addSubview(videoView)
+    }
+
+    if hasDocument {
+      contentView.addSubview(documentContainerView)
+      syncDocumentSlotView()
+    }
+
+    syncTextViewForCurrentProps()
+
+    syncMessageActionRowsView(message: fullMessage, props: props)
+    syncUploadProgressView(props: props)
+
+    if hasReactions {
+      setupReactions(animate: false)
+    }
+
+    if hasAttachments {
+      attachmentsView = createAttachmentsView()
+      contentView.addSubview(attachmentsView!)
+    }
+
+    updateReplyThreadSummaryView(for: props)
+
+    addSubview(timeAndStateView)
+    addSubview(acknowledgementView, positioned: .above, relativeTo: nil)
+
+    setupMessageText()
+    setupContextMenu()
+    setupGestureRecognizers()
+
+    // Setup translation state observation
+    setupTranslationStateObservation()
+  }
+
+  private func setupTranslationStateObservation() {
+    guard AppSettings.shared.translationUIEnabled else {
+      translationStateCancellable?.cancel()
+      translationStateCancellable = nil
+      updateShineEffect(isTranslating: false)
+      return
+    }
+
+    translationStateCancellable = TranslatingStatePublisher.shared.publisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] translatingSet in
+        guard let self else { return }
+        let isTranslating = translatingSet.contains(
+          TranslatingStatePublisher.TranslatingStateHolder.Translating(
+            messageId: message.messageId,
+            peerId: message.peerId
+          )
+        )
+        updateShineEffect(isTranslating: isTranslating)
+      }
+  }
+
+  private func setupEntityClickHandling() {
+    guard let messageTextView = textView as? MessageTextView else {
+      MessageGestureTrace.debug("MessageView.setupEntityClickHandling messageId=\(message.messageId) result=noMessageTextView")
+      return
+    }
+    // Keep entity ownership in the message view, but start from NSTextView's
+    // mouseDown because recognizers attached to text views can be swallowed.
+    messageTextView.onEntityClick = { [weak self] location, event in
+      self?.handleEntityClick(at: location, event: event) ?? false
+    }
+    messageTextView.onTextLongPress = { [weak self] location, event in
+      self?.handleTextLongPress(at: location, event: event)
+    }
+    MessageGestureTrace.debug("MessageView.setupEntityClickHandling messageId=\(message.messageId) mode=mouseDownCallback")
+  }
+
+  private func syncTextViewForCurrentProps() {
+    if hasText {
+      if textView.superview == nil {
+        contentView.addSubview(textView)
+        MessageGestureTrace.debug("MessageView.syncTextView messageId=\(message.messageId) action=attachTextView")
+      }
+      if let messageTextView = textView as? MessageTextView {
+        if messageTextView.onEntityClick == nil {
+          setupEntityClickHandling()
+        }
+      } else {
+        setupEntityClickHandling()
+      }
+      return
+    }
+
+    guard textView.superview != nil else { return }
+    MessageGestureTrace.debug("MessageView.syncTextView messageId=\(message.messageId) action=detachTextView")
+    (textView as? MessageTextView)?.onEntityClick = nil
+    (textView as? MessageTextView)?.onTextLongPress = nil
+    textView.removeFromSuperview()
+    clearTextViewConstraints()
+    detectedLinks = []
+  }
+
+  private func clearTextViewConstraints() {
+    NSLayoutConstraint.deactivate([
+      textViewWidthConstraint,
+      textViewHeightConstraint,
+      textViewTopConstraint,
+      textViewLeadingConstraint,
+    ].compactMap(\.self))
+    textViewWidthConstraint = nil
+    textViewHeightConstraint = nil
+    textViewTopConstraint = nil
+    textViewLeadingConstraint = nil
+  }
+
+  @discardableResult
+  private func handleEntityClick(at location: NSPoint, event: NSEvent? = nil) -> Bool {
+    if let event, handledEntityClickEventNumber == event.eventNumber {
+      MessageGestureTrace.debug(
+        "MessageView.handleEntityClick messageId=\(message.messageId) point=\(MessageGestureTrace.point(location)) result=alreadyHandled eventNumber=\(event.eventNumber)"
+      )
+      return true
+    }
+
+    guard let hit = textEntityHit(at: location) else {
+      MessageGestureTrace.debug(
+        "MessageView.handleEntityClick messageId=\(message.messageId) point=\(MessageGestureTrace.point(location)) result=noHit"
+      )
+      return false
+    }
+    let handled = handleTextEntityClick(hit, attributedString: textView.attributedString())
+    if handled, let event {
+      handledEntityClickEventNumber = event.eventNumber
+    }
+    MessageGestureTrace.debug(
+      "MessageView.handleEntityClick messageId=\(message.messageId) point=\(MessageGestureTrace.point(location)) hit=\(hit) handled=\(handled)"
+    )
+    return handled
+  }
+
+  @discardableResult
+  private func handleTextEntityClick(
+    _ hit: MessageTextEntityHit,
+    attributedString: NSAttributedString
+  ) -> Bool {
+    switch hit {
+    case let .codeBlock(codeRange):
+      let codeText = (attributedString.string as NSString).substring(with: codeRange)
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(codeText, forType: .string)
+      ToastCenter.shared.showSuccess("Copied code")
+      performProgressiveHaptic()
+      MessageGestureTrace.debug(
+        "MessageView.handleTextEntityClick messageId=\(message.messageId) action=copyCodeBlock range=\(MessageGestureTrace.range(codeRange))"
+      )
+      return true
+
+    case let .inlineCode(inlineCodeRange):
+      let inlineCodeText = (attributedString.string as NSString).substring(with: inlineCodeRange)
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(inlineCodeText, forType: .string)
+      ToastCenter.shared.showSuccess("Copied code")
+      performProgressiveHaptic()
+      MessageGestureTrace.debug(
+        "MessageView.handleTextEntityClick messageId=\(message.messageId) action=copyInlineCode range=\(MessageGestureTrace.range(inlineCodeRange))"
+      )
+      return true
+
+    case let .text(range):
+      let characterIndex = range.location
+      guard characterIndex != NSNotFound, characterIndex < attributedString.length else {
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=none reason=badCharacterIndex range=\(MessageGestureTrace.range(range))"
+        )
+        return false
+      }
+
+      if let userId = attributedString.attribute(.mentionUserId, at: characterIndex, effectiveRange: nil) as? Int64 {
+        if let agentId = attributedString.attribute(.mentionAgentId, at: characterIndex, effectiveRange: nil) as? Int64 {
+          MessageGestureTrace.debug(
+            "MessageView.handleTextEntityClick messageId=\(message.messageId) action=resolveAgent agentId=\(agentId) range=\(MessageGestureTrace.range(range))"
+          )
+          Task { @MainActor in
+            guard !(await BotAgentMentionNavigator.open(
+              agentId: agentId,
+              botUserId: userId,
+              peer: message.peerId
+            )) else { return }
+            openChat(peer: .user(id: userId))
+          }
+          return true
+        }
+        Task { @MainActor in
+          openChat(peer: .user(id: userId))
+        }
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=openMention userId=\(userId) range=\(MessageGestureTrace.range(range))"
+        )
+        return true
+      }
+
+      if let groupId = attributedString.attribute(.mentionGroupId, at: characterIndex, effectiveRange: nil) as? Int64 {
+        NotificationCenter.default.post(
+          name: .userGroupMentionTapped,
+          object: nil,
+          userInfo: ["target": UserGroupMentionTarget(groupId: groupId, spaceId: messageSpaceId())]
+        )
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=openGroupMention groupId=\(groupId) range=\(MessageGestureTrace.range(range))"
+        )
+        return true
+      }
+
+      if let threadTarget = attributedString.attribute(.threadLink, at: characterIndex, effectiveRange: nil)
+        as? ThreadLinkTarget
+      {
+        openThreadLink(threadTarget)
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=openThreadLink range=\(MessageGestureTrace.range(range))"
+        )
+        return true
+      }
+
+      var commandRange = NSRange(location: 0, length: 0)
+      if let command = attributedString.attribute(.botCommand, at: characterIndex, effectiveRange: &commandRange) as? String,
+         commandRange.length > 0
+      {
+        let commandText = command.isEmpty
+          ? (attributedString.string as NSString).substring(with: commandRange)
+          : command
+        sendBotCommand(commandText)
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=sendBotCommand range=\(MessageGestureTrace.range(commandRange))"
+        )
+        return true
+      }
+
+      if let email = attributedString.attribute(.emailAddress, at: characterIndex, effectiveRange: nil) as? String {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(email, forType: .string)
+        ToastCenter.shared.showSuccess("Copied email")
+        performProgressiveHaptic()
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=copyEmail range=\(MessageGestureTrace.range(range))"
+        )
+        return true
+      }
+
+      if let phoneNumber = attributedString
+        .attribute(.phoneNumber, at: characterIndex, effectiveRange: nil) as? String
+      {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(phoneNumber, forType: .string)
+        ToastCenter.shared.showSuccess("Copied number")
+        performProgressiveHaptic()
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=copyPhone range=\(MessageGestureTrace.range(range))"
+        )
+        return true
+      }
+
+      guard let url = linkURL(at: characterIndex, in: attributedString) else {
+        MessageGestureTrace.debug(
+          "MessageView.handleTextEntityClick messageId=\(message.messageId) action=none reason=noURL range=\(MessageGestureTrace.range(range))"
+        )
+        return false
+      }
+      openTextURL(url)
+      MessageGestureTrace.debug(
+        "MessageView.handleTextEntityClick messageId=\(message.messageId) action=openURL range=\(MessageGestureTrace.range(range)) url=\(MessageGestureTrace.url(url))"
+      )
+      return true
+    }
+  }
+
+  private func sendBotCommand(_ command: String) {
+    Task {
+      do {
+        try await Api.realtime.send(.sendMessage(
+          text: command,
+          peerId: message.peerId,
+          chatId: message.chatId,
+          replyToMsgId: nil,
+          isSticker: nil,
+          entities: botCommandEntities(for: command)
+        ))
+      } catch {
+        ToastCenter.shared.showError("Failed to send command")
+      }
+    }
+  }
+
+  private func botCommandEntities(for command: String) -> MessageEntities {
+    var entity = MessageEntity()
+    entity.type = .botCommand
+    entity.offset = 0
+    entity.length = Int64((command as NSString).length)
+
+    var entities = MessageEntities()
+    entities.entities = [entity]
+    return entities
+  }
+
+  private func textEntityHit(at location: NSPoint) -> MessageTextEntityHit? {
+    guard let messageTextView = textView as? MessageTextView else { return nil }
+    let hit = messageTextView.entityHit(
+      at: location,
+      extraTextRanges: detectedLinks.map(\.range)
+    )
+    MessageGestureTrace.trace(
+      "MessageView.textEntityHit messageId=\(message.messageId) point=\(MessageGestureTrace.point(location)) hit=\(String(describing: hit))"
+    )
+    return hit
+  }
+
+  private func handleEntityClick(from event: NSEvent, source: String) -> Bool {
+    guard event.type == .leftMouseDown, event.clickCount == 1 else { return false }
+    if handledEntityClickEventNumber == event.eventNumber {
+      MessageGestureTrace.debug(
+        "MessageView.handleEntityClickFromEvent messageId=\(message.messageId) source=\(source) result=alreadyHandled eventNumber=\(event.eventNumber)"
+      )
+      return true
+    }
+
+    guard textView.superview != nil, !textView.isHidden else { return false }
+
+    let locationInSelf = convert(event.locationInWindow, from: nil)
+    let locationInText = textView.convert(locationInSelf, from: self)
+    guard textView.bounds.contains(locationInText) else { return false }
+
+    let handled = handleEntityClick(at: locationInText, event: event)
+    MessageGestureTrace.debug(
+      "MessageView.handleEntityClickFromEvent messageId=\(message.messageId) source=\(source) point=\(MessageGestureTrace.point(locationInText)) handled=\(handled)"
+    )
+    return handled
+  }
+
+  private func isTextEntityPoint(_ locationInSelf: NSPoint) -> Bool {
+    if let richBlockContentView, richBlockContentView.superview != nil, !richBlockContentView.isHidden,
+       let hit = richBlockContentView.interactiveTextHitTest(
+         richBlockContentView.convert(locationInSelf, from: self)
+       ) as? MessageTextView {
+      return hit.entityHit(at: hit.convert(locationInSelf, from: self), extraTextRanges: []) != nil
+    }
+    guard textView.superview != nil, !textView.isHidden else { return false }
+
+    let locationInText = textView.convert(locationInSelf, from: self)
+    guard textView.bounds.contains(locationInText) else { return false }
+
+    return textEntityHit(at: locationInText) != nil
+  }
+
+  private func handleTextLongPress(at location: NSPoint, event: NSEvent) {
+    let locationInSelf = textView.convert(location, to: self)
+    MessageGestureTrace.debug(
+      "MessageView.handleTextLongPress messageId=\(message.messageId) eventNumber=\(event.eventNumber) point=\(MessageGestureTrace.point(locationInSelf))"
+    )
+
+    if let result = interactiveHitTestResult(locationInSelf) {
+      guard let text = result.view as? MessageTextView, text.onTextLongPress != nil else {
+        MessageGestureTrace.debug(
+          "MessageView.handleTextLongPress messageId=\(message.messageId) blocked=interactive target=\(result.name)"
+        )
+        return
+      }
+    }
+
+    if isTextEntityPoint(locationInSelf) {
+      MessageGestureTrace.debug("MessageView.handleTextLongPress messageId=\(message.messageId) blocked=textEntity")
+      return
+    }
+
+    performConfiguredHoldAction(at: locationInSelf, source: "textHold")
+  }
+
+  private func openThreadLink(_ target: ThreadLinkTarget) {
+    if let peer = target.directPeer {
+      openChat(peer: peer)
+      performProgressiveHaptic()
+      return
+    }
+
+    let database = dependencies?.database ?? AppDatabase.shared
+    let currentUserId = dependencies?.auth.getCurrentUserId() ?? Auth.shared.getCurrentUserId()
+    let realtimeV2 = dependencies?.realtimeV2 ?? Api.realtime
+    Task { @MainActor in
+      do {
+        guard let peer = try await ThreadLinkResolver.resolveOrCreate(
+          target,
+          currentUserId: currentUserId,
+          database: database,
+          realtimeV2: realtimeV2
+        ) else {
+          ToastCenter.shared.showError("Thread not found")
+          return
+        }
+
+        openChat(peer: peer)
+        performProgressiveHaptic()
+      } catch ThreadLinkResolver.Error.missingCurrentUser {
+        ToastCenter.shared.showError("You're signed out. Please log in again.")
+      } catch {
+        ToastCenter.shared.showError("Failed to open thread")
+        log.error("Failed to resolve thread link", error: error)
+      }
+    }
+  }
+
+  private func performProgressiveHaptic() {
+    let performer = NSHapticFeedbackManager.defaultPerformer
+    performer.perform(.generic, performanceTime: .default)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+      performer.perform(.levelChange, performanceTime: .default)
+    }
+  }
+
+  private func updateShineEffect(isTranslating: Bool) {
+    if isTranslating {
+      if shineEffectView == nil {
+        let shineView = ShineEffectView(frame: bubbleView.bounds)
+        shineView.translatesAutoresizingMaskIntoConstraints = false
+        bubbleView.addSubview(shineView)
+
+        NSLayoutConstraint.activate([
+          shineView.topAnchor.constraint(equalTo: bubbleView.topAnchor),
+          shineView.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor),
+          shineView.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor),
+          shineView.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor),
+        ])
+
+        shineEffectView = shineView
+        shineView.startAnimation()
+      }
+    } else {
+      shineEffectView?.stopAnimation()
+      shineEffectView?.removeFromSuperview()
+      shineEffectView = nil
+    }
+  }
+
+  // MARK: - Reactions UI
+
+  private func clearReactionsConstraints() {
+    let constraintsToDeactivate = [
+      reactionViewWidthConstraint,
+      reactionViewHeightConstraint,
+      reactionViewTopConstraint,
+      reactionViewLeadingConstraint,
+      reactionViewTrailingConstraint,
+    ].compactMap(\.self)
+    NSLayoutConstraint.deactivate(constraintsToDeactivate)
+
+    reactionViewWidthConstraint = nil
+    reactionViewHeightConstraint = nil
+    reactionViewTopConstraint = nil
+    reactionViewLeadingConstraint = nil
+    reactionViewTrailingConstraint = nil
+  }
+
+  private func setupReactions(animate: Bool) {
+    if let oldView = reactionsView {
+      oldView.removeFromSuperview()
+    }
+    clearReactionsConstraints()
+
+    // View
+    let view = MessageReactionsView()
+    view.update(
+      fullMessage: fullMessage,
+      groups: fullMessage.groupedReactions,
+      layoutItems: props.layout.reactionItems,
+      forceIncomingStyle: reactionsOutsideBubble,
+      transparentOutgoingStyle: shouldUseTransparentOutgoingReactions,
+      animate: animate
+    )
+    view.translatesAutoresizingMaskIntoConstraints = false
+    reactionsView = view
+
+    // debug
+//    let view = NSView()
+//    view.translatesAutoresizingMaskIntoConstraints = false
+//    view.wantsLayer = true
+//    view.layer?.backgroundColor = NSColor.red.cgColor
+//    reactionsView = view
+
+    if hasText, textView.superview != nil {
+      if reactionsOutsideBubble {
+        addSubview(reactionsView!)
+      } else {
+        // Keep reaction chips above the (transparent) NSTextView for reliable hit-testing.
+        // When the textView overlaps the reactions area (even slightly due to layout rounding),
+        // placing reactions "below" makes them appear visible but prevents clicks from reaching them.
+        contentView.addSubview(reactionsView!, positioned: .above, relativeTo: textView)
+      }
+    } else {
+      if reactionsOutsideBubble {
+        addSubview(reactionsView!)
+      } else {
+        contentView.addSubview(reactionsView!)
+      }
+    }
+
+    // Reactions
+    if let reactionsPlan = props.layout.reactions, let reactionsView {
+      reactionViewHeightConstraint = reactionsView.heightAnchor.constraint(
+        equalToConstant: reactionsPlan.size.height
+      )
+      reactionViewWidthConstraint = reactionsView.widthAnchor.constraint(
+        equalToConstant: reactionsPlan.size.width
+      )
+      if reactionsOutsideBubble {
+        reactionViewTopConstraint = reactionsView.topAnchor.constraint(
+          equalTo: (messageActionRowsView?.bottomAnchor ?? bubbleView.bottomAnchor),
+          constant: props.layout.reactionsOutsideBubbleTopInset
+        )
+        if hasAcknowledgement {
+          reactionViewLeadingConstraint = reactionsView.leftAnchor.constraint(
+            equalTo: bubbleView.leftAnchor,
+            constant: reactionsPlan.spacing.left
+          )
+        } else if outgoing {
+          reactionViewTrailingConstraint = reactionsView.trailingAnchor.constraint(
+            equalTo: bubbleView.trailingAnchor,
+            constant: -reactionsPlan.spacing.right
+          )
+        } else {
+          reactionViewLeadingConstraint = reactionsView.leadingAnchor.constraint(
+            equalTo: bubbleView.leadingAnchor,
+            constant: reactionsPlan.spacing.left
+          )
+        }
+      } else {
+        reactionViewTopConstraint = reactionsView.topAnchor.constraint(
+          equalTo: contentView.topAnchor,
+          constant: props.layout.reactionsViewTop
+        )
+        reactionViewLeadingConstraint = reactionsView.leadingAnchor.constraint(
+          equalTo: contentView.leadingAnchor,
+          constant: reactionsPlan.spacing.left
+        )
+      }
+
+      NSLayoutConstraint.activate(
+        [
+          reactionViewHeightConstraint,
+          reactionViewWidthConstraint,
+          reactionViewTopConstraint,
+          reactionViewLeadingConstraint,
+          reactionViewTrailingConstraint,
+        ].compactMap(\.self)
+      )
+    }
+  }
+
+  private func updateReactionsSizes() {
+    reactionsView?.update(
+      fullMessage: fullMessage,
+      groups: fullMessage.groupedReactions,
+      layoutItems: props.layout.reactionItems,
+      forceIncomingStyle: reactionsOutsideBubble,
+      transparentOutgoingStyle: shouldUseTransparentOutgoingReactions,
+      animate: false
+    )
+  }
+
+  private func applyAttachmentsLayout(_ attachments: MessageSizeCalculator.LayoutPlan) {
+    guard let attachmentsView else { return }
+
+    attachmentsView.apply(itemPlans: props.layout.attachmentItems)
+
+    if attachmentsViewTopConstraint == nil ||
+      attachmentsViewLeadingConstraint == nil ||
+      attachmentsViewWidthConstraint == nil ||
+      attachmentsViewHeightConstraint == nil
+    {
+      clearAttachmentsViewConstraints()
+
+      attachmentsViewTopConstraint = attachmentsView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: props.layout.attachmentsContentViewTop
+      )
+      attachmentsViewLeadingConstraint = attachmentsView.leadingAnchor.constraint(
+        equalTo: contentView.leadingAnchor,
+        constant: attachments.spacing.left
+      )
+      attachmentsViewWidthConstraint = attachmentsView.widthAnchor.constraint(equalToConstant: attachments.size.width)
+      attachmentsViewHeightConstraint = attachmentsView.heightAnchor.constraint(equalToConstant: attachments.size.height)
+
+      NSLayoutConstraint.activate([
+        attachmentsViewTopConstraint,
+        attachmentsViewLeadingConstraint,
+        attachmentsViewWidthConstraint,
+        attachmentsViewHeightConstraint,
+      ].compactMap(\.self))
+      return
+    }
+
+    if attachmentsViewTopConstraint?.constant != props.layout.attachmentsContentViewTop {
+      attachmentsViewTopConstraint?.constant = props.layout.attachmentsContentViewTop
+    }
+    if attachmentsViewLeadingConstraint?.constant != attachments.spacing.left {
+      attachmentsViewLeadingConstraint?.constant = attachments.spacing.left
+    }
+    if attachmentsViewWidthConstraint?.constant != attachments.size.width {
+      attachmentsViewWidthConstraint?.constant = attachments.size.width
+    }
+    if attachmentsViewHeightConstraint?.constant != attachments.size.height {
+      attachmentsViewHeightConstraint?.constant = attachments.size.height
+    }
+  }
+
+  private func clearAttachmentsViewConstraints() {
+    NSLayoutConstraint.deactivate([
+      attachmentsViewTopConstraint,
+      attachmentsViewLeadingConstraint,
+      attachmentsViewWidthConstraint,
+      attachmentsViewHeightConstraint,
+    ].compactMap(\.self))
+
+    attachmentsViewTopConstraint = nil
+    attachmentsViewLeadingConstraint = nil
+    attachmentsViewWidthConstraint = nil
+    attachmentsViewHeightConstraint = nil
+  }
+
+  private func clearMessageActionRowsConstraints() {
+    NSLayoutConstraint.deactivate([
+      messageActionRowsWidthConstraint,
+      messageActionRowsHeightConstraint,
+      messageActionRowsTopConstraint,
+      messageActionRowsSideConstraint,
+    ].compactMap(\.self))
+
+    messageActionRowsWidthConstraint = nil
+    messageActionRowsHeightConstraint = nil
+    messageActionRowsTopConstraint = nil
+    messageActionRowsSideConstraint = nil
+  }
+
+  private func updateReactions(prev _: FullMessage, next: FullMessage, props: MessageViewProps) {
+    if reactionsView != nil, next.reactions.count == 0 {
+      log.trace("Removing reactions view")
+      // Remove
+      reactionsView?.removeFromSuperview()
+      reactionsView = nil
+      clearReactionsConstraints()
+      return
+    }
+
+    let shouldPlaceOutside = props.layout.reactionsOutsideBubble
+    if let reactionsView, shouldPlaceOutside != (reactionsView.superview === self) {
+      log.trace("Rebuilding reactions view for placement change")
+      setupReactions(animate: false)
+      needsUpdateConstraints = true
+      layoutSubtreeIfNeeded()
+      return
+    }
+
+    if reactionsView == nil, next.reactions.count > 0 {
+      log.trace("Adding reactions view \(props.layout.reactions)")
+      // Added
+      setupReactions(animate: true)
+      needsUpdateConstraints = true
+      layoutSubtreeIfNeeded()
+    } else {
+      log.trace("Updating reactions view")
+      reactionsView?.update(
+        fullMessage: next,
+        groups: next.groupedReactions,
+        layoutItems: props.layout.reactionItems,
+        forceIncomingStyle: reactionsOutsideBubble,
+        transparentOutgoingStyle: shouldUseTransparentOutgoingReactions,
+        animate: true
+      )
+    }
+  }
+
+  private func setupGestureRecognizers() {
+    // Add long press gesture recognizer
+    longPressGesture = NSPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+    longPressGesture?.minimumPressDuration = 0.5
+    longPressGesture?.allowableMovement = 10
+    longPressGesture?.buttonMask = 1
+    longPressGesture?.delaysPrimaryMouseButtonEvents = false
+    longPressGesture?.delegate = self
+    if let gesture = longPressGesture {
+      addGestureRecognizer(gesture)
+    }
+    MessageGestureTrace.debug("MessageView.setupGestureRecognizers messageId=\(message.messageId) added=longPress")
+
+    // Add double click gesture recognizer
+    doubleClickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleDoubleClick(_:)))
+    doubleClickGesture?.numberOfClicksRequired = 2
+    doubleClickGesture?.buttonMask = 1
+    doubleClickGesture?.delaysPrimaryMouseButtonEvents = false
+    doubleClickGesture?.delegate = self
+    if let gesture = doubleClickGesture {
+      addGestureRecognizer(gesture)
+    }
+    MessageGestureTrace.debug("MessageView.setupGestureRecognizers messageId=\(message.messageId) added=doubleClick")
+
+    if showsInlineAvatar {
+      avatarView.onClick = { [weak self] in
+        if let self {
+          MessageGestureTrace.debug("MessageView.avatarClick messageId=\(self.message.messageId)")
+        }
+        self?.handleAvatarClick()
+      }
+    }
+  }
+
+  @objc private func handleLongPress(_ gesture: NSPressGestureRecognizer) {
+    let location = gesture.location(in: self)
+    MessageGestureTrace.debug(
+      "MessageView.handleLongPress messageId=\(message.messageId) state=\(gesture.state.rawValue) point=\(MessageGestureTrace.point(location))"
+    )
+    if gesture.state == .began {
+      if let result = interactiveHitTestResult(location) {
+        MessageGestureTrace.debug(
+          "MessageView.handleLongPress messageId=\(message.messageId) blocked=interactive target=\(result.name)"
+        )
+        return
+      }
+
+      // Run the configured hold action after interactive hit-testing.
+      performConfiguredHoldAction(at: location, source: "recognizer")
+    }
+  }
+
+  @objc private func handleDoubleClick(_ gesture: NSClickGestureRecognizer) {
+    let location = gesture.location(in: self)
+    MessageGestureTrace.debug(
+      "MessageView.handleDoubleClick messageId=\(message.messageId) state=\(gesture.state.rawValue) point=\(MessageGestureTrace.point(location))"
+    )
+    guard gesture.state == .ended else { return }
+    performConfiguredDoubleClickAction(at: location, source: "recognizer")
+  }
+
+  private func performConfiguredDoubleClickAction(at location: NSPoint, source: String) {
+    performMessageGestureAction(
+      AppSettings.shared.messageDoubleClickAction,
+      at: location,
+      source: "doubleClick.\(source)",
+      blocksText: true
+    )
+  }
+
+  private func performConfiguredHoldAction(at location: NSPoint, source: String) {
+    performMessageGestureAction(
+      AppSettings.shared.messageHoldAction,
+      at: location,
+      source: "hold.\(source)",
+      blocksText: false
+    )
+  }
+
+  private func performMessageGestureAction(
+    _ action: MessageGestureAction,
+    at location: NSPoint,
+    source: String,
+    blocksText: Bool
+  ) {
+    guard action != .none else { return }
+
+    MessageGestureTrace.debug(
+      "MessageView.performMessageGestureAction messageId=\(message.messageId) source=\(source) action=\(action.rawValue) point=\(MessageGestureTrace.point(location))"
+    )
+    if let result = interactiveHitTestResult(location),
+       blocksText || !(result.view is NSTextView)
+    {
+      MessageGestureTrace.debug(
+        "MessageView.performMessageGestureAction messageId=\(message.messageId) source=\(source) blocked=interactive target=\(result.name)"
+      )
+      return
+    }
+
+    if action == .toggleAck, isTextEntityPoint(location) { return }
+
+    if blocksText, isTextPoint(location) {
+      MessageGestureTrace.debug("MessageView.performMessageGestureAction messageId=\(message.messageId) source=\(source) blocked=textPoint")
+      return
+    }
+
+    if action == .reply, (!fullMessage.canReply || isAnchorMessage) {
+      MessageGestureTrace.debug("MessageView.performMessageGestureAction messageId=\(message.messageId) source=\(source) blocked=replyUnavailable")
+      return
+    }
+
+    if action == .toggleAck, currentAcknowledgementAction() == nil {
+      MessageGestureTrace.debug("MessageView.performMessageGestureAction messageId=\(message.messageId) source=\(source) blocked=ackUnavailable")
+      return
+    }
+
+    // Provide haptic feedback only for an action that can run.
+    NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+
+    switch action {
+    case .none:
+      return
+    case .reply:
+      reply()
+    case .reactionsMenu:
+      resetGestureStateForReactionOverlay(source: source)
+      showReactionOverlay()
+    case .toggleAck:
+      acknowledgeMessage()
+    case .toggleHeart, .toggleThumbsUp:
+      guard let emoji = action.reactionEmoji else { return }
+      toggleReaction(AppSettings.shared.preferredEmojiSkinTone.applying(to: emoji), action: action, source: source)
+    }
+  }
+
+  private func currentAcknowledgementAction() -> AcknowledgementAction? {
+    guard !isAnchorMessage else { return nil }
+    let currentUserId = dependencies?.auth.getCurrentUserId() ?? Auth.shared.getCurrentUserId()
+    return fullMessage.acknowledgementAction(currentUserId: currentUserId)
+  }
+
+  @objc private func acknowledgeMessage() {
+    guard let action = currentAcknowledgementAction() else { return }
+    let targetMessage = fullMessage
+    Task { [weak self] in
+      do {
+        try await Api.realtime.send(.acknowledgeMessages(message: targetMessage, action: action))
+      } catch {
+        self?.log.error("Failed to update Ack", error: error)
+        ToastCenter.shared.showError("Could not update Ack")
+      }
+    }
+  }
+
+  private func resetGestureStateForReactionOverlay(source: String) {
+    MessageGestureTrace.debug("MessageView.resetGestureStateForReactionOverlay messageId=\(message.messageId) source=\(source)")
+    DispatchQueue.main.async { [weak self] in
+      self?.longPressGesture?.isEnabled = false
+      self?.longPressGesture?.isEnabled = true
+      self?.doubleClickGesture?.isEnabled = false
+      self?.doubleClickGesture?.isEnabled = true
+    }
+  }
+
+  private func toggleReaction(_ emoji: String, action: MessageGestureAction, source: String) {
+    guard let currentUserId = Auth.shared.getCurrentUserId() else {
+      MessageGestureTrace.debug("MessageView.toggleReaction messageId=\(message.messageId) source=\(source) action=\(action.rawValue) blocked=noCurrentUser")
+      return
+    }
+    let targetMessage = fullMessage.message
+    let weReacted = fullMessage.groupedReactions
+      .first(where: { $0.emoji == emoji })?
+      .reactions
+      .contains(where: { $0.reaction.userId == currentUserId }) ?? false
+
+    if weReacted {
+      MessageGestureTrace.debug("MessageView.toggleReaction messageId=\(message.messageId) source=\(source) action=\(action.rawValue) rpc=deleteReaction")
+      Task(priority: .userInitiated) {
+        do {
+          try await Api.realtime.send(.deleteReaction(
+            emoji: emoji,
+            message: targetMessage,
+          ))
+        } catch {
+          self.log.error("Failed to delete reaction from message gesture", error: error)
+        }
+      }
+    } else {
+      MessageGestureTrace.debug("MessageView.toggleReaction messageId=\(message.messageId) source=\(source) action=\(action.rawValue) rpc=addReaction")
+      Task(priority: .userInitiated) {
+        do {
+          try await Api.realtime.send(.addReaction(
+            emoji: emoji,
+            message: targetMessage,
+          ))
+        } catch {
+          self.log.error("Failed to add reaction from message gesture", error: error)
+        }
+      }
+    }
+  }
+
+  private func handleAvatarClick() {
+    guard !isDM else { return }
+    guard let user = fullMessage.senderInfo?.user else { return }
+
+    Task { @MainActor in
+      openSenderProfile(peer: .user(id: user.id))
+    }
+  }
+
+  private func openSenderProfile(peer: Peer) {
+    guard let dependencies else {
+      Nav.main.open(.chatInfo(peer: peer))
+      return
+    }
+
+    dependencies.openChatInfo(peer: peer)
+  }
+
+  func avatarOverlayItem(in coordinateView: NSView) -> MessageAvatarOverlayItem? {
+    guard usesAvatarOverlay, showsAvatar, let avatar = props.layout.avatar else { return nil }
+
+    let sourceHeight = bounds.height > 0 ? bounds.height : props.layout.totalHeight
+    guard sourceHeight > 0 else { return nil }
+
+    let top = props.layout.wrapper.spacing.top + avatar.spacing.top
+    let sourceY = isFlipped ? top : sourceHeight - top
+    let avatarOrigin = convert(NSPoint(x: avatar.spacing.left, y: sourceY), to: coordinateView)
+    let y = coordinateView.isFlipped ? avatarOrigin.y : avatarOrigin.y - avatar.size.height
+    let frame = NSRect(
+      x: avatarOrigin.x,
+      y: y,
+      width: avatar.size.width,
+      height: avatar.size.height
+    )
+
+    return MessageAvatarOverlayItem(
+      stableId: fullMessage.id,
+      userInfo: fullMessage.senderInfo ?? .deleted,
+      frame: frame,
+      sticky: nil
+    ) { [weak self] in
+      if let self {
+        MessageGestureTrace.debug("MessageView.avatarOverlayClick messageId=\(self.message.messageId)")
+      }
+      self?.handleAvatarClick()
+    }
+  }
+
+  @objc private func handleNameClick() {
+    MessageGestureTrace.debug("MessageView.handleNameClick messageId=\(message.messageId)")
+    handleAvatarClick()
+  }
+
+  @objc private func handleForwardHeaderClick(_: NSClickGestureRecognizer) {
+    guard let forwardedMessageId = message.forwardFromMessageId else {
+      MessageGestureTrace.debug("MessageView.handleForwardHeaderClick messageId=\(message.messageId) result=noForwardedMessageId")
+      return
+    }
+
+    var forwardPeer: Peer?
+    if let peerUserId = message.forwardFromPeerUserId {
+      let currentUserId = Auth.shared.getCurrentUserId()
+      if let senderId = message.forwardFromUserId, senderId != currentUserId {
+        forwardPeer = .user(id: senderId)
+      } else {
+        forwardPeer = .user(id: peerUserId)
+      }
+    } else if let threadId = message.forwardFromPeerThreadId {
+      forwardPeer = .thread(id: threadId)
+    }
+
+    let targetPeer = forwardPeer ?? message.peerId
+
+    if forwardHeaderIsPrivate, targetPeer.isPrivate, targetPeer != message.peerId {
+      MessageGestureTrace.debug("MessageView.handleForwardHeaderClick messageId=\(message.messageId) action=openPrivateForwardPeer")
+      openChat(peer: targetPeer)
+      return
+    }
+
+    if targetPeer == message.peerId {
+      MessageGestureTrace.debug("MessageView.handleForwardHeaderClick messageId=\(message.messageId) action=scrollCurrentPeer")
+      let chatState = ChatsManager.shared.get(for: targetPeer, chatId: message.chatId)
+      chatState.scrollTo(msgId: forwardedMessageId, reason: .forwarded)
+      return
+    }
+
+    MessageGestureTrace.debug("MessageView.handleForwardHeaderClick messageId=\(message.messageId) action=openForwardPeerAndScroll")
+    let database = dependencies?.database ?? AppDatabase.shared
+    let messageId = message.messageId
+    openChat(peer: targetPeer)
+
+    Task { @MainActor in
+      guard let chat = try? await database.reader.read({ db in
+        try Chat.getByPeerId(db: db, peerId: targetPeer)
+      }) else {
+        MessageGestureTrace.debug("MessageView.handleForwardHeaderClick messageId=\(messageId) result=noForwardPeerAccess")
+        ToastCenter.shared.showError("You don't have access to that chat")
+        return
+      }
+
+      let chatState = ChatsManager.shared.get(for: targetPeer, chatId: chat.id)
+      chatState.scrollTo(msgId: forwardedMessageId, reason: .forwarded)
+    }
+  }
+
+  private func setupConstraints() {
+    var constraints: [NSLayoutConstraint] = []
+    let layout = props.layout
+
+    defer {
+      NSLayoutConstraint.activate(constraints)
+    }
+
+    // Note:
+    // There shouldn't be any calculations of sizes or spacing here. All of it must be off-loaded to SizeCalculator
+    // and stored in the layout plan.
+
+    // Content View Top and Bottom Insets
+//    contentView.edgeInsets = NSEdgeInsets(
+//      top: layout.topMostContentTopSpacing,
+//      left: 0,
+//      bottom: layout.bottomMostContentBottomSpacing,
+//      right: 0
+//    )
+
+    if let avatar = layout.avatar, showsInlineAvatar {
+      constraints.append(
+        contentsOf: [
+          avatarView.leadingAnchor
+            .constraint(equalTo: leadingAnchor, constant: avatar.spacing.left),
+          avatarView.topAnchor
+            .constraint(
+              equalTo: topAnchor,
+              constant: avatar.spacing.top + layout.wrapper.spacing.top
+            ),
+          avatarView.widthAnchor.constraint(equalToConstant: avatar.size.width),
+          avatarView.heightAnchor.constraint(equalToConstant: avatar.size.height),
+        ]
+      )
+    }
+
+    if let name = layout.name, showsName {
+      constraints.append(
+        contentsOf: [
+          nameLabel.leadingAnchor
+            .constraint(
+              equalTo: leadingAnchor,
+              constant: layout.nameAndBubbleLeading + name.spacing.left
+            ),
+          nameLabel.topAnchor
+            .constraint(equalTo: topAnchor, constant: layout.wrapper.spacing.top),
+          nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+          nameLabel.heightAnchor
+            .constraint(equalToConstant: name.size.height),
+        ]
+      )
+    }
+
+    // Bubble And Content View
+
+    if layout.hasName {
+      // if we have name, attach bubble to it
+      constraints.append(contentsOf: [
+        bubbleView.topAnchor.constraint(
+          equalTo: nameLabel.bottomAnchor
+        ),
+        contentView.topAnchor.constraint(
+          equalTo: nameLabel.bottomAnchor
+        ),
+      ])
+
+    } else {
+      // otherwise attach to top
+      constraints.append(contentsOf: [
+        bubbleView.topAnchor.constraint(
+          equalTo: topAnchor,
+          constant: layout.wrapper.spacing.top
+        ),
+        contentView.topAnchor.constraint(
+          equalTo: topAnchor,
+          constant: layout.wrapper.spacing.top
+        ),
+      ])
+    }
+
+    bubbleViewHeightConstraint = bubbleView.heightAnchor.constraint(equalToConstant: layout.bubble.size.height)
+    bubbleTailView.bubbleSize = layout.bubble.size
+    bubbleViewWidthConstraint = bubbleView.widthAnchor.constraint(
+      equalToConstant: layout.bubble.size.width
+    )
+    contentViewWidthConstraint = contentView.widthAnchor.constraint(equalToConstant: layout.bubble.size.width)
+    contentViewHeightConstraint = contentView.heightAnchor.constraint(equalToConstant: layout.bubble.size.height)
+
+    let sidePadding = Theme.messageSidePadding
+    let contentLeading = chatHasAvatar ? layout.nameAndBubbleLeading : sidePadding
+
+    // Depending on outgoing or incoming message
+    let contentViewSideAnchor =
+      !outgoing ?
+      contentView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: contentLeading) :
+      contentView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -sidePadding)
+    let bubbleViewSideAnchor =
+      !outgoing ?
+      bubbleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: contentLeading) :
+      bubbleView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -sidePadding)
+    bubbleTailLeadingConstraint = bubbleTailView.trailingAnchor.constraint(
+      equalTo: bubbleView.leadingAnchor,
+      constant: MessageBubbleTailView.bubbleOverlap
+    )
+    bubbleTailTrailingConstraint = bubbleTailView.leadingAnchor.constraint(
+      equalTo: bubbleView.trailingAnchor,
+      constant: -MessageBubbleTailView.bubbleOverlap
+    )
+    syncBubbleTailSideConstraint(bubbleTailSide)
+
+    constraints.append(
+      contentsOf: [
+        bubbleViewHeightConstraint,
+        bubbleViewWidthConstraint,
+        bubbleViewSideAnchor,
+        bubbleTailView.widthAnchor.constraint(equalToConstant: MessageBubbleTailView.size.width),
+        bubbleTailView.heightAnchor.constraint(equalToConstant: MessageBubbleTailView.size.height),
+        bubbleTailView.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: MessageBubbleTailView.bottomOverhang),
+
+        contentViewHeightConstraint,
+        contentViewWidthConstraint,
+        contentViewSideAnchor,
+      ]
+    )
+
+    if let actionsRows = layout.actionsRows, let messageActionRowsView {
+      messageActionRowsWidthConstraint = messageActionRowsView.widthAnchor.constraint(equalToConstant: actionsRows.size.width)
+      messageActionRowsHeightConstraint = messageActionRowsView.heightAnchor.constraint(equalToConstant: actionsRows.size.height)
+      messageActionRowsTopConstraint = messageActionRowsView.topAnchor.constraint(
+        equalTo: bubbleView.bottomAnchor,
+        constant: actionsRows.spacing.top
+      )
+
+      if outgoing {
+        messageActionRowsSideConstraint = messageActionRowsView.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor)
+      } else {
+        messageActionRowsSideConstraint = messageActionRowsView.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor)
+      }
+
+      constraints.append(
+        contentsOf: [
+          messageActionRowsWidthConstraint,
+          messageActionRowsHeightConstraint,
+          messageActionRowsTopConstraint,
+          messageActionRowsSideConstraint,
+        ].compactMap(\.self)
+      )
+    }
+
+    // Text
+
+    if let text = layout.text {
+      textViewWidthConstraint = textView.widthAnchor
+        .constraint(equalToConstant: text.size.width)
+      textViewHeightConstraint = textView.heightAnchor
+        .constraint(equalToConstant: text.size.height)
+      textViewTopConstraint = textView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: layout.textContentViewTop
+      )
+      textViewLeadingConstraint = textView.leadingAnchor.constraint(
+        equalTo: contentView.leadingAnchor,
+        constant: text.spacing.left
+      )
+
+      constraints.append(
+        contentsOf: [
+          textViewHeightConstraint!,
+          textViewWidthConstraint!,
+          textViewTopConstraint!,
+          textViewLeadingConstraint!,
+        ]
+      )
+
+      // TODO: Handle RTL
+    }
+
+    // setupReactions owns and activates reaction constraints.
+
+    // Time
+    if let time = layout.time {
+      let timeWidthConstraint = timeAndStateView.widthAnchor.constraint(
+        equalToConstant: time.size.width
+      )
+      let timeHeightConstraint = timeAndStateView.heightAnchor.constraint(
+        equalToConstant: time.size.height
+      )
+      let timeTrailingConstraint = hasAcknowledgement
+        ? timeAndStateView.rightAnchor.constraint(
+          equalTo: bubbleView.rightAnchor,
+          constant: -time.spacing.right
+        )
+        : timeAndStateView.trailingAnchor.constraint(
+          equalTo: bubbleView.trailingAnchor,
+          constant: -time.spacing.right
+        )
+
+      self.timeViewTrailingConstraint = timeTrailingConstraint
+      constraints.append(contentsOf: [
+        timeWidthConstraint,
+        timeHeightConstraint,
+        timeTrailingConstraint,
+      ])
+
+      if reactionsOutsideBubble, hasAcknowledgement, let reactionsView {
+        timeViewBottomConstraint = timeAndStateView.bottomAnchor.constraint(
+          equalTo: reactionsView.bottomAnchor,
+          constant: -6
+        )
+        constraints.append(timeViewBottomConstraint!)
+      } else if layout.placesTimeAboveReactions {
+        timeViewTopConstraint = timeAndStateView.topAnchor.constraint(
+          equalTo: contentView.topAnchor,
+          constant: layout.timeViewTop
+        )
+        constraints.append(timeViewTopConstraint!)
+      } else {
+        timeViewBottomConstraint = timeAndStateView.bottomAnchor.constraint(
+          equalTo: bubbleView.bottomAnchor,
+          constant: -time.spacing.bottom
+        )
+        constraints.append(timeViewBottomConstraint!)
+      }
+    }
+
+    if let forwardHeader = layout.forwardHeader {
+      forwardHeaderTopConstraint = forwardHeaderLabel.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: forwardHeader.spacing.top
+      )
+      forwardHeaderLeadingConstraint = forwardHeaderLabel.leadingAnchor.constraint(
+        equalTo: contentView.leadingAnchor,
+        constant: forwardHeader.spacing.left
+      )
+      forwardHeaderTrailingConstraint = forwardHeaderLabel.trailingAnchor.constraint(
+        equalTo: contentView.trailingAnchor,
+        constant: -forwardHeader.spacing.right
+      )
+
+      constraints.append(
+        contentsOf: [
+          forwardHeaderLeadingConstraint!,
+          forwardHeaderTrailingConstraint!,
+          forwardHeaderTopConstraint!,
+        ]
+      )
+    }
+
+    if let reply = layout.reply {
+      replyViewTopConstraint = replyView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: layout.replyContentTop
+      )
+
+      constraints.append(
+        contentsOf: [
+          replyView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: reply.spacing.left),
+          replyView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -reply.spacing.right),
+          replyViewTopConstraint!,
+        ]
+      )
+    }
+
+    let replyThreadSummaryLayout = layout.replyThreadSummary
+    let showsReplyThreadSummary = shouldShowReplyThreadSummary(for: props)
+    replyThreadSummaryViewTopConstraint = replyThreadSummaryView.topAnchor.constraint(
+      equalTo: contentView.topAnchor,
+      constant: layout.replyThreadSummaryContentViewTop
+    )
+    replyThreadSummaryViewLeadingConstraint = replyThreadSummaryView.leadingAnchor.constraint(
+      equalTo: contentView.leadingAnchor,
+      constant: replyThreadSummaryLayout?.spacing.left ?? 0
+    )
+    replyThreadSummaryViewTrailingConstraint = replyThreadSummaryView.trailingAnchor.constraint(
+      equalTo: contentView.trailingAnchor,
+      constant: -(replyThreadSummaryLayout?.spacing.right ?? 0)
+    )
+    replyThreadSummaryViewHeightConstraint = replyThreadSummaryView.heightAnchor.constraint(
+      equalToConstant: showsReplyThreadSummary ? (replyThreadSummaryLayout?.size.height ?? 0) : 0
+    )
+    constraints.append(
+      contentsOf: [
+        replyThreadSummaryViewTopConstraint!,
+        replyThreadSummaryViewLeadingConstraint!,
+        replyThreadSummaryViewTrailingConstraint!,
+        replyThreadSummaryViewHeightConstraint!,
+      ]
+    )
+
+    // Document
+    if let document = layout.document {
+      documentViewTopConstraint = documentContainerView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: layout.documentContentViewTop
+      )
+      documentViewHeightConstraint = documentContainerView.heightAnchor.constraint(equalToConstant: document.size.height)
+      documentViewWidthConstraint = documentContainerView.widthAnchor.constraint(equalToConstant: document.size.width)
+
+      constraints.append(
+        contentsOf: [
+          documentViewTopConstraint!,
+          documentViewHeightConstraint!,
+          documentViewWidthConstraint!,
+          documentContainerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: document.spacing.left),
+        ]
+      )
+    }
+
+    // // Attachments
+    // if let attachments = layout.attachments, let attachmentsView {
+    //   attachmentsViewTopConstraint = attachmentsView.topAnchor.constraint(
+    //     equalTo: contentView.topAnchor,
+    //     constant: layout.attachmentsContentViewTop
+    //   )
+
+    //   constraints.append(contentsOf: [
+    //     attachmentsViewTopConstraint!,
+    //     attachmentsView.leadingAnchor.constraint(
+    //       equalTo: contentView.leadingAnchor,
+    //       constant: 0
+    //     ),
+    //     attachmentsView.trailingAnchor.constraint(
+    //       equalTo: contentView.trailingAnchor,
+    //       constant: 0
+    //     ),
+    //   ])
+    // }
+
+    // Photo
+
+    if let photo = layout.photo {
+      photoViewTopConstraint = photoView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: layout.photoContentViewTop
+      )
+      photoViewHeightConstraint = photoView.heightAnchor.constraint(equalToConstant: photo.size.height)
+      photoViewWidthConstraint = photoView.widthAnchor
+        .constraint(equalToConstant: photo.size.width)
+      constraints.append(contentsOf: [
+        photoViewTopConstraint!,
+        photoViewHeightConstraint!,
+        photoViewWidthConstraint!,
+        photoView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: photo.spacing.left),
+      ])
+    }
+
+    // Video
+
+    if let video = layout.video {
+      videoViewTopConstraint = videoView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: layout.videoContentViewTop
+      )
+      videoViewHeightConstraint = videoView.heightAnchor.constraint(equalToConstant: video.size.height)
+      videoViewWidthConstraint = videoView.widthAnchor
+        .constraint(equalToConstant: video.size.width)
+      constraints.append(contentsOf: [
+        videoViewTopConstraint!,
+        videoViewHeightConstraint!,
+        videoViewWidthConstraint!,
+        videoView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: video.spacing.left),
+      ])
+    }
+  }
+
+  // MARK: - Constraints
+
+  private var textViewWidthConstraint: NSLayoutConstraint?
+  private var textViewHeightConstraint: NSLayoutConstraint?
+  private var textViewTopConstraint: NSLayoutConstraint?
+  private var textViewLeadingConstraint: NSLayoutConstraint?
+
+  private var photoViewHeightConstraint: NSLayoutConstraint?
+  private var photoViewWidthConstraint: NSLayoutConstraint?
+  private var photoViewTopConstraint: NSLayoutConstraint?
+
+  private var videoViewHeightConstraint: NSLayoutConstraint?
+  private var videoViewWidthConstraint: NSLayoutConstraint?
+  private var videoViewTopConstraint: NSLayoutConstraint?
+
+  private var replyViewTopConstraint: NSLayoutConstraint?
+  private var replyThreadSummaryViewTopConstraint: NSLayoutConstraint?
+  private var replyThreadSummaryViewLeadingConstraint: NSLayoutConstraint?
+  private var replyThreadSummaryViewTrailingConstraint: NSLayoutConstraint?
+  private var replyThreadSummaryViewHeightConstraint: NSLayoutConstraint?
+  private var forwardHeaderTopConstraint: NSLayoutConstraint?
+  private var forwardHeaderLeadingConstraint: NSLayoutConstraint?
+  private var forwardHeaderTrailingConstraint: NSLayoutConstraint?
+
+  private var documentViewTopConstraint: NSLayoutConstraint?
+  private var documentViewHeightConstraint: NSLayoutConstraint?
+  private var documentViewWidthConstraint: NSLayoutConstraint?
+
+  private var attachmentsViewTopConstraint: NSLayoutConstraint?
+  private var attachmentsViewLeadingConstraint: NSLayoutConstraint?
+  private var attachmentsViewWidthConstraint: NSLayoutConstraint?
+  private var attachmentsViewHeightConstraint: NSLayoutConstraint?
+  private var messageActionRowsWidthConstraint: NSLayoutConstraint?
+  private var messageActionRowsHeightConstraint: NSLayoutConstraint?
+  private var messageActionRowsTopConstraint: NSLayoutConstraint?
+  private var messageActionRowsSideConstraint: NSLayoutConstraint?
+
+  private var reactionViewWidthConstraint: NSLayoutConstraint!
+  private var reactionViewHeightConstraint: NSLayoutConstraint!
+  private var reactionViewTopConstraint: NSLayoutConstraint!
+  private var reactionViewLeadingConstraint: NSLayoutConstraint?
+  private var reactionViewTrailingConstraint: NSLayoutConstraint?
+
+  private var timeViewTopConstraint: NSLayoutConstraint?
+  private var timeViewBottomConstraint: NSLayoutConstraint?
+  private var timeViewTrailingConstraint: NSLayoutConstraint?
+
+  private var contentViewWidthConstraint: NSLayoutConstraint!
+  private var contentViewHeightConstraint: NSLayoutConstraint!
+
+  private var bubbleViewWidthConstraint: NSLayoutConstraint!
+  private var bubbleViewHeightConstraint: NSLayoutConstraint!
+  private var bubbleTailLeadingConstraint: NSLayoutConstraint?
+  private var bubbleTailTrailingConstraint: NSLayoutConstraint?
+
+  private var isInitialUpdateConstraint = true
+
+  override func updateConstraints() {
+    var skipUpdates = false
+    if isInitialUpdateConstraint {
+      setupConstraints()
+      isInitialUpdateConstraint = false
+      super.updateConstraints()
+      skipUpdates = true
+    }
+
+    // Setup/update attachments view constraints
+    if let attachments = props.layout.attachments {
+      applyAttachmentsLayout(attachments)
+    } else {
+      clearAttachmentsViewConstraints()
+    }
+
+    if let actionsRows = props.layout.actionsRows, let messageActionRowsView {
+      let expectedSideAttribute: NSLayoutConstraint.Attribute = outgoing ? .trailing : .leading
+      let hasUnexpectedSideConstraint =
+        messageActionRowsSideConstraint?.firstAttribute != expectedSideAttribute
+
+      if messageActionRowsWidthConstraint == nil
+        || messageActionRowsHeightConstraint == nil
+        || messageActionRowsTopConstraint == nil
+        || messageActionRowsSideConstraint == nil
+        || hasUnexpectedSideConstraint
+      {
+        clearMessageActionRowsConstraints()
+
+        messageActionRowsWidthConstraint = messageActionRowsView.widthAnchor.constraint(
+          equalToConstant: actionsRows.size.width
+        )
+        messageActionRowsHeightConstraint = messageActionRowsView.heightAnchor.constraint(
+          equalToConstant: actionsRows.size.height
+        )
+        messageActionRowsTopConstraint = messageActionRowsView.topAnchor.constraint(
+          equalTo: bubbleView.bottomAnchor,
+          constant: actionsRows.spacing.top
+        )
+
+        if outgoing {
+          messageActionRowsSideConstraint = messageActionRowsView.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor)
+        } else {
+          messageActionRowsSideConstraint = messageActionRowsView.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor)
+        }
+
+        NSLayoutConstraint.activate([
+          messageActionRowsWidthConstraint,
+          messageActionRowsHeightConstraint,
+          messageActionRowsTopConstraint,
+          messageActionRowsSideConstraint,
+        ].compactMap(\.self))
+      }
+    } else {
+      if messageActionRowsWidthConstraint != nil
+        || messageActionRowsHeightConstraint != nil
+        || messageActionRowsTopConstraint != nil
+        || messageActionRowsSideConstraint != nil
+      {
+        clearMessageActionRowsConstraints()
+      }
+    }
+
+    // Initial setup handled the stable constraints. Optional message parts below
+    // still repair their constraints when a reused view gains or loses content.
+    if skipUpdates {
+      return
+    }
+
+    // Text can appear/disappear when a view is reused for a different message.
+    syncTextViewForCurrentProps()
+    if let text = props.layout.text, textView.superview != nil {
+      var constraintsToActivate: [NSLayoutConstraint] = []
+      if textViewWidthConstraint == nil {
+        textViewWidthConstraint = textView.widthAnchor.constraint(equalToConstant: text.size.width)
+        constraintsToActivate.append(textViewWidthConstraint!)
+      }
+      if textViewHeightConstraint == nil {
+        textViewHeightConstraint = textView.heightAnchor.constraint(equalToConstant: text.size.height)
+        constraintsToActivate.append(textViewHeightConstraint!)
+      }
+      if textViewTopConstraint == nil {
+        textViewTopConstraint = textView.topAnchor.constraint(
+          equalTo: contentView.topAnchor,
+          constant: props.layout.textContentViewTop
+        )
+        constraintsToActivate.append(textViewTopConstraint!)
+      }
+      if textViewLeadingConstraint == nil {
+        textViewLeadingConstraint = textView.leadingAnchor.constraint(
+          equalTo: contentView.leadingAnchor,
+          constant: text.spacing.left
+        )
+        constraintsToActivate.append(textViewLeadingConstraint!)
+      }
+      NSLayoutConstraint.activate(constraintsToActivate)
+
+      log.trace("Updating text view constraints for message \(text.size)")
+      if textViewWidthConstraint?.constant != text.size.width {
+        textViewWidthConstraint?.constant = text.size.width
+      }
+
+      if textViewHeightConstraint?.constant != text.size.height {
+        textViewHeightConstraint?.constant = text.size.height
+      }
+
+      if textViewTopConstraint?.constant != props.layout.textContentViewTop {
+        textViewTopConstraint?.constant = props.layout.textContentViewTop
+      }
+
+      if textViewLeadingConstraint?.constant != text.spacing.left {
+        textViewLeadingConstraint?.constant = text.spacing.left
+      }
+    } else {
+      clearTextViewConstraints()
+    }
+
+    if let reply = props.layout.reply,
+       let replyViewTopConstraint
+    {
+      log.trace("Updating reply view constraints for message \(reply.size)")
+      if replyViewTopConstraint.constant != props.layout.replyContentTop {
+        replyViewTopConstraint.constant = props.layout.replyContentTop
+      }
+    }
+
+    if let replyThreadSummaryViewTopConstraint,
+       let replyThreadSummaryViewLeadingConstraint,
+       let replyThreadSummaryViewTrailingConstraint,
+       let replyThreadSummaryViewHeightConstraint
+    {
+      let summaryPlan = props.layout.replyThreadSummary
+      let showSummary = shouldShowReplyThreadSummary(for: props)
+      replyThreadSummaryViewTopConstraint.constant = props.layout.replyThreadSummaryContentViewTop
+      replyThreadSummaryViewLeadingConstraint.constant = summaryPlan?.spacing.left ?? 0
+      replyThreadSummaryViewTrailingConstraint.constant = -(summaryPlan?.spacing.right ?? 0)
+      replyThreadSummaryViewHeightConstraint.constant = showSummary ? (summaryPlan?.size.height ?? 0) : 0
+      replyThreadSummaryView.isHidden = !showSummary
+    }
+
+    if let forwardHeader = props.layout.forwardHeader {
+      if forwardHeaderLabel.superview == nil {
+        contentView.addSubview(forwardHeaderLabel)
+      }
+
+      if forwardHeaderTopConstraint == nil
+        || forwardHeaderLeadingConstraint == nil
+        || forwardHeaderTrailingConstraint == nil
+      {
+        forwardHeaderTopConstraint = forwardHeaderLabel.topAnchor.constraint(
+          equalTo: contentView.topAnchor,
+          constant: forwardHeader.spacing.top
+        )
+        forwardHeaderLeadingConstraint = forwardHeaderLabel.leadingAnchor.constraint(
+          equalTo: contentView.leadingAnchor,
+          constant: forwardHeader.spacing.left
+        )
+        forwardHeaderTrailingConstraint = forwardHeaderLabel.trailingAnchor.constraint(
+          equalTo: contentView.trailingAnchor,
+          constant: -forwardHeader.spacing.right
+        )
+        NSLayoutConstraint.activate([
+          forwardHeaderTopConstraint!,
+          forwardHeaderLeadingConstraint!,
+          forwardHeaderTrailingConstraint!,
+        ])
+      }
+
+      guard let forwardHeaderTopConstraint,
+            let forwardHeaderLeadingConstraint,
+            let forwardHeaderTrailingConstraint
+      else {
+        super.updateConstraints()
+        return
+      }
+
+      log.trace("Updating forward header constraints for message \(forwardHeader.size)")
+      if forwardHeaderTopConstraint.constant != forwardHeader.spacing.top {
+        forwardHeaderTopConstraint.constant = forwardHeader.spacing.top
+      }
+
+      if forwardHeaderLeadingConstraint.constant != forwardHeader.spacing.left {
+        forwardHeaderLeadingConstraint.constant = forwardHeader.spacing.left
+      }
+
+      let trailingConstant = -forwardHeader.spacing.right
+      if forwardHeaderTrailingConstraint.constant != trailingConstant {
+        forwardHeaderTrailingConstraint.constant = trailingConstant
+      }
+    }
+
+    if let photo = props.layout.photo,
+       let photoViewHeightConstraint,
+       let photoViewWidthConstraint,
+       let photoViewTopConstraint
+    {
+      log.trace("Updating photo view constraints for message \(photo.size)")
+      if photoViewHeightConstraint.constant != photo.size.height {
+        photoViewHeightConstraint.constant = photo.size.height
+      }
+
+      if photoViewWidthConstraint.constant != photo.size.width {
+        photoViewWidthConstraint.constant = photo.size.width
+      }
+
+      if photoViewTopConstraint.constant != props.layout.photoContentViewTop {
+        photoViewTopConstraint.constant = props.layout.photoContentViewTop
+      }
+    } else if let photo = props.layout.photo {
+      if photoView.superview == nil {
+        contentView.addSubview(photoView)
+      }
+      photoViewTopConstraint = photoView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: props.layout.photoContentViewTop
+      )
+      photoViewHeightConstraint = photoView.heightAnchor.constraint(equalToConstant: photo.size.height)
+      photoViewWidthConstraint = photoView.widthAnchor.constraint(equalToConstant: photo.size.width)
+      NSLayoutConstraint.activate([
+        photoViewTopConstraint!,
+        photoViewHeightConstraint!,
+        photoViewWidthConstraint!,
+        photoView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: photo.spacing.left),
+      ])
+    }
+
+    if let video = props.layout.video,
+       let videoViewHeightConstraint,
+       let videoViewWidthConstraint,
+       let videoViewTopConstraint
+    {
+      log.trace("Updating video view constraints for message \(video.size)")
+      if videoViewHeightConstraint.constant != video.size.height {
+        videoViewHeightConstraint.constant = video.size.height
+      }
+
+      if videoViewWidthConstraint.constant != video.size.width {
+        videoViewWidthConstraint.constant = video.size.width
+      }
+
+      if videoViewTopConstraint.constant != props.layout.videoContentViewTop {
+        videoViewTopConstraint.constant = props.layout.videoContentViewTop
+      }
+    } else if let video = props.layout.video {
+      // Set up constraints if they didn't exist (e.g. view reused for a different message)
+      if videoView.superview == nil {
+        contentView.addSubview(videoView)
+      }
+      videoViewTopConstraint = videoView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: props.layout.videoContentViewTop
+      )
+      videoViewHeightConstraint = videoView.heightAnchor.constraint(equalToConstant: video.size.height)
+      videoViewWidthConstraint = videoView.widthAnchor.constraint(equalToConstant: video.size.width)
+      NSLayoutConstraint.activate([
+        videoViewTopConstraint!,
+        videoViewHeightConstraint!,
+        videoViewWidthConstraint!,
+        videoView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: video.spacing.left),
+      ])
+    }
+
+    if let document = props.layout.document,
+       let documentViewTopConstraint,
+       let documentViewHeightConstraint,
+       let documentViewWidthConstraint
+    {
+      log.trace("Updating document view constraints for message \(document.size)")
+      let documentTop = props.layout.documentContentViewTop
+      if documentViewTopConstraint.constant != documentTop {
+        documentViewTopConstraint.constant = documentTop
+      }
+      if documentViewHeightConstraint.constant != document.size.height {
+        documentViewHeightConstraint.constant = document.size.height
+      }
+      if documentViewWidthConstraint.constant != document.size.width {
+        documentViewWidthConstraint.constant = document.size.width
+      }
+    } else if let document = props.layout.document {
+      if documentContainerView.superview == nil {
+        contentView.addSubview(documentContainerView)
+      }
+      syncDocumentSlotView()
+      documentViewTopConstraint = documentContainerView.topAnchor.constraint(
+        equalTo: contentView.topAnchor,
+        constant: props.layout.documentContentViewTop
+      )
+      documentViewHeightConstraint = documentContainerView.heightAnchor.constraint(equalToConstant: document.size.height)
+      documentViewWidthConstraint = documentContainerView.widthAnchor.constraint(equalToConstant: document.size.width)
+      NSLayoutConstraint.activate([
+        documentViewTopConstraint!,
+        documentViewHeightConstraint!,
+        documentViewWidthConstraint!,
+        documentContainerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: document.spacing.left),
+      ])
+    }
+
+    if let bubbleViewWidthConstraint,
+       let bubbleViewHeightConstraint,
+       let contentViewWidthConstraint,
+       let contentViewHeightConstraint
+    {
+      let bubble = props.layout.bubble
+      log.trace("Updating bubble view constraints for message \(bubble.size)")
+      bubbleTailView.bubbleSize = bubble.size
+      if bubbleViewWidthConstraint.constant != bubble.size.width {
+        bubbleViewWidthConstraint.constant = bubble.size.width
+      }
+
+      if bubbleViewHeightConstraint.constant != bubble.size.height {
+        bubbleViewHeightConstraint.constant = bubble.size.height
+      }
+
+      if contentViewWidthConstraint.constant != bubble.size.width {
+        contentViewWidthConstraint.constant = bubble.size.width
+      }
+
+      if contentViewHeightConstraint.constant != bubble.size.height {
+        contentViewHeightConstraint.constant = bubble.size.height
+      }
+    }
+
+    if let actionsRows = props.layout.actionsRows,
+       let messageActionRowsWidthConstraint,
+       let messageActionRowsHeightConstraint,
+       let messageActionRowsTopConstraint
+    {
+      if messageActionRowsWidthConstraint.constant != actionsRows.size.width {
+        messageActionRowsWidthConstraint.constant = actionsRows.size.width
+      }
+
+      if messageActionRowsHeightConstraint.constant != actionsRows.size.height {
+        messageActionRowsHeightConstraint.constant = actionsRows.size.height
+      }
+
+      if messageActionRowsTopConstraint.constant != actionsRows.spacing.top {
+        messageActionRowsTopConstraint.constant = actionsRows.spacing.top
+      }
+    }
+
+    // Update reaction constraints
+    if let reactionsPlan = props.layout.reactions,
+       let reactionViewWidthConstraint,
+       let reactionViewHeightConstraint,
+       let existingReactionViewTopConstraint = reactionViewTopConstraint
+    {
+      log.trace("Updating reactions view constraints for message \(reactionsPlan.size)")
+      if reactionViewWidthConstraint.constant != reactionsPlan.size.width {
+        reactionViewWidthConstraint.constant = reactionsPlan.size.width
+      }
+
+      if reactionViewHeightConstraint.constant != reactionsPlan.size.height {
+        reactionViewHeightConstraint.constant = reactionsPlan.size.height
+      }
+
+      let reactionTopConstant = props.layout.reactionsOutsideBubble
+        ? props.layout.reactionsOutsideBubbleTopInset
+        : props.layout.reactionsViewTop
+      if props.layout.reactionsOutsideBubble {
+        existingReactionViewTopConstraint.isActive = false
+        self.reactionViewTopConstraint = reactionsView?.topAnchor.constraint(
+          equalTo: (messageActionRowsView?.bottomAnchor ?? bubbleView.bottomAnchor),
+          constant: reactionTopConstant
+        )
+        self.reactionViewTopConstraint?.isActive = true
+      } else if existingReactionViewTopConstraint.constant != reactionTopConstant {
+        existingReactionViewTopConstraint.constant = reactionTopConstant
+      }
+      if props.layout.reactionsOutsideBubble, hasAcknowledgement {
+        if let reactionViewLeadingConstraint,
+           reactionViewLeadingConstraint.constant != reactionsPlan.spacing.left
+        {
+          reactionViewLeadingConstraint.constant = reactionsPlan.spacing.left
+        }
+      } else if props.layout.reactionsOutsideBubble, outgoing {
+        if let reactionViewTrailingConstraint,
+           reactionViewTrailingConstraint.constant != -reactionsPlan.spacing.right
+        {
+          reactionViewTrailingConstraint.constant = -reactionsPlan.spacing.right
+        }
+      } else {
+        if let reactionViewLeadingConstraint,
+           reactionViewLeadingConstraint.constant != reactionsPlan.spacing.left
+        {
+          reactionViewLeadingConstraint.constant = reactionsPlan.spacing.left
+        }
+      }
+    }
+
+    if let time = props.layout.time {
+      let trailingConstant = -time.spacing.right
+      if timeViewTrailingConstraint?.constant != trailingConstant {
+        timeViewTrailingConstraint?.constant = trailingConstant
+      }
+      if props.layout.placesTimeAboveReactions {
+        if let timeViewTopConstraint {
+          if timeViewTopConstraint.constant != props.layout.timeViewTop {
+            timeViewTopConstraint.constant = props.layout.timeViewTop
+          }
+        } else {
+          timeViewBottomConstraint?.isActive = false
+          timeViewBottomConstraint = nil
+          timeViewTopConstraint = timeAndStateView.topAnchor.constraint(
+            equalTo: contentView.topAnchor,
+            constant: props.layout.timeViewTop
+          )
+          timeViewTopConstraint?.isActive = true
+        }
+      } else {
+        let bottomConstant = reactionsOutsideBubble && hasAcknowledgement
+          ? -6
+          : -time.spacing.bottom
+        if let timeViewBottomConstraint {
+          if timeViewBottomConstraint.constant != bottomConstant {
+            timeViewBottomConstraint.constant = bottomConstant
+          }
+        } else {
+          timeViewTopConstraint?.isActive = false
+          timeViewTopConstraint = nil
+          timeViewBottomConstraint = timeAndStateView.bottomAnchor.constraint(
+            equalTo: bubbleView.bottomAnchor,
+            constant: bottomConstant
+          )
+          timeViewBottomConstraint?.isActive = true
+        }
+      }
+    }
+//    if hasReactions {
+//      for (index, reaction) in reactionItems.enumerated() {
+//        if let constraints = reactionItemConstraints[reaction] {
+//          let newLeadingConstant = CGFloat(index) *
+//            (props.layout.reactionsSize.width + props.layout.reactionsSpacing.left)
+//          if constraints.leading.constant != newLeadingConstant {
+//            constraints.leading.constant = newLeadingConstant
+//          }
+//
+//          if constraints.width.constant != props.layout.reactionsSize.width {
+//            constraints.width.constant = props.layout.reactionsSize.width
+//          }
+//
+//          if constraints.height.constant != props.layout.reactionsSize.height {
+//            constraints.height.constant = props.layout.reactionsSize.height
+//          }
+//        }
+//      }
+//    }
+
+    super.updateConstraints()
+  }
+
+  private func setupMessageText() {
+    guard hasText else { return }
+
+    // Get display text which handles translations
+    // TODO: Instead of using multiple computed properties, we should have do a single check here
+    let translationText = fullMessage.translationText
+    let translationEntities = fullMessage.translationEntities
+    let text = translationText ?? fullMessage.message.text ?? ""
+    let entities = translationEntities ?? fullMessage.message.entities
+    let richBlockPlan = props.layout.richBlockContent
+    let blockContent = richBlockPlan == nil ? nil : fullMessage.leadingReplyQuote?.body ?? fullMessage.message.blockContent
+
+    // Sizing caches the entity projection before view-only link styling. Keep a
+    // separate immutable render entry so rich and flat rows can reuse the exact
+    // attributed string that they display.
+    let renderCacheStyleKey = "\(richTextStyleKey)|links-v1"
+    let attributedString: NSAttributedString
+    if let cached = CacheAttrs.shared.get(
+      message: fullMessage,
+      renderStyle: .bubble,
+      styleKey: renderCacheStyleKey
+    ) {
+      attributedString = cached
+      detectedLinks = LinkDetector.shared.detectLinks(in: cached).map { (range: $0.range, url: $0.url) }
+    } else {
+      let codeBlockBackgroundColor = usesOutgoingBubbleStyle ? nil : textColor.withAlphaComponent(0.05)
+      let inlineCodeBackgroundColor = usesOutgoingBubbleStyle ? nil : textColor.withAlphaComponent(0.06)
+      let processed = ProcessEntities.toAttributedString(
+        text: text,
+        entities: entities,
+        configuration: .init(
+          font: ChatTypography.current.font(sized: props.layout.fontSize),
+          boldWeight: .semibold,
+          monospaceBaseFont: MessageTextConfiguration.monospaceBaseFont,
+          palette: richTextPalette,
+          codeBlockBackgroundColor: codeBlockBackgroundColor,
+          inlineCodeBackgroundColor: inlineCodeBackgroundColor
+        )
+      )
+      let linkMatches = LinkDetector.shared.applyLinkStyling(
+        to: processed,
+        linkColor: linkColor,
+        cursor: NSCursor.pointingHand
+      )
+      detectedLinks = linkMatches.map { (range: $0.range, url: $0.url) }
+      attributedString = NSAttributedString(attributedString: processed)
+      CacheAttrs.shared.set(
+        message: fullMessage,
+        renderStyle: .bubble,
+        styleKey: renderCacheStyleKey,
+        value: attributedString
+      )
+    }
+
+    if let richBlockPlan, let blockContent {
+      let richView = richBlockContentView ?? {
+        let view = RichBlockContentView(frame: .zero)
+        richBlockContentView = view
+        return view
+      }()
+      let wasAttached = richView.superview != nil
+      richView.menu = menu
+      richView.onTextEntityClick = { [weak self] hit, text in
+        self?.handleTextEntityClick(hit, attributedString: text) ?? false
+      }
+      richView.onTextLongPress = { [weak self] event in
+        guard let self else { return }
+        handleTextLongPress(at: textView.convert(event.locationInWindow, from: nil), event: event)
+      }
+      richView.onDisclosureToggle = { [weak self] path, expanded in
+        guard let self else { return }
+        RichBlockMessageActions.toggleDisclosure(
+          path: path,
+          expanded: expanded,
+          message: self.fullMessage.message
+        )
+      }
+      textView.setMessageAttributedString(
+        NSAttributedString(),
+        isRtl: props.isRtl,
+        layoutSize: props.layout.text?.size ?? .zero,
+        useTextKit2: useTextKit2
+      )
+      if richView.superview !== textView {
+        richView.removeFromSuperview()
+        textView.addSubview(richView)
+      }
+      textView.setAccessibilityElement(true)
+      textView.setAccessibilityRole(.group)
+      textView.setAccessibilityChildren([richView])
+      richView.frame = CGRect(origin: .zero, size: richBlockPlan.size)
+      richView.update(
+        plan: richBlockPlan,
+        content: blockContent,
+        attributedText: attributedString,
+        baseFontSize: props.layout.fontSize,
+        palette: richBlockPalette,
+        relatedMessage: fullMessage.message,
+        codePresentation: props.richBlockCodePresentation,
+        renderStyle: .bubble,
+        animated: wasAttached
+      )
+      detectedLinks = []
+      return
+    }
+
+    richBlockContentView?.prepareForReuse()
+    richBlockContentView?.removeFromSuperview()
+    textView.setAccessibilityElement(true)
+    textView.setAccessibilityRole(.textArea)
+    textView.setAccessibilityChildren(nil)
+    textView.setMessageAttributedString(
+      attributedString,
+      isRtl: props.isRtl,
+      layoutSize: props.layout.text?.size ?? .zero,
+      useTextKit2: useTextKit2
+    )
+  }
+
+  func reflectBoundsChange(fraction _: CGFloat) {
+    syncContinuousBubbleGradient()
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    richBlockContentView?.setContentVisible(window != nil)
+
+    setupBoundsChangeObserver()
+    setupScrollStateObserver()
+    syncContinuousBubbleGradient()
+  }
+
+  private func syncContinuousBubbleGradient() {
+    guard props.layout.hasBubbleColor else {
+      bubbleView.clearContinuousGradient()
+      bubbleTailView.clearContinuousGradient()
+      return
+    }
+
+    if let vector = windowGradientVector(for: bubbleView) {
+      bubbleView.updateContinuousGradient(startY: vector.startY, endY: vector.endY)
+    } else {
+      bubbleView.clearContinuousGradient()
+    }
+
+    if bubbleTailSide != .none, let vector = windowGradientVector(for: bubbleTailView) {
+      bubbleTailView.updateContinuousGradient(startY: vector.startY, endY: vector.endY)
+    } else {
+      bubbleTailView.clearContinuousGradient()
+    }
+  }
+
+  private func windowGradientVector(for view: NSView) -> (startY: CGFloat, endY: CGFloat)? {
+    guard let contentView = window?.contentView else { return nil }
+    let windowBounds = contentView.bounds
+    let rect = view.convert(view.bounds, to: contentView).standardized
+    guard windowBounds.height > 1, rect.height > 1 else { return nil }
+
+    let distanceFromWindowTop = contentView.isFlipped
+      ? rect.minY - windowBounds.minY
+      : windowBounds.maxY - rect.maxY
+    return (
+      startY: -distanceFromWindowTop / rect.height,
+      endY: (windowBounds.height - distanceFromWindowTop) / rect.height
+    )
+  }
+
+  private var boundsChangeObserver: NSObjectProtocol?
+
+  private func setupBoundsChangeObserver() {
+    if let observer = boundsChangeObserver {
+      NotificationCenter.default.removeObserver(observer)
+      boundsChangeObserver = nil
+    }
+
+    // Experimental in build 66
+    // Adjust viewport instead of layouting
+    if superview != nil, window != nil, let clipView = enclosingScrollView?.contentView {
+      // Register for both frame and bounds changes
+//      NotificationCenter.default.addObserver(
+//        self,
+//        selector: #selector(handleBoundsChange),
+//        name: NSView.frameDidChangeNotification,
+//        object: enclosingScrollView?.contentView
+//      )
+
+      ////      // Also observe bounds changes
+      boundsChangeObserver = NotificationCenter.default.addObserver(
+        forName: NSView.boundsDidChangeNotification,
+        object: clipView,
+        queue: .main
+      ) { [weak self] notification in
+        self?.handleBoundsChange(notification)
+      }
+
+//      // Observe window resize notifications
+//      NotificationCenter.default.addObserver(
+//        self,
+//        selector: #selector(handleBoundsChange),
+//        name: NSWindow.didResizeNotification,
+//        object: window
+//      )
+    }
+  }
+
+  private var prevWidth: CGFloat = 0
+
+  // Fix a bug that when messages were out of viewport and came back during a live resize
+  // text would not appear until the user ended live resize operation. Seems like in TextKit 2 calling layoutViewport
+  // solves this.
+  // The property `allowsNonContiguousLayout` also seems to fix this issue but it has two other issues:
+  // 1. that forces textkit 1
+  // 2. it adds a scroll jump everytime user resizes the window
+  // which made it unsusable.
+  // This approach still needs further testing.
+  @objc private func handleBoundsChange(_ notification: Notification) {
+    guard let scrollView = enclosingScrollView,
+          let clipView = notification.object as? NSClipView else { return }
+
+    boundsChange(scrollView: scrollView, clipView: clipView)
+  }
+
+  private var prevInViewport = false
+
+  private func boundsChange(scrollView: NSScrollView, clipView: NSClipView) {
+    guard feature_relayoutOnBoundsChange else { return }
+    guard hasText else { return }
+    // guard textView.inLiveResize else { return }
+
+    let visibleRect = scrollView.documentVisibleRect
+    let textViewRect = convert(bounds, to: clipView)
+    let inViewport = visibleRect.insetBy(dx: 0.0, dy: 60.0).intersects(
+      textViewRect
+    )
+
+    if !prevInViewport, inViewport {
+      if textView.inLiveResize, MessageTextConfiguration.useTextKit2ViewportWorkarounds {
+        // Avoid forcing TextKit 2 viewport layout on macOS 27; crash reports show
+        // AppKit throwing from this path during NSTableView row install.
+        textView.textLayoutManager?.textViewportLayoutController.layoutViewport()
+      }
+      log
+        .trace(
+          "Layouting viewport for text view \(message.id)"
+        )
+      prevInViewport = true
+    }
+    if !inViewport {
+      prevInViewport = false
+    }
+  }
+
+  // MARK: - Context Menu
+
+  private func setupContextMenu() {
+    let newMenu = NSMenu()
+    newMenu.delegate = self
+    menu = newMenu
+    if hasDocument {
+      documentContainerView.menu = newMenu
+      if hasVoiceInDocumentSlot {
+        voiceMessageView?.menu = newMenu
+      }
+    }
+  }
+
+  @objc private func addReaction() {
+    focusWindowIfNeeded()
+    // Show reaction overlay
+    showReactionOverlay()
+  }
+
+  @objc private func copyMessage() {
+    guard ExperimentalFeatureFlags.richMessageCopyEditingEnabled else {
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(fullMessage.displayText ?? "", forType: .string)
+      return
+    }
+    MessageTextPasteboard.copy(
+      text: fullMessage.displayText ?? "",
+      entities: fullMessage.translationEntities ?? message.entities
+    )
+  }
+
+  @objc private func copyMessageWithEntities() {
+    struct DebugMessageContent<Entities: Encodable>: Encodable {
+      let text: String?
+      let entities: Entities?
+    }
+
+    let payload = DebugMessageContent(
+      text: fullMessage.translationText ?? message.text,
+      entities: fullMessage.translationEntities ?? message.entities
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+    NSPasteboard.general.clearContents()
+
+    do {
+      let data = try encoder.encode(payload)
+      if let string = String(data: data, encoding: .utf8) {
+        NSPasteboard.general.setString(string, forType: .string)
+      } else {
+        log.error("Failed to encode message debug payload: invalid UTF-8")
+        NSPasteboard.general.setString(fullMessage.displayText ?? "", forType: .string)
+      }
+    } catch {
+      log.error("Failed to encode message debug payload", error: error)
+      NSPasteboard.general.setString(fullMessage.displayText ?? "", forType: .string)
+    }
+  }
+
+  @objc private func copyLinkAddress(_ sender: NSMenuItem) {
+    guard let url = sender.representedObject as? URL else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(url.absoluteString, forType: .string)
+  }
+
+  @objc private func copyMessageLink() {
+    ChatMenuActions.copyMessageLink(
+      chatId: message.chatId,
+      messageId: message.messageId
+    )
+  }
+
+  @objc private func deleteMessage() {
+    if message.status == .failed {
+      let messageId = message.messageId
+      let chatId = message.chatId
+      let peerId = message.peerId
+      Task {
+        _ = try? await AppDatabase.shared.dbWriter.write { db in
+          try Message.deleteMessages(db, messageIds: [messageId], chatId: chatId)
+        }
+        await MainActor.run {
+          MessagesPublisher.shared.messagesDeleted(messageIds: [messageId], peer: peerId)
+        }
+      }
+      return
+    }
+
+    // Delete message
+    Task(priority: .userInitiated) { @MainActor in
+      try await Api.realtime.send(.deleteMessages(
+        messageIds: [message.messageId],
+        peerId: message.peerId,
+        chatId: message.chatId
+      ))
+    }
+  }
+
+  @objc private func pinMessage() {
+    guard !isAnchorMessage else { return }
+    Task(priority: .userInitiated) { @MainActor in
+      let peer = chatPeerId()
+      try await Api.realtime.send(.pinMessage(
+        peer: peer,
+        messageId: message.messageId,
+        unpin: false
+      ))
+    }
+  }
+
+  @objc private func unpinMessage() {
+    guard !isAnchorMessage else { return }
+    Task(priority: .userInitiated) { @MainActor in
+      let peer = chatPeerId()
+      try await Api.realtime.send(.pinMessage(
+        peer: peer,
+        messageId: message.messageId,
+        unpin: true
+      ))
+    }
+  }
+
+  private func chatPeerId() -> Peer {
+    return message.peerId
+  }
+
+  @objc private func reply() {
+    guard !isAnchorMessage else { return }
+    let state = ChatsManager
+      .get(
+        for: fullMessage.peerId,
+        chatId: fullMessage.chatId
+      )
+
+    state.setReplyingToMsgId(fullMessage.message.messageId)
+  }
+
+  /// Selected text in this message, captured when the menu opens. A selection that spans
+  /// rich blocks wins; otherwise the focused text view's own selection is used.
+  private func selectedTextForQuote() -> String? {
+    let selected: String?
+    if let text = richBlockContentView?.multiSurfaceSelectedText {
+      selected = text.string
+    } else if let textView = window?.firstResponder as? NSTextView, textView.isDescendant(of: self),
+              textView.selectedRange().length > 0 {
+      selected = (textView.string as NSString).substring(with: textView.selectedRange())
+    } else {
+      selected = nil
+    }
+    let trimmed = selected?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  @objc private func quoteSelection(_ sender: NSMenuItem) {
+    guard !isAnchorMessage, let quoted = sender.representedObject as? String else { return }
+    ChatsManager
+      .get(for: fullMessage.peerId, chatId: fullMessage.chatId)
+      .quote(MessageMarkdown.quoteLines(quoted), replyingTo: fullMessage.message.messageId)
+  }
+
+  @objc private func replyInThread() {
+    openReplyThreadFlow(
+      source: .menu,
+      action: AppSettings.shared.openReplyThreadsInSidePane ? .sidePane : .current
+    )
+  }
+
+  private func makeReplyThreadSummaryMenu() -> NSMenu {
+    let menu = NSMenu()
+    if !message.isSubthreadPlacement {
+      menu.addItem(replyThreadMenuItem(
+        title: "Open in Side Pane",
+        systemSymbolName: "arrow.turn.down.right",
+        action: #selector(openReplyThreadInSidePaneFromSummaryMenu)
+      ))
+    }
+    menu.addItem(replyThreadMenuItem(
+      title: message.isSubthreadPlacement ? "Open Subthread" : "Open as Chat",
+      systemSymbolName: "arrow.up.left.and.arrow.down.right",
+      action: #selector(openReplyThreadAsChatFromSummaryMenu)
+    ))
+    menu.addItem(replyThreadMenuItem(
+      title: "Copy Link",
+      systemSymbolName: "link",
+      action: #selector(copyReplyThreadLinkFromSummaryMenu)
+    ))
+    menu.addItem(replyThreadMenuItem(
+      title: "Open in Sidebar",
+      systemSymbolName: "sidebar.left",
+      action: #selector(addReplyThreadToInboxFromSummaryMenu)
+    ))
+    if message.isSubthreadPlacement {
+      menu.addItem(.separator())
+      menu.addItem(replyThreadMenuItem(
+        title: "Delete",
+        systemSymbolName: "trash",
+        action: #selector(deleteMessage)
+      ))
+    }
+    return menu
+  }
+
+  private func replyThreadMenuItem(
+    title: String,
+    systemSymbolName: String,
+    action: Selector
+  ) -> NSMenuItem {
+    let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+    item.target = self
+    item.isEnabled = !isAnchorMessage
+    item.image = NSImage(systemSymbolName: systemSymbolName, accessibilityDescription: title)
+    return item
+  }
+
+  @objc private func openReplyThreadInSidePaneFromSummaryMenu() {
+    openReplyThreadFlow(source: .menu, action: .sidePane)
+  }
+
+  @objc private func openReplyThreadAsChatFromSummaryMenu() {
+    openReplyThreadFlow(source: .menu, action: .current)
+  }
+
+  @objc private func copyReplyThreadLinkFromSummaryMenu() {
+    guard !isAnchorMessage else { return }
+
+    Task { @MainActor in
+      do {
+        let peer = try await resolveReplyThreadPeerForMenuAction()
+        guard let url = replyThreadDeepLinkURL(for: peer) else {
+          throw ReplyThreadOpenError.invalidResponse
+        }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
+        ToastCenter.shared.showSuccess("Copied link")
+      } catch {
+        ToastCenter.shared.showError("Failed to copy link")
+        log.error("Failed to copy reply thread link", error: error)
+      }
+    }
+  }
+
+  @objc private func addReplyThreadToInboxFromSummaryMenu() {
+    guard !isAnchorMessage else { return }
+
+    Task { @MainActor in
+      do {
+        guard let dependencies else {
+          throw ReplyThreadOpenError.invalidResponse
+        }
+
+        let peer = try await resolveReplyThreadPeerForMenuAction()
+        ToastCenter.shared.showLoading("Opening in sidebar…")
+
+        _ = try await dependencies.realtimeV2.send(.updateDialogFollowMode(peerId: peer, selection: .following))
+        try await InboxMembershipService.shared.open(peer: peer)
+
+        ToastCenter.shared.dismiss()
+        ToastCenter.shared.showSuccess("Opened in sidebar")
+      } catch {
+        ToastCenter.shared.dismiss()
+        ToastCenter.shared.showError("Couldn’t open in sidebar")
+        log.error("Failed to add reply thread to inbox", error: error)
+      }
+    }
+  }
+
+  @MainActor
+  private func resolveReplyThreadPeerForMenuAction() async throws -> Peer {
+    if let existingPeer = message.replyThreadPeer {
+      return existingPeer
+    }
+
+    guard let dependencies else {
+      throw ReplyThreadOpenError.invalidResponse
+    }
+
+    ToastCenter.shared.showLoading("Creating thread…")
+    defer {
+      ToastCenter.shared.dismiss()
+    }
+
+    let rpcResult = try await dependencies.realtimeV2.send(
+      .createSubthread(
+        parentChatId: message.chatId,
+        parentMessageId: message.messageId
+      )
+    )
+
+    guard case let .createSubthread(response) = rpcResult, response.hasChat else {
+      throw ReplyThreadOpenError.invalidResponse
+    }
+
+    return .thread(id: response.chat.id)
+  }
+
+  private func replyThreadDeepLinkURL(for peer: Peer) -> URL? {
+    switch peer {
+    case let .user(id):
+      InlineDeepLink.user(id: id).url
+    case let .thread(id):
+      InlineDeepLink.chat(id: id).url
+    }
+  }
+
+  private func openReplyThreadFlow(
+    source: ReplyThreadOpenSource,
+    action: ReplyThreadOpenAction
+  ) {
+    guard !isAnchorMessage else { return }
+    let action = message.isSubthreadPlacement ? ReplyThreadOpenAction.current : action
+    if action.usesCurrentWindowPresentation {
+      focusWindowIfNeeded()
+    }
+    let useInlineSpinner =
+      source == .threadSummary
+      && hasReplyThreadSummary
+      && action.usesCurrentWindowPresentation
+
+    if useInlineSpinner {
+      replyThreadSummaryView.setLoading(true)
+    }
+
+    Task { @MainActor in
+      defer {
+        if useInlineSpinner {
+          replyThreadSummaryView.setLoading(false)
+        }
+      }
+
+      guard let dependencies else {
+        ToastCenter.shared.showError("Failed to open thread")
+        return
+      }
+
+      if let existingPeer = message.replyThreadPeer {
+        openReplyThread(peer: existingPeer, dependencies: dependencies, action: action)
+        return
+      }
+
+      if !useInlineSpinner {
+        ToastCenter.shared.showLoading("Creating thread…")
+      }
+
+      do {
+        let rpcResult = try await dependencies.realtimeV2.send(
+          .createSubthread(
+            parentChatId: message.chatId,
+            parentMessageId: message.messageId
+          )
+        )
+
+        guard case let .createSubthread(response) = rpcResult, response.hasChat else {
+          throw ReplyThreadOpenError.invalidResponse
+        }
+
+        let threadPeer: Peer = .thread(id: response.chat.id)
+
+        if !useInlineSpinner {
+          ToastCenter.shared.dismiss()
+        }
+        openReplyThread(peer: threadPeer, dependencies: dependencies, action: action)
+      } catch {
+        if !useInlineSpinner {
+          ToastCenter.shared.dismiss()
+        }
+        ToastCenter.shared.showError("Failed to open thread")
+        log.error("Failed to open reply thread", error: error)
+      }
+    }
+  }
+
+  private func openReplyThread(
+    peer: Peer,
+    dependencies: AppDependencies,
+    action: ReplyThreadOpenAction
+  ) {
+    switch action {
+    case .sidePane:
+      dependencies.openReplyThreadInPane(
+        parentPeer: message.peerId,
+        threadPeer: peer,
+        sourceMessageId: message.messageId
+      )
+    case .current:
+      dependencies.openChatRoute(peer: peer)
+    case .newTab:
+      MainWindowOpenCoordinator.shared.openTab(.chat(peer: peer))
+    }
+  }
+
+  @objc private func selectMessagesForForwarding() {
+    MessageSelectionCoordinator.beginSelection(from: self)
+  }
+
+  @objc private func forwardMessage() {
+    if let forwardMessages = dependencies?.forwardMessages {
+      forwardMessages.present(messages: [fullMessage])
+      return
+    }
+
+    guard let window, let presentingController = window.contentViewController else { return }
+
+    var dismissForwardSheet: (() -> Void)?
+    var sheetClickMonitor: Any?
+    var escapeKeyMonitor: Any?
+    var sheetCloseObserver: Any?
+    var isDismissingForwardSheet = false
+
+    weak var weakHostingController: NSViewController?
+    let rootView = ForwardMessagesSheet(
+      messages: [fullMessage],
+      onSelect: { [weak self] destination, selection in
+        guard let destinationChatId = destination.dialog.chatId ?? destination.chat?.id else {
+          Log.shared.error("Forward nav failed: missing destination chat id")
+          return
+        }
+        let destinationPeer = destination.peerId
+        let state = ChatsManager.get(for: destinationPeer, chatId: destinationChatId)
+        state.setForwardingMessages(
+          fromPeerId: selection.fromPeerId,
+          sourceChatId: selection.sourceChatId,
+          messageIds: selection.messageIds
+        )
+
+        self?.openChat(peer: destinationPeer)
+        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+      },
+      onSend: { [weak self] destinations, selection in
+        guard let self else { return }
+        await self.forwardMessages(destinations: destinations, selection: selection)
+      },
+      onClose: {
+        dismissForwardSheet?()
+      }
+    )
+    .appDatabase(AppDatabase.shared)
+
+    let hostingController = NSHostingController(rootView: AnyView(rootView))
+    weakHostingController = hostingController
+    hostingController.title = "Forward"
+    hostingController.preferredContentSize = NSSize(width: 480, height: 560)
+
+    let cleanupForwardSheetDismissHandlers = {
+      if let monitor = sheetClickMonitor {
+        NSEvent.removeMonitor(monitor)
+        sheetClickMonitor = nil
+      }
+      if let monitor = escapeKeyMonitor {
+        NSEvent.removeMonitor(monitor)
+        escapeKeyMonitor = nil
+      }
+      if let observer = sheetCloseObserver {
+        NotificationCenter.default.removeObserver(observer)
+        sheetCloseObserver = nil
+      }
+    }
+
+    dismissForwardSheet = { [weak presentingController] in
+      guard !isDismissingForwardSheet else { return }
+      isDismissingForwardSheet = true
+      cleanupForwardSheetDismissHandlers()
+      guard let hostingController = weakHostingController else { return }
+      presentingController?.dismiss(hostingController)
+    }
+
+    presentingController.presentAsSheet(hostingController)
+    DispatchQueue.main.async { [weak hostingController] in
+      guard let hostingController, let sheetWindow = hostingController.view.window else { return }
+      sheetWindow.title = "Forward"
+      sheetWindow.styleMask.insert(.closable)
+      sheetWindow.standardWindowButton(.closeButton)?.isHidden = false
+
+      sheetCloseObserver = NotificationCenter.default.addObserver(
+        forName: NSWindow.willCloseNotification,
+        object: sheetWindow,
+        queue: .main
+      ) { _ in
+        cleanupForwardSheetDismissHandlers()
+      }
+
+      sheetClickMonitor = NSEvent.addLocalMonitorForEvents(
+        matching: [.leftMouseDown, .rightMouseDown]
+      ) { event in
+        guard !isDismissingForwardSheet else { return event }
+        if let eventWindow = event.window, eventWindow === sheetWindow {
+          return event
+        }
+        dismissForwardSheet?()
+        return event
+      }
+
+      escapeKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        guard !isDismissingForwardSheet else { return event }
+        guard event.keyCode == 53 else { return event } // Esc
+        dismissForwardSheet?()
+        return nil
+      }
+    }
+  }
+
+  private func openChat(peer: Peer) {
+    guard let dependencies else {
+      Nav.main.open(.chat(peer: peer))
+      return
+    }
+
+    dependencies.requestOpenChat(peer: peer)
+  }
+
+  private func messageSpaceId() -> Int64? {
+    guard message.peerId.isThread else { return nil }
+    if didResolveMessageSpaceId {
+      return resolvedMessageSpaceId
+    }
+    loadMessageSpaceIdIfNeeded()
+    return nil
+  }
+
+  private func loadMessageSpaceIdIfNeeded() {
+    guard message.peerId.isThread, !didResolveMessageSpaceId, !isResolvingMessageSpaceId else {
+      return
+    }
+
+    isResolvingMessageSpaceId = true
+    let database = dependencies?.database ?? AppDatabase.shared
+    let chatId = message.chatId
+    Task { [weak self] in
+      do {
+        let spaceId = try await database.reader.read { db in
+          try Chat.fetchOne(db, id: chatId)?.spaceId
+        }
+        await MainActor.run {
+          guard let self else { return }
+          guard self.message.chatId == chatId else { return }
+          self.resolvedMessageSpaceId = spaceId
+          self.didResolveMessageSpaceId = true
+          self.isResolvingMessageSpaceId = false
+        }
+      } catch {
+        Log.shared.error("Failed to resolve message chat space", error: error)
+        await MainActor.run {
+          guard let self else { return }
+          guard self.message.chatId == chatId else { return }
+          self.isResolvingMessageSpaceId = false
+        }
+      }
+    }
+  }
+
+  private func messageHasLinearAccess() -> Bool {
+    let service = LinearIntegrationService.shared
+
+    if message.peerId.isThread {
+      guard let spaceId = messageSpaceId() else { return false }
+      let connected = service.isConnected(spaceId: spaceId)
+      if connected == nil {
+        service.refresh(spaceId: spaceId)
+      }
+      return connected == true
+    }
+
+    let connected = service.isConnectedAnySpace()
+    if connected == nil {
+      service.refreshAnySpace()
+    }
+    return connected == true
+  }
+
+  @MainActor
+  private func forwardMessages(
+    destinations: [HomeChatItem],
+    selection: ForwardMessagesSheet.ForwardMessagesSelection
+  ) async {
+    guard !destinations.isEmpty else { return }
+    guard !selection.messageIds.isEmpty else {
+      log.error("Forward failed: empty message ids")
+      return
+    }
+
+    for destination in destinations {
+      let destinationPeer = destination.peerId
+      do {
+        let result = try await Api.realtime.send(.forwardMessages(
+          fromPeerId: selection.fromPeerId,
+          toPeerId: destinationPeer,
+          messageIds: selection.messageIds
+        ))
+
+        if case let .forwardMessages(response) = result, response.updates.isEmpty {
+          _ = await Api.realtime.sendQueued(.getChatHistory(peer: destinationPeer))
+        }
+      } catch {
+        log.error("Forward failed", error: error)
+      }
+    }
+
+    ToastCenter.shared.showSuccess("Forwarded to \(destinations.count) chats")
+  }
+
+  @objc private func editMessage() {
+    guard !isAnchorMessage else { return }
+    let state = ChatsManager
+      .get(
+        for: fullMessage.peerId,
+        chatId: fullMessage.chatId
+      )
+
+    state.setEditingMsgId(fullMessage.message.messageId)
+  }
+
+  @objc private func handleWillDo() {
+    guard !isAnchorMessage else { return }
+    guard let window else { return }
+
+    Task { @MainActor in
+      let spaceId: Int64? = if message.peerId.isThread {
+        messageSpaceId()
+      } else {
+        nil
+      }
+
+      await NotionTaskCoordinator.shared.handleWillDo(
+        message: message,
+        spaceId: spaceId,
+        window: window
+      )
+    }
+  }
+
+  @objc private func handleCreateLinearIssue() {
+    guard !isAnchorMessage else { return }
+    guard let window else { return }
+
+    Task { @MainActor in
+      let spaceId: Int64? = if message.peerId.isThread {
+        messageSpaceId()
+      } else {
+        nil
+      }
+      await LinearIssueCoordinator.shared.handleCreateLinearIssue(
+        message: message,
+        spaceId: spaceId,
+        window: window
+      )
+    }
+  }
+
+  @objc private func saveDocument() {
+    guard let documentInfo = fullMessage.documentInfo else { return }
+    guard let window else { return }
+
+    // Get the source file URL
+    let cacheDirectory = FileHelpers.getLocalCacheDirectory(for: .documents)
+    guard let localPath = documentInfo.document.localPath else {
+      Task { @MainActor in
+        ToastCenter.shared.showError("File isn’t available")
+      }
+      return
+    }
+    let sourceURL = cacheDirectory.appendingPathComponent(localPath)
+    guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+      Task { @MainActor in
+        ToastCenter.shared.showError("File isn’t downloaded yet")
+      }
+      return
+    }
+
+    // Get the Downloads directory
+    let fileManager = FileManager.default
+    let downloadsURL = fileManager.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+
+    // Get the filename
+    let fileName = documentInfo.document.fileName ?? "Unknown File"
+
+    // Create a save panel
+    let savePanel = NSSavePanel()
+    savePanel.nameFieldStringValue = fileName
+    savePanel.directoryURL = downloadsURL
+    savePanel.canCreateDirectories = true
+
+    savePanel.beginSheetModal(for: window) { [weak self] response in
+      if response == .OK, let destinationURL = savePanel.url {
+        do {
+          if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
+          }
+          try fileManager.copyItem(at: sourceURL, to: destinationURL)
+          Task { @MainActor in
+            ToastCenter.shared.showSuccess("File saved")
+          }
+          NSWorkspace.shared.activateFileViewerSelecting([destinationURL])
+        } catch {
+          self?.log.error("Error saving document", error: error)
+          Task { @MainActor in
+            ToastCenter.shared.showError("Failed to save file")
+          }
+        }
+      }
+    }
+  }
+
+  @objc private func saveAudio() {
+    VoiceMessageAudioSaver.save(message: message, window: window)
+  }
+
+  override func willOpenMenu(_: NSMenu, with _: NSEvent) {
+    // Apply selection style when menu is about to open
+    layer?.backgroundColor = NSColor.darkGray
+      .withAlphaComponent(0.05).cgColor
+  }
+
+  override func didCloseMenu(_: NSMenu, with _: NSEvent?) {
+    // Remove selection style when menu closes
+    layer?.backgroundColor = nil
+  }
+
+  // MARK: - View Updates
+
+  private func updatePropsAndUpdateLayout(
+    props: MessageViewProps,
+    disableTextRelayout _: Bool = false,
+    animate: Bool = false
+  ) {
+    // update internal props (must update so contentView is recalced)
+    self.props = props
+    syncBubbleTail(animated: animate)
+
+    if textView.textContainer?.size != props.layout.text?.size ?? .zero {
+      log.trace("updating size for text in msg \(message.id)")
+      textView.textContainer?.size = props.layout.text?.size ?? .zero
+    }
+
+    layoutSubtreeIfNeeded()
+
+    needsUpdateConstraints = true
+
+    if animate {
+      // Animate the changes
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0.15
+        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        context.allowsImplicitAnimation = true
+
+        // self.animator().layoutSubtreeIfNeeded()
+        self.layoutSubtreeIfNeeded()
+      } completionHandler: { [weak self] in
+        // Completion block
+        DispatchQueue.main.async {
+          // Avoid forcing TextKit 2 viewport layout on macOS 27; crash reports show
+          // AppKit throwing from this path during NSTableView row install.
+          guard MessageTextConfiguration.useTextKit2ViewportWorkarounds else { return }
+          // Fixes text display issues going blank
+          self?.textView.textLayoutManager?.textViewportLayoutController
+            .layoutViewport()
+        }
+      }
+    }
+  }
+
+  func updateTextAndSize(fullMessage: FullMessage, props: MessageViewProps, animate: Bool = false) {
+    log.trace(
+      "Updating message view content. from: \(self.fullMessage.message.messageId) to: \(fullMessage.message.messageId)"
+    )
+
+    let prev = self.fullMessage
+
+    prevInViewport = false
+
+    // Ensure media views exist before constraint updates when reusing the view
+    if props.layout.photo != nil, photoView.superview == nil {
+      contentView.addSubview(photoView)
+    }
+
+    if props.layout.video != nil, videoView.superview == nil {
+      contentView.addSubview(videoView)
+    }
+
+    // update internal props
+    self.fullMessage = fullMessage
+    acknowledgementView.configure(
+      isAnchorMessage ? fullMessage.withoutAcknowledgements : fullMessage,
+      fallbackRTL: props.isRtl || userInterfaceLayoutDirection == .rightToLeft,
+      action: currentAcknowledgementAction(),
+      animated: animate
+    )
+    needsLayout = true
+    if prev.message.chatId != fullMessage.message.chatId {
+      didResolveMessageSpaceId = false
+      isResolvingMessageSpaceId = false
+      resolvedMessageSpaceId = nil
+    }
+    syncForwardHeaderView(for: props)
+    syncMessageActionRowsView(message: fullMessage, props: props)
+    syncUploadProgressView(props: props)
+
+    if props.layout.document != nil {
+      if documentContainerView.superview == nil {
+        contentView.addSubview(documentContainerView)
+      }
+      syncDocumentSlotView()
+    } else {
+      documentContainerView.removeFromSuperview()
+      documentViewTopConstraint = nil
+      documentViewHeightConstraint = nil
+      documentViewWidthConstraint = nil
+    }
+
+    // Update related message for reply view
+    if props.layout.hasReply {
+      replyView.setRelatedMessage(fullMessage.message)
+      replyView.setStyle(embeddedReplyStyle(for: props))
+      if let embeddedMessage = fullMessage.repliedToMessage {
+        replyView.update(with: embeddedMessage, kind: .replyInMessage, quote: fullMessage.leadingReplyQuote?.text)
+      }
+    }
+    updateReplyThreadSummaryView(for: props)
+
+    // Update props and reflect changes
+    updatePropsAndUpdateLayout(props: props, disableTextRelayout: true, animate: animate)
+
+    // Reactions
+    // TODO: Reactions are not updating as expected
+    updateReactions(prev: prev, next: fullMessage, props: props)
+
+    // Text
+    syncTextViewForCurrentProps()
+    setupMessageText()
+
+    // Update bubble background
+    bubbleView.backgroundColor = bubbleBackgroundColor
+    syncBubbleTail(animated: animate)
+    syncContinuousBubbleGradient()
+
+    syncForwardHeaderView(for: props)
+
+    // Photo
+    if hasPhoto {
+      photoView.update(with: fullMessage)
+    }
+
+    // Video
+    if hasVideo {
+      if videoView.superview == nil {
+        contentView.addSubview(videoView)
+      }
+      videoView.update(with: fullMessage)
+    }
+
+    // Document
+    if hasDocument {
+      syncDocumentSlotView()
+    }
+
+    if hasAttachments {
+      if let attachmentsView {
+        attachmentsView.configure(
+          attachments: fullMessage.attachments,
+          message: fullMessage.message,
+          usesOutgoingBubbleStyle: usesOutgoingBubbleStyle
+        )
+        attachmentsView.apply(itemPlans: props.layout.attachmentItems)
+      } else {
+        attachmentsView = createAttachmentsView()
+        contentView.addSubview(attachmentsView!)
+      }
+    } else {
+      clearAttachmentsViewConstraints()
+      attachmentsView?.removeFromSuperview()
+      attachmentsView = nil
+    }
+
+    // Update time and state
+    timeAndStateView.updateMessage(
+      fullMessage,
+      overlay: isTimeOverlay,
+      usesOutgoingBubbleStyle: usesOutgoingBubbleStyle
+    )
+
+    // Ensure swipe UI is reset if message cannot be replied to
+    if !self.fullMessage.canReply || self.isAnchorMessage {
+      layer?.transform = CATransform3DIdentity
+      swipeAnimationView?.alphaValue = 0
+      isSwipeInProgress = false
+      hasTriggerHapticFeedback = false
+      didReachThreshold = false
+    }
+
+    // Experimental: I wanted to add this for external task attachments when created, but I'm just adding it here.
+    // Force update constraints
+    needsUpdateConstraints = true
+  }
+
+  func updateSize(props: MessageViewProps) {
+    needsLayout = true
+    // update props and reflect changes
+    updatePropsAndUpdateLayout(
+      props: props,
+      // disableTextRelayout: props.layout.singleLine // Quick hack to reduce such re-layouts
+      disableTextRelayout: true
+    )
+
+    if let richBlockPlan = props.layout.richBlockContent,
+       let richBlockContentView
+    {
+      richBlockContentView.frame = CGRect(origin: .zero, size: richBlockPlan.size)
+      richBlockContentView.applyLayout(richBlockPlan, animated: false)
+    }
+
+    if hasVoiceInDocumentSlot {
+      syncDocumentSlotView()
+    }
+
+    // if hasReactions {
+    updateReactionsSizes()
+    // }
+  }
+
+  private func setTimeAndStateVisibility(visible _: Bool) {
+//    NSAnimationContext.runAnimationGroup { context in
+//      context.duration = visible ? 0.05 : 0.05
+//      context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+//      context.allowsImplicitAnimation = true
+//      timeAndStateView.layer?.opacity = visible ? 1 : 0
+//    }
+  }
+
+  // MARK: - Actions
+
+  // ---
+  private var notificationObserver: NSObjectProtocol?
+  private var scrollState: MessageListScrollState = .idle {
+    didSet {
+      if hasPhoto {
+        if scrollState == .idle {
+          photoView.setIsScrolling(false)
+        } else {
+          photoView.setIsScrolling(true)
+        }
+      }
+      if hasVideo {
+        if scrollState == .idle {
+          videoView.setIsScrolling(false)
+        } else {
+          videoView.setIsScrolling(true)
+        }
+      }
+    }
+  }
+
+  private var hoverTrackingArea: NSTrackingArea?
+  private func setupScrollStateObserver() {
+    if let observer = notificationObserver {
+      NotificationCenter.default.removeObserver(observer)
+      notificationObserver = nil
+    }
+
+    guard superview != nil, window != nil, let scrollView = enclosingScrollView else { return }
+    notificationObserver = NotificationCenter.default.addObserver(
+      forName: .messageListScrollStateDidChange,
+      object: scrollView,
+      queue: .main
+    ) { [weak self] notification in
+      guard let state = notification.userInfo?["state"] as? MessageListScrollState else { return }
+      self?.handleScrollStateChange(state)
+    }
+  }
+
+  // MARK: - Swipe to Reply
+
+  // Track swipe state
+  private var isSwipeInProgress = false
+  private var swipeOffset: CGFloat = 0
+  private var swipeDirection = MessageSwipeToReplyDirection.defaultValue
+  private var swipeAnimationView: NSView?
+  private var hasTriggerHapticFeedback = false
+  private var swipeThreshold: CGFloat = 50.0
+  private var didReachThreshold = false
+  private var avatarSwipeProvider: MessageAvatarSwipeProvider?
+  private weak var swipedAvatarOverlayView: NSView?
+
+  func setAvatarSwipeProvider(_ provider: MessageAvatarSwipeProvider?) {
+    avatarSwipeProvider = provider
+  }
+
+  override func scrollWheel(with event: NSEvent) {
+    if richBlockContentView?.consumeNestedHorizontalScroll(event) == true {
+      resetSwipePresentation()
+      return
+    }
+    // Do not allow swipe-to-reply if message cannot be replied to
+    if !fullMessage.canReply || isAnchorMessage {
+      // Ensure UI is reset and pass through
+      resetSwipePresentation()
+      super.scrollWheel(with: event)
+      return
+    }
+    // Only handle horizontal scrolling with two fingers
+    if event.phase == .began, abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
+      // Start of a horizontal scroll
+      isSwipeInProgress = true
+      swipeOffset = 0
+      swipeDirection = AppSettings.shared.messageSwipeToReplyDirection
+      hasTriggerHapticFeedback = false
+      didReachThreshold = false
+      swipedAvatarOverlayView?.layer?.transform = CATransform3DIdentity
+      swipedAvatarOverlayView = avatarSwipeProvider?(self)
+      swipedAvatarOverlayView?.wantsLayer = true
+
+      // Create animation view if needed
+      if swipeAnimationView == nil {
+        swipeAnimationView = createReplyIndicator()
+        addSubview(swipeAnimationView!, positioned: .below, relativeTo: nil)
+        swipeAnimationView?.alphaValue = 0
+      }
+
+      // Position the animation view
+      if let animView = swipeAnimationView {
+        let yPosition = bubbleView.bounds.midY - animView.bounds.height / 2
+        let xPosition = swipeDirection.revealsLeftEdge ? -animView.bounds.width : bounds.width
+        animView.frame.origin = NSPoint(x: xPosition, y: yPosition)
+      }
+    }
+
+    if isSwipeInProgress {
+      swipeOffset += event.scrollingDeltaX
+
+      if swipeDirection.accepts(swipeOffset) {
+        // Calculate swipe progress (0 to 1)
+        let progress = min(1.0, abs(swipeOffset) / swipeThreshold)
+
+        // Update position using layer transform on self
+        let maxOffset: CGFloat = 40.0
+        let offset = swipeDirection.boundedOffset(swipeOffset, maximum: maxOffset)
+
+        // Apply transform to root view layer
+        wantsLayer = true
+        let transform = CATransform3DMakeTranslation(offset, 0, 0)
+        layer?.transform = transform
+        swipedAvatarOverlayView?.layer?.transform = transform
+
+        // Update animation view
+        swipeAnimationView?.alphaValue = progress
+
+        // Track if we've reached the threshold
+        let hasReachedThreshold = abs(swipeOffset) > swipeThreshold
+
+        // Only trigger haptic feedback when first crossing the threshold
+        if hasReachedThreshold, !didReachThreshold {
+          NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+          didReachThreshold = true
+          hasTriggerHapticFeedback = true
+        } else if !hasReachedThreshold, didReachThreshold {
+          // We've moved back below the threshold
+          didReachThreshold = false
+        }
+      } else {
+        // Reset motion opposite the configured reply direction.
+        layer?.transform = CATransform3DIdentity
+        swipedAvatarOverlayView?.layer?.transform = CATransform3DIdentity
+        swipeAnimationView?.alphaValue = 0
+      }
+
+      // End of swipe gesture
+      if event.phase == .ended || event.phase == .cancelled {
+        isSwipeInProgress = false
+
+        // Check if swipe was far enough to trigger reply
+        if abs(swipeOffset) > swipeThreshold, swipeDirection.accepts(swipeOffset) {
+          // Guard again in case state changed mid-gesture
+          guard fullMessage.canReply, !isAnchorMessage else {
+            // Reset and exit
+            NSAnimationContext.runAnimationGroup { context in
+              context.duration = 0.2
+              context.allowsImplicitAnimation = true
+              context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+              self.layer?.transform = CATransform3DIdentity
+              self.swipedAvatarOverlayView?.layer?.transform = CATransform3DIdentity
+              swipeAnimationView?.animator().alphaValue = 0
+            }
+            swipedAvatarOverlayView = nil
+            hasTriggerHapticFeedback = false
+            didReachThreshold = false
+            return
+          }
+          focusWindowIfNeeded()
+          Task(priority: .userInitiated) { @MainActor in self.reply() }
+
+          // Animate back with spring effect
+          NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.3
+            context.allowsImplicitAnimation = true
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.layer?.transform = CATransform3DIdentity
+            self.swipedAvatarOverlayView?.layer?.transform = CATransform3DIdentity
+            swipeAnimationView?.animator().alphaValue = 0
+          }) {}
+        } else {
+          // Not far enough, just animate back
+          NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            context.allowsImplicitAnimation = true
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.layer?.transform = CATransform3DIdentity
+            self.swipedAvatarOverlayView?.layer?.transform = CATransform3DIdentity
+            swipeAnimationView?.animator().alphaValue = 0
+          }
+        }
+
+        // Reset state
+        swipedAvatarOverlayView = nil
+        hasTriggerHapticFeedback = false
+        didReachThreshold = false
+      }
+    } else {
+      // Pass the event to super if we're not handling it
+      super.scrollWheel(with: event)
+    }
+  }
+
+  private func resetSwipePresentation() {
+    layer?.transform = CATransform3DIdentity
+    swipedAvatarOverlayView?.layer?.transform = CATransform3DIdentity
+    swipedAvatarOverlayView = nil
+    swipeAnimationView?.alphaValue = 0
+    isSwipeInProgress = false
+    swipeOffset = 0
+    hasTriggerHapticFeedback = false
+    didReachThreshold = false
+  }
+
+  private func focusWindowIfNeeded() {
+    guard let window else { return }
+    if !NSApplication.shared.isActive {
+      NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+    if !window.isKeyWindow {
+      window.makeKeyAndOrderFront(nil)
+    }
+  }
+
+  private func createReplyIndicator() -> NSView {
+    // Create a smaller indicator (24x24 pixels)
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
+    container.wantsLayer = true
+    container.layer?.cornerRadius = 12
+    container.layer?.backgroundColor = Theme.accentColor.withAlphaComponent(0.2).cgColor
+
+    // Add reply icon (smaller size)
+    let iconView = NSImageView(frame: NSRect(x: 4, y: 4, width: 16, height: 16))
+    if let replyImage = NSImage(systemSymbolName: "arrowshape.turn.up.left.fill", accessibilityDescription: "Reply") {
+      iconView.image = replyImage
+      iconView.contentTintColor = Theme.accentColor
+      container.addSubview(iconView)
+    }
+
+    return container
+  }
+
+  func reset() {
+    resetSwipePresentation()
+
+    // Cancel translation state observation
+    translationStateCancellable?.cancel()
+    translationStateCancellable = nil
+
+    // Remove shine effect
+    shineEffectView?.stopAnimation()
+    shineEffectView?.removeFromSuperview()
+    shineEffectView = nil
+    replyThreadSummaryView.clear()
+
+    // Re-setup translation state observation
+    setupTranslationStateObservation()
+  }
+
+  @objc private func cancelMessage() {
+    PendingMessageCanceller.cancel(fullMessage)
+  }
+
+  @objc private func resendMessage() {
+    let failedMessage = fullMessage
+    Task { @MainActor in
+      do { try await FailedMessageResender.resend(failedMessage) }
+      catch { ToastCenter.shared.showError(error.localizedDescription) }
+    }
+  }
+}
+
+extension MessageViewAppKit: AppThemeRefreshable {
+  func refreshAppTheme() {
+    swipeAnimationView?.removeFromSuperview()
+    swipeAnimationView = nil
+    bubbleView.backgroundColor = bubbleBackgroundColor
+    syncBubbleTail()
+    configureContinuousBubbleGradientLighting()
+    syncContinuousBubbleGradient()
+    setupMessageText()
+  }
+}
+
+// MARK: - Tracking Area & Hover
+
+extension MessageViewAppKit {
+  func setScrollState(_ state: MessageListScrollState) {
+    handleScrollStateChange(state)
+  }
+
+  private func handleScrollStateChange(_ state: MessageListScrollState) {
+    scrollState = state
+    switch state {
+      case .scrolling:
+        // Clear hover state
+        updateHoverState(false)
+      case .idle:
+        break
+        // Re-enable hover state if needed
+        // TODO: How can I check if mouse is inside the view?
+        // addHoverTrackingArea()
+    }
+  }
+
+  var shouldAlwaysShowTimeAndState: Bool {
+    message.status == .sending || message.status == .failed
+  }
+
+  private func updateHoverState(_ isHovered: Bool) {
+    isMouseInside = isHovered
+  }
+
+  func removeHoverTrackingArea() {
+    if let hoverTrackingArea {
+      removeTrackingArea(hoverTrackingArea)
+    }
+  }
+
+  func addHoverTrackingArea() {
+    removeHoverTrackingArea()
+    hoverTrackingArea = NSTrackingArea(
+      rect: .zero,
+      options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+      owner: self,
+      userInfo: nil
+    )
+    addTrackingArea(hoverTrackingArea!)
+  }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+  }
+
+  override func mouseEntered(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.mouseEntered messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.mouseEntered(with: event)
+    guard scrollState == .idle else { return }
+    updateHoverState(true)
+  }
+
+  override func mouseExited(with event: NSEvent) {
+    MessageGestureTrace.trace("MessageView.mouseExited messageId=\(message.messageId) \(MessageGestureTrace.eventDescription(event))")
+    super.mouseExited(with: event)
+    updateHoverState(false)
+  }
+}
+
+// MARK: - NSGestureRecognizerDelegate
+
+extension MessageViewAppKit: NSGestureRecognizerDelegate {
+  func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldAttemptToRecognizeWith event: NSEvent) -> Bool {
+    let result = shouldHandleMessageGesture(gestureRecognizer, event: event)
+    MessageGestureTrace.debug(
+      "MessageView.delegate.shouldAttempt messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) event=\(eventSummary(event)) allow=\(result)"
+    )
+
+    if result,
+       gestureRecognizer === doubleClickGesture,
+       event.type == .leftMouseDown,
+       event.clickCount == 2
+    {
+      // Run the configured double-click action at the second mouse-down boundary. Returning false keeps
+      // the recognizer action fallback from firing a duplicate when it does work.
+      if handledDoubleClickEventNumber == event.eventNumber {
+        MessageGestureTrace.debug(
+          "MessageView.delegate.shouldAttempt messageId=\(message.messageId) recognizer=doubleClick eventNumber=\(event.eventNumber) action=skipDuplicateDoubleClick"
+        )
+        return false
+      }
+
+      handledDoubleClickEventNumber = event.eventNumber
+      let location = convert(event.locationInWindow, from: nil)
+      MessageGestureTrace.debug(
+        "MessageView.delegate.shouldAttempt messageId=\(message.messageId) recognizer=doubleClick eventNumber=\(event.eventNumber) action=handleDoubleClickInDelegate"
+      )
+      performConfiguredDoubleClickAction(at: location, source: "delegate")
+      return false
+    }
+
+    return result
+  }
+
+  private func shouldHandleMessageGesture(_ gestureRecognizer: NSGestureRecognizer, event: NSEvent) -> Bool {
+    let locationInSelf = convert(event.locationInWindow, from: nil)
+
+    if (gestureRecognizer === longPressGesture || gestureRecognizer === doubleClickGesture),
+       event.type != .leftMouseDown
+    {
+      MessageGestureTrace.debug(
+        "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=false reason=nonPrimaryMouse"
+      )
+      return false
+    }
+
+    if gestureRecognizer === longPressGesture, event.clickCount > 1 {
+      MessageGestureTrace.debug(
+        "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=false reason=multiClick"
+      )
+      return false
+    }
+
+    if gestureRecognizer === longPressGesture, isTextViewPoint(locationInSelf) {
+      MessageGestureTrace.debug(
+        "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=false reason=textHoldFallback"
+      )
+      return false
+    }
+
+    if gestureRecognizer === longPressGesture, isTextEntityPoint(locationInSelf) {
+      MessageGestureTrace.debug(
+        "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=false reason=textEntity"
+      )
+      return false
+    }
+
+    if gestureRecognizer === doubleClickGesture {
+      if isTextEntityPoint(locationInSelf) { return false }
+      if handleEntityClick(from: event, source: recognizerName(gestureRecognizer)) {
+        MessageGestureTrace.debug(
+          "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=false reason=entityClick"
+        )
+        return false
+      }
+
+      // Preserve native word selection for every configured action, including Ack.
+      if isTextPoint(locationInSelf) {
+        MessageGestureTrace.debug(
+          "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=false reason=textPoint"
+        )
+        return false
+      }
+    }
+
+    if let result = interactiveHitTestResult(locationInSelf) {
+      MessageGestureTrace.debug(
+        "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=false reason=interactive target=\(result.name)"
+      )
+      return false
+    }
+
+    MessageGestureTrace.debug(
+      "MessageView.shouldHandleGesture messageId=\(message.messageId) recognizer=\(recognizerName(gestureRecognizer)) point=\(MessageGestureTrace.point(locationInSelf)) allow=true"
+    )
+    return true
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: NSGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+  ) -> Bool {
+    let allow = (gestureRecognizer === longPressGesture && otherGestureRecognizer === doubleClickGesture)
+      || (gestureRecognizer === doubleClickGesture && otherGestureRecognizer === longPressGesture)
+    MessageGestureTrace.debug(
+      "MessageView.delegate.simultaneous messageId=\(message.messageId) lhs=\(recognizerName(gestureRecognizer)) rhs=\(recognizerName(otherGestureRecognizer)) allow=\(allow)"
+    )
+    return allow
+  }
+
+  private struct InteractiveHitResult {
+    let name: String
+    let view: NSView
+  }
+
+  private func interactiveHitTestResult(_ point: NSPoint) -> InteractiveHitResult? {
+    if let richBlockContentView, richBlockContentView.superview != nil, !richBlockContentView.isHidden,
+       let hit = richBlockContentView.interactiveImageHitTest(richBlockContentView.convert(point, from: self))
+    {
+      return InteractiveHitResult(name: "richImage", view: hit)
+    }
+
+    if let richBlockContentView, richBlockContentView.superview != nil,
+       let hit = richBlockContentView.interactiveTextHitTest(richBlockContentView.convert(point, from: self)) {
+      return InteractiveHitResult(name: "rich-text", view: hit)
+    }
+
+    if let reactionsView {
+      let locationInReactions = reactionsView.convert(point, from: self)
+      if let hit = reactionsView.interactiveHitTest(locationInReactions) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=reactions point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(locationInReactions)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "reactions", view: hit)
+      }
+    }
+
+    if let messageActionRowsView {
+      let pointInActions = messageActionRowsView.convert(point, from: self)
+      if let hit = messageActionRowsView.hitTest(pointInActions) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=actions point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInActions)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "actions", view: hit)
+      }
+    }
+
+    if let attachmentsView, attachmentsView.superview != nil, !attachmentsView.isHidden {
+      let pointInAttachments = attachmentsView.convert(point, from: self)
+      if let hit = attachmentsView.interactiveHitTest(pointInAttachments) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=attachments point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInAttachments)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "attachments", view: hit)
+      }
+    }
+
+    if hasPhoto, photoView.superview != nil, !photoView.isHidden {
+      let pointInPhoto = photoView.convert(point, from: self)
+      if let hit = photoView.hitTest(pointInPhoto) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=photo point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInPhoto)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "photo", view: hit)
+      }
+    }
+
+    if hasVideo, videoView.superview != nil, !videoView.isHidden {
+      let pointInVideo = videoView.convert(point, from: self)
+      if let hit = videoView.hitTest(pointInVideo) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=video point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInVideo)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "video", view: hit)
+      }
+    }
+
+    if hasDocument, documentContainerView.superview != nil, !documentContainerView.isHidden {
+      let pointInDocument = documentContainerView.convert(point, from: self)
+      if let hit = documentContainerView.hitTest(pointInDocument) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=document point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInDocument)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "document", view: hit)
+      }
+    }
+
+    if hasReply, replyView.superview != nil, !replyView.isHidden {
+      let pointInReply = replyView.convert(point, from: self)
+      if let hit = replyView.hitTest(pointInReply) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=reply point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInReply)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "reply", view: hit)
+      }
+    }
+
+    if shouldShowReplyThreadSummary(for: props),
+       replyThreadSummaryView.superview != nil,
+       !replyThreadSummaryView.isHidden {
+      let pointInSummary = replyThreadSummaryView.convert(point, from: self)
+      // The summary is one control: its title, avatars, reply count, and padding
+      // should all open the thread. `pointInSummary` is already in local
+      // coordinates, so test it against bounds instead of passing it to AppKit's
+      // `hitTest`, which expects a point in the receiver's superview.
+      if replyThreadSummaryView.bounds.contains(pointInSummary) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=replyThreadSummary point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInSummary)) hit=\(type(of: replyThreadSummaryView))"
+        )
+        return InteractiveHitResult(name: "replyThreadSummary", view: replyThreadSummaryView)
+      }
+    }
+
+    if showsInlineAvatar, avatarView.superview != nil {
+      let pointInAvatar = avatarView.convert(point, from: self)
+      if let hit = avatarView.hitTest(pointInAvatar) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=avatar point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInAvatar)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "avatar", view: hit)
+      }
+    }
+
+    if showsName, nameLabel.superview != nil {
+      let pointInName = nameLabel.convert(point, from: self)
+      if let hit = nameLabel.hitTest(pointInName) {
+        MessageGestureTrace.trace(
+          "MessageView.interactiveHitTest messageId=\(message.messageId) target=name point=\(MessageGestureTrace.point(point)) local=\(MessageGestureTrace.point(pointInName)) hit=\(type(of: hit))"
+        )
+        return InteractiveHitResult(name: "name", view: hit)
+      }
+    }
+
+    MessageGestureTrace.trace(
+      "MessageView.interactiveHitTest messageId=\(message.messageId) point=\(MessageGestureTrace.point(point)) target=nil"
+    )
+    return nil
+  }
+
+  private func isTextViewPoint(_ point: NSPoint) -> Bool {
+    guard textView.superview != nil, !textView.isHidden else { return false }
+    return textView.bounds.contains(textView.convert(point, from: self))
+  }
+
+  private func isTextPoint(_ point: NSPoint) -> Bool {
+    guard textView.superview != nil, !textView.isHidden else {
+      MessageGestureTrace.trace("MessageView.isTextPoint messageId=\(message.messageId) point=\(MessageGestureTrace.point(point)) result=false reason=noTextView")
+      return false
+    }
+
+    let pointInText = textView.convert(point, from: self)
+    guard textView.bounds.contains(pointInText) else {
+      MessageGestureTrace.trace(
+        "MessageView.isTextPoint messageId=\(message.messageId) point=\(MessageGestureTrace.point(point)) textPoint=\(MessageGestureTrace.point(pointInText)) result=false reason=outOfBounds"
+      )
+      return false
+    }
+
+    guard let messageTextView = textView as? MessageTextView else {
+      MessageGestureTrace.trace(
+        "MessageView.isTextPoint messageId=\(message.messageId) point=\(MessageGestureTrace.point(point)) textPoint=\(MessageGestureTrace.point(pointInText)) result=true reason=plainTextView"
+      )
+      return true
+    }
+
+    let codeRange = messageTextView.codeBlockRange(at: pointInText)
+    let inlineRange = messageTextView.inlineCodeRange(at: pointInText)
+    let renderedText = messageTextView.renderedTextContains(pointInText)
+    let result = codeRange != nil || inlineRange != nil || renderedText
+    MessageGestureTrace.trace(
+      "MessageView.isTextPoint messageId=\(message.messageId) point=\(MessageGestureTrace.point(point)) textPoint=\(MessageGestureTrace.point(pointInText)) result=\(result) code=\(MessageGestureTrace.range(codeRange)) inline=\(MessageGestureTrace.range(inlineRange)) rendered=\(renderedText)"
+    )
+    return result
+  }
+
+  private func recognizerName(_ gestureRecognizer: NSGestureRecognizer) -> String {
+    if gestureRecognizer === longPressGesture { return "longPress" }
+    if gestureRecognizer === doubleClickGesture { return "doubleClick" }
+    return String(describing: type(of: gestureRecognizer))
+  }
+
+  private func eventSummary(_ event: NSEvent) -> String {
+    let point = convert(event.locationInWindow, from: nil)
+    return "\(MessageGestureTrace.eventDescription(event)) local=\(MessageGestureTrace.point(point))"
+  }
+}
+
+// MARK: - NSTextViewDelegate
+
+extension MessageViewAppKit: NSTextViewDelegate, RichBlockTextMenuProviding {
+  func textViewDidChangeSelection(_ notification: Notification) {
+    guard let textView = notification.object as? NSTextView else { return }
+    guard textView.selectedRanges.contains(where: { $0.rangeValue.length > 0 }) else { return }
+    MessageGestureTrace.debug("MessageView.textSelectionChanged messageId=\(message.messageId) action=dismissReactionOverlay")
+    ReactionOverlayWindow.dismiss(for: self)
+  }
+
+  func textView(_: NSTextView, menu: NSMenu, for _: NSEvent, at charIndex: Int) -> NSMenu? {
+    let linkURL = linkURLForContextMenu(at: charIndex)
+    return createMenu(context: .textView, nativeMenu: menu, linkURL: linkURL)
+  }
+
+  func richBlockTextMenu(
+    nativeMenu: NSMenu,
+    event _: NSEvent,
+    characterIndex: Int,
+    attributedText: NSAttributedString
+  ) -> NSMenu? {
+    let linkURL = linkURL(at: characterIndex, in: attributedText)
+    let menu = createMenu(context: .textView, nativeMenu: nativeMenu, linkURL: linkURL)
+    return richBlockContentView?.retargetMultiSurfaceCopy(in: menu) ?? menu
+  }
+
+  func richBlockMessageMenu() -> NSMenu {
+    let menu = createMenu(context: .message)
+    return richBlockContentView?.retargetMultiSurfaceCopy(in: menu) ?? menu
+  }
+
+  // func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+  //   // Handle our custom detected links
+  //   handleLinkClick(at: charIndex)
+  //   return true
+  // }
+}
+
+extension MessageViewAppKit: NSMenuDelegate {
+  enum MenuContext {
+    case message
+    case textView
+  }
+
+  func menuNeedsUpdate(_ menu: NSMenu) {
+    guard menu === self.menu else { return }
+    let updatedMenu = richBlockMessageMenu()
+    menu.removeAllItems()
+    for item in updatedMenu.items {
+      // NSMenuItem can only belong to one NSMenu. Copy before inserting to avoid:
+      // "Item to be inserted into menu already is in another menu".
+      if let copied = item.copy() as? NSMenuItem {
+        menu.addItem(copied)
+      }
+    }
+  }
+
+  func createMenu(context: MenuContext, nativeMenu: NSMenu? = nil, linkURL: URL? = nil) -> NSMenu {
+    let menu = NSMenu()
+
+    let regularMessage = message.status != .sending && message.status != .failed
+    // Reply
+    if regularMessage, !isAnchorMessage {
+      let replyItem = NSMenuItem(title: "Reply", action: #selector(reply), keyEquivalent: "r")
+      replyItem.image = NSImage(systemSymbolName: "arrowshape.turn.up.left", accessibilityDescription: "Reply")
+      menu.addItem(replyItem)
+
+      // Quote is offered only while part of this message is selected.
+      if let quoted = selectedTextForQuote() {
+        let quoteItem = NSMenuItem(title: "Quote", action: #selector(quoteSelection(_:)), keyEquivalent: "")
+        quoteItem.image = NSImage(systemSymbolName: "text.quote", accessibilityDescription: "Quote")
+        quoteItem.representedObject = quoted
+        menu.addItem(quoteItem)
+      }
+
+      let replyInThreadItem = NSMenuItem(
+        title: message.isSubthreadPlacement ? "Open Subthread" : "Reply in Thread",
+        action: #selector(replyInThread),
+        keyEquivalent: ""
+      )
+      replyInThreadItem.image = NSImage(
+        systemSymbolName: "arrowshape.turn.up.left.circle",
+        accessibilityDescription: message.isSubthreadPlacement ? "Open Subthread" : "Reply in Thread"
+      )
+      menu.addItem(replyInThreadItem)
+
+      if !message.isSubthreadPlacement {
+        let forwardItem = NSMenuItem(title: "Forward", action: #selector(forwardMessage), keyEquivalent: "")
+        forwardItem.image = NSImage(systemSymbolName: "arrowshape.turn.up.right", accessibilityDescription: "Forward")
+        if ExperimentalFeatureFlags.quickForwardEnabled, let dependencies,
+           dependencies.forwardMessages != nil {
+          forwardItem.submenu = ForwardMessageMenu.make(messages: [fullMessage], dependencies: dependencies)
+        }
+        menu.addItem(forwardItem)
+        if ExperimentalFeatureFlags.macMessageSelectionEnabled, message.messageId > 0,
+           message.status == nil || message.status == .sent
+        {
+          let selectItem = NSMenuItem(
+            title: "Select Messages", action: #selector(selectMessagesForForwarding), keyEquivalent: ""
+          )
+          selectItem.target = self
+          selectItem.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)
+          menu.addItem(selectItem)
+        }
+      }
+    }
+
+    // Edit
+    if !isAnchorMessage, !message.isSubthreadPlacement, !message.isGridTranscript, message.out == true,
+       message.status == .sent
+    {
+      let editItem = NSMenuItem(title: "Edit", action: #selector(editMessage), keyEquivalent: "e")
+      editItem.image = NSImage(systemSymbolName: "square.and.pencil", accessibilityDescription: "Edit")
+      menu.addItem(editItem)
+    }
+
+    if regularMessage, !isAnchorMessage {
+      let pinned = isMessagePinned()
+      let pinTitle = pinned ? "Unpin" : "Pin"
+      let pinAction = pinned ? #selector(unpinMessage) : #selector(pinMessage)
+      let pinItem = NSMenuItem(title: pinTitle, action: pinAction, keyEquivalent: "")
+      pinItem.image = NSImage(
+        systemSymbolName: pinned ? "pin.slash" : "pin",
+        accessibilityDescription: pinTitle
+      )
+      menu.addItem(pinItem)
+    }
+
+    if regularMessage {
+      // Add reaction action
+      let addReactionItem = NSMenuItem(title: "Add Reaction...", action: #selector(addReaction), keyEquivalent: "e")
+      addReactionItem.image = NSImage(systemSymbolName: "face.smiling", accessibilityDescription: "Add Reaction")
+      menu.addItem(addReactionItem)
+    }
+
+    // Integrations section (separator above + below)
+    var integrationItems: [NSMenuItem] = []
+
+    if regularMessage, !isAnchorMessage, NotionTaskService.shared.hasAccess(peerId: message.peerId) {
+      let willDoItem = NSMenuItem(title: "Create Notion Task", action: #selector(handleWillDo), keyEquivalent: "")
+      willDoItem.image = NSImage(
+        systemSymbolName: "circle.badge.plus",
+        accessibilityDescription: "Create Notion Task"
+      )
+      integrationItems.append(willDoItem)
+    }
+
+    if regularMessage, !isAnchorMessage, hasText {
+      if messageHasLinearAccess() {
+        let createLinearIssueItem = NSMenuItem(
+          title: "Create Linear Issue",
+          action: #selector(handleCreateLinearIssue),
+          keyEquivalent: ""
+        )
+        createLinearIssueItem.image = NSImage(
+          systemSymbolName: "circle.badge.plus",
+          accessibilityDescription: "Create Linear Issue"
+        )
+        integrationItems.append(createLinearIssueItem)
+      }
+    }
+
+    if !integrationItems.isEmpty {
+      if !menu.items.isEmpty {
+        menu.addItem(NSMenuItem.separator())
+      }
+      integrationItems.forEach { menu.addItem($0) }
+      menu.addItem(NSMenuItem.separator())
+    }
+
+    var rendersCopyText = false
+
+    if regularMessage,
+       InlineDeepLink.message(chatId: message.chatId, messageId: message.messageId).url != nil {
+      let copyMessageLinkItem = NSMenuItem(
+        title: "Copy Message Link",
+        action: #selector(copyMessageLink),
+        keyEquivalent: ""
+      )
+      copyMessageLinkItem.target = self
+      copyMessageLinkItem.image = NSImage(
+        systemSymbolName: "link",
+        accessibilityDescription: "Copy Message Link"
+      )
+      menu.addItem(copyMessageLinkItem)
+    }
+
+    if context == .textView, let linkURL {
+      let copyLinkItem = NSMenuItem(
+        title: "Copy Link Address",
+        action: #selector(copyLinkAddress),
+        keyEquivalent: ""
+      )
+      copyLinkItem.target = self
+      copyLinkItem.representedObject = linkURL
+      copyLinkItem.image = NSImage(systemSymbolName: "link", accessibilityDescription: "Copy Link")
+      menu.addItem(copyLinkItem)
+    }
+
+    // Add native copy for selected text if in text view context
+    if context == .textView,
+       let nativeMenu,
+       let nativeCopyItem = nativeMenu.items.first(where: { $0.action == #selector(NSText.copy(_:)) })
+    {
+      let newItem = nativeCopyItem.copy() as! NSMenuItem
+      newItem.title = "Copy Selected Text"
+      menu.addItem(newItem)
+      rendersCopyText = true
+    }
+
+    // Add copy message action for text
+    if hasText {
+      let copyItem = NSMenuItem(title: "Copy Text", action: #selector(copyMessage), keyEquivalent: "c")
+      if !rendersCopyText {
+        copyItem.image = NSImage(systemSymbolName: "document.on.document", accessibilityDescription: "Copy")
+        rendersCopyText = true
+      }
+      menu.addItem(copyItem)
+
+      if canCopyMessageWithEntities {
+        let debugCopyItem = NSMenuItem(
+          title: "Copy Message + Entities",
+          action: #selector(copyMessageWithEntities),
+          keyEquivalent: ""
+        )
+        menu.addItem(debugCopyItem)
+      }
+    }
+
+    // Add photo actions
+    if hasPhoto {
+      let copyItem = NSMenuItem(title: "Copy Image", action: #selector(photoView.copyImage), keyEquivalent: "i")
+      copyItem.target = photoView
+      copyItem.isEnabled = true
+      copyItem.image = NSImage(systemSymbolName: "photo.on.rectangle", accessibilityDescription: "Copy Image")
+      menu.addItem(copyItem)
+    }
+
+    if hasPhoto {
+      menu.addItem(NSMenuItem.separator())
+      let saveItem = NSMenuItem(title: "Save Image", action: #selector(photoView.saveImage), keyEquivalent: "m")
+      saveItem.target = photoView
+      saveItem.isEnabled = true
+      saveItem.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Save Image")
+      menu.addItem(saveItem)
+    }
+
+    // Add video actions
+    if hasVideo {
+      menu.addItem(NSMenuItem.separator())
+      let openItem = NSMenuItem(title: "Open Video", action: #selector(videoView.openQuickLook), keyEquivalent: "v")
+      openItem.target = videoView
+      openItem.isEnabled = true
+      openItem.image = NSImage(systemSymbolName: "play.circle", accessibilityDescription: "Play")
+      menu.addItem(openItem)
+
+      let saveItem = NSMenuItem(
+        title: "Save Video",
+        action: #selector(videoView.saveVideo),
+        keyEquivalent: "s"
+      )
+      saveItem.target = videoView
+      saveItem.isEnabled = true
+      saveItem.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Save Video")
+      menu.addItem(saveItem)
+
+      if videoView.canSaveAsGIF {
+        let saveGIFItem = NSMenuItem(
+          title: "Save GIF",
+          action: #selector(videoView.saveGIF),
+          keyEquivalent: "g"
+        )
+        saveGIFItem.target = videoView
+        saveGIFItem.isEnabled = true
+        saveGIFItem.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Save GIF")
+        menu.addItem(saveGIFItem)
+      }
+    }
+
+    // Add document actions
+    if hasActualDocument {
+      documentView?.appendContextMenuItems(to: menu)
+    }
+
+    if canSaveLoadedVoice {
+      menu.addItem(NSMenuItem.separator())
+      let saveItem = NSMenuItem(title: "Save Audio", action: #selector(saveAudio), keyEquivalent: "s")
+      saveItem.target = self
+      saveItem.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Save Audio")
+      menu.addItem(saveItem)
+    }
+
+    // Add other native menu items if in text view context
+    if context == .textView, let nativeMenu {
+      menu.addItem(NSMenuItem.separator())
+
+      for item in nativeMenu.items {
+        if item.title.hasPrefix("Look Up") {
+          let newItem = item.copy() as! NSMenuItem
+          newItem.image = NSImage(systemSymbolName: "character.bubble", accessibilityDescription: "Save Document")
+          menu.addItem(newItem)
+        }
+
+        if item.title.hasPrefix("Translate") {
+          let newItem = item.copy() as! NSMenuItem
+          menu.addItem(newItem)
+        }
+      }
+    }
+
+    menu.addItem(NSMenuItem.separator())
+
+    // Resend for failed messages
+    if message.status == .failed {
+      let resendItem = NSMenuItem(title: "Resend", action: #selector(resendMessage), keyEquivalent: "")
+      resendItem.target = self
+      resendItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Resend")
+      menu.addItem(resendItem)
+    }
+
+    // Delete or cancel button
+    if message.status == .sending {
+      let cancelTitle = fullMessage.showsPhotoUploadProgress ? "Cancel Upload" : "Cancel"
+      let cancelItem = NSMenuItem(title: cancelTitle, action: #selector(cancelMessage), keyEquivalent: "delete")
+      cancelItem.target = self
+      cancelItem.image = NSImage(systemSymbolName: "x.circle", accessibilityDescription: cancelTitle)
+      menu.addItem(cancelItem)
+    } else {
+      let deleteItem = NSMenuItem(title: "Delete", action: #selector(deleteMessage), keyEquivalent: "delete")
+      deleteItem.target = self
+      deleteItem.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Delete")
+      menu.addItem(deleteItem)
+    }
+
+    /// If message is edited, show edit date in context menu
+    if let editDate = message.editDate {
+      menu.addItem(NSMenuItem.separator())
+      let formatted = DateFormatter.localizedString(from: editDate, dateStyle: .medium, timeStyle: .short)
+      let editDateItem = NSMenuItem(title: "Edited \(formatted)", action: nil, keyEquivalent: "")
+      editDateItem.isEnabled = false
+      menu.addItem(editDateItem)
+    }
+
+    #if DEBUG
+    menu.addItem(NSMenuItem.separator())
+
+    // Add debug items
+    let idItem = NSMenuItem(title: "ID: \(message.id)", action: nil, keyEquivalent: "")
+    idItem.isEnabled = false
+    menu.addItem(idItem)
+
+    let indexItem = NSMenuItem(
+      title: "Index: \(props.index?.description ?? "?")",
+      action: nil,
+      keyEquivalent: ""
+    )
+    indexItem.isEnabled = false
+    menu.addItem(indexItem)
+
+    #endif
+
+    if let attribution = fullMessage.acknowledgementAttributionLabel {
+      if !menu.items.isEmpty, menu.items.last?.isSeparatorItem == false {
+        menu.addItem(.separator())
+      }
+      let attributionItem = NSMenuItem(title: attribution, action: nil, keyEquivalent: "")
+      attributionItem.image = NSImage(
+        systemSymbolName: "person.2",
+        accessibilityDescription: attribution
+      )
+      attributionItem.isEnabled = false
+      menu.addItem(attributionItem)
+    }
+
+    menu.delegate = self
+    return menu
+  }
+}
+
+// Helper extension for constraint priorities
+private extension NSLayoutConstraint {
+  func withPriority(_ priority: NSLayoutConstraint.Priority) -> NSLayoutConstraint {
+    self.priority = priority
+    return self
+  }
+}
+
+//// Implement viewport constraint
+extension MessageViewAppKit: NSTextViewportLayoutControllerDelegate {
+  func textViewportLayoutController(
+    _ textViewportLayoutController: NSTextViewportLayoutController,
+    configureRenderingSurfaceFor textLayoutFragment: NSTextLayoutFragment
+  ) {
+    prevDelegate?.textViewportLayoutController(
+      textViewportLayoutController,
+      configureRenderingSurfaceFor: textLayoutFragment
+    )
+  }
+
+  func textViewportLayoutControllerWillLayout(_ textViewportLayoutController: NSTextViewportLayoutController) {
+    prevDelegate?.textViewportLayoutControllerWillLayout?(textViewportLayoutController)
+  }
+
+  func textViewportLayoutControllerDidLayout(_ textViewportLayoutController: NSTextViewportLayoutController) {
+    prevDelegate?.textViewportLayoutControllerDidLayout?(textViewportLayoutController)
+  }
+
+  func viewportBounds(for _: NSTextViewportLayoutController) -> CGRect {
+    // During resize, we need to be more aggressive with the viewport size
+    let visibleRect = enclosingScrollView?.documentVisibleRect ?? textView.visibleRect
+
+    // Create a larger viewport during resize to ensure text remains visible
+    let expandedRect = visibleRect.insetBy(dx: -100, dy: -500)
+
+    // Convert to text view coordinates if needed
+    let textViewRect = textView.convert(expandedRect, from: enclosingScrollView?.contentView)
+
+    return textViewRect
+  }
+}

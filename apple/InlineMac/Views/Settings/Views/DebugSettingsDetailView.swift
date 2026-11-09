@@ -1,0 +1,335 @@
+import AppKit
+import InlineKit
+import Logger
+import MacDevtools
+import SwiftUI
+
+struct DebugSettingsDetailView: View {
+  @Environment(\.dependencies) private var dependencies
+  @State private var showSyncStats = false
+  @State private var showPermissions = false
+  @State private var showConnectionSecurity = false
+  @State private var confirmDeleteDatabase = false
+  @State private var isDeletingDatabase = false
+  @State private var databaseErrorMessage = ""
+  @State private var showDatabaseError = false
+  @State private var unredactedLogs = Log.unredactedLocalLogs
+#if DEBUG || DEBUG_BUILD
+  @State private var showThemeWorkshop = false
+  @State private var messageGestureTracing = MessageGestureTrace.isEnabled
+#endif
+#if (DEBUG || DEBUG_BUILD) && SPARKLE
+  @State private var updatePreview = DebugSoftwareUpdatePreview.updateAvailable
+  @Environment(UpdateController.self) private var updates
+#endif
+
+  var body: some View {
+#if (DEBUG || DEBUG_BUILD) && SPARKLE
+    @Bindable var updates = updates
+#endif
+    Form {
+      Section {
+        LabeledContent {
+          Button("Open") {
+            showSyncStats = true
+          }
+        } label: {
+          SettingsRowLabel(
+            .syncEngine,
+            description: "Inspect local RealtimeV2 state and run sync debug scenarios."
+          )
+        }
+        .settingsSearchAnchor(.syncEngine)
+
+        LabeledContent {
+          Button("Open") {
+            showPermissions = true
+          }
+        } label: {
+          SettingsRowLabel(
+            .appPermissions,
+            description: "Check notification, microphone, and local permission state."
+          )
+        }
+        .settingsSearchAnchor(.appPermissions)
+
+        LabeledContent {
+          Button("Open") {
+            showConnectionSecurity = true
+          }
+        } label: {
+          SettingsRowLabel(
+            .connectionSecurity,
+            description: "Verify the active realtime protocol and authentication lifecycle."
+          )
+        }
+        .settingsSearchAnchor(.connectionSecurity)
+
+        LabeledContent {
+          Button("Open") {
+            MacDevtoolsWindowController.show()
+          }
+        } label: {
+          SettingsRowLabel(
+            .macDevtools,
+            description: "Open the internal macOS developer tools window."
+          )
+        }
+        .settingsSearchAnchor(.macDevtools)
+
+#if DEBUG || DEBUG_BUILD
+        LabeledContent {
+          Button("Open") {
+            dependencies?.viewModel.openOnboardingForDebug()
+          }
+          .disabled(dependencies?.auth.currentUserId == nil)
+        } label: {
+          SettingsRowLabel(
+            .onboarding,
+            description: "Open the onboarding flow for this development build."
+          )
+        }
+        .settingsSearchAnchor(.onboarding)
+
+        LabeledContent {
+          Button("Open") {
+            DeveloperPlaygroundWindowController.show()
+          }
+        } label: {
+          SettingsRowLabel(
+            .playground,
+            description: "Inspect UI components and fixture combinations in a standalone window."
+          )
+        }
+        .settingsSearchAnchor(.playground)
+#endif
+      } header: {
+        SettingsSectionHeader("Tools")
+      }
+
+      Section {
+        LabeledContent {
+          Button("Clear…", role: .destructive) {
+            AppRecoveryActions.clearCache(confirming: true)
+          }
+        } label: {
+          SettingsRowLabel(
+            .appCache,
+            description: "Clear local app data and sync state, then reload the account from the server."
+          )
+        }
+        .settingsSearchAnchor(.appCache)
+
+        LabeledContent {
+          Button("Clear") {
+            AppRecoveryActions.clearMediaCache()
+          }
+        } label: {
+          SettingsRowLabel(
+            .mediaCache,
+            description: "Remove downloaded images, videos, and files without resetting app data."
+          )
+        }
+        .settingsSearchAnchor(.mediaCache)
+
+        LabeledContent {
+          Button("Reset") {
+            AppRecoveryActions.resetDismissedPopovers()
+          }
+        } label: {
+          SettingsRowLabel(
+            .dismissedPopovers,
+            description: "Show informational popovers and notices that were previously dismissed."
+          )
+        }
+        .settingsSearchAnchor(.dismissedPopovers)
+      } header: {
+        SettingsSectionHeader("Recovery")
+      }
+
+      Section {
+        Toggle(isOn: Binding(
+          get: { unredactedLogs },
+          set: { enabled in
+            Log.setUnredactedLocalLogs(enabled)
+            unredactedLogs = enabled
+          }
+        )) {
+          SettingsRowLabel(
+            "Full Log Details",
+            description: "Write raw, unscrubbed messages and debug-level logs on this device."
+          )
+        }
+        .toggleStyle(.switch)
+      } header: {
+        SettingsSectionHeader("Logging")
+      } footer: {
+        Text("Logs are readable by default, with emails, tokens, and similar values scrubbed. Turn this on to also write raw messages and debug-level logs to the system log and devtools on this device. Sentry reports stay scrubbed.")
+      }
+#if DEBUG || DEBUG_BUILD
+      Section {
+        Toggle("Trace Message Mouse Events", isOn: Binding(
+          get: { messageGestureTracing },
+          set: { enabled in
+            MessageGestureTrace.setEnabled(enabled)
+            messageGestureTracing = enabled
+          }
+        ))
+      } header: {
+        SettingsSectionHeader("Message Input")
+      } footer: {
+        Text("Streams event routing and selection decisions through the MessageGesture log category. Does not include message text.")
+      }
+
+      Section {
+        LabeledContent {
+          Button("Open") {
+            showThemeWorkshop = true
+          }
+        } label: {
+          SettingsRowLabel(
+            .themeWorkshop,
+            description: "Tune preset colors live and copy a palette export for production polish."
+          )
+        }
+        .settingsSearchAnchor(.themeWorkshop)
+      } header: {
+        SettingsSectionHeader("Appearance")
+      }
+
+      Section {
+        LabeledContent {
+          Button(role: .destructive) {
+            confirmDeleteDatabase = true
+          } label: {
+            if isDeletingDatabase {
+              Text("Deleting...")
+            } else {
+              Text("Delete and Restart...")
+            }
+          }
+          .disabled(isDeletingDatabase)
+        } label: {
+          SettingsRowLabel(
+            .localDatabase,
+            description: "Delete this build profile's local SQLite database, then restart Inline."
+          )
+        }
+        .settingsSearchAnchor(.localDatabase)
+      } header: {
+        SettingsSectionHeader("Database")
+      }
+#endif
+#if (DEBUG || DEBUG_BUILD) && SPARKLE
+      Section {
+        LabeledContent {
+          HStack(spacing: 8) {
+            Picker("Updater State", selection: $updatePreview) {
+              ForEach(DebugSoftwareUpdatePreview.allCases) { preview in
+                Text(preview.title)
+                  .tag(preview)
+              }
+            }
+            .labelsHidden()
+            .frame(width: 170)
+
+            Button("Show") {
+              updates.presentDebugPreview(updatePreview)
+            }
+            .disabled(!updates.canPresentDebugPreview)
+          }
+        } label: {
+          SettingsRowLabel(
+            "Updater Dialog",
+            description: "Preview updater states without contacting the update server."
+          )
+        }
+
+        Toggle(isOn: $updates.debugForceReady) {
+          SettingsRowLabel(
+            "Show Update Button",
+            description: "Force the update UI into a ready state in debug builds."
+          )
+        }
+          .toggleStyle(.switch)
+      } header: {
+        SettingsSectionHeader("Updates")
+      }
+#endif
+    }
+    .settingsFormStyle()
+    .sheet(isPresented: $showSyncStats) {
+      SyncEngineStatsDetailView()
+    }
+    .sheet(isPresented: $showPermissions) {
+      PermissionsDebugSheet()
+    }
+    .sheet(isPresented: $showConnectionSecurity) {
+      ConnectionSecurityDebugSheet()
+    }
+#if DEBUG || DEBUG_BUILD
+    .sheet(isPresented: $showThemeWorkshop) {
+      ThemeWorkshopView()
+    }
+    .confirmationDialog(
+      "Delete database file?",
+      isPresented: $confirmDeleteDatabase,
+      titleVisibility: .visible
+    ) {
+      Button("Delete and Restart", role: .destructive) {
+        deleteDatabaseAndRestart()
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text("This deletes the on-disk SQLite database for the current build profile and restarts Inline.")
+    }
+    .alert("Database Reset Failed", isPresented: $showDatabaseError) {
+      Button("OK", role: .cancel) {}
+    } message: {
+      Text(databaseErrorMessage)
+    }
+#endif
+  }
+
+#if DEBUG || DEBUG_BUILD
+  private func deleteDatabaseAndRestart() {
+    guard !isDeletingDatabase else { return }
+    isDeletingDatabase = true
+
+    do {
+      try AppDatabase.deleteDatabaseFilesOnDisk()
+      relaunchApp()
+    } catch {
+      isDeletingDatabase = false
+      databaseErrorMessage = error.localizedDescription
+      showDatabaseError = true
+    }
+  }
+
+  private func relaunchApp() {
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    configuration.createsNewApplicationInstance = true
+
+    NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
+      Task { @MainActor in
+        if let error {
+          isDeletingDatabase = false
+          databaseErrorMessage = "Database file was deleted, but Inline could not restart: \(error.localizedDescription)"
+          showDatabaseError = true
+          return
+        }
+
+        NSApp.terminate(nil)
+      }
+    }
+  }
+#endif
+}
+
+#Preview {
+  DebugSettingsDetailView()
+#if (DEBUG || DEBUG_BUILD) && SPARKLE
+    .environment(UpdateController())
+#endif
+}

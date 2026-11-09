@@ -1,0 +1,61 @@
+import {
+  Context,
+  Data,
+  Effect,
+} from "effect"
+
+export type OAuthHttpOperation =
+  | "metadata"
+  | "register"
+  | "authorize"
+  | "authorizeContinue"
+  | "sendEmailCode"
+  | "verifyEmailCode"
+  | "sendSmsCode"
+  | "verifySmsCode"
+  | "consent"
+  | "token"
+  | "revoke"
+  | "introspect"
+  | "mcpEvents"
+  | "providerStart"
+  | "providerNativeAppleStart"
+  | "providerNativeAppleComplete"
+  | "providerNativeAppleContinueInvite"
+  | "providerCallbackGoogle"
+  | "providerCallbackApple"
+  | "providerContinueInvite"
+  | "providerSendEmailCode"
+  | "providerVerifyEmailCode"
+  | "providerRedeem"
+  | "hostedLoginGet"
+  | "hostedLoginSendEmail"
+  | "hostedLoginVerifyEmail"
+  | "hostedLoginSendSms"
+  | "hostedLoginVerifySms"
+  | "hostedLoginConfirm"
+
+export interface OAuthHttpInput {
+  readonly request: Request
+  readonly clientIp?: string | undefined
+}
+
+export class OAuthHttpFailure extends Data.TaggedError(
+  "OAuthHttpFailure",
+)<{
+  readonly operation: OAuthHttpOperation
+  readonly cause: unknown
+  readonly publicResponse?: Response | undefined
+}> {}
+
+export interface OAuthHttpServiceShape {
+  readonly execute: (
+    operation: OAuthHttpOperation,
+    input: OAuthHttpInput,
+  ) => Effect.Effect<Response, OAuthHttpFailure>
+}
+
+export class OAuthHttpService extends Context.Service<
+  OAuthHttpService,
+  OAuthHttpServiceShape
+>()("@inline/server/oauth/OAuthHttpService") {}

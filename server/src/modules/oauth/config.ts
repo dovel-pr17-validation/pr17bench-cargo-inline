@@ -1,0 +1,108 @@
+import { API_BASE_URL } from "@in/server/env"
+import type { RateLimitRule } from "@in/server/modules/oauth/rateLimiter"
+
+export type OauthServerConfig = {
+  issuer: string
+  resource: string
+  cookiePrefix: string
+  authRequestTtlMs: number
+  authCodeTtlMs: number
+  accessTokenTtlMs: number
+  refreshTokenTtlMs: number
+  endpointRateLimits: {
+    register: RateLimitRule
+    providerStart: RateLimitRule
+    providerCallback: RateLimitRule
+    providerContinueInvite: RateLimitRule
+    providerRedeem: RateLimitRule
+    sendEmailCode: RateLimitRule
+    verifyEmailCode: RateLimitRule
+    sendSmsCode: RateLimitRule
+    verifySmsCode: RateLimitRule
+    token: RateLimitRule
+  }
+  emailAbuseRateLimits: {
+    sendPerEmail: RateLimitRule
+    sendPerContext: RateLimitRule
+    verifyPerEmail: RateLimitRule
+    verifyPerContext: RateLimitRule
+  }
+  phoneAbuseRateLimits: {
+    sendPerPhone: RateLimitRule
+    sendPerContext: RateLimitRule
+    verifyPerPhone: RateLimitRule
+    verifyPerContext: RateLimitRule
+  }
+  internalSharedSecret: string | null
+}
+
+function parsePositiveIntEnv(name: string, fallback: number, opts: { min: number; max: number }): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) return fallback
+  const value = Math.trunc(parsed)
+  if (value < opts.min || value > opts.max) return fallback
+  return value
+}
+
+function parseRateLimitRuleEnv(prefix: string, fallback: RateLimitRule): RateLimitRule {
+  return {
+    max: parsePositiveIntEnv(`${prefix}_MAX`, fallback.max, { min: 1, max: 100_000 }),
+    windowMs: parsePositiveIntEnv(`${prefix}_WINDOW_MS`, fallback.windowMs, {
+      min: 1_000,
+      max: 24 * 60 * 60_000,
+    }),
+  }
+}
+
+export function oauthConfig(): OauthServerConfig {
+  const issuer = process.env["MCP_OAUTH_ISSUER"] || API_BASE_URL
+
+  return {
+    issuer,
+    resource: process.env["MCP_OAUTH_RESOURCE"] || "https://mcp.inline.chat",
+    cookiePrefix: process.env["MCP_OAUTH_COOKIE_PREFIX"] || "inline_mcp",
+    authRequestTtlMs: parsePositiveIntEnv("MCP_OAUTH_AUTH_REQUEST_TTL_MS", 15 * 60_000, {
+      min: 60_000,
+      max: 24 * 60 * 60_000,
+    }),
+    authCodeTtlMs: parsePositiveIntEnv("MCP_OAUTH_AUTH_CODE_TTL_MS", 5 * 60_000, {
+      min: 30_000,
+      max: 2 * 60 * 60_000,
+    }),
+    accessTokenTtlMs: parsePositiveIntEnv("MCP_OAUTH_ACCESS_TOKEN_TTL_MS", 2 * 60 * 60_000, {
+      min: 60_000,
+      max: 7 * 24 * 60 * 60_000,
+    }),
+    refreshTokenTtlMs: parsePositiveIntEnv("MCP_OAUTH_REFRESH_TOKEN_TTL_MS", 180 * 24 * 60 * 60_000, {
+      min: 60_000,
+      max: 365 * 24 * 60 * 60_000,
+    }),
+    endpointRateLimits: {
+      register: parseRateLimitRuleEnv("MCP_OAUTH_RATE_LIMIT_REGISTER", { max: 30, windowMs: 60_000 }),
+      providerStart: parseRateLimitRuleEnv("PROVIDER_AUTH_RATE_LIMIT_START", { max: 20, windowMs: 10 * 60_000 }),
+      providerCallback: parseRateLimitRuleEnv("PROVIDER_AUTH_RATE_LIMIT_CALLBACK", { max: 60, windowMs: 10 * 60_000 }),
+      providerContinueInvite: parseRateLimitRuleEnv("PROVIDER_AUTH_RATE_LIMIT_INVITE", { max: 20, windowMs: 10 * 60_000 }),
+      providerRedeem: parseRateLimitRuleEnv("PROVIDER_AUTH_RATE_LIMIT_REDEEM", { max: 60, windowMs: 60_000 }),
+      sendEmailCode: parseRateLimitRuleEnv("MCP_OAUTH_RATE_LIMIT_SEND_EMAIL_CODE", { max: 10, windowMs: 10 * 60_000 }),
+      verifyEmailCode: parseRateLimitRuleEnv("MCP_OAUTH_RATE_LIMIT_VERIFY_EMAIL_CODE", { max: 20, windowMs: 10 * 60_000 }),
+      sendSmsCode: parseRateLimitRuleEnv("MCP_OAUTH_RATE_LIMIT_SEND_SMS_CODE", { max: 10, windowMs: 10 * 60_000 }),
+      verifySmsCode: parseRateLimitRuleEnv("MCP_OAUTH_RATE_LIMIT_VERIFY_SMS_CODE", { max: 20, windowMs: 10 * 60_000 }),
+      token: parseRateLimitRuleEnv("MCP_OAUTH_RATE_LIMIT_TOKEN", { max: 60, windowMs: 60_000 }),
+    },
+    emailAbuseRateLimits: {
+      sendPerEmail: parseRateLimitRuleEnv("MCP_OAUTH_EMAIL_ABUSE_SEND_PER_EMAIL", { max: 4, windowMs: 10 * 60_000 }),
+      sendPerContext: parseRateLimitRuleEnv("MCP_OAUTH_EMAIL_ABUSE_SEND_PER_CONTEXT", { max: 6, windowMs: 10 * 60_000 }),
+      verifyPerEmail: parseRateLimitRuleEnv("MCP_OAUTH_EMAIL_ABUSE_VERIFY_PER_EMAIL", { max: 10, windowMs: 10 * 60_000 }),
+      verifyPerContext: parseRateLimitRuleEnv("MCP_OAUTH_EMAIL_ABUSE_VERIFY_PER_CONTEXT", { max: 12, windowMs: 10 * 60_000 }),
+    },
+    phoneAbuseRateLimits: {
+      sendPerPhone: parseRateLimitRuleEnv("MCP_OAUTH_PHONE_ABUSE_SEND_PER_PHONE", { max: 4, windowMs: 10 * 60_000 }),
+      sendPerContext: parseRateLimitRuleEnv("MCP_OAUTH_PHONE_ABUSE_SEND_PER_CONTEXT", { max: 6, windowMs: 10 * 60_000 }),
+      verifyPerPhone: parseRateLimitRuleEnv("MCP_OAUTH_PHONE_ABUSE_VERIFY_PER_PHONE", { max: 10, windowMs: 10 * 60_000 }),
+      verifyPerContext: parseRateLimitRuleEnv("MCP_OAUTH_PHONE_ABUSE_VERIFY_PER_CONTEXT", { max: 12, windowMs: 10 * 60_000 }),
+    },
+    internalSharedSecret: process.env["MCP_INTERNAL_SHARED_SECRET"] || null,
+  }
+}

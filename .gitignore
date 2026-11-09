@@ -1,0 +1,191 @@
+# General JS world
+**/.cache
+**/build
+.env
+.env.*
+.env.test
+.env.prod
+.env.staging
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Ignore package locks for anything other than bun
+package-lock.json
+yarn.lock
+
+.index-build
+
+# Local temp
+.tmp/
+.traces/
+.context/
+.context/snapshots/
+
+# React
+/build
+/dist
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# iOS
+## User settings
+xcuserdata/
+
+## Obj-C/Swift specific
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+## Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Swift Package Manager
+.build/
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# Accio dependency management
+Dependencies/
+.accio/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# Code Injection
+iOSInjectionProject/
+
+# General
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+.DS_Store
+xcuserdata/
+DerivedData/
+**/.build
+**/.swiftpm/configuration/registries.json
+**/.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+**/.netrc
+
+server/dist
+
+buildServer.json
+
+apple/Local.xcconfig
+
+.eslintcache
+
+# Ignore the dist directory
+dist/
+
+# Ignore TypeScript build info files
+*.tsbuildinfo
+
+# Ignore local.json for CLAUDE
+**/*.local.json
+
+# Web
+.output
+web/.artifacts/
+web/.tanstack/
+web/artifacts/
+web/dist-electron/
+
+# Expo mobile
+mobile/.expo/
+mobile/android/
+mobile/ios/
+mobile/dist/
+mobile/*.apk
+mobile/*.aab
+mobile/.eas/build/
+
+
+# Swift
+.swift-module-cache
+*.profraw
+*.profdata
+
+# AI
+test_write_permission
+
+# Rust
+cli/target
+cli/dist
+
+# Release temp assets
+scripts/.release-tmp/
+
+# Local proto tooling
+scripts/.tools/
+
+# Actions
+.action/sparkle/
+
+# OpenClaw inline release artifacts
+packages/openclaw-inline/*.tgz
+
+# Local agent docs
+.superpowers/
+docs/superpowers
+.references/
+**/graphify-out/
+.committing
+.running
+
+.build-macos
+
+.context/traces
+.context/profiles
+.wip
+.running
+
+# Consolidated tooling outputs and local coordination
+landing/playwright-report/
+landing/test-results/
+target/
+**/__pycache__/
+*.py[cod]
+.wip
+.running
+.committing
+scripts/.release-tmp/
+!cli/src/bridge/adapter_locks/amp/dist/
+!cli/src/bridge/adapter_locks/amp/dist/index.js
+
+# Embedded CLI adapter lockfiles are required by Rust include_bytes!.
+!cli/src/bridge/adapter_locks/amp/package-lock.json
+!cli/src/bridge/adapter_locks/claude/package-lock.json

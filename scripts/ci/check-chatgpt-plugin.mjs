@@ -1,0 +1,613 @@
+// Compiled artifact/HTTP contract smoke. No real Inline account or ChatGPT host.
+import assert from "node:assert/strict"
+import { readFile, writeFile } from "node:fs/promises"
+import path from "node:path"
+import { createRequire } from "node:module"
+import { fileURLToPath } from "node:url"
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
+const requireMcp = createRequire(path.join(root, "packages/mcp/package.json"))
+const { default: Ajv2020 } = await import(requireMcp.resolve("ajv/dist/2020.js"))
+const { default: Ajv } = await import(requireMcp.resolve("ajv"))
+const { default: addFormats } = await import(requireMcp.resolve("ajv-formats"))
+const protocolSchema = JSON.parse(await readFile(path.join(root, "scripts/ci/fixtures/mcp-2026-07-28/schema.json"), "utf8"))
+const protocolValidator = new Ajv2020({ strict: false, allErrors: true })
+const toolValidator = new Ajv({ strict: false, allErrors: true })
+addFormats(protocolValidator)
+addFormats(toolValidator)
+const resultTypes = {
+  "server/discover": "DiscoverResult", "tools/list": "ListToolsResult",
+  "resources/list": "ListResourcesResult", "resources/templates/list": "ListResourceTemplatesResult",
+  "resources/read": "ReadResourceResult", "tools/call": "CallToolResult",
+}
+const schemaValidators = new Map()
+const validator = (name) => {
+  if (!schemaValidators.has(name)) schemaValidators.set(name, protocolValidator.compile({
+    $ref: `#/$defs/${name}`, $defs: protocolSchema.$defs,
+  }))
+  return schemaValidators.get(name)
+}
+const assertSchema = (name, value, context) => {
+  const validate = validator(name)
+  assert.ok(validate(value), `${context}: ${JSON.stringify(validate.errors)}`)
+}
+const validatedResponses = []
+function validateModernResponse(method, message) {
+  const name = resultTypes[method]
+  if (!name) return // Events use a separate draft, not the core protocol schema.
+  assertSchema(`${name}Response`, message, `${method} response envelope`)
+  // ReadResourceResultResponse also accepts an extensible InputRequiredResult.
+  // Validate the announced complete branch explicitly, not just that loose union.
+  assertSchema(name, message.result, `${method} complete result`)
+  validatedResponses.push({ method, message: structuredClone(message) })
+}
+const { createApp } = await import(path.join(root, "packages/mcp/dist/index.js"))
+const submission = JSON.parse(await readFile(path.join(root, "packages/mcp/chatgpt-app-submission.json"), "utf8"))
+const uiUri = "ui://inline/message-results-v1.html"
+const threadUiUri = "ui://inline/thread-v3.html"
+const scenarios = []
+// Retain deferred view acceptance code, but never exercise or advertise it as
+// part of the core-only release. Production registration is independently gated.
+const CHECK_DEFERRED_APP_VIEWS = false
+
+// Exercise the packaged profile handler through the SDK, including strict
+// identity selection and the documented ChatGPT account-label response shape.
+async function checkCompiledAccountProfile() {
+  const { createInlineMcpServer } = await import(path.join(root, "packages/mcp/dist/server/mcp/server.js"))
+  let profile = { id: 1n, name: "Connected User", email: "connected@example.test", nickname: "connected" }
+  let reads = 0
+  const grant = { id: "profile-grant", clientId: "profile-client", inlineUserId: 1n, scope: "", spaceIds: [], allowDms: false, allowHomeThreads: false }
+  const server = createInlineMcpServer({ grant, contractVersion: "submission-v2", inline: {
+    getProfile: async () => { reads++; return profile }, close: async () => {},
+  } })
+  const authInfo = { token: "synthetic-profile-token", clientId: grant.clientId, scopes: [], extra: { grantId: grant.id, inlineUserId: "1" } }
+  const pending = new Map()
+  let requestId = 0
+  const transport = { start: async () => {}, close: async () => {}, send: async (message) => pending.get(message.id)?.(message) }
+  const request = async (method, params) => {
+    const id = ++requestId
+    let timer
+    const response = new Promise((resolve, reject) => {
+      pending.set(id, resolve)
+      timer = setTimeout(() => reject(new Error("Compiled profile timed out")), 5_000)
+    })
+    transport.onmessage({ jsonrpc: "2.0", id, method, params }, { authInfo })
+    try { return await response } finally { clearTimeout(timer); pending.delete(id) }
+  }
+  try {
+    await server.connect(transport)
+    await request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "profile-contract", version: "1" } })
+    transport.onmessage({ jsonrpc: "2.0", method: "notifications/initialized" }, { authInfo })
+    const catalog = await request("tools/list", {})
+    const tool = catalog.result.tools.find((item) => item.name === "account.profile")
+    assert.equal(tool?._meta?.["openai/profile"], true)
+    assert.deepEqual(tool._meta.securitySchemes, [{ type: "oauth2", scopes: [] }])
+    assert.equal(tool.annotations.readOnlyHint, true)
+    assert.deepEqual(Object.keys(tool.inputSchema.properties), [])
+    assert.equal(tool.inputSchema.additionalProperties, false)
+    assert.deepEqual(Object.keys(tool.outputSchema.properties).sort(), ["email", "id", "name", "nickname"])
+    assert.deepEqual(tool.outputSchema.required, ["id"])
+    assert.equal(tool.outputSchema.additionalProperties, false)
+    const validate = toolValidator.compile(tool.outputSchema)
+    const call = (args = {}) => request("tools/call", { name: "account.profile", arguments: args })
+    const result = (await call()).result
+    assert.equal(result.isError, false)
+    assert.ok(validate(result.structuredContent), JSON.stringify(validate.errors))
+    assert.deepEqual(result.structuredContent, { id: "1", name: "Connected User", email: "connected@example.test", nickname: "connected" })
+    assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent)
+    profile = { id: 1n, name: "Renamed User" }
+    assert.deepEqual((await call()).result.structuredContent, { id: "1", name: "Renamed User" }, "profile ID stays stable and unavailable fields are omitted")
+    const beforeSelector = reads
+    const selector = await call({ userId: "2" })
+    assert.ok(selector.error || selector.result?.isError)
+    assert.equal(reads, beforeSelector, "caller cannot select another identity")
+    profile = { id: 2n, email: "other@example.test" }
+    const mismatch = (await call()).result
+    assert.equal(mismatch.isError, true)
+    assert.match(JSON.stringify(mismatch._meta), /invalid_token/)
+    assert.equal(mismatch.structuredContent, undefined)
+    assert.doesNotMatch(JSON.stringify(mismatch), /other@example.test/)
+  } finally { await server.close() }
+}
+
+// Use compiled tool handlers and their packaged HTML together. Domain fixtures
+// replace the upstream account; the wire result is produced by the real server.
+async function checkCompiledMessageCards() {
+  const { createInlineMcpServer } = await import(path.join(root, "packages/mcp/dist/server/mcp/server.js"))
+  const requireMcp = createRequire(path.join(root, "packages/mcp/package.json"))
+  const { Window } = await import(requireMcp.resolve("happy-dom"))
+  const chat = {
+    chatId: 7n, title: "Contract Chat", chatTitle: "Contract Chat", kind: "space_chat", spaceId: 10n, spaceName: "Inline",
+    peerUserId: null, peerDisplayName: null, peerUsername: null, archived: false, pinned: false, unreadCount: 0,
+    readMaxId: null, lastMessageId: 100n, lastMessageDate: 1790726400n,
+  }
+  const message = { id: 100n, chatId: 7n, fromId: 2n, message: "Compiled card text ".repeat(30), out: false, date: 1790726400n }
+  const inline = {
+    close: async () => {},
+    recentMessages: async () => ({ chat, direction: "all", scannedCount: 1, nextOffsetId: 100n, messages: [message], senderDisplayNames: { "2": "Dena Example" }, senderAvatarUrls: { "2": "https://api.inline.chat/file?id=fixture_avatar&exp=1999999999&sig=fixture" } }),
+    searchMessages: async ({ query }) => ({ chat, query, content: "all", mode: "search", scannedCount: 1, nextOffsetId: 99n, messages: [], senderDisplayNames: {} }),
+  }
+  const server = createInlineMcpServer({
+    grant: { id: "card-contract", clientId: "card-client", inlineUserId: 1n, scope: "messages:read", spaceIds: [10n], allowDms: false, allowHomeThreads: false },
+    inline, contractVersion: "submission-v2",
+  })
+  const pending = new Map()
+  const transport = {
+    start: async () => {}, close: async () => {},
+    send: async (message) => { if (typeof message.id === "number") pending.get(message.id)?.(message) },
+  }
+  const authInfo = { token: "synthetic-card-token", clientId: "card-client", scopes: ["messages:read"], expiresAt: Math.floor(Date.now() / 1000) + 3600 }
+  let requestId = 0
+  const request = async (method, params) => {
+    const id = ++requestId
+    const response = new Promise((resolve) => pending.set(id, resolve))
+    transport.onmessage({ jsonrpc: "2.0", id, method, params }, { authInfo })
+    let timeout
+    const deadline = new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(`${method} compiled card contract timed out`)), 5_000) })
+    let message
+    try { message = await Promise.race([response, deadline]) }
+    finally { clearTimeout(timeout); pending.delete(id) }
+    assert.ok(message.result && !message.error && !message.result.isError, `${method} compiled card contract must succeed`)
+    return message.result
+  }
+  let window
+  try {
+    await server.connect(transport)
+    await request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "compiled-card-contract", version: "1" } })
+    transport.onmessage({ jsonrpc: "2.0", method: "notifications/initialized" }, { authInfo })
+    const { contents } = await request("resources/read", { uri: uiUri })
+    const html = contents[0].text
+    const script = html.match(/<script>([\s\S]+)<\/script>/)?.[1]
+    assert.ok(script, "compiled card must include its script")
+    window = new Window({ url: "https://mcp.inline.chat", settings: { enableJavaScriptEvaluation: true } })
+    const parent = { postMessage: () => {} }
+    Object.defineProperty(window, "parent", { value: parent })
+    Object.defineProperty(window, "fetch", { value: () => { throw new Error("card must not fetch") } })
+    window.document.write(html.replace(/<script>[\s\S]+<\/script>/, ""))
+    window.eval(script)
+    const receive = (data) => window.dispatchEvent(new window.MessageEvent("message", { source: parent, data: { jsonrpc: "2.0", ...data } }))
+    receive({ id: 1, result: { protocolVersion: "2026-01-26", hostContext: { theme: "light" } } })
+    const listed = await request("tools/call", { name: "messages.list", arguments: { chatId: "7", limit: 20 } })
+    assert.equal(listed.structuredContent.senderUserId, null, "unfiltered list has no selected sender")
+    assert.deepEqual(JSON.parse(listed.content[0].text), listed.structuredContent, "text fallback retains the real result")
+    receive({ method: "ui/notifications/tool-result", params: listed })
+    assert.equal(window.document.querySelectorAll("li").length, 1, "real list result must render")
+    assert.equal(window.document.querySelector(".sender")?.textContent, "Dena Example")
+    assert.ok(window.document.querySelector(".incoming .bubble"), "incoming messages use a native bubble")
+    const photo = window.document.querySelector(".avatar img")
+    assert.equal(photo?.getAttribute("src"), listed._meta.inline.senderAvatarUrls["2"])
+    assert.equal(photo?.referrerPolicy, "no-referrer")
+    assert.doesNotMatch(JSON.stringify([listed.structuredContent, listed.content]), /sig=fixture/, "signed avatars stay out of model-visible content")
+    photo.dispatchEvent(new window.Event("error"))
+    assert.equal(photo.hidden, true, "unavailable photo reveals the native initials fallback")
+    assert.equal(window.document.querySelector(".avatar-initial")?.textContent, "D")
+    const disclosure = window.document.querySelector("button")
+    assert.ok(disclosure, "long returned text must have local disclosure")
+    disclosure.click()
+    assert.equal(window.document.querySelector(".message-text")?.textContent, message.message)
+    const searched = await request("tools/call", { name: "messages.search", arguments: { chatId: "7", query: "blocked" } })
+    assert.equal(searched.structuredContent.senderUserId, null, "unfiltered search has no selected sender")
+    assert.equal(searched.structuredContent.nextOffsetId, "99")
+    receive({ method: "ui/notifications/tool-result", params: searched })
+    assert.equal(window.document.querySelectorAll("li").length, 0, "search replaces previous rows")
+    assert.match(window.document.querySelector("footer")?.textContent ?? "", /Older results may be available\. Ask in chat to continue\./)
+    assert.doesNotMatch(window.document.body.textContent, /No messages matched/)
+  } finally {
+    await window?.happyDOM.close()
+    await server.close()
+  }
+}
+
+// A successful send receipt is insufficient: Inline's real parser must produce
+// exact mention links for the send pipeline's resolver, even hostile display names.
+async function checkCompiledConsultationMentions() {
+  const { createInlineMcpServer } = await import(path.join(root, "packages/mcp/dist/server/mcp/server.js"))
+  const { parseMarkdown } = await import(path.join(root, "server/src/modules/message/parseMarkdown.ts"))
+  const people = [
+    { userId: 2n, displayName: "Mo" },
+    { userId: 3n, displayName: "😀 [Eve](inline://user?id=999) & <b>" },
+  ]
+  const writes = []
+  const server = createInlineMcpServer({
+    grant: { id: "ask-contract", clientId: "ask-client", inlineUserId: 1n, scope: "messages:read messages:write", spaceIds: [], allowDms: true, allowHomeThreads: true },
+    contractVersion: "submission-v2",
+    inline: {
+      searchPeople: async ({ query }) => ({ items: people.filter((person) => person.userId.toString() === query) }),
+      createChat: async (args) => { writes.push({ kind: "create", args }); return { chatId: 7n, title: args.title, chatTitle: args.title, kind: "home_thread", archived: false, pinned: false, unreadCount: 0 } },
+      sendMessage: async (args) => { writes.push({ kind: "send", args }); return { messageId: 123n } },
+    },
+    events: () => ({ request: async (method) => method === "events/cursor" ? { cursor: "before-question" } : { events: [] } }),
+  })
+  const authInfo = { token: "synthetic-ask-token", clientId: "ask-client", scopes: ["messages:read", "messages:write"] }
+  const pending = new Map()
+  let requestId = 0
+  const transport = { start: async () => {}, close: async () => {}, send: async (message) => pending.get(message.id)?.(message) }
+  const request = async (method, params) => {
+    const id = ++requestId
+    let timer
+    const response = new Promise((resolve, reject) => {
+      pending.set(id, resolve)
+      timer = setTimeout(() => reject(new Error("Compiled consultation timed out")), 5_000)
+    })
+    transport.onmessage({ jsonrpc: "2.0", id, method, params }, { authInfo })
+    try { return await response } finally { clearTimeout(timer); pending.delete(id) }
+  }
+  try {
+    await server.connect(transport)
+    await request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "consultation-contract", version: "1" } })
+    transport.onmessage({ jsonrpc: "2.0", method: "notifications/initialized" }, { authInfo })
+    const response = await request("tools/call", { name: "conversations.ask", arguments: { title: "Parser acceptance", participantUserIds: ["1", "2", "3", "2"], question: "Please review **this**." } })
+    assert.equal(response.result?.isError, undefined, JSON.stringify(response))
+    assert.equal(response.result.structuredContent.questionStatus, "sent")
+    assert.equal(writes.length, 2, "exactly one create and one send")
+    assert.deepEqual(writes[0].args.participantUserIds, [2n, 3n])
+    assert.equal(writes[1].args.parseMarkdown, true)
+    const parsed = parseMarkdown(writes[1].args.text)
+    const mentions = parsed.entities.filter((entity) => entity.entity.oneofKind === "textUrl")
+    assert.deepEqual(mentions.map((entity) => entity.entity.textUrl.url), ["inline://user?id=2", "inline://user?id=3"], "real send parser must preserve recipient mention links and never a name-injected ID")
+    assert.deepEqual(mentions.map((entity) => parsed.text.slice(Number(entity.offset), Number(entity.offset + entity.length))), people.map((person) => `@${person.displayName}`))
+    assert.ok(parsed.text.endsWith("Please review this."), "question formatting remains intact")
+    assert.equal(response.result.structuredContent.monitoring, undefined, "send must not claim monitoring")
+    assert.match(response.result.structuredContent.nextStep, /no monitoring was installed/)
+
+    if (CHECK_DEFERRED_APP_VIEWS) {
+      // Expansion may supply a launch snapshot without sending tool-result again.
+      // Mount the packaged app with the actual ask receipt and verify its read.
+      const resource = await request("resources/read", { uri: threadUiUri })
+      const html = resource.result.contents[0].text
+      const requireMcp = createRequire(path.join(root, "packages/mcp/package.json"))
+      const { Window } = await import(requireMcp.resolve("happy-dom"))
+      const { sampleThread } = await import(path.join(root, "plugins/chatgpt/ui/scripts/fixtures.ts"))
+      const snapshot = sampleThread("7", "Parser acceptance")
+      const window = new Window({ url: "https://mcp.inline.chat", settings: { enableJavaScriptEvaluation: true } })
+      const opened = []
+      const hostMethods = []
+      const receive = (data) => window.dispatchEvent(new window.MessageEvent("message", { source: parent, data: { jsonrpc: "2.0", ...data } }))
+      const parent = { postMessage: (message) => {
+        hostMethods.push(message.method)
+        if (message.method === "ui/initialize") queueMicrotask(() => receive({ id: message.id, result: { protocolVersion: "2026-01-26", hostCapabilities: {}, hostContext: { displayMode: "fullscreen" } } }))
+        if (message.method === "tools/call") {
+          assert.equal(message.params.name, "conversations.open")
+          assert.deepEqual(JSON.parse(JSON.stringify(message.params.arguments)), { chatId: "7" })
+          opened.push(message.params.arguments.chatId)
+          queueMicrotask(() => receive({ id: message.id, result: { structuredContent: snapshot } }))
+        }
+      } }
+      try {
+        Object.defineProperty(window, "parent", { value: parent })
+        window.openai = { toolOutput: response.result.structuredContent, toolResponseMetadata: { mcp_tool_result: response.result }, displayMode: "fullscreen", setWidgetState: (state) => { window.openai.widgetState = state } }
+        Object.defineProperty(window, "fetch", { value: () => { throw new Error("thread must read through the host") } })
+        const script = html.match(/<script type="module">([\s\S]+)<\/script>/)?.[1]
+        assert.ok(script, "packaged thread has its production bundle")
+        window.document.write(html.replace(/<script type="module">[\s\S]+<\/script>/, ""))
+        window.eval(script)
+        const deadline = Date.now() + 3_000
+        while (!window.document.querySelector("textarea") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+        assert.deepEqual(opened, ["7"], `initial ask receipt must open its confirmed thread once without a later notification: ${JSON.stringify({ hostMethods, text: window.document.body.textContent })}`)
+        assert.ok(window.document.querySelector("textarea"), "the opened thread must have its working composer")
+        assert.equal(window.openai.widgetState.activeChatId, "7")
+        assert.match(window.document.body.textContent, /Parser acceptance/)
+        assert.ok(window.document.querySelector(".thread-sidebar"), "fullscreen must show the small remembered-thread sidebar even for one thread")
+      } finally { await window.happyDOM.close() }
+    }
+  } finally { await server.close() }
+}
+
+let active = true
+let scope = "messages:read spaces:read"
+let appServer
+let upstreamRequests = 0
+const eventRequests = []
+const upstream = Bun.serve({
+  hostname: "127.0.0.1", port: 0,
+  fetch: () => {
+    upstreamRequests += 1
+    return new Response("This metadata-only check must not call Inline", { status: 503 })
+  },
+})
+const introspection = Bun.serve({
+  hostname: "127.0.0.1",
+  port: 0,
+  fetch: async (request) => {
+    if (new URL(request.url).pathname === "/oauth/mcp-events") {
+      assert.equal(request.headers.get("x-inline-mcp-secret"), "synthetic-ci-secret")
+      const body = await request.json()
+      assert.equal(body.token, "mcp_at_chatgpt_ci")
+      assert.deepEqual(Object.keys(body).sort(), ["method", "params", "token"])
+      assert.ok(!("_meta" in body.params), "protocol metadata must stop at the MCP proxy")
+      eventRequests.push(body)
+      if (body.method === "events/list") return Response.json({ events: [{
+        name: "message.created", delivery: ["webhook"],
+        inputSchema: { type: "object", properties: { chatId: { type: "string" } }, required: ["chatId"] },
+      }] })
+      if (body.method === "events/subscribe") return Response.json({ id: "ci-subscription", cursor: "ci-cursor", truncated: false, refreshBefore: new Date(Date.now() + 300_000).toISOString() })
+      if (body.method === "events/unsubscribe") return Response.json({})
+      throw new Error("Unexpected compiled-smoke internal event method")
+    }
+    return Response.json({
+    active, grant_id: "chatgpt-ci-grant", client_id: "chatgpt-ci-client", scope,
+    aud: "http://127.0.0.1:8791", exp: Math.floor(Date.now() / 1000) + 3600,
+    inline_user_id: "1", space_ids: [], allow_dms: false, allow_home_threads: false,
+    inline_token: "1:synthetic-ci-token",
+    })
+  },
+})
+
+try {
+  const app = createApp({
+    issuer: "http://127.0.0.1:8791",
+    inlineApiBaseUrl: `http://127.0.0.1:${upstream.port}`,
+    oauthIssuer: "http://127.0.0.1:8791",
+    oauthProxyBaseUrl: `http://127.0.0.1:${introspection.port}`,
+    oauthIntrospectionUrl: `http://127.0.0.1:${introspection.port}/introspect`,
+    oauthInternalSharedSecret: "synthetic-ci-secret",
+  })
+  appServer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch })
+  const endpoint = `http://127.0.0.1:${appServer.port}/mcp/v2`
+  const headers = {
+    authorization: "Bearer mcp_at_chatgpt_ci",
+    accept: "application/json, text/event-stream",
+    "content-type": "application/json",
+  }
+  let session
+  let requestId = 0
+  const request = async (method, params, authenticated = true) => {
+    const id = ++requestId
+    const requestHeaders = { ...headers, ...(session ? { "mcp-session-id": session } : {}) }
+    if (!authenticated) delete requestHeaders.authorization
+    const response = await fetch(endpoint, {
+      method: "POST", headers: requestHeaders, signal: AbortSignal.timeout(10_000),
+      body: JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }),
+    })
+    session = response.headers.get("mcp-session-id") ?? session
+    const body = await response.text()
+    const messages = response.headers.get("content-type")?.includes("text/event-stream")
+      ? body.split(/\r?\n\r?\n/).flatMap((event) => {
+          const data = event.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n")
+          return data ? [JSON.parse(data)] : []
+        })
+      : body ? [JSON.parse(body)] : []
+    return { status: response.status, message: messages.find((message) => message.id === id) }
+  }
+  const success = async (method, params) => {
+    const { status, message } = await request(method, params)
+    assert.equal(status, 200, `${method} HTTP status`)
+    assert.ok(message?.result && !message.error && !message.result.isError, `${method} must return a successful MCP result`)
+    return message.result
+  }
+
+  assert.equal((await request("resources/read", { uri: uiUri }, false)).status, 401)
+  assert.equal((await request("tools/call", { name: "account.profile", arguments: {} }, false)).status, 401)
+  scenarios.push("anonymous-resource-read-denied")
+  await success("initialize", {
+    protocolVersion: "2025-11-25", capabilities: {},
+    clientInfo: { name: "inline-chatgpt-contract-ci", version: "1" },
+  })
+  assert.ok(session, "HTTP initialization must create a session")
+  const initialized = await fetch(endpoint, {
+    method: "POST", headers: { ...headers, "mcp-session-id": session }, signal: AbortSignal.timeout(10_000),
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+  })
+  assert.equal(initialized.status, 202, "client initialization notification must be accepted")
+  const { tools } = await success("tools/list")
+  assert.ok(Array.isArray(tools))
+  assert.ok(!tools.some((tool) => tool.name === "conversations.mentions"), "deferred app-only mention picker is not registered")
+  for (const tool of tools) {
+    assert.equal(tool._meta?.ui, undefined, `${tool.name} must not launch an app view`)
+    assert.equal(tool._meta?.["openai/ui"], undefined)
+    assert.equal(tool._meta?.["openai/outputTemplate"], undefined)
+  }
+  for (const name of ["messages.list", "messages.search"]) {
+    const tool = tools.find((tool) => tool.name === name)
+    assert.equal(tool.annotations.readOnlyHint, true)
+    assert.ok(tool.outputSchema, `${name} retains structured output schema`)
+  }
+  scenarios.push("core-tools-have-no-app-view-metadata-or-app-only-picker")
+
+  for (const tool of tools) {
+    const declared = submission.tools[tool.name]
+    assert.ok(declared, `submission annotations missing for ${tool.name}`)
+    for (const key of ["readOnlyHint", "openWorldHint", "destructiveHint"]) {
+      assert.equal(declared.annotations[key], tool.annotations[key], `${tool.name} ${key} submission drift`)
+    }
+    for (const key of ["read_only_justification", "open_world_justification", "destructive_justification"]) {
+      assert.ok(declared.justifications[key]?.trim(), `${tool.name} ${key} must explain its annotation`)
+    }
+  }
+  assert.deepEqual(Object.keys(submission.tools).sort(), tools.map((tool) => tool.name).sort(), "submission tool inventory must match compiled server")
+  scenarios.push("submission-annotations-match-compiled-tools")
+
+  const open = tools.find((tool) => tool.name === "conversations.open")
+  const ask = tools.find((tool) => tool.name === "conversations.ask")
+  assert.ok(open?.outputSchema, "thread read remains available as structured data")
+  assert.equal(ask?.annotations.idempotentHint, false)
+  for (const name of ["conversations.ask", "conversations.create", "messages.send", "messages.send_media", "messages.send_batch"]) {
+    assert.equal(tools.find((tool) => tool.name === name)?.annotations.openWorldHint, true,
+      `${name} communicates with independently controlled recipients, even in a private thread`)
+  }
+  const emptyThread = await success("tools/call", { name: "conversations.open", arguments: {} })
+  assert.equal(emptyThread.structuredContent.chat, null)
+  assert.deepEqual(emptyThread.structuredContent.messages, [])
+  assert.equal(emptyThread.structuredContent.capabilities.canSend, false)
+  scenarios.push("core-thread-read-without-id-does-not-fetch-workspace-catalog")
+
+  const { resourceTemplates } = await success("resources/templates/list")
+  assert.ok(resourceTemplates.some((resource) => resource.uriTemplate === "inline://chat/{chatId}"))
+  const parkedViews = [uiUri, "ui://inline/thread-v1.html", "ui://inline/thread-v2.html", threadUiUri]
+  const listedResources = (await success("resources/list")).resources
+  assert.ok(listedResources.every((resource) => !resource.uri.startsWith("ui://")), "no app HTML may be advertised")
+  for (const uri of parkedViews) {
+    const response = await request("resources/read", { uri })
+    assert.ok(response.message?.error, `${uri} must not remain readable through an old host reference`)
+    assert.equal(response.message?.result?.contents, undefined)
+  }
+  scenarios.push("all-deferred-view-resources-and-legacy-aliases-are-unavailable")
+
+  const modernVersion = "2026-07-28"
+  const modernRequest = async (method, params = {}) => {
+    const id = ++requestId
+    const response = await fetch(endpoint, {
+      method: "POST", signal: AbortSignal.timeout(10_000),
+      headers: { ...headers, "mcp-protocol-version": modernVersion, "mcp-method": method,
+        // A cached legacy session must never select the legacy lane.
+        "mcp-session-id": session,
+        ...(method === "tools/call" ? { "mcp-name": params.name } : method === "resources/read" ? { "mcp-name": params.uri } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id, method, params: { ...params, _meta: {
+        "io.modelcontextprotocol/protocolVersion": modernVersion,
+        "io.modelcontextprotocol/clientCapabilities": {},
+      } } }),
+    })
+    assert.equal(response.status, 200, `${method} modern HTTP status`)
+    assert.equal(response.headers.get("mcp-session-id"), null)
+    const message = await response.json()
+    assert.equal(message.id, id)
+    assert.equal(message.result?.resultType, "complete")
+    assert.ok(!message.error && !message.result.isError, `${method} modern result`)
+    assert.doesNotMatch(JSON.stringify(message), /mcp_at_chatgpt_ci|synthetic-ci-secret|synthetic-ci-token/, "protocol replies must not leak credentials")
+    validateModernResponse(method, message)
+    return message.result
+  }
+  const discovered = await modernRequest("server/discover")
+  assert.deepEqual(discovered.capabilities.events, {})
+  assert.ok(discovered.supportedVersions.includes(modernVersion))
+  const modernTools = (await modernRequest("tools/list")).tools
+  assert.deepEqual(modernTools.map((tool) => tool.name).sort(), tools.map((tool) => tool.name).sort())
+  for (const tool of modernTools) {
+    toolValidator.compile(tool.inputSchema)
+    if (tool.outputSchema) toolValidator.compile(tool.outputSchema)
+  }
+  const modernResources = (await modernRequest("resources/list")).resources
+  await modernRequest("resources/templates/list")
+  for (const resource of modernResources) {
+    const result = await modernRequest("resources/read", { uri: resource.uri })
+    assert.ok(result.contents.some((content) => content.uri === resource.uri), "every advertised resource is readable")
+  }
+  for (const name of ["account.me", "conversations.open"]) {
+    const result = await modernRequest("tools/call", { name, arguments: {} })
+    const tool = modernTools.find((tool) => tool.name === name)
+    assert.ok(tool?.outputSchema, `${name} output schema`)
+    const validateOutput = toolValidator.compile(tool.outputSchema)
+    assert.ok(validateOutput(result.structuredContent), `${name}: ${JSON.stringify(validateOutput.errors)}`)
+  }
+  scenarios.push("all-modern-catalogs-and-advertised-resources-match-official-schema")
+
+  // Negative controls reproduce the production defect and prove nested schema
+  // validation remains active. These must fail without relying on HTTP status.
+  for (const { method, message } of validatedResponses) {
+    const name = resultTypes[method]
+    const validateResult = validator(name)
+    for (const field of ["resultType", ...(method === "tools/call" ? [] : ["ttlMs", "cacheScope"])]) {
+      const malformed = structuredClone(message.result)
+      delete malformed[field]
+      assert.equal(validateResult(malformed), false, `${method} must reject missing ${field}`)
+    }
+    const missingId = structuredClone(message)
+    delete missingId.id
+    assert.equal(validator(`${name}Response`)(missingId), false, `${method} must reject missing response ID`)
+  }
+  const badTool = structuredClone(modernTools)
+  delete badTool[0].inputSchema
+  assert.equal(validator("ListToolsResult")({ resultType: "complete", ttlMs: 0, cacheScope: "private", tools: badTool }), false)
+  assert.equal(validator("ReadResourceResult")({ resultType: "complete", ttlMs: 0, cacheScope: "private", contents: [{ uri: threadUiUri, text: 42 }] }), false)
+  scenarios.push("official-schema-rejects-old-cache-defect-and-malformed-nested-payloads")
+
+  for (const [label, method, params, metadata, extraHeaders, expectedStatus, expectedCode] of [
+    ["missing client capabilities", "tools/list", {}, { "io.modelcontextprotocol/clientCapabilities": null }, {}, 400, -32602],
+    ["version mismatch", "tools/list", {}, {}, { "mcp-protocol-version": "2026-07-27" }, 400, -32020],
+    ["unsupported version", "tools/list", {}, { "io.modelcontextprotocol/protocolVersion": "2026-07-27" }, { "mcp-protocol-version": "2026-07-27" }, 400, -32022],
+    ["resource name mismatch", "resources/read", { uri: threadUiUri }, {}, { "mcp-name": "ui://wrong/resource.html" }, 400, -32020],
+    ["unknown tool", "tools/call", { name: "not-a-tool", arguments: {} }, {}, { "mcp-name": "not-a-tool" }, 400, -32602],
+    ["deferred app picker", "tools/call", { name: "conversations.mentions", arguments: { query: "" } }, {}, { "mcp-name": "conversations.mentions" }, 400, -32602],
+    ...parkedViews.map((uri) => ["deferred app resource", "resources/read", { uri }, {}, { "mcp-name": uri }, 400, -32602]),
+    ["unknown method", "not-a-method", {}, {}, {}, 404, -32601],
+  ]) {
+    const id = ++requestId
+    const response = await fetch(endpoint, {
+      method: "POST", signal: AbortSignal.timeout(10_000),
+      headers: { ...headers, "mcp-protocol-version": modernVersion, "mcp-method": method, ...extraHeaders },
+      body: JSON.stringify({ jsonrpc: "2.0", id, method, params: { ...params, _meta: {
+        "io.modelcontextprotocol/protocolVersion": modernVersion,
+        "io.modelcontextprotocol/clientCapabilities": {}, ...metadata,
+      } } }),
+    })
+    const message = await response.json()
+    assert.equal(response.status, expectedStatus, label)
+    assert.equal(message.id, id, label)
+    assert.equal(message.error?.code, expectedCode, label)
+    assertSchema("JSONRPCErrorResponse", message, label)
+  }
+  scenarios.push("modern-http-rejects-invalid-metadata-headers-versions-and-methods")
+  const listedEvents = await modernRequest("events/list")
+  assert.equal(listedEvents.events[0].name, "message.created")
+  const selector = { name: "message.created", arguments: { chatId: "7", excludeSelf: true } }
+  const delivery = { mode: "webhook", url: "https://callbacks.example.com/inline", secret: "synthetic-ci-webhook-secret-not-a-provider-credential" }
+  const subscribed = await modernRequest("events/subscribe", { ...selector, delivery, cursor: "ci-cursor", ttlMs: 300_000 })
+  assert.equal(subscribed.id, "ci-subscription")
+  assert.equal(subscribed.truncated, false)
+  await modernRequest("events/unsubscribe", { ...selector, delivery: { mode: delivery.mode, url: delivery.url } })
+  assert.deepEqual(eventRequests.map((value) => value.method), ["events/list", "events/subscribe", "events/unsubscribe"])
+  assert.deepEqual(eventRequests[1].params.arguments, selector.arguments)
+  assert.equal((await modernRequest("tools/call", { name: "conversations.open", arguments: {} })).structuredContent.chat, null)
+  scenarios.push("modern-discovery-events-and-ui-preserve-legacy-session-compatibility")
+
+  // Scope-denial paths must fail before any request to the Inline server.
+  scope = "spaces:read"
+  for (const [method, params] of [
+    ["tools/call", { name: "conversations.open", arguments: { chatId: "123" } }],
+    ["resources/read", { uri: "inline://chat/123" }],
+  ]) {
+    const result = await request(method, params)
+    const explicitScopeError = (result.message?.error || result.message?.result?.isError)
+      && JSON.stringify(result.message).includes("messages:read")
+    assert.ok(result.status === 401 || result.status === 403 || explicitScopeError,
+      `${method} must deny missing messages:read`)
+    assert.ok(!result.message?.result?.contents, "denial must not expose snapshot content")
+  }
+  scenarios.push("thread-read-and-direct-resource-require-read-scope")
+  scope = "messages:read spaces:read"
+  const deniedAsk = await request("tools/call", { name: "conversations.ask", arguments: { title: "CI consultation", question: "Approved fixture question", participantUserIds: ["2"] } })
+  assert.ok(deniedAsk.message?.result?.isError)
+  assert.match(JSON.stringify(deniedAsk.message), /messages:write/)
+  assert.equal(eventRequests.length, 3, "write denial must precede Events preflight")
+  scenarios.push("consultation-write-scope-denied-before-side-effects")
+  active = false
+  assert.equal((await request("resources/read", { uri: uiUri })).status, 401)
+  assert.equal((await request("tools/call", { name: "account.profile", arguments: {} })).status, 401)
+  const revokedModern = await fetch(endpoint, {
+    method: "POST", signal: AbortSignal.timeout(10_000),
+    headers: { ...headers, "mcp-protocol-version": modernVersion, "mcp-method": "resources/read", "mcp-name": threadUiUri },
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++requestId, method: "resources/read", params: { uri: threadUiUri, _meta: {
+      "io.modelcontextprotocol/protocolVersion": modernVersion, "io.modelcontextprotocol/clientCapabilities": {},
+    } } }),
+  })
+  assert.equal(revokedModern.status, 401)
+  assert.match(revokedModern.headers.get("www-authenticate") ?? "", /invalid_token/)
+  scenarios.push("revoked-grant-denies-existing-session")
+  assert.equal(upstreamRequests, 0, "metadata and scope-denial checks must not contact Inline")
+
+  await checkCompiledAccountProfile()
+  scenarios.push("compiled-profile-identifies-only-authenticated-self-with-strict-host-schema")
+  scenarios.push("anonymous-and-revoked-profile-requests-denied-before-upstream")
+
+  await checkCompiledConsultationMentions()
+  scenarios.push("compiled-consultation-preserves-recipient-mention-links-through-send-parser")
+  if (CHECK_DEFERRED_APP_VIEWS) {
+    scenarios.push("packaged-thread-opens-initial-ask-receipt-in-fullscreen-without-notification")
+    await checkCompiledMessageCards()
+    scenarios.push("compiled-list-and-search-results-render-in-packaged-card")
+  }
+
+  const receipt = {
+    sourceSha: process.env.GITHUB_SHA ?? null,
+    evidence: "compiled MCP HTTP contract with synthetic local OAuth; not ChatGPT host acceptance",
+    protocolSchema: { version: "2026-07-28", upstreamCommit: "271ecc9accafdd9b83a3c869fa67c22953b2af80", validatedResponses: validatedResponses.length },
+    scenarios: scenarios.map((scenario) => ({ scenario, status: "passed" })),
+  }
+  if (process.argv[2]) await writeFile(process.argv[2], `${JSON.stringify(receipt, null, 2)}\n`)
+  console.log(`ChatGPT plugin contract: ${scenarios.length} scenarios passed. Real host acceptance remains separate.`)
+} finally {
+  appServer?.stop(true)
+  introspection.stop(true)
+  upstream.stop(true)
+}

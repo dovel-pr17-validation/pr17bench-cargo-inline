@@ -1,0 +1,69 @@
+# Version-controlled, non-secret settings for the traffic-serving Machine.
+# The dark validation Machine uses fly.dark-machine.json and has no Fly Proxy
+# service. The manual release workflow selects existing public Machines and
+# supplies a qualified immutable image; this file does not select Machines.
+app = "inline-api"
+primary_region = "fra"
+kill_signal = "SIGTERM"
+kill_timeout = "45s"
+
+# Deployment consumes an already tested image; it never builds the checkout.
+# Override this sentinel with --image registry/repository@sha256:... .
+[build]
+  image = "REPLACE_WITH_IMMUTABLE_IMAGE_DIGEST"
+
+[deploy]
+  strategy = "bluegreen"
+  # No release_command: run the same image's migrator as a controlled job.
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8000"
+  # This Fly role participates in shared worker claims alongside qualified
+  # warm fallback origins; routing priority does not fence background workers.
+  INLINE_PROCESS_ROLE = "all"
+  # Deployment overlap and the warm standby share PostgreSQL. Redis supplies
+  # optional wake-up hints; durable catch-up must remain enabled without it.
+  INLINE_REALTIME_DISTRIBUTED = "1"
+  # Three query slots plus one separate health slot per process. Budget the
+  # warm standby and temporary deployment overlap against the database limit.
+  INLINE_DATABASE_QUERY_POOL_MAX = "3"
+  # Public TLS and application authentication also work directly at Fly. An
+  # existing Cloudflare proof authenticates IP attribution when present.
+  INLINE_INGRESS_MODE = "cloudflare-optional"
+  INLINE_INGRESS_HOST = "api.inline.chat"
+  INLINE_TRUSTED_CLIENT_IP_HEADER = "cf-connecting-ip"
+  INLINE_INGRESS_DIRECT_IP_SOURCE = "fly-client-ip"
+  # Leave five seconds after the application's 40-second drain for Fly's
+  # supervisor to complete termination.
+  SHUTDOWN_TIMEOUT_MS = "40000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/readyz"
+    interval = "5s"
+    timeout = "3s"
+    grace_period = "15s"
+
+    [http_service.checks.headers]
+      X-Forwarded-Proto = "https"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 6
+  memory = "1536mb"
+
+[[restart]]
+  policy = "on-failure"
+  retries = 10
+  processes = ["app"]
+
+# No release_command while migrations use an explicitly reviewed one-off job.
+# A healthy check controls routing only; it does not fence the old writer or
+# restart a process which is still running but unhealthy. See fly-deployment.md.

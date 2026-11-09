@@ -1,0 +1,289 @@
+import InlineKit
+import InlineUI
+import RealtimeV2
+import SwiftUI
+
+struct SpacePickerMenu: View {
+  private enum PresentedSheet: String, Identifiable {
+    case picker
+
+    var id: String { rawValue }
+  }
+
+  @ObservedObject private var compactSpaceList: CompactSpaceList
+  @ObservedObject private var realtimeState: RealtimeState
+
+  var selectedSpaceId: Binding<Int64?>?
+  var onSelectHome: (() -> Void)?
+  var onSelectSpace: ((Space) -> Void)?
+  let onCreateSpace: () -> Void
+  var showsConnectionStateInTitle = true
+
+  @State private var localSelectedSpaceId: Int64?
+  @State private var presentedSheet: PresentedSheet?
+
+  init(
+    compactSpaceList: CompactSpaceList,
+    realtimeState: RealtimeState,
+    selectedSpaceId: Binding<Int64?>? = nil,
+    onSelectHome: (() -> Void)? = nil,
+    onSelectSpace: ((Space) -> Void)? = nil,
+    onCreateSpace: @escaping () -> Void,
+    showsConnectionStateInTitle: Bool = true
+  ) {
+    _compactSpaceList = ObservedObject(wrappedValue: compactSpaceList)
+    _realtimeState = ObservedObject(wrappedValue: realtimeState)
+    self.selectedSpaceId = selectedSpaceId
+    self.onSelectHome = onSelectHome
+    self.onSelectSpace = onSelectSpace
+    self.onCreateSpace = onCreateSpace
+    self.showsConnectionStateInTitle = showsConnectionStateInTitle
+  }
+
+  var body: some View {
+    let selectedSpaceId = selectedSpaceId ?? $localSelectedSpaceId
+    let activeSpace = selectedSpace(selectedSpaceId.wrappedValue)
+    let visibleConnectionState = showsConnectionStateInTitle
+      ? connectionStateForToolbar(activeSpace: activeSpace)
+      : nil
+    let title = visibleConnectionState?.title
+      ?? activeSpace?.displayName
+      ?? (onSelectHome != nil ? "Home" : "Spaces")
+    let selection = Binding<Int64?>(
+      get: { selectedSpaceId.wrappedValue },
+      set: { newSpaceId in
+        selectedSpaceId.wrappedValue = newSpaceId
+        if let newSpaceId,
+           let space = compactSpaceList.spaces.first(where: { $0.id == newSpaceId }) {
+          onSelectSpace?(space)
+        } else {
+          onSelectHome?()
+        }
+      }
+    )
+
+    Menu {
+      Picker("Space", selection: selection) {
+        if onSelectHome != nil {
+          Text("Home")
+            .tag(nil as Int64?)
+        }
+
+        ForEach(compactSpaceList.spaces) { space in
+          Text(space.displayName)
+            .tag(space.id as Int64?)
+        }
+      }
+      .labelsHidden()
+
+      Divider()
+
+      Button {
+        onCreateSpace()
+      } label: {
+        Text("Create Space")
+      }
+    } label: {
+      HStack(spacing: 4) {
+        Text(title)
+          .font(activeSpace == nil ? .title.weight(.bold) : .headline)
+          .foregroundStyle(.primary)
+          .lineLimit(1)
+          .truncationMode(.tail)
+          .allowsTightening(true)
+
+        Image(systemName: "chevron.down")
+          .font(.caption2.weight(.semibold))
+          .foregroundStyle(.tertiary)
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .tint(.primary)
+    .accessibilityLabel(title)
+  }
+
+  private func selectedSpace(_ selectedSpaceId: Int64?) -> Space? {
+    if let selectedSpaceId {
+      return compactSpaceList.spaces.first(where: { $0.id == selectedSpaceId })
+    }
+
+    if onSelectHome == nil {
+      return compactSpaceList.spaces.first
+    }
+
+    return nil
+  }
+
+  private func connectionStateForToolbar(activeSpace _: Space?) -> RealtimeConnectionState? {
+    realtimeState.displayedConnectionState
+  }
+}
+
+// TODO: Reconsider a toolbar space icon only if the text-only context
+// picker proves insufficient during prototype review.
+private struct SpacePickerToolbarIcon: View {
+  let space: Space?
+  let systemImage: String
+  let size: CGFloat
+
+  var body: some View {
+    if let space {
+      SpacePickerMonochromeAvatar(space: space, size: size)
+    } else {
+      RoundedRectangle(cornerRadius: size / 3.0, style: .continuous)
+        .fill(Color.gray.opacity(0.15))
+        .frame(width: size, height: size)
+        .overlay {
+          Image(systemName: systemImage)
+            .font(.system(size: size * 0.44, weight: .semibold))
+            .foregroundStyle(.primary)
+        }
+    }
+  }
+}
+
+// TODO: Remove the old sheet picker after the compact menu UX is accepted.
+private struct SpacePickerSheet: View {
+  let spaces: [Space]
+  let selectedSpaceId: Int64?
+  let showsHome: Bool
+  let onSelectHome: (() -> Void)?
+  let onSelectSpace: (Space) -> Void
+  let onCreateSpace: () -> Void
+
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    NavigationStack {
+      List {
+        if showsHome, let onSelectHome {
+          Button {
+            dismiss()
+            onSelectHome()
+          } label: {
+            SpacePickerRow(
+              title: "Home",
+              space: nil,
+              systemImage: "house.fill",
+              isSelected: selectedSpaceId == nil
+            )
+          }
+          .buttonStyle(.plain)
+        }
+
+        if spaces.isEmpty {
+          Text("No Spaces")
+            .foregroundStyle(.secondary)
+        } else {
+          ForEach(spaces) { space in
+            Button {
+              dismiss()
+              onSelectSpace(space)
+            } label: {
+              SpacePickerRow(
+                title: space.displayName,
+                space: space,
+                systemImage: "building.2.fill",
+                isSelected: space.id == selectedSpaceId
+              )
+            }
+            .buttonStyle(.plain)
+          }
+        }
+
+        Button {
+          dismiss()
+          onCreateSpace()
+        } label: {
+          SpacePickerCreateRow(systemImage: "plus")
+        }
+        .buttonStyle(.plain)
+      }
+      .navigationTitle("Spaces")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button("Close") {
+            dismiss()
+          }
+        }
+      }
+    }
+    .presentationDetents([.medium, .large])
+    .presentationDragIndicator(.visible)
+  }
+}
+
+private struct SpacePickerRow: View {
+  let title: String
+  let space: Space?
+  let systemImage: String
+  let isSelected: Bool
+
+  var body: some View {
+    HStack(spacing: 12) {
+      SpacePickerListIcon(space: space, systemImage: systemImage, size: 28)
+
+      Text(title)
+        .foregroundStyle(.primary)
+        .lineLimit(1)
+
+      Spacer()
+
+      if isSelected {
+        Image(systemName: "checkmark")
+          .font(.body)
+          .fontWeight(.semibold)
+          .foregroundStyle(Color.accentColor)
+      }
+    }
+    .contentShape(Rectangle())
+  }
+}
+
+private struct SpacePickerCreateRow: View {
+  let systemImage: String
+
+  var body: some View {
+    HStack(spacing: 12) {
+      SpacePickerListIcon(space: nil, systemImage: systemImage, size: 28)
+
+      Text("Create Space")
+        .foregroundStyle(.primary)
+
+      Spacer()
+    }
+    .contentShape(Rectangle())
+  }
+}
+
+private struct SpacePickerListIcon: View {
+  let space: Space?
+  let systemImage: String
+  let size: CGFloat
+
+  var body: some View {
+    if let space {
+      SpacePickerMonochromeAvatar(space: space, size: size)
+    } else {
+      RoundedRectangle(cornerRadius: size / 3, style: .continuous)
+        .fill(Color.gray.opacity(0.15))
+        .frame(width: size, height: size)
+        .overlay {
+          Image(systemName: systemImage)
+            .font(.system(size: size * 0.44, weight: .semibold))
+            .foregroundStyle(.secondary)
+        }
+    }
+  }
+}
+
+private struct SpacePickerMonochromeAvatar: View {
+  let space: Space
+  let size: CGFloat
+
+  var body: some View {
+    SpaceAvatar(space: space, size: size)
+  }
+}

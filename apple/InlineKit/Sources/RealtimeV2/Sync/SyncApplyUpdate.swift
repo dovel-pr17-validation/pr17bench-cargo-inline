@@ -1,0 +1,423 @@
+import Auth
+import InlineProtocol
+
+public enum UpdateApplySource: Sendable, Equatable {
+  case realtime
+  case syncCatchup
+}
+
+/// Durable admission conflicts are recoverable state changes, not reducer failures.
+public enum UpdateApplyFailure: Sendable {
+  case removalRevisionChanged(expected: Int64, actual: Int64)
+  case cursorChanged(bucket: BucketKey, expected: BucketState, actual: BucketState)
+  case rejected(category: String)
+
+  public var category: String {
+    switch self {
+      case .cursorChanged: "cursor_changed"
+      case .removalRevisionChanged: "removal_revision_changed"
+      case let .rejected(category): category
+    }
+  }
+}
+
+public struct UpdateApplyResult: Sendable {
+  public let appliedCount: Int
+  public let failedCount: Int
+  public let failure: UpdateApplyFailure?
+  public let committedBucketState: BucketState?
+
+  public var succeeded: Bool {
+    failedCount == 0 && failure == nil
+  }
+
+  public init(
+    appliedCount: Int,
+    failedCount: Int,
+    committedBucketState: BucketState? = nil,
+    failure: UpdateApplyFailure? = nil
+  ) {
+    self.appliedCount = appliedCount
+    self.failedCount = failedCount
+    self.failure = failure
+    self.committedBucketState = committedBucketState
+  }
+
+  public static func success(count: Int) -> UpdateApplyResult {
+    UpdateApplyResult(appliedCount: count, failedCount: 0)
+  }
+}
+
+public struct UpdateBucketCommit: Sendable {
+  public let key: BucketKey
+  public let state: BucketState
+  public let expectedStartState: BucketState?
+  /// Destructive-change revision captured before requesting a zero-cursor child.
+  /// Survives removal/regrant without coupling admission to ordinary User traffic.
+  public let expectedRemovalRevision: Int64?
+
+  public init(
+    key: BucketKey,
+    state: BucketState,
+    expectedStartState: BucketState? = nil,
+    expectedRemovalRevision: Int64? = nil
+  ) {
+    self.key = key
+    self.state = state
+    self.expectedStartState = expectedStartState
+    self.expectedRemovalRevision = expectedRemovalRevision
+  }
+}
+
+public struct ChatRepairSnapshot: Sendable {
+  public let peer: InlineProtocol.Peer
+  public let chat: InlineProtocol.GetChatResult
+  /// Optional hydration for a subset of `chat.pinnedMessageIds`. Pin identity
+  /// remains authoritative even while a body is unavailable.
+  public let pinnedMessages: [InlineProtocol.Message]
+  public let targetState: BucketState
+  public let mutationToken: AuthAccountMutationToken
+  public let expectedRemovalRevision: Int64?
+  public let reason: String
+  public let expectedHistoryRevision: Int64?
+  public let allowsHistoryRows: Bool
+
+  public init(
+    peer: InlineProtocol.Peer,
+    chat: InlineProtocol.GetChatResult,
+    pinnedMessages: [InlineProtocol.Message],
+    targetState: BucketState,
+    mutationToken: AuthAccountMutationToken,
+    reason: String,
+    expectedRemovalRevision: Int64? = nil,
+    expectedHistoryRevision: Int64? = nil,
+    allowsHistoryRows: Bool = true
+  ) {
+    self.peer = peer
+    self.chat = chat
+    self.pinnedMessages = pinnedMessages
+    self.targetState = targetState
+    self.mutationToken = mutationToken
+    self.expectedRemovalRevision = expectedRemovalRevision
+    self.reason = reason
+    self.expectedHistoryRevision = expectedHistoryRevision
+    self.allowsHistoryRows = allowsHistoryRows
+  }
+}
+
+public struct SpaceRepairSnapshot: Sendable {
+  public let spaceID: Int64
+  public let snapshot: InlineProtocol.GetSpaceResult
+  public let targetState: BucketState
+  public let mutationToken: AuthAccountMutationToken
+  public let expectedRemovalRevision: Int64?
+  public let reason: String
+
+  public init(
+    spaceID: Int64,
+    snapshot: InlineProtocol.GetSpaceResult,
+    targetState: BucketState,
+    mutationToken: AuthAccountMutationToken,
+    reason: String,
+    expectedRemovalRevision: Int64? = nil
+  ) {
+    self.spaceID = spaceID
+    self.snapshot = snapshot
+    self.targetState = targetState
+    self.mutationToken = mutationToken
+    self.expectedRemovalRevision = expectedRemovalRevision
+    self.reason = reason
+  }
+}
+
+/// Attempt-scoped evidence returned by the durable owner after the account
+/// catalog projection has committed. It is carried with the same repair call;
+/// it is not cached and is never a substitute for the writer-local cursor and
+/// account-token checks performed during final admission.
+public struct UserBootstrapCatalogPersistence: Sendable {
+  public let checkpointState: BucketState
+  public let userStateAtPersistence: BucketState
+  public let seededStates: [BucketKey: BucketState]
+  public let catchUpTargets: [BucketKey: Int64]
+  public let retiredBucketKeys: Set<BucketKey>
+
+  public init(
+    checkpointState: BucketState,
+    userStateAtPersistence: BucketState,
+    seededStates: [BucketKey: BucketState],
+    catchUpTargets: [BucketKey: Int64],
+    retiredBucketKeys: Set<BucketKey>
+  ) {
+    self.checkpointState = checkpointState
+    self.userStateAtPersistence = userStateAtPersistence
+    self.seededStates = seededStates
+    self.catchUpTargets = catchUpTargets
+    self.retiredBucketKeys = retiredBucketKeys
+  }
+}
+
+/// Dispatch-time fence for importing a coherent catalog's last message into a
+/// truly absent chat. This never certifies a history range.
+public struct ColdHistoryBootstrapAdmission: Sendable {
+  public let expectedRemovalRevision: Int64
+  public let allowedChatIDs: Set<Int64>
+
+  public init(expectedRemovalRevision: Int64, allowedChatIDs: Set<Int64>) {
+    self.expectedRemovalRevision = expectedRemovalRevision
+    self.allowedChatIDs = allowedChatIDs
+  }
+}
+
+public struct UserRepairSnapshot: Sendable {
+  public let chats: InlineProtocol.GetChatsResult
+  public let me: InlineProtocol.GetMeResult
+  public let settings: InlineProtocol.GetUserSettingsResult
+  public let checkpointState: BucketState
+  /// User state captured after the ordinary account projections were fetched.
+  /// A typed User TOO_LONG replays this bounded suffix after installing the
+  /// projection at `checkpointState`; ordinary audits leave it nil.
+  public let replayThroughState: BucketState?
+  public let targetState: BucketState
+  public let mutationToken: AuthAccountMutationToken
+  /// Present only when this same zero-date attempt resolved every required
+  /// projection independently. Final admission consumes the durable catalog
+  /// metadata without repeating projection writes.
+  public let bootstrapCatalogPersistence: UserBootstrapCatalogPersistence?
+  public let catalogHistoryAdmission: ColdHistoryBootstrapAdmission?
+  /// An authoritative account rebase may replace active catalog inclusion.
+  /// Projection audits and other scoped repairs must leave omissions inert.
+  public let replacesActiveCatalog: Bool
+  /// Forces a snapshot projection audit even when the durable user cursor has
+  /// already reached the checkpoint. This is reserved for zero-date bootstrap
+  /// and exceptional global watermark recovery, and never rewinds the cursor.
+  public let requiresProjectionAudit: Bool
+  public let reason: String
+
+  /// A zero-date bootstrap can resume after its user cursor reached an older
+  /// checkpoint. Only that authoritative replacement plus audit combination
+  /// may inspect a checkpoint behind the durable target, and the writer must
+  /// preserve every newer user-owned projection and cursor.
+  public var allowsCheckpointBehindTarget: Bool {
+    replacesActiveCatalog && requiresProjectionAudit
+  }
+
+  public init(
+    chats: InlineProtocol.GetChatsResult,
+    me: InlineProtocol.GetMeResult,
+    settings: InlineProtocol.GetUserSettingsResult,
+    checkpointState: BucketState,
+    replayThroughState: BucketState? = nil,
+    targetState: BucketState,
+    mutationToken: AuthAccountMutationToken,
+    bootstrapCatalogPersistence: UserBootstrapCatalogPersistence? = nil,
+    catalogHistoryAdmission: ColdHistoryBootstrapAdmission? = nil,
+    replacesActiveCatalog: Bool = false,
+    requiresProjectionAudit: Bool = false,
+    reason: String
+  ) {
+    self.chats = chats
+    self.me = me
+    self.settings = settings
+    self.checkpointState = checkpointState
+    self.replayThroughState = replayThroughState
+    self.targetState = targetState
+    self.mutationToken = mutationToken
+    self.bootstrapCatalogPersistence = bootstrapCatalogPersistence
+    self.catalogHistoryAdmission = catalogHistoryAdmission
+    self.replacesActiveCatalog = replacesActiveCatalog
+    self.requiresProjectionAudit = requiresProjectionAudit
+    self.reason = reason
+  }
+}
+
+/// One independently durable projection fetched during a zero-date account
+/// bootstrap. Persisting these does not commit the user or global cursor; the
+/// complete `UserRepairSnapshot` remains the sole baseline owner.
+public enum UserBootstrapProjection: Sendable {
+  case chats(InlineProtocol.GetChatsResult)
+  case me(InlineProtocol.GetMeResult)
+  case settings(InlineProtocol.GetUserSettingsResult)
+}
+
+public struct UserBootstrapProjectionSnapshot: Sendable {
+  public let projection: UserBootstrapProjection
+  public let checkpointState: BucketState
+  public let mutationToken: AuthAccountMutationToken
+  public let catalogHistoryAdmission: ColdHistoryBootstrapAdmission?
+
+  public init(
+    projection: UserBootstrapProjection,
+    checkpointState: BucketState,
+    mutationToken: AuthAccountMutationToken,
+    catalogHistoryAdmission: ColdHistoryBootstrapAdmission? = nil
+  ) {
+    self.projection = projection
+    self.checkpointState = checkpointState
+    self.mutationToken = mutationToken
+    self.catalogHistoryAdmission = catalogHistoryAdmission
+  }
+}
+
+public enum UserBootstrapProjectionPersistence: Sendable {
+  case chats(UserBootstrapCatalogPersistence)
+  case me
+  case settings
+}
+
+/// Opaque admission captured by a user repair whose child catch-up demands
+/// must become durable before the proposed user cursor can commit.
+public struct UserRepairFinalization: Sendable {
+  public let expectedUserState: BucketState
+  public let expectedUserStateExists: Bool
+  public let proposedUserState: BucketState
+  public let replayThroughState: BucketState?
+  public let catchUpTargets: [BucketKey: Int64]
+  public let retiredBucketKeys: Set<BucketKey>
+  public let mutationToken: AuthAccountMutationToken
+
+  public init(
+    expectedUserState: BucketState,
+    expectedUserStateExists: Bool,
+    proposedUserState: BucketState,
+    replayThroughState: BucketState? = nil,
+    catchUpTargets: [BucketKey: Int64],
+    retiredBucketKeys: Set<BucketKey> = [],
+    mutationToken: AuthAccountMutationToken
+  ) {
+    self.expectedUserState = expectedUserState
+    self.expectedUserStateExists = expectedUserStateExists
+    self.proposedUserState = proposedUserState
+    self.replayThroughState = replayThroughState
+    self.catchUpTargets = catchUpTargets
+    self.retiredBucketKeys = retiredBucketKeys
+    self.mutationToken = mutationToken
+  }
+}
+
+/// Sync-owned proof describing the durable state reached for one exact child
+/// demand. `authoritative` distinguishes a resolved latest-state request from
+/// an ordinary numeric target.
+public struct UserRepairTargetResolution: Sendable {
+  public let state: BucketState
+  public let authoritative: Bool
+
+  public init(state: BucketState, authoritative: Bool) {
+    self.state = state
+    self.authoritative = authoritative
+  }
+}
+
+public enum UserRepairOutcome: Sendable {
+  case applied(
+    state: BucketState,
+    seededStates: [BucketKey: BucketState],
+    replayThroughState: BucketState?,
+    retiredBucketKeys: Set<BucketKey>
+  )
+  case pending(
+    finalization: UserRepairFinalization,
+    seededStates: [BucketKey: BucketState]
+  )
+  case superseded(currentState: BucketState, replayThroughState: BucketState?)
+}
+
+/// Protocol for applying updates within the Sync actor context
+public protocol ApplyUpdates: Sendable {
+  /// Apply a batch of updates to the database
+  func apply(
+    updates: [InlineProtocol.Update],
+    source: UpdateApplySource,
+    sidecars: InlineProtocol.UpdateSidecars?
+  ) async -> UpdateApplyResult
+
+  /// Apply a batch and, when supplied, commit its durable bucket cursor in the
+  /// same storage transaction. This is a protocol requirement so existential
+  /// dispatch reaches database-backed implementations instead of silently
+  /// selecting the forwarding default below.
+  func apply(
+    updates: [InlineProtocol.Update],
+    source: UpdateApplySource,
+    sidecars: InlineProtocol.UpdateSidecars?,
+    bucketCommit: UpdateBucketCommit?
+  ) async -> UpdateApplyResult
+
+  func apply(
+    updates: [InlineProtocol.Update],
+    source: UpdateApplySource,
+    sidecars: InlineProtocol.UpdateSidecars?,
+    bucketCommit: UpdateBucketCommit?,
+    mutationToken: AuthAccountMutationToken?
+  ) async -> UpdateApplyResult
+
+  /// Apply a bounded current-state repair for a chat bucket.
+  func repairChat(_ snapshot: ChatRepairSnapshot) async -> BucketState?
+  /// Apply a bounded current-state repair for a space bucket.
+  func repairSpace(_ snapshot: SpaceRepairSnapshot) async -> BucketState?
+  /// Apply a current account projection fetched after a frozen user cursor.
+  func repairUser(_ snapshot: UserRepairSnapshot) async -> UserRepairOutcome?
+  /// Persist one successful zero-date bootstrap projection without advancing
+  /// the user or global cursor.
+  func persistUserBootstrapProjection(
+    _ snapshot: UserBootstrapProjectionSnapshot
+  ) async -> UserBootstrapProjectionPersistence?
+  /// Advance a pending user repair only after its exact child demands are durable.
+  func finalizeUserRepair(
+    _ finalization: UserRepairFinalization,
+    resolvedTargets: [BucketKey: UserRepairTargetResolution]
+  ) async -> BucketState?
+}
+
+public extension ApplyUpdates {
+  func apply(updates: [InlineProtocol.Update], source: UpdateApplySource) async -> UpdateApplyResult {
+    await apply(updates: updates, source: source, sidecars: nil)
+  }
+
+  func repairChat(_ snapshot: ChatRepairSnapshot) async -> BucketState? {
+    nil
+  }
+
+  func repairSpace(_ snapshot: SpaceRepairSnapshot) async -> BucketState? {
+    nil
+  }
+
+  func repairUser(_ snapshot: UserRepairSnapshot) async -> UserRepairOutcome? {
+    nil
+  }
+
+  func persistUserBootstrapProjection(
+    _: UserBootstrapProjectionSnapshot
+  ) async -> UserBootstrapProjectionPersistence? {
+    nil
+  }
+
+  func finalizeUserRepair(
+    _ finalization: UserRepairFinalization,
+    resolvedTargets: [BucketKey: UserRepairTargetResolution]
+  ) async -> BucketState? {
+    nil
+  }
+
+  func apply(
+    updates: [InlineProtocol.Update],
+    source: UpdateApplySource,
+    sidecars: InlineProtocol.UpdateSidecars?,
+    bucketCommit: UpdateBucketCommit?
+  ) async -> UpdateApplyResult {
+    await apply(updates: updates, source: source, sidecars: sidecars)
+  }
+
+  func apply(
+    updates: [InlineProtocol.Update],
+    source: UpdateApplySource,
+    sidecars: InlineProtocol.UpdateSidecars?,
+    bucketCommit: UpdateBucketCommit?,
+    mutationToken: AuthAccountMutationToken?
+  ) async -> UpdateApplyResult {
+    await apply(
+      updates: updates,
+      source: source,
+      sidecars: sidecars,
+      bucketCommit: bucketCommit
+    )
+  }
+}

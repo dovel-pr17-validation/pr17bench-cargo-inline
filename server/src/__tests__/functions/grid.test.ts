@@ -1,0 +1,723 @@
+import { describe, expect, test } from "bun:test"
+import { db } from "@in/server/db"
+import { gridPresence, gridProviderEffects, gridRooms, members, spaces } from "@in/server/db/schema"
+import {
+  createGridRoom,
+  deleteGridRoom,
+  getGrid,
+  getGridHome,
+  joinGridRoom,
+  leaveGridRoom,
+  prepareGridConnection,
+  setGridRoomLocked,
+  setGridRoomTitle,
+  setGridAvatarMicrophoneEnabled,
+} from "@in/server/functions/grid"
+import { GridConnectionUnavailableReason } from "@inline-chat/protocol/core"
+import { toggleSpaceGrid } from "@in/server/functions/space.settings"
+import { eq } from "drizzle-orm"
+import { setupTestLifecycle, testUtils } from "../setup"
+import { revokeSession } from "@in/server/modules/sessions/revokeSession"
+import { lockGridMutations, removeGridMemberPresence } from "@in/server/modules/grid/roomLifecycle"
+import { sweepExpiredGridState } from "@in/server/modules/grid/expirySweeper"
+import { onGridChanged } from "@in/server/modules/grid/realtime"
+import { durableLiveKitProviderTarget } from "@in/server/modules/grid/livekit"
+import { handler as leaveSpace } from "@in/server/methods/leaveSpace"
+import { handler as deleteSpace } from "@in/server/methods/deleteSpace"
+
+const runId = Date.now()
+let counter = 0
+const email = (label: string) => `${label}-${runId}-${counter++}@example.com`
+
+describe("grid", () => {
+  setupTestLifecycle()
+
+  test("keeps Grid unavailable until a Space admin enables it", async () => {
+    const { space, users, contexts } = await createFixture("disabled", 1)
+    const grid = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(grid.grid).toEqual({
+      spaceId: BigInt(space.id),
+      enabled: false,
+      rooms: [],
+      revision: 0n,
+      callTransferEnabled: false,
+    })
+
+    await expect(createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)).rejects.toThrow()
+
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const enabled = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(enabled.grid?.enabled).toBe(true)
+    expect(enabled.grid?.rooms).toEqual([])
+    expect(users).toHaveLength(1)
+  })
+
+  test("assigns a monotonic revision to every complete Grid snapshot", async () => {
+    const { space, contexts } = await createFixture("snapshot-revision", 1)
+    const initial = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const enabled = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(enabled.grid!.revision).toBeGreaterThan(initial.grid!.revision)
+
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const createdGrid = created.grids[0]!
+    expect(createdGrid.revision).toBeGreaterThan(enabled.grid!.revision)
+
+    const roomId = createdGrid.rooms[0]!.id
+    await setGridAvatarMicrophoneEnabled({ expectedRoomId: roomId, enabled: true }, contexts[0]!)
+    const microphoneChanged = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(microphoneChanged.grid!.revision).toBeGreaterThan(createdGrid.revision)
+
+    const titled = await setGridRoomTitle({ roomId, title: "Revisioned" }, contexts[0]!)
+    expect(titled.grid!.revision).toBeGreaterThan(microphoneChanged.grid!.revision)
+  })
+
+  test("creates an ephemeral solo room and starts a connection only at two avatars", async () => {
+    const { space, contexts } = await createFixture("lifecycle", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const room = created.grids[0]?.rooms[0]
+    expect(room?.avatars).toHaveLength(1)
+    expect(room?.connection).toBeUndefined()
+    expect(room?.avatars[0]?.ownedByCurrentSession).toBe(true)
+    expect(room?.avatars[0]?.microphoneEnabled).toBe(false)
+    expect(room?.avatars[0]?.membershipId).not.toBe("")
+    expect(room?.avatars[0]?.microphoneRevision).toBe(0)
+
+    const microphone = await setGridAvatarMicrophoneEnabled(
+      { expectedRoomId: room!.id, enabled: true },
+      contexts[0]!,
+    )
+    expect(microphone.enabled).toBe(true)
+    const [persistedPresence] = await db
+      .select({
+        microphoneEnabled: gridPresence.microphoneEnabled,
+        microphoneRevision: gridPresence.microphoneRevision,
+        mediaMembershipId: gridPresence.mediaMembershipId,
+      })
+      .from(gridPresence)
+      .where(eq(gridPresence.userId, contexts[0]!.currentUserId))
+    expect(persistedPresence?.microphoneEnabled).toBe(true)
+    expect(persistedPresence?.microphoneRevision).toBe(1)
+    const withMicrophone = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(withMicrophone.grid?.rooms[0]?.avatars[0]?.microphoneEnabled).toBe(true)
+    expect(withMicrophone.grid?.rooms[0]?.avatars[0]?.microphoneRevision).toBe(1)
+
+    const idempotent = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(idempotent.grids[0]?.rooms).toHaveLength(1)
+    expect(idempotent.grids[0]?.rooms[0]?.id).toBe(room?.id)
+    const [idempotentPresence] = await db
+      .select({ mediaMembershipId: gridPresence.mediaMembershipId })
+      .from(gridPresence)
+      .where(eq(gridPresence.userId, contexts[0]!.currentUserId))
+    expect(idempotentPresence?.mediaMembershipId).toBe(persistedPresence?.mediaMembershipId)
+
+    const joined = await joinGridRoom({ roomId: room!.id }, contexts[1]!)
+    expect(joined.grids[0]?.rooms[0]?.avatars).toHaveLength(2)
+    expect(joined.grids[0]?.rooms[0]?.connection?.generation).toBe(1)
+
+    const secondLeaves = await leaveGridRoom({ expectedRoomId: room!.id }, contexts[1]!)
+    expect(secondLeaves.grids[0]?.rooms[0]?.avatars).toHaveLength(1)
+    expect(secondLeaves.grids[0]?.rooms[0]?.connection).toBeUndefined()
+    const effects = await db.select().from(gridProviderEffects)
+    expect(effects.map((effect) => effect.kind).sort()).toEqual(["close_connection", "revoke_participant"])
+    expect(effects.find((effect) => effect.kind === "revoke_participant")?.userId).toBe(
+      contexts[1]!.currentUserId,
+    )
+    expect(
+      effects
+        .find((effect) => effect.kind === "revoke_participant")
+        ?.participantIdentity?.startsWith(`inline-grid-user-${contexts[1]!.currentUserId}-`),
+    ).toBe(true)
+    expect(effects.find((effect) => effect.kind === "close_connection")?.availableAt.getTime()).toBeGreaterThan(
+      Date.now(),
+    )
+
+    const creatorLeaves = await leaveGridRoom({ expectedRoomId: room!.id }, contexts[0]!)
+    expect(creatorLeaves.grids[0]?.rooms).toEqual([])
+    expect(await db.select().from(gridRooms)).toHaveLength(0)
+  })
+
+  test("applies microphone intent in the create and join snapshots", async () => {
+    const { space, contexts } = await createFixture("join-microphone-intent", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+
+    const created = await createGridRoom(
+      { spaceId: BigInt(space.id), microphoneEnabled: true },
+      contexts[0]!,
+    )
+    const roomId = created.grids[0]!.rooms[0]!.id
+    expect(created.grids[0]!.rooms[0]!.avatars[0]!.microphoneEnabled).toBe(true)
+
+    const joined = await joinGridRoom(
+      { roomId, microphoneEnabled: true },
+      contexts[1]!,
+    )
+    expect(joined.grids[0]!.rooms[0]!.avatars.map((avatar) => avatar.microphoneEnabled)).toEqual([
+      true,
+      true,
+    ])
+  })
+
+  test("keeps presence leased across the ten-minute recovery budget", async () => {
+    const { space, contexts } = await createFixture("lease-budget", 1)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+
+    const [presence] = await db
+      .select({ joinedAt: gridPresence.joinedAt, leaseExpiresAt: gridPresence.leaseExpiresAt })
+      .from(gridPresence)
+      .where(eq(gridPresence.userId, contexts[0]!.currentUserId))
+    expect(presence).toBeDefined()
+    expect(presence!.leaseExpiresAt.getTime() - presence!.joinedAt.getTime()).toBeGreaterThanOrEqual(4 * 60_000)
+  })
+
+  test("does not mint connection credentials for an expired presence", async () => {
+    const { space, contexts } = await createFixture("expired-prepare", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    const joined = await joinGridRoom({ roomId }, contexts[1]!)
+    const generation = joined.grids[0]!.rooms[0]!.connection!.generation
+    await db
+      .update(gridPresence)
+      .set({ leaseExpiresAt: new Date(Date.now() - 1) })
+      .where(eq(gridPresence.userId, contexts[0]!.currentUserId))
+
+    const prepared = await prepareGridConnection({ roomId, generation }, contexts[0]!)
+    expect(prepared.connection).toBeUndefined()
+    expect(prepared.unavailableReason).toBe(GridConnectionUnavailableReason.NOT_ACTIVE)
+  })
+
+  test("does not resurrect expired presence during snapshot repair", async () => {
+    const { space, contexts } = await createFixture("expired-snapshot", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    const joined = await joinGridRoom({ roomId }, contexts[1]!)
+    const generation = joined.grids[0]!.rooms[0]!.connection!.generation
+    const expiredAt = new Date(Date.now() - 1)
+    await db
+      .update(gridPresence)
+      .set({ leaseExpiresAt: expiredAt })
+      .where(eq(gridPresence.userId, contexts[0]!.currentUserId))
+
+    // Reads hide the expired lease without renewing it; the sweep removes it.
+    const stale = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(stale.grid?.currentRoomId).toBeUndefined()
+    expect(stale.currentCall).toBeUndefined()
+    expect(stale.grid?.rooms[0]?.avatars).toHaveLength(1)
+    const [unrenewed] = await db.select().from(gridPresence).where(eq(gridPresence.userId, contexts[0]!.currentUserId))
+    expect(unrenewed?.leaseExpiresAt).toEqual(expiredAt)
+
+    expect(await sweepExpiredGridState()).toEqual({ status: "swept", expiredPresences: 1, retiredTranscriptionSpaces: 0 })
+    const repaired = await getGrid({ spaceId: BigInt(space.id) }, contexts[1]!)
+    expect(repaired.grid?.rooms[0]?.avatars).toHaveLength(1)
+    expect(repaired.grid?.rooms[0]?.connection).toBeUndefined()
+    expect(repaired.grid!.revision).toBeGreaterThan(stale.grid!.revision)
+    expect(await db.select().from(gridPresence).where(eq(gridPresence.userId, contexts[0]!.currentUserId))).toEqual([])
+    const revocations = (await db.select().from(gridProviderEffects)).filter((effect) => effect.kind === "revoke_participant")
+    expect(revocations.map((effect) => [effect.userId, effect.connectionGeneration])).toEqual([
+      [contexts[0]!.currentUserId, generation],
+    ])
+    expect(await sweepExpiredGridState()).toEqual({ status: "idle", nextDueAt: await earliestLease() })
+  })
+
+  test("snapshot reads and lease renewal never wait on the Grid mutation lock", async () => {
+    const { space, contexts } = await createFixture("lockless-reads", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    const joined = await joinGridRoom({ roomId }, contexts[1]!)
+    const shortenedLease = new Date(Date.now() + 60_000)
+    await db.update(gridPresence).set({ leaseExpiresAt: shortenedLease })
+
+    // A held mutation lock stands in for a slow mutation or, before this
+    // change, any other client's read.
+    const held = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const mutation = db.transaction(async (tx) => {
+      await lockGridMutations(tx)
+      held.resolve()
+      await release.promise
+    })
+    await held.promise
+    try {
+      const reads = Promise.all([
+        getGrid({ spaceId: BigInt(space.id) }, contexts[0]!),
+        getGridHome({}, contexts[0]!),
+        getGrid({ spaceId: BigInt(space.id) }, contexts[1]!),
+        getGridHome({}, contexts[1]!),
+      ])
+      const settled = await Promise.race([reads, Bun.sleep(3_000).then(() => "blocked" as const)])
+      if (settled === "blocked") throw new Error("Grid reads waited on the mutation lock")
+      const [ownerGrid, ownerHome, peerGrid, peerHome] = settled
+      expect(ownerGrid.grid!.rooms[0]!.avatars).toHaveLength(2)
+      expect(ownerGrid.currentCall?.roomId).toBe(roomId)
+      expect(peerGrid.grid!.revision).toBe(ownerGrid.grid!.revision)
+      expect(ownerHome.spaces[0]!.activeAvatarCount).toBe(2)
+      expect(peerHome.currentCall?.roomId).toBe(roomId)
+      // A lease-only renewal leaves the snapshot revision unchanged.
+      expect(peerGrid.grid!.revision).toBe(joined.grids[0]!.revision)
+      expect(await sweepExpiredGridState()).toEqual({ status: "idle", nextDueAt: await earliestLease() })
+    } finally {
+      release.resolve()
+      await mutation
+    }
+    const leases = await db.select({ leaseExpiresAt: gridPresence.leaseExpiresAt }).from(gridPresence)
+    expect(leases).toHaveLength(2)
+    expect(leases.every(({ leaseExpiresAt }) => leaseExpiresAt > shortenedLease)).toBe(true)
+  })
+
+  test("committed Grid changes wake in-process listeners such as the expiry sweeper", async () => {
+    const { space, contexts } = await createFixture("change-listener", 1)
+    let changes = 0
+    const unsubscribe = onGridChanged(() => {
+      changes += 1
+    })
+    try {
+      await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+      const before = changes
+      const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+      expect(changes).toBe(before + 1)
+      await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+      // Reads and lease renewals only move deadlines later and stay quiet.
+      expect(changes).toBe(before + 1)
+      await leaveGridRoom({ expectedRoomId: created.grids[0]!.rooms[0]!.id }, contexts[0]!)
+      expect(changes).toBe(before + 2)
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  test("an expiry sweep never revokes a presence whose renewal is in flight", async () => {
+    const { space, contexts } = await createFixture("sweep-renewal-race", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    await joinGridRoom({ roomId: created.grids[0]!.rooms[0]!.id }, contexts[1]!)
+    const ownerId = contexts[0]!.currentUserId
+    await db.update(gridPresence).set({ leaseExpiresAt: new Date(Date.now() - 1) }).where(eq(gridPresence.userId, ownerId))
+
+    const renewing = Promise.withResolvers<void>()
+    const commit = Promise.withResolvers<void>()
+    const renewal = db.transaction(async (tx) => {
+      await tx
+        .update(gridPresence)
+        .set({ leaseExpiresAt: new Date(Date.now() + 60_000) })
+        .where(eq(gridPresence.userId, ownerId))
+      renewing.resolve()
+      await commit.promise
+    })
+    await renewing.promise
+    try {
+      expect(await sweepExpiredGridState()).toEqual({ status: "swept", expiredPresences: 0, retiredTranscriptionSpaces: 0 })
+    } finally {
+      commit.resolve()
+      await renewal
+    }
+    expect(await db.select().from(gridPresence).where(eq(gridPresence.userId, ownerId))).toHaveLength(1)
+    expect(await db.select().from(gridProviderEffects)).toEqual([])
+    expect(await sweepExpiredGridState()).toEqual({ status: "idle", nextDueAt: await earliestLease() })
+
+    // A sweep also stays out of the way of a held mutation lock.
+    await db.update(gridPresence).set({ leaseExpiresAt: new Date(Date.now() - 1) }).where(eq(gridPresence.userId, ownerId))
+    const held = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const mutation = db.transaction(async (tx) => {
+      await lockGridMutations(tx)
+      held.resolve()
+      await release.promise
+    })
+    await held.promise
+    try {
+      expect(await sweepExpiredGridState()).toEqual({ status: "busy" })
+    } finally {
+      release.resolve()
+      await mutation
+    }
+    expect(await sweepExpiredGridState()).toEqual({ status: "swept", expiredPresences: 1, retiredTranscriptionSpaces: 0 })
+  })
+
+  test("reconciles an expired owner before rejoining the same room", async () => {
+    const { space, contexts } = await createFixture("expired-rejoin", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    const initial = await joinGridRoom({ roomId }, contexts[1]!)
+    const initialGeneration = initial.grids[0]!.rooms[0]!.connection!.generation
+    await db
+      .update(gridPresence)
+      .set({ leaseExpiresAt: new Date(Date.now() - 1) })
+      .where(eq(gridPresence.userId, contexts[0]!.currentUserId))
+
+    const rejoined = await joinGridRoom({ roomId }, contexts[0]!)
+    expect(rejoined.grids[0]!.rooms[0]!.avatars).toHaveLength(2)
+    expect(rejoined.grids[0]!.rooms[0]!.connection!.generation).toBe(initialGeneration + 1)
+  })
+
+  test("keeps a three-person generation active when one participant leaves", async () => {
+    const { space, contexts } = await createFixture("three-person-leave", 3)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    await joinGridRoom({ roomId }, contexts[1]!)
+    const joined = await joinGridRoom({ roomId }, contexts[2]!)
+    const generation = joined.grids[0]!.rooms[0]!.connection!.generation
+
+    const left = await leaveGridRoom({ expectedRoomId: roomId }, contexts[2]!)
+    expect(left.grids[0]!.rooms[0]!.avatars).toHaveLength(2)
+    expect(left.grids[0]!.rooms[0]!.connection?.generation).toBe(generation)
+  })
+
+  test("rotates an active generation when member access is revoked", async () => {
+    const { space, contexts } = await createFixture("three-person-access-revocation", 3)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    await joinGridRoom({ roomId }, contexts[1]!)
+    const joined = await joinGridRoom({ roomId }, contexts[2]!)
+    const oldGeneration = joined.grids[0]!.rooms[0]!.connection!.generation
+
+    const state = await removeGridMemberPresence(space.id, contexts[2]!.currentUserId)
+    const current = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const newGeneration = current.grid!.rooms[0]!.connection!.generation
+    const cleanup = await db
+      .select()
+      .from(gridProviderEffects)
+      .where(eq(gridProviderEffects.kind, "close_connection"))
+
+    expect(state.endedConnections.map((connection) => connection.generation)).toContain(oldGeneration)
+    expect(newGeneration).toBe(oldGeneration + 1)
+    expect(cleanup.some((effect) => effect.connectionGeneration === oldGeneration)).toBe(true)
+    const oldGenerationCleanup = cleanup.find((effect) => effect.connectionGeneration === oldGeneration)!
+    expect(oldGenerationCleanup.providerTarget).toBe(durableLiveKitProviderTarget())
+    expect(oldGenerationCleanup.availableAt.getTime()).toBeLessThanOrEqual(Date.now())
+  })
+
+  test("an old participant revocation cannot target a rapid rejoin in the same generation", async () => {
+    const { space, contexts } = await createFixture("membership-identity", 3)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    await joinGridRoom({ roomId }, contexts[1]!)
+    const joined = await joinGridRoom({ roomId }, contexts[2]!)
+    const generation = joined.grids[0]!.rooms[0]!.connection!.generation
+    const [before] = await db
+      .select({ mediaMembershipId: gridPresence.mediaMembershipId })
+      .from(gridPresence)
+      .where(eq(gridPresence.userId, contexts[2]!.currentUserId))
+
+    await leaveGridRoom({ expectedRoomId: roomId }, contexts[2]!)
+    const [revocation] = await db
+      .select()
+      .from(gridProviderEffects)
+      .where(eq(gridProviderEffects.kind, "revoke_participant"))
+    const rejoined = await joinGridRoom({ roomId }, contexts[2]!)
+    const [after] = await db
+      .select({ mediaMembershipId: gridPresence.mediaMembershipId })
+      .from(gridPresence)
+      .where(eq(gridPresence.userId, contexts[2]!.currentUserId))
+
+    expect(rejoined.grids[0]!.rooms[0]!.connection!.generation).toBe(generation)
+    expect(after?.mediaMembershipId).not.toBe(before?.mediaMembershipId)
+    expect(revocation?.participantIdentity).toContain(before!.mediaMembershipId)
+    expect(revocation?.participantIdentity).not.toContain(after!.mediaMembershipId)
+    expect(revocation?.providerTarget).toBe(durableLiveKitProviderTarget())
+  })
+
+  test("moves one global avatar between Spaces atomically", async () => {
+    const user = await testUtils.createUser(email("global-avatar"))
+    const session = await testUtils.createSessionForUser(user.id)
+    const first = await testUtils.createSpace("Grid Global First")
+    const second = await testUtils.createSpace("Grid Global Second")
+    if (!first || !second) throw new Error("Failed to create spaces")
+    await db.insert(members).values([
+      { spaceId: first.id, userId: user.id, role: "owner" },
+      { spaceId: second.id, userId: user.id, role: "owner" },
+    ])
+    const context = testUtils.functionContext({ userId: user.id, sessionId: session.session.id })
+    await toggleSpaceGrid({ spaceId: BigInt(first.id), enabled: true }, context)
+    await toggleSpaceGrid({ spaceId: BigInt(second.id), enabled: true }, context)
+
+    await createGridRoom({ spaceId: BigInt(first.id) }, context)
+    const moved = await createGridRoom({ spaceId: BigInt(second.id) }, context)
+
+    expect(moved.grids.map((grid) => Number(grid.spaceId))).toEqual([first.id, second.id].sort((a, b) => a - b))
+    expect(moved.grids.find((grid) => grid.spaceId === BigInt(first.id))?.rooms).toEqual([])
+    expect(moved.grids.find((grid) => grid.spaceId === BigInt(second.id))?.rooms[0]?.avatars).toHaveLength(1)
+    expect(await db.select().from(gridPresence)).toHaveLength(1)
+  })
+
+  test("returns only enabled member Spaces in the bounded Home summary", async () => {
+    const user = await testUtils.createUser(email("home-member"))
+    const session = await testUtils.createSessionForUser(user.id)
+    const enabled = await testUtils.createSpace("Grid Home Enabled")
+    const disabled = await testUtils.createSpace("Grid Home Disabled")
+    const hidden = await testUtils.createSpace("Grid Home Hidden")
+    if (!enabled || !disabled || !hidden) throw new Error("Failed to create spaces")
+
+    await db.insert(members).values([
+      { spaceId: enabled.id, userId: user.id, role: "owner" },
+      { spaceId: disabled.id, userId: user.id, role: "owner" },
+    ])
+    const context = testUtils.functionContext({ userId: user.id, sessionId: session.session.id })
+    await toggleSpaceGrid({ spaceId: BigInt(enabled.id), enabled: true }, context)
+
+    const outsider = await testUtils.createUser(email("home-outsider"))
+    const outsiderSession = await testUtils.createSessionForUser(outsider.id)
+    await db.insert(members).values({ spaceId: hidden.id, userId: outsider.id, role: "owner" })
+    await toggleSpaceGrid(
+      { spaceId: BigInt(hidden.id), enabled: true },
+      testUtils.functionContext({ userId: outsider.id, sessionId: outsiderSession.session.id }),
+    )
+
+    const empty = await getGridHome({}, context)
+    expect(empty.spaces.map((space) => Number(space.spaceId))).toEqual([enabled.id])
+    expect(empty.spaces[0]?.activeAvatarCount).toBe(0)
+    expect(empty.spaces[0]?.recentAvatars).toEqual([])
+
+    await createGridRoom({ spaceId: BigInt(enabled.id) }, context)
+    const active = await getGridHome({}, context)
+    expect(active.spaces[0]?.activeAvatarCount).toBe(1)
+    expect(active.spaces[0]?.recentAvatars).toHaveLength(1)
+    expect(active.spaces[0]?.recentAvatars[0]?.user?.id).toBe(BigInt(user.id))
+    expect(active.spaces[0]?.recentAvatars[0]?.membershipId).not.toBe("")
+    expect(active.spaces[0]?.recentAvatars[0]?.microphoneRevision).toBe(0)
+  })
+
+  test("persists named rooms, unlocks them when empty, and enforces locks", async () => {
+    const { space, contexts } = await createFixture("named", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+
+    const titled = await setGridRoomTitle({ roomId, title: "  Design   room  " }, contexts[1]!)
+    expect(titled.grid?.rooms[0]?.title).toBe("Design room")
+    await setGridRoomLocked({ roomId, locked: true }, contexts[0]!)
+    await expect(joinGridRoom({ roomId }, contexts[1]!)).rejects.toThrow()
+
+    await setGridRoomLocked({ roomId, locked: false }, contexts[0]!)
+    await joinGridRoom({ roomId }, contexts[1]!)
+    await setGridRoomLocked({ roomId, locked: true }, contexts[1]!)
+    await leaveGridRoom({ expectedRoomId: roomId }, contexts[1]!)
+    const empty = await leaveGridRoom({ expectedRoomId: roomId }, contexts[0]!)
+
+    expect(empty.grids[0]?.rooms[0]?.title).toBe("Design room")
+    expect(empty.grids[0]?.rooms[0]?.locked).toBe(false)
+    expect(empty.grids[0]?.rooms[0]?.avatars).toEqual([])
+
+    await expect(deleteGridRoom({ roomId }, contexts[1]!)).rejects.toThrow()
+    const deleted = await deleteGridRoom({ roomId }, contexts[0]!)
+    expect(deleted.grid?.rooms).toEqual([])
+  })
+
+  test("deleting an expired room retains cleanup for its active provider generation", async () => {
+    const { space, contexts } = await createFixture("delete-expired", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    const joined = await joinGridRoom({ roomId }, contexts[1]!)
+    const generation = joined.grids[0]!.rooms[0]!.connection!.generation
+    await db.update(gridPresence).set({ leaseExpiresAt: new Date(0) }).where(eq(gridPresence.roomId, Number(roomId)))
+
+    const deleted = await deleteGridRoom({ roomId }, contexts[0]!)
+
+    expect(deleted.grid?.rooms).toEqual([])
+    expect(await db.select().from(gridPresence)).toEqual([])
+    const effects = await db.select().from(gridProviderEffects)
+    expect(effects.map((effect) => effect.kind).sort()).toEqual([
+      "close_connection", "revoke_participant", "revoke_participant",
+    ])
+    expect(effects.every((effect) => effect.roomId === Number(roomId))).toBe(true)
+    expect(effects.every((effect) => effect.connectionGeneration === generation)).toBe(true)
+    expect(effects.every((effect) => effect.providerTarget === durableLiveKitProviderTarget())).toBe(true)
+  })
+
+  test("limits public-Space room naming and locking to admins", async () => {
+    const { space, contexts } = await createFixture("public-permissions", 2)
+    await db.update(spaces).set({ isPublic: true }).where(eq(spaces.id, space.id))
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+
+    await expect(setGridRoomTitle({ roomId, title: "Members cannot rename" }, contexts[1]!)).rejects.toThrow()
+    await joinGridRoom({ roomId }, contexts[1]!)
+    await expect(setGridRoomLocked({ roomId, locked: true }, contexts[1]!)).rejects.toThrow()
+
+    const titled = await setGridRoomTitle({ roomId, title: "Admin room" }, contexts[0]!)
+    expect(titled.grid?.rooms[0]?.title).toBe("Admin room")
+    const locked = await setGridRoomLocked({ roomId, locked: true }, contexts[0]!)
+    expect(locked.grid?.rooms[0]?.locked).toBe(true)
+  })
+
+  test("prevents an older session from removing presence claimed by a newer session", async () => {
+    const user = await testUtils.createUser(email("session-owner"))
+    const oldSession = await testUtils.createSessionForUser(user.id, { deviceId: "old" })
+    const newSession = await testUtils.createSessionForUser(user.id, { deviceId: "new" })
+    const space = await testUtils.createSpace("Grid Session Ownership")
+    if (!space) throw new Error("Failed to create space")
+    await db.insert(members).values({ spaceId: space.id, userId: user.id, role: "owner" })
+    const oldContext = testUtils.functionContext({ userId: user.id, sessionId: oldSession.session.id })
+    const newContext = testUtils.functionContext({ userId: user.id, sessionId: newSession.session.id })
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, oldContext)
+
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, oldContext)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    await setGridAvatarMicrophoneEnabled({ expectedRoomId: roomId, enabled: true }, oldContext)
+    await joinGridRoom({ roomId }, newContext)
+
+    const oldView = await getGrid({ spaceId: BigInt(space.id) }, oldContext)
+    expect(oldView.grid?.currentRoomId).toBeUndefined()
+    expect(oldView.grid?.rooms[0]?.avatars[0]?.ownedByCurrentSession).toBe(false)
+    await expect(setGridRoomLocked({ roomId, locked: true }, oldContext)).rejects.toThrow()
+
+    const newView = await getGrid({ spaceId: BigInt(space.id) }, newContext)
+    expect(newView.grid?.currentRoomId).toBe(roomId)
+    expect(newView.grid?.rooms[0]?.avatars[0]?.ownedByCurrentSession).toBe(true)
+    expect(newView.grid?.rooms[0]?.avatars[0]?.microphoneEnabled).toBe(false)
+    await setGridRoomLocked({ roomId, locked: true }, newContext)
+
+    const oldLeave = await leaveGridRoom({ expectedRoomId: roomId }, oldContext)
+    expect(oldLeave.grids).toEqual([])
+
+    const [presence] = await db.select().from(gridPresence).where(eq(gridPresence.userId, user.id))
+    expect(presence?.ownerSessionId).toBe(newSession.session.id)
+  })
+
+  test("a same-room session handoff revokes the old participant and rotates self-hosted authority", async () => {
+    const { space, users, contexts } = await createFixture("active-session-handoff", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    const joined = await joinGridRoom({ roomId }, contexts[1]!)
+    const oldGeneration = joined.grids[0]!.rooms[0]!.connection!.generation
+    const [oldPresence] = await db.select().from(gridPresence).where(eq(gridPresence.userId, users[0]!.id))
+    const newSession = await testUtils.createSessionForUser(users[0]!.id, { deviceId: "handoff" })
+    const newContext = testUtils.functionContext({ userId: users[0]!.id, sessionId: newSession.session.id })
+
+    const handedOff = await joinGridRoom({ roomId }, newContext)
+
+    const room = handedOff.grids[0]!.rooms[0]!
+    expect(room.avatars).toHaveLength(2)
+    expect(room.connection!.generation).toBe(oldGeneration + 1)
+    const effects = await db.select().from(gridProviderEffects)
+    expect(effects.find((effect) => effect.kind === "revoke_participant")?.participantIdentity)
+      .toBe(`inline-grid-user-${users[0]!.id}-${oldPresence!.mediaMembershipId}`)
+    expect(effects.find((effect) => effect.kind === "close_connection")?.connectionGeneration).toBe(oldGeneration)
+    expect(effects.every((effect) => effect.availableAt.getTime() <= Date.now())).toBe(true)
+
+    // An idempotent retry from the new owner must preserve membership and media.
+    const retried = await joinGridRoom({ roomId }, newContext)
+    expect(retried.grids[0]!.rooms[0]!.connection!.generation).toBe(room.connection!.generation)
+    expect(await db.select().from(gridProviderEffects)).toHaveLength(effects.length)
+  })
+
+  test("leaving a Space atomically removes Grid authority and invalidates cached access", async () => {
+    const { space, users, contexts } = await createFixture("leave-space", 3)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    await joinGridRoom({ roomId }, contexts[1]!)
+    const joined = await joinGridRoom({ roomId }, contexts[2]!)
+    const oldGeneration = joined.grids[0]!.rooms[0]!.connection!.generation
+    await getGrid({ spaceId: BigInt(space.id) }, contexts[2]!)
+
+    const result = await leaveSpace({ spaceId: space.id }, { ...contexts[2]!, ip: undefined })
+
+    expect(result.userId).toBe(users[2]!.id)
+    expect(await db.select().from(gridPresence).where(eq(gridPresence.userId, users[2]!.id))).toEqual([])
+    const current = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(current.grid!.rooms[0]!.avatars).toHaveLength(2)
+    expect(current.grid!.rooms[0]!.connection!.generation).toBe(oldGeneration + 1)
+    const effects = await db.select().from(gridProviderEffects)
+    expect(effects.map((effect) => effect.kind).sort()).toEqual(["close_connection", "revoke_participant"])
+    await expect(getGrid({ spaceId: BigInt(space.id) }, contexts[2]!)).rejects.toThrow()
+    await expect(createGridRoom({ spaceId: BigInt(space.id) }, contexts[2]!)).rejects.toThrow()
+  })
+
+  test("deleting a Space retires media and prevents Grid recreation", async () => {
+    const { space, users, contexts } = await createFixture("delete-space", 2)
+    await db.update(spaces).set({ creatorId: users[0]!.id }).where(eq(spaces.id, space.id))
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    await setGridRoomTitle({ roomId, title: "Retained room" }, contexts[0]!)
+    await joinGridRoom({ roomId }, contexts[1]!)
+
+    await deleteSpace({ spaceId: space.id }, { ...contexts[0]!, ip: undefined })
+
+    expect(await db.select().from(gridPresence)).toEqual([])
+    const [room] = await db.select().from(gridRooms).where(eq(gridRooms.id, Number(roomId)))
+    expect(room?.connectionStartedAt).toBeNull()
+    const effects = await db.select().from(gridProviderEffects)
+    expect(effects.map((effect) => effect.kind).sort()).toEqual([
+      "close_connection", "revoke_participant", "revoke_participant",
+    ])
+    expect((await getGridHome({}, contexts[1]!)).spaces).toEqual([])
+    await expect(getGrid({ spaceId: BigInt(space.id) }, contexts[1]!)).rejects.toThrow()
+    await expect(createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)).rejects.toThrow()
+    await expect(joinGridRoom({ roomId }, contexts[1]!)).rejects.toThrow()
+    await expect(toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)).rejects.toThrow()
+  })
+
+  test("reconciles an active room when its owning app session is revoked", async () => {
+    const { space, users, contexts } = await createFixture("session-revocation", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const created = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const roomId = created.grids[0]!.rooms[0]!.id
+    await joinGridRoom({ roomId }, contexts[1]!)
+
+    await revokeSession({
+      actor: "user",
+      actorUserId: users[0]!.id,
+      targetUserId: users[1]!.id,
+      sessionId: contexts[1]!.currentSessionId,
+    })
+
+    const remaining = await getGrid({ spaceId: BigInt(space.id) }, contexts[0]!)
+    expect(remaining.grid?.rooms[0]?.avatars.map((avatar) => avatar.user?.id)).toEqual([
+      BigInt(users[0]!.id),
+    ])
+    expect(remaining.grid?.rooms[0]?.connection).toBeUndefined()
+    expect(await db.select().from(gridPresence).where(eq(gridPresence.userId, users[1]!.id))).toEqual([])
+  })
+
+  test("clears avatars and ephemeral rooms when Grid is disabled while preserving named rooms", async () => {
+    const { space, contexts } = await createFixture("disable-cleanup", 2)
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: true }, contexts[0]!)
+    const named = await createGridRoom({ spaceId: BigInt(space.id) }, contexts[0]!)
+    const namedRoomId = named.grids[0]!.rooms[0]!.id
+    await setGridRoomTitle({ roomId: namedRoomId, title: "Standup" }, contexts[0]!)
+    await createGridRoom({ spaceId: BigInt(space.id) }, contexts[1]!)
+
+    await toggleSpaceGrid({ spaceId: BigInt(space.id), enabled: false }, contexts[0]!)
+
+    expect(await db.select().from(gridPresence)).toEqual([])
+    const rooms = await db.select().from(gridRooms)
+    expect(rooms).toHaveLength(1)
+    expect(rooms[0]?.title).toBe("Standup")
+    expect(rooms[0]?.locked).toBe(false)
+    expect(rooms[0]?.connectionStartedAt).toBeNull()
+  })
+})
+
+async function earliestLease() {
+  const leases = await db.select({ leaseExpiresAt: gridPresence.leaseExpiresAt }).from(gridPresence)
+  return leases.map(({ leaseExpiresAt }) => leaseExpiresAt).sort((a, b) => a.getTime() - b.getTime())[0]
+}
+
+async function createFixture(label: string, userCount: number) {
+  const space = await testUtils.createSpace(`Grid ${label}`)
+  if (!space) throw new Error("Failed to create space")
+  const users = await Promise.all(Array.from({ length: userCount }, (_, index) => testUtils.createUser(email(`${label}-${index}`))))
+  await db.insert(members).values(
+    users.map((user, index) => ({ spaceId: space.id, userId: user.id, role: index === 0 ? "owner" as const : "member" as const })),
+  )
+  const sessions = await Promise.all(users.map((user) => testUtils.createSessionForUser(user.id)))
+  const contexts = users.map((user, index) =>
+    testUtils.functionContext({ userId: user.id, sessionId: sessions[index]!.session.id }),
+  )
+  return { space, users, contexts }
+}

@@ -1,0 +1,1356 @@
+use super::*;
+
+#[test]
+fn codex_and_claude_publish_initial_provider_catalogs() {
+    assert!(publishes_initial_provider_catalog("codex"));
+    assert!(publishes_initial_provider_catalog("claude"));
+    assert!(!publishes_initial_provider_catalog("opencode"));
+    assert!(!publishes_initial_provider_catalog("amp"));
+}
+
+#[test]
+fn canonical_owner_dm_repair_replaces_only_the_matching_provider_identity() {
+    let (mut account, _) = account_fixture();
+
+    assert!(replace_owner_dm_chat_id(&mut account, "codex", 84, 706).unwrap());
+    assert_eq!(account.providers[0].dm_chat_id, Some(706));
+    assert!(!account.providers[0].greeting_sent);
+    assert!(!replace_owner_dm_chat_id(&mut account, "codex", 84, 706).unwrap());
+    assert!(replace_owner_dm_chat_id(&mut account, "codex", 999, 800).is_err());
+    assert!(replace_owner_dm_chat_id(&mut account, "missing", 84, 800).is_err());
+}
+
+#[tokio::test]
+async fn advancing_control_epoch_cancels_detached_generation_watchers() {
+    let epoch = ControlTaskEpoch::new();
+    let mut watcher = epoch.subscribe();
+    assert_eq!(*watcher.borrow(), 0);
+
+    epoch.advance();
+    watcher.changed().await.expect("control epoch stays open");
+
+    assert_eq!(*watcher.borrow(), 1);
+}
+
+#[test]
+fn debug_settings_output_redacts_picker_capabilities_recursively() {
+    let secret = "capability-that-must-never-be-printed";
+    let mut value = serde_json::json!({
+        "response": {
+            "localPickerCapability": secret,
+            "nested": [{ "local_picker_capability": secret }],
+        }
+    });
+
+    dev::redact_debug_settings_secrets(&mut value);
+
+    let output = serde_json::to_string(&value).expect("serialize redacted output");
+    assert!(!output.contains(secret));
+    assert_eq!(
+        value["response"]["localPickerCapability"],
+        serde_json::Value::String("[redacted]".to_string())
+    );
+    assert_eq!(
+        value["response"]["nested"][0]["local_picker_capability"],
+        serde_json::Value::String("[redacted]".to_string())
+    );
+}
+
+#[test]
+fn provider_restart_backoff_is_bounded_and_starts_promptly() {
+    assert_eq!(provider_restart_delay(0), Duration::from_secs(1));
+    assert_eq!(provider_restart_delay(1), Duration::from_secs(1));
+    assert_eq!(provider_restart_delay(2), Duration::from_secs(2));
+    assert_eq!(provider_restart_delay(6), Duration::from_secs(30));
+    assert_eq!(provider_restart_delay(u32::MAX), Duration::from_secs(30));
+}
+
+#[test]
+fn instance_lock_contention_is_a_typed_duplicate_not_an_io_error() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("bridge.lock");
+    let owner = try_acquire_instance_lock(&path)
+        .expect("lock file")
+        .expect("first owner");
+    assert!(
+        try_acquire_instance_lock(&path)
+            .expect("lock file")
+            .is_none()
+    );
+    let error = acquire_instance_lock(&path).expect_err("duplicate owner");
+    assert!(error.downcast_ref::<BridgeAlreadyRunning>().is_some());
+    assert_eq!(
+        crate::errors::json_cli_error_from_error(error.as_ref()).code,
+        "bridge_already_running"
+    );
+    drop(owner);
+    assert!(
+        try_acquire_instance_lock(&path)
+            .expect("lock file")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_standby_service_takes_over_when_the_owner_exits() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("bridge.lock");
+    let owner = acquire_instance_lock(&path).expect("first owner");
+    let standby_path = path.clone();
+    let standby = tokio::spawn(async move { wait_for_instance_lock(&standby_path).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!standby.is_finished(), "standby must wait, not fail");
+    drop(owner);
+    let lock = tokio::time::timeout(INSTANCE_LOCK_STANDBY_POLL * 3, standby)
+        .await
+        .expect("standby takes over")
+        .expect("standby task")
+        .expect("lock file");
+    assert!(lock.is_some());
+}
+
+#[test]
+fn scheduler_admits_more_than_four_independent_sessions_and_blocks_aliases() {
+    let store = BridgeStore::open_in_memory().expect("store");
+    let installation_id = InstallationId::new("install").expect("installation");
+    let workspace_id = WorkspaceId::new("workspace").expect("workspace");
+    let provider_id = ProviderId::new("codex").expect("provider");
+    let binding = |chat_id| BindingKey {
+        installation_id: installation_id.clone(),
+        chat_id,
+        workspace_id: workspace_id.clone(),
+    };
+    let mut active_turns = HashMap::new();
+    let mut active_bindings = HashMap::new();
+    for chat_id in 1..=5 {
+        store
+            .put_binding(
+                &binding(chat_id),
+                &provider_id,
+                &inline_agent_bridge::ProviderSessionId::new(format!("session-{chat_id}"))
+                    .expect("session"),
+                1,
+            )
+            .expect("binding");
+        let (sender, _) = tokio::sync::mpsc::channel::<LosslessEventDelivery>(1);
+        active_turns.insert(chat_id, sender);
+        active_bindings.insert(chat_id, binding(chat_id));
+    }
+    let active_sessions = active_bound_sessions(&store, &active_bindings).expect("active sessions");
+    assert_eq!(active_sessions.len(), 5);
+    assert!(
+        pending_binding_has_free_lane(&store, &binding(6), &active_turns, &active_sessions)
+            .expect("independent sixth session")
+    );
+
+    store
+        .put_binding(
+            &binding(7),
+            &provider_id,
+            &inline_agent_bridge::ProviderSessionId::new("session-1").expect("session"),
+            1,
+        )
+        .expect("alias binding");
+    assert!(
+        !pending_binding_has_free_lane(&store, &binding(7), &active_turns, &active_sessions)
+            .expect("native-session alias")
+    );
+}
+
+#[test]
+fn promotion_moves_active_binding_and_old_completion_preserves_reused_source_lane() {
+    let store = BridgeStore::open_in_memory().expect("store");
+    let installation_id = InstallationId::new("install").expect("installation");
+    let workspace_id = WorkspaceId::new("workspace").expect("workspace");
+    let provider_id = ProviderId::new("codex").expect("provider");
+    let session_id =
+        inline_agent_bridge::ProviderSessionId::new("promoted-session").expect("session");
+    let binding = |chat_id| BindingKey {
+        installation_id: installation_id.clone(),
+        chat_id,
+        workspace_id: workspace_id.clone(),
+    };
+    let (old_sender, _) = tokio::sync::mpsc::channel::<LosslessEventDelivery>(1);
+    let (new_sender, _) = tokio::sync::mpsc::channel::<LosslessEventDelivery>(1);
+    let mut active_turns = HashMap::from([(10, old_sender.clone())]);
+    let mut active_bindings = HashMap::from([(10, binding(10))]);
+
+    assert!(promote_turn_lane(
+        &mut active_turns,
+        &mut active_bindings,
+        10,
+        binding(20),
+        old_sender.clone(),
+    ));
+    assert_eq!(active_bindings.get(&20), Some(&binding(20)));
+    assert!(!active_bindings.contains_key(&10));
+    for chat_id in [20, 30] {
+        store
+            .put_binding(&binding(chat_id), &provider_id, &session_id, 1)
+            .expect("binding");
+    }
+    let active_sessions = active_bound_sessions(&store, &active_bindings).expect("active sessions");
+    assert!(
+        !pending_binding_has_free_lane(&store, &binding(30), &active_turns, &active_sessions)
+            .expect("alias after promotion")
+    );
+
+    active_turns.insert(10, new_sender.clone());
+    active_bindings.insert(10, binding(10));
+    release_turn_lane(&mut active_turns, &mut active_bindings, 10, &old_sender);
+    release_turn_lane(&mut active_turns, &mut active_bindings, 20, &old_sender);
+    assert!(
+        active_turns
+            .get(&10)
+            .is_some_and(|sender| sender.same_channel(&new_sender))
+    );
+    assert_eq!(active_bindings.get(&10), Some(&binding(10)));
+    assert!(!active_turns.contains_key(&20));
+}
+
+#[test]
+fn inline_message_retry_backoff_is_jittered_and_bounded() {
+    assert_eq!(
+        message_retry_delay_with_entropy(0, 0),
+        Duration::from_millis(112)
+    );
+    assert_eq!(
+        message_retry_delay_with_entropy(0, 50),
+        Duration::from_millis(187)
+    );
+    assert_eq!(
+        message_retry_delay_with_entropy(1, 0),
+        Duration::from_millis(225)
+    );
+    assert_eq!(
+        message_retry_delay_with_entropy(u32::MAX, 50),
+        Duration::from_millis(1_500)
+    );
+}
+
+pub(super) fn account_fixture() -> (AccountBridgeConfig, AccountBridgeSecrets) {
+    let codex = ProviderInstallationConfig {
+        installation_id: "codex".to_string(),
+        provider_id: "codex".to_string(),
+        bot_user_id: 84,
+        bot_username: "inline_codex_42_bot".to_string(),
+        dm_chat_id: Some(12),
+        workspace: PathBuf::from("/tmp/project"),
+        greeting_sent: true,
+        accept_messages_after: 10,
+        initial_cursor_seeded: true,
+        display_name: "Mo's Codex".to_string(),
+        managed_avatar_digest: None,
+        managed_avatar_file_unique_id: None,
+        executable: PathBuf::from("/usr/bin/codex"),
+        provider_runtime: None,
+        provider_path: "/usr/bin:/bin".to_string(),
+        state_dir: PathBuf::from("/tmp/bridge/accounts/42/providers/codex"),
+    };
+    (
+        AccountBridgeConfig {
+            version: ACCOUNT_CONFIG_VERSION,
+            owner_user_id: 42,
+            host_installation_id: "host-test".to_string(),
+            host_label: "Test Mac".to_string(),
+            api_base_url: "http://localhost:8000/v1".to_string(),
+            realtime_url: "ws://localhost:8000/realtime".to_string(),
+            service_label: "chat.inline.agent-bridge.42".to_string(),
+            service_binary: PathBuf::from("/tmp/bridge/accounts/42/bin/inline"),
+            provider_path: "/usr/bin:/bin".to_string(),
+            superseded_service_labels: Vec::new(),
+            operator_user_ids: vec![42],
+            owner_control_cursor_seeded: true,
+            providers: vec![codex],
+        },
+        AccountBridgeSecrets {
+            version: ACCOUNT_SECRETS_VERSION,
+            owner_user_id: 42,
+            control_token: "control-secret".to_string(),
+            owner_auth: Some(AuthCredential::AccessToken {
+                token: AuthToken::try_new("owner-secret").unwrap(),
+            }),
+            owner_token: String::new(),
+            providers: vec![ProviderCredentials {
+                installation_id: "codex".to_string(),
+                bot_user_id: 84,
+                bot_token: "bot-secret".to_string(),
+            }],
+        },
+    )
+}
+
+#[test]
+fn account_secret_debug_output_is_redacted() {
+    let (_, secrets) = account_fixture();
+    let rendered = format!("{secrets:?}");
+    assert!(!rendered.contains("control-secret"));
+    assert!(!rendered.contains("owner-secret"));
+    assert!(!rendered.contains("bot-secret"));
+    assert!(rendered.contains("<redacted>"));
+}
+
+#[test]
+fn issued_owner_bearers_are_readable_but_mixed_authority_is_rejected() {
+    let (account, mut secrets) = account_fixture();
+    secrets.version = 1;
+    secrets.owner_auth = None;
+    secrets.owner_token = "legacy-owner".to_string();
+    assert!(matches!(
+        owner_credential(&secrets).unwrap(),
+        AuthCredential::AccessToken { .. }
+    ));
+    validate_account(&account, &secrets).unwrap();
+
+    secrets.version = ACCOUNT_SECRETS_VERSION;
+    secrets.owner_token = "current-owner".to_string();
+    assert!(matches!(
+        owner_credential(&secrets).unwrap(),
+        AuthCredential::AccessToken { .. }
+    ));
+    validate_account(&account, &secrets).unwrap();
+
+    secrets.owner_auth = Some(AuthCredential::AccessToken {
+        token: AuthToken::try_new("new-owner").unwrap(),
+    });
+    assert!(validate_account(&account, &secrets).is_err());
+}
+
+#[test]
+fn v3_owner_authority_round_trips_without_a_bearer() {
+    let (account, mut secrets) = account_fixture();
+    let authorization = |temporary: bool, byte: u8| inline_sdk::InlineProtocolAuthorization {
+        key: [byte; 256],
+        key_id: [byte; 8],
+        server_salt: 7,
+        temporary,
+        expires_at: temporary.then_some(2_000_000_000),
+    };
+    let expected = AuthCredential::InlineProtocolV3 {
+        permanent: authorization(false, 1),
+        temporary: authorization(true, 2),
+        public_keys: vec![inline_sdk::InlineProtocolPublicKey {
+            modulus: "pinned".to_string(),
+            exponent: "AQAB".to_string(),
+            fingerprint: "1".to_string(),
+        }],
+    };
+    secrets.owner_auth = Some(expected.clone());
+    secrets.owner_token.clear();
+    validate_account(&account, &secrets).unwrap();
+    let encoded = serde_json::to_vec(&secrets).unwrap();
+    let decoded: AccountBridgeSecrets = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(owner_credential(&decoded).unwrap(), expected);
+}
+
+#[test]
+fn revoked_bridge_owner_authority_is_cleared_without_touching_bot_credentials() {
+    let (account, secrets) = account_fixture();
+    let revoked = owner_credential(&secrets).expect("revoked owner credential");
+    let directory = tempfile::tempdir().expect("temporary bridge directory");
+    let paths = BridgePaths::from_root(
+        directory.path().to_path_buf(),
+        directory.path().join("bin").join("inline"),
+    );
+    write_private_json(&paths.secrets, &secrets).expect("write bridge secrets");
+
+    assert!(clear_bridge_owner_authority(&paths, &revoked).expect("clear revoked owner authority"));
+
+    let persisted: AccountBridgeSecrets =
+        read_required_json(&paths.secrets).expect("read bridge secrets");
+    assert!(persisted.owner_auth.is_none());
+    assert!(persisted.owner_token.is_empty());
+    assert_eq!(persisted.providers.len(), secrets.providers.len());
+    assert_eq!(
+        persisted.providers[0].bot_token,
+        secrets.providers[0].bot_token
+    );
+    assert!(owner_credential(&persisted).is_err());
+    validate_account_for_setup(&account, &persisted).expect("setup can repair owner authority");
+    assert!(owner_signed_out(&persisted));
+    validate_account_allowing_signed_out(&account, &persisted)
+        .expect("a signed-out account stays loadable so login can repair it");
+    assert!(validate_account(&account, &persisted).is_err());
+
+    let mut conflicting = persisted.clone();
+    conflicting.owner_token = "legacy-owner".to_string();
+    conflicting.owner_auth = Some(AuthCredential::AccessToken {
+        token: AuthToken::try_new("current-owner").unwrap(),
+    });
+    assert!(validate_account_allowing_signed_out(&account, &conflicting).is_err());
+
+    let replacement = AuthCredential::AccessToken {
+        token: AuthToken::try_new("replacement-owner").unwrap(),
+    };
+    let mut repaired = persisted;
+    repaired.owner_auth = Some(replacement.clone());
+    write_private_json(&paths.secrets, &repaired).expect("write replacement owner authority");
+    assert!(
+        !clear_bridge_owner_authority(&paths, &revoked).expect("ignore a superseded revocation")
+    );
+    let preserved: AccountBridgeSecrets =
+        read_required_json(&paths.secrets).expect("read replacement owner authority");
+    assert_eq!(owner_credential(&preserved).unwrap(), replacement);
+}
+
+#[test]
+fn provider_bot_usernames_are_stable_provider_and_host_scoped() {
+    let host_a = "host-0123456789abcdef0123456789abcdef";
+    let host_b = "host-fedcba9876543210fedcba9876543210";
+    let usernames = ["codex", "opencode", "claude", "amp"]
+        .map(|provider_id| provider_bot_username(provider_id, 1_600, host_a));
+    assert_eq!(
+        usernames,
+        ["codex", "opencode", "claude", "amp"].map(|provider_id| provider_bot_username(
+            provider_id,
+            1_600,
+            host_a
+        ))
+    );
+    assert_ne!(usernames[0], provider_bot_username("codex", 1_600, host_b));
+    assert!(usernames.iter().all(|username| username.ends_with("bot")));
+    assert!(usernames.iter().all(|username| username.len() <= 64));
+    assert_ne!(
+        provider_installation_id("codex", host_a),
+        provider_installation_id("codex", host_b)
+    );
+}
+
+#[test]
+fn control_tokens_are_random_sized_hex_without_shell_metacharacters() {
+    let first = generate_control_token();
+    let second = generate_control_token();
+    assert_eq!(first.len(), 64);
+    assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(first, second);
+}
+
+#[test]
+fn interactive_message_identity_is_stable_and_kind_scoped() {
+    let first = interaction_random_id("question", "token-1");
+    assert_eq!(first, interaction_random_id("question", "token-1"));
+    assert_ne!(first, interaction_random_id("approval", "token-1"));
+    assert_ne!(first, interaction_random_id("question", "token-2"));
+    assert!(first.get() > 0);
+}
+
+#[test]
+fn legacy_secret_debug_output_is_redacted() {
+    let secrets = DevBridgeSecrets {
+        bot_user_id: 42,
+        bot_token: "bot-secret".to_string(),
+        control_token: "control-secret".to_string(),
+    };
+    let debug = format!("{secrets:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("bot-secret"));
+    assert!(!debug.contains("control-secret"));
+}
+
+#[test]
+fn setup_defaults_to_home_but_explicit_folder_wins() {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .expect("test home directory");
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let explicit = directory.path().join("explicit");
+    fs::create_dir(&explicit).expect("explicit workspace");
+
+    assert_eq!(
+        resolve_setup_workspace(None).unwrap(),
+        fs::canonicalize(home).unwrap()
+    );
+    assert_eq!(
+        resolve_setup_workspace(Some(explicit.clone())).unwrap(),
+        fs::canonicalize(explicit).unwrap()
+    );
+}
+
+#[test]
+fn account_paths_scope_service_and_provider_state_by_owner() {
+    let config = Config {
+        api_base_url: "http://localhost:8000/v1".to_string(),
+        realtime_url: "ws://localhost:8000/realtime".to_string(),
+        secrets_path: PathBuf::from("/tmp/inline/secrets.json"),
+        state_path: PathBuf::from("/tmp/inline/state.json"),
+        data_dir: PathBuf::from("/tmp/inline"),
+        release_manifest_url: None,
+        release_install_url: None,
+    };
+    let paths = BridgePaths::for_owner(&config, 42);
+    assert_eq!(paths.root, PathBuf::from("/tmp/inline/bridge/accounts/42"));
+    assert_eq!(
+        paths.installed_binary,
+        PathBuf::from("/tmp/inline/bridge/accounts/42/bin/inline")
+    );
+    let (account, _) = account_fixture();
+    let provider = paths.provider_paths(&account.providers[0]);
+    assert_eq!(
+        provider.bridge_db,
+        PathBuf::from("/tmp/bridge/accounts/42/providers/codex/bridge.sqlite")
+    );
+
+    let wrong_paths = BridgePaths::from_root(
+        PathBuf::from("/tmp/inline/bridge/accounts/99"),
+        PathBuf::from("/tmp/inline/bridge/accounts/99/bin/inline"),
+    );
+    assert!(validate_account_location(&wrong_paths, &account).is_err());
+}
+
+#[test]
+fn configured_owner_is_read_without_loading_another_accounts_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    fs::write(&path, r#"{"version":3,"ownerUserId":42}"#).unwrap();
+
+    assert_eq!(configured_owner_user_id(&path).unwrap(), 42);
+}
+
+#[test]
+fn legacy_v3_adapts_without_relocating_provider_databases() {
+    let legacy_root = PathBuf::from("/tmp/inline/bridge/codex");
+    let legacy = DevBridgeConfig {
+        version: LEGACY_CONFIG_VERSION,
+        installation_id: "codex".to_string(),
+        owner_user_id: 42,
+        bot_user_id: 84,
+        bot_username: "inline_codex_42_bot".to_string(),
+        dm_chat_id: Some(12),
+        workspace: PathBuf::from("/tmp/project"),
+        greeting_sent: true,
+        accept_messages_after: 10,
+        initial_cursor_seeded: false,
+        display_name: "Mo's Codex".to_string(),
+        api_base_url: "http://localhost:8000/v1".to_string(),
+        realtime_url: "ws://localhost:8000/realtime".to_string(),
+        codex_executable: PathBuf::from("/usr/bin/codex"),
+        provider_path: "/usr/bin:/bin".to_string(),
+        service_label: "chat.inline.agent-bridge.42".to_string(),
+        service_binary: PathBuf::from("/tmp/inline/bin/inline"),
+    };
+    let legacy_secrets = DevBridgeSecrets {
+        bot_user_id: 84,
+        bot_token: "bot-secret".to_string(),
+        control_token: "control-secret".to_string(),
+    };
+    let (mut account, secrets) = account_from_legacy(legacy, legacy_secrets, &legacy_root).unwrap();
+    assert_eq!(account.version, ACCOUNT_CONFIG_VERSION);
+    assert_eq!(account.providers[0].state_dir, legacy_root);
+    assert_eq!(
+        account.providers[0].workspace,
+        PathBuf::from("/tmp/project")
+    );
+    assert_eq!(secrets.owner_user_id, 42);
+    assert_eq!(secrets.providers[0].installation_id, "codex");
+
+    account.service_label = "chat.inline.legacy-agent.42".to_string();
+    adopt_service_identity(
+        &mut account,
+        "chat.inline.agent-bridge.42".to_string(),
+        PathBuf::from("/tmp/inline/bridge/accounts/42/bin/inline"),
+    );
+    assert_eq!(
+        account.superseded_service_labels,
+        vec!["chat.inline.legacy-agent.42"]
+    );
+    assert_eq!(account.service_label, "chat.inline.agent-bridge.42");
+    assert_eq!(account.providers[0].state_dir, legacy_root);
+}
+
+#[test]
+fn account_schema_preserves_multiple_provider_namespaces() {
+    let (mut account, mut secrets) = account_fixture();
+    let mut claude = account.providers[0].clone();
+    claude.installation_id = "claude".to_string();
+    claude.provider_id = "claude".to_string();
+    claude.bot_user_id = 85;
+    claude.bot_username = "inline_claude_42_bot".to_string();
+    claude.display_name = "Mo's Claude".to_string();
+    claude.executable = PathBuf::from("/usr/bin/claude");
+    claude.state_dir = PathBuf::from("/tmp/bridge/accounts/42/providers/claude");
+    account.providers.push(claude);
+    secrets.providers.push(ProviderCredentials {
+        installation_id: "claude".to_string(),
+        bot_user_id: 85,
+        bot_token: "claude-secret".to_string(),
+    });
+    validate_account(&account, &secrets).unwrap();
+    assert_eq!(account.providers.len(), 2);
+    assert_eq!(secrets.providers.len(), 2);
+    let serialized = serde_json::to_string(&account).unwrap();
+    assert!(!serialized.contains("bot-secret"));
+    assert!(!serialized.contains("claude-secret"));
+}
+
+#[test]
+fn setup_upsert_preserves_sibling_provider_identity_and_state() {
+    let (mut account, mut secrets) = account_fixture();
+    let codex_before = account.providers[0].clone();
+    let codex_secret_before = secrets.providers[0].clone();
+    let mut opencode = codex_before.clone();
+    opencode.installation_id = "opencode".to_string();
+    opencode.provider_id = "opencode".to_string();
+    opencode.bot_user_id = 86;
+    opencode.bot_username = "inline_opencode_42_bot".to_string();
+    opencode.display_name = "Mo's OpenCode".to_string();
+    opencode.executable = PathBuf::from("/usr/bin/opencode");
+    opencode.state_dir = PathBuf::from("/tmp/bridge/accounts/42/providers/opencode");
+    let opencode_secret = ProviderCredentials {
+        installation_id: "opencode".to_string(),
+        bot_user_id: 86,
+        bot_token: "opencode-secret".to_string(),
+    };
+
+    upsert_provider_identity(
+        &mut account,
+        &mut secrets,
+        opencode.clone(),
+        opencode_secret.clone(),
+    )
+    .unwrap();
+    opencode.workspace = PathBuf::from("/tmp/another-project");
+    upsert_provider_identity(
+        &mut account,
+        &mut secrets,
+        opencode.clone(),
+        opencode_secret,
+    )
+    .unwrap();
+
+    assert_eq!(account.providers.len(), 2);
+    assert_eq!(secrets.providers.len(), 2);
+    assert_eq!(
+        account.providers[0].installation_id,
+        codex_before.installation_id
+    );
+    assert_eq!(account.providers[0].state_dir, codex_before.state_dir);
+    assert_eq!(
+        secrets.providers[0].bot_user_id,
+        codex_secret_before.bot_user_id
+    );
+    assert_eq!(
+        account
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == "opencode")
+            .unwrap()
+            .workspace,
+        PathBuf::from("/tmp/another-project")
+    );
+    validate_account(&account, &secrets).unwrap();
+}
+
+#[test]
+fn account_validation_rejects_duplicate_and_mismatched_identities() {
+    let (mut account, secrets) = account_fixture();
+    account.providers.push(account.providers[0].clone());
+    assert!(validate_account(&account, &secrets).is_err());
+
+    let (account, mut secrets) = account_fixture();
+    secrets.providers[0].bot_user_id = 999;
+    assert!(validate_account(&account, &secrets).is_err());
+
+    let (account, mut secrets) = account_fixture();
+    secrets.owner_user_id = 99;
+    assert!(validate_account(&account, &secrets).is_err());
+
+    let (mut account, secrets) = account_fixture();
+    account.service_label = "../unsafe".to_string();
+    assert!(validate_account(&account, &secrets).is_err());
+}
+
+#[test]
+fn setup_validation_allows_missing_credentials_but_not_identity_mismatch() {
+    let (account, mut secrets) = account_fixture();
+    secrets.control_token.clear();
+    secrets.providers.clear();
+    validate_account_for_setup(&account, &secrets).unwrap();
+
+    let (account, mut secrets) = account_fixture();
+    secrets.providers[0].bot_user_id = 999;
+    assert!(validate_account_for_setup(&account, &secrets).is_err());
+}
+
+fn account_fixture_at(root: &Path) -> (BridgePaths, AccountBridgeConfig, AccountBridgeSecrets) {
+    let paths = BridgePaths::from_root(root.to_path_buf(), root.join("bin").join("inline"));
+    let (mut account, secrets) = account_fixture();
+    account.service_binary = paths.installed_binary.clone();
+    account.providers[0].state_dir = root.join("providers").join("codex");
+    (paths, account, secrets)
+}
+
+#[test]
+fn loading_follows_chatgpt_moving_its_bundled_codex() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("accounts").join("42");
+    let (paths, mut account, secrets) = account_fixture_at(&root);
+    ensure_private_dir(&paths.root).expect("account directory");
+    let resources = directory.path().join("ChatGPT.app/Contents/Resources");
+    let moved = resources.join("codex-cli/CodexCLI.app/Contents/MacOS/codex");
+    fs::create_dir_all(moved.parent().expect("bundle directory")).expect("bundle directories");
+    fs::write(&moved, "").expect("bundled codex");
+    account.providers[0].executable = resources.join("codex");
+    persist_setup_account_files(&paths, &account, &secrets, false).expect("setup");
+
+    let (loaded, _) = load_account_files(&paths).expect("load account");
+
+    assert_eq!(loaded.providers[0].executable, moved);
+}
+
+#[test]
+fn interrupted_first_setup_ignores_orphaned_secrets_and_retries_cleanly() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("accounts").join("42");
+    let (paths, account, secrets) = account_fixture_at(&root);
+    ensure_private_dir(&paths.root).expect("account directory");
+
+    assert_eq!(
+        setup_account_write_order(false),
+        [SetupAccountFile::Secrets, SetupAccountFile::Config]
+    );
+    write_private_json(&paths.secrets, &secrets).expect("first setup write");
+    assert!(!paths.config.is_file());
+
+    persist_setup_account_files(&paths, &account, &secrets, false).expect("setup retry");
+    let (loaded_account, loaded_secrets) =
+        load_account_files(&paths).expect("load recovered setup");
+    validate_account(&loaded_account, &loaded_secrets).expect("valid recovered setup");
+}
+
+#[test]
+fn interrupted_provider_addition_is_repairable_from_committed_config() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("accounts").join("42");
+    let (paths, account, secrets) = account_fixture_at(&root);
+    ensure_private_dir(&paths.root).expect("account directory");
+    persist_setup_account_files(&paths, &account, &secrets, false).expect("initial setup");
+
+    let mut next_account = account.clone();
+    let mut next_secrets = secrets.clone();
+    let mut claude = account.providers[0].clone();
+    claude.installation_id = "claude".to_string();
+    claude.provider_id = "claude".to_string();
+    claude.bot_user_id = 85;
+    claude.bot_username = "inline_claude_42_bot".to_string();
+    claude.display_name = "Mo's Claude".to_string();
+    claude.executable = PathBuf::from("/usr/bin/claude");
+    claude.state_dir = root.join("providers").join("claude");
+    let claude_credentials = ProviderCredentials {
+        installation_id: "claude".to_string(),
+        bot_user_id: 85,
+        bot_token: "claude-secret".to_string(),
+    };
+    upsert_provider_identity(
+        &mut next_account,
+        &mut next_secrets,
+        claude,
+        claude_credentials,
+    )
+    .expect("add provider");
+
+    assert_eq!(
+        setup_account_write_order(true),
+        [SetupAccountFile::Config, SetupAccountFile::Secrets]
+    );
+    write_private_json(&paths.config, &next_account).expect("interrupted config write");
+    let (partial_account, partial_secrets) =
+        load_account_files(&paths).expect("load partial setup");
+    validate_account_for_setup(&partial_account, &partial_secrets)
+        .expect("missing new credentials are repairable");
+    assert!(validate_account(&partial_account, &partial_secrets).is_err());
+
+    persist_setup_account_files(&paths, &next_account, &next_secrets, true).expect("setup retry");
+    let (loaded_account, loaded_secrets) =
+        load_account_files(&paths).expect("load recovered setup");
+    validate_account(&loaded_account, &loaded_secrets).expect("valid recovered setup");
+    assert_eq!(loaded_account.providers.len(), 2);
+    assert_eq!(loaded_secrets.providers.len(), 2);
+}
+
+#[test]
+fn private_chat_id_accepts_server_string_ids() {
+    let chat = serde_json::json!({ "id": "706" });
+    assert_eq!(private_chat_id(&chat, &serde_json::json!({})).unwrap(), 706);
+}
+
+#[test]
+fn callback_payload_round_trips_provider_choices() {
+    let callback = ApprovalCallback {
+        version: 1,
+        token: "opaque-token".to_string(),
+        decision: CallbackDecision::Option { index: 4 },
+    };
+    let decoded: ApprovalCallback =
+        serde_json::from_slice(&serde_json::to_vec(&callback).unwrap()).unwrap();
+    assert_eq!(decoded.token, "opaque-token");
+    assert!(matches!(
+        decoded.decision,
+        CallbackDecision::Option { index: 4 }
+    ));
+}
+
+#[test]
+fn shared_approval_callback_stays_in_origin_thread() {
+    let store = BridgeStore::open_in_memory().expect("store");
+    let callback = ApprovalCallback {
+        version: 1,
+        token: "opaque-token".to_string(),
+        decision: CallbackDecision::Option { index: 0 },
+    };
+    store
+        .insert_approval(&PendingApproval {
+            callback_token: callback.token.clone(),
+            installation_id: InstallationId::new("codex").expect("installation"),
+            provider_id: ProviderId::new("codex").expect("provider"),
+            provider_approval_id: "provider-approval".to_string(),
+            turn_id: inline_agent_bridge::TurnId::new("turn-1").expect("turn"),
+            origin_chat_id: 708,
+            action_chat_id: 708,
+            message_id: Some(9),
+            origin_status_message_id: None,
+            decisions: vec![ApprovalDecision::ApproveOnce],
+            created_at: 100,
+            expires_at: 200,
+        })
+        .expect("insert approval");
+    let mut event = ClientEvent::MessageActionInvoked {
+        interaction_id: InlineId::new(1),
+        chat_id: InlineId::new(708),
+        message_id: InlineId::new(9),
+        actor_user_id: InlineId::new(42),
+        action_id: "bridge_approval_0".to_string(),
+        data: serde_json::to_vec(&callback).expect("callback"),
+    };
+
+    assert_eq!(
+        approval_dispatch_chat_id(&event, &store).expect("dispatch"),
+        Some(708)
+    );
+    if let ClientEvent::MessageActionInvoked { chat_id, .. } = &mut event {
+        *chat_id = InlineId::new(999);
+    }
+    assert_eq!(
+        approval_dispatch_chat_id(&event, &store).expect("wrong chat"),
+        None
+    );
+}
+
+#[test]
+fn outsider_approval_callback_stays_pending_before_provider_dispatch() {
+    let store = BridgeStore::open_in_memory().expect("store");
+    let installation_id = InstallationId::new("codex").expect("installation");
+    let turn_id = inline_agent_bridge::TurnId::new("turn-1").expect("turn");
+    let callback = ApprovalCallback {
+        version: 1,
+        token: "outsider-proof".to_string(),
+        decision: CallbackDecision::Option { index: 0 },
+    };
+    store
+        .insert_approval(&PendingApproval {
+            callback_token: callback.token.clone(),
+            installation_id: installation_id.clone(),
+            provider_id: ProviderId::new("codex").expect("provider"),
+            provider_approval_id: "provider-approval".to_string(),
+            turn_id: turn_id.clone(),
+            origin_chat_id: 708,
+            action_chat_id: 708,
+            message_id: Some(9),
+            origin_status_message_id: None,
+            decisions: vec![ApprovalDecision::ApproveOnce],
+            created_at: 100,
+            expires_at: 200,
+        })
+        .expect("insert approval");
+    let event = ClientEvent::MessageActionInvoked {
+        interaction_id: InlineId::new(1),
+        chat_id: InlineId::new(708),
+        message_id: InlineId::new(9),
+        actor_user_id: InlineId::new(8),
+        action_id: "bridge_approval_0".to_string(),
+        data: serde_json::to_vec(&callback).expect("callback"),
+    };
+
+    let dispatch_chat_id = approval_dispatch_chat_id(&event, &store)
+        .expect("dispatch lookup")
+        .expect("known approval callback");
+    let ClientEvent::MessageActionInvoked {
+        chat_id,
+        actor_user_id,
+        ..
+    } = event
+    else {
+        unreachable!("approval event")
+    };
+    let outcome = store
+        .claim_approval(
+            &callback.token,
+            0,
+            &ApprovalClaimContext {
+                installation_id,
+                turn_id,
+                origin_chat_id: dispatch_chat_id,
+                action_chat_id: chat_id.get(),
+                actor_user_id: actor_user_id.get(),
+                allowed_actor_user_id: 7,
+                now: 150,
+            },
+        )
+        .expect("claim outcome");
+
+    assert_eq!(outcome, ApprovalClaimOutcome::Unauthorized);
+    assert_eq!(
+        store
+            .get_approval(&callback.token)
+            .expect("approval lookup")
+            .expect("approval record")
+            .state,
+        inline_agent_bridge::ApprovalState::Pending
+    );
+}
+
+#[test]
+fn agent_command_catalog_is_stable_and_within_server_limits() {
+    let catalog = agent_command_catalog("claude");
+    let names = catalog
+        .iter()
+        .map(|command| command.command.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "help",
+            "status",
+            "history",
+            "new",
+            "clear",
+            "compact",
+            "folder",
+            "projects",
+            "follow",
+            "unfollow",
+            "queue",
+            "stop",
+            "model",
+            "reasoning",
+            "permissions",
+            "verbose",
+            "threads",
+            "allowlist",
+        ]
+    );
+    assert!(catalog.len() <= 100);
+    for (index, command) in catalog.iter().enumerate() {
+        assert!(!command.command.is_empty() && command.command.len() <= 32);
+        assert!(
+            command
+                .command
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        );
+        assert!(!command.description.is_empty() && command.description.len() <= 256);
+        assert_eq!(command.sort_order, i32::try_from(index).ok());
+    }
+
+    let codex_names = agent_command_catalog("codex")
+        .into_iter()
+        .map(|command| command.command)
+        .collect::<Vec<_>>();
+    for required in ["projects", "sessions", "open", "resume", "stop", "close"] {
+        assert!(codex_names.iter().any(|name| name == required));
+    }
+}
+
+#[test]
+fn final_output_keeps_file_list_concise_and_relative() {
+    let workspace = Path::new("/tmp/project");
+    let mut files = (0..10)
+        .map(|index| FileChange {
+            path: workspace.join(format!("src/file-{index}.rs")),
+            summary: (index == 0).then(|| "updated parser".to_string()),
+        })
+        .collect::<Vec<_>>();
+    files.push(FileChange {
+        path: PathBuf::from("/private/secret/outside.rs"),
+        summary: None,
+    });
+    let output = final_turn_text(
+        "Done.",
+        TurnOutcome::Completed,
+        &files,
+        workspace,
+        true,
+        None,
+        None,
+    );
+    assert!(
+        output.contains("- [`src/file-0.rs`](file:///tmp/project/src/file-0.rs) — updated parser")
+    );
+    assert!(output.contains("- and 2 more"));
+    assert!(!output.contains("file-8.rs"));
+    assert!(!output.contains("/private/secret"));
+    assert!(output.contains("Checks: not reported separately."));
+
+    let shared_output = final_turn_text(
+        "Done.",
+        TurnOutcome::Completed,
+        &files,
+        workspace,
+        false,
+        None,
+        None,
+    );
+    assert!(shared_output.contains("- `src/file-0.rs` — updated parser"));
+    assert!(!shared_output.contains("file://"));
+}
+
+#[test]
+fn changed_file_code_labels_handle_backticks_safely() {
+    assert_eq!(
+        markdown_code_span("src/odd`name.rs"),
+        "`` src/odd`name.rs ``"
+    );
+    assert_eq!(markdown_code_span("src/main.rs"), "`src/main.rs`");
+}
+
+#[test]
+fn unhealthy_provider_status_fails_the_command_gate() {
+    let mut status = service::BridgeStatus {
+        status: "running".to_string(),
+        installed: true,
+        service_loaded: true,
+        healthy: true,
+        provider: "codex".to_string(),
+        display_name: Some("Codex".to_string()),
+        bot_username: Some("mo_codex".to_string()),
+        workspace: Some("project".to_string()),
+        process_id: Some(42),
+        inline_connected: true,
+        provider_ready: true,
+        detail: None,
+    };
+    assert!(ensure_provider_statuses_healthy(&[status.clone()]).is_ok());
+
+    status.healthy = false;
+    status.status = "needs_attention".to_string();
+    assert!(ensure_provider_statuses_healthy(&[status]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_file_paths_reject_symlink_workspace_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temporary root");
+    let workspace = root.path().join("workspace");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("secret.txt"), "secret").expect("outside file");
+    symlink(&outside, workspace.join("linked")).expect("workspace escape symlink");
+
+    let escaped = workspace.join("linked/secret.txt");
+    assert_eq!(safe_relative_path(&escaped, &workspace), None);
+    assert_eq!(
+        safe_relative_path(Path::new("linked/secret.txt"), &workspace),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_file_paths_reject_replaced_workspace_roots() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temporary root");
+    let workspace = root.path().join("workspace");
+    let moved_workspace = root.path().join("moved-workspace");
+    let outside = root.path().join("outside");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("secret.txt"), "secret").expect("outside file");
+    fs::rename(&workspace, &moved_workspace).expect("move original workspace");
+    symlink(&outside, &workspace).expect("replace workspace with symlink");
+
+    assert_eq!(
+        safe_relative_path(Path::new("secret.txt"), &workspace),
+        None
+    );
+}
+
+#[test]
+fn failed_and_interrupted_partial_output_stays_honest_without_raw_errors() {
+    let workspace = Path::new("/tmp/project");
+    let failed = final_turn_text(
+        "Partial output",
+        TurnOutcome::Failed,
+        &[],
+        workspace,
+        false,
+        None,
+        None,
+    );
+    assert!(failed.contains("Partial output"));
+
+    let authentication = final_turn_text(
+        "Partial output",
+        TurnOutcome::AuthenticationRequired,
+        &[],
+        workspace,
+        false,
+        None,
+        None,
+    );
+    assert!(authentication.contains("Partial output"));
+    assert!(authentication.contains(BridgeNotice::AuthenticationRequired.message()));
+    assert!(failed.contains("couldn’t finish"));
+    assert!(!failed.contains("secret diagnostic"));
+
+    let disconnected = final_turn_text(
+        "Partial output",
+        TurnOutcome::ConnectionLost,
+        &[],
+        workspace,
+        false,
+        None,
+        None,
+    );
+    assert!(disconnected.contains(BridgeNotice::AgentConnectionLost.message()));
+
+    let interrupted = final_turn_text(
+        "Partial output",
+        TurnOutcome::Interrupted,
+        &[],
+        workspace,
+        false,
+        None,
+        None,
+    );
+    assert_eq!(interrupted, "Stopped.");
+}
+
+#[test]
+fn failed_turn_reply_includes_provider_explanation_with_or_without_partial_output() {
+    let diagnostic = r#"{"error":{"message":"The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade."}}"#;
+    for partial in ["", "Partial work"] {
+        let output = final_turn_text(
+            partial,
+            TurnOutcome::Failed,
+            &[],
+            Path::new("/tmp/project"),
+            false,
+            None,
+            Some(diagnostic),
+        );
+        assert!(output.contains("gpt-6-astra"));
+        assert!(output.contains("Please upgrade."));
+        assert!(output.contains(partial));
+        assert!(!output.contains("/status"));
+        assert!(!output.contains("{\"error\""));
+    }
+}
+
+#[test]
+fn utf16_truncation_respects_action_label_limit() {
+    let truncated = truncate_utf16(&"🦀".repeat(40), 64);
+    assert!(truncated.encode_utf16().count() <= 64);
+    assert!(truncated.ends_with('…'));
+}
+
+#[test]
+fn diagnostics_are_bounded_and_redact_secret_markers() {
+    assert_eq!(
+        safe_diagnostic("request used Authorization: Bearer private"),
+        "[redacted provider diagnostic]"
+    );
+    assert_eq!(
+        safe_diagnostic("request failed with token=private-value"),
+        "[redacted provider diagnostic]"
+    );
+    assert_eq!(
+        safe_diagnostic(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz"
+        ),
+        "[redacted provider diagnostic]"
+    );
+    assert!(safe_diagnostic(&"x".repeat(1_000)).len() <= 513);
+}
+
+#[test]
+fn login_heals_only_a_bridge_that_lost_its_sign_in_or_recorded_failures() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("accounts").join("42");
+    let (paths, account, mut secrets) = account_fixture_at(&root);
+    ensure_private_dir(&paths.root).expect("account directory");
+    assert_eq!(
+        login_heal_plan(&paths, &account, &secrets),
+        LoginHeal::Nothing
+    );
+
+    let provider = FailureLedger::provider(&account.providers[0]);
+    provider.record("provider_exited", None, FailureClass::Transient, 10);
+    assert_eq!(
+        login_heal_plan(&paths, &account, &secrets),
+        LoginHeal::Restart
+    );
+    provider.clear();
+
+    // The service stopped after the server revoked the owner session.
+    FailureLedger::service(&paths).record_needs_setup(
+        "owner_credential_expired",
+        "the Inline sign-in used by this bridge expired",
+        10,
+    );
+    assert_eq!(
+        login_heal_plan(&paths, &account, &secrets),
+        LoginHeal::RefreshOwnerSignIn
+    );
+    FailureLedger::service(&paths).clear();
+
+    // The revoked sign-in was already cleared from the bridge secrets.
+    secrets.owner_auth = None;
+    secrets.owner_token.clear();
+    assert_eq!(
+        login_heal_plan(&paths, &account, &secrets),
+        LoginHeal::RefreshOwnerSignIn
+    );
+}
+
+#[tokio::test]
+async fn a_parked_agent_resumes_when_its_runtime_is_installed() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (account, _) = account_fixture();
+    let mut installation = account.providers[0].clone();
+    installation.executable = directory.path().join("codex");
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut shutdown = Some(shutdown_rx);
+    let parked_installation = installation.clone();
+    let parked = tokio::spawn(async move {
+        park_until_runtime_recovers(
+            &parked_installation,
+            PROVIDER_RUNTIME_SETUP,
+            Duration::from_millis(20),
+            &mut shutdown,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(!parked.is_finished(), "a missing runtime stays parked");
+    fs::write(&installation.executable, b"#!/bin/sh\n").expect("install runtime");
+    set_file_mode(&installation.executable, 0o755).expect("make executable");
+    let resumed = tokio::time::timeout(Duration::from_secs(5), parked)
+        .await
+        .expect("re-probe finds the runtime")
+        .expect("parked task");
+    assert!(resumed);
+}
+
+#[tokio::test]
+async fn a_revoked_bot_stays_parked_until_shutdown() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (account, _) = account_fixture();
+    let mut installation = account.providers[0].clone();
+    installation.executable = directory.path().join("codex");
+    fs::write(&installation.executable, b"#!/bin/sh\n").expect("install runtime");
+    set_file_mode(&installation.executable, 0o755).expect("make executable");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut shutdown = Some(shutdown_rx);
+    let parked = tokio::spawn(async move {
+        park_until_runtime_recovers(
+            &installation,
+            PROVIDER_CREDENTIAL_SETUP,
+            Duration::from_millis(20),
+            &mut shutdown,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(!parked.is_finished(), "a re-probe cannot fix a revoked bot");
+    shutdown_tx.send(true).expect("request shutdown");
+    let resumed = tokio::time::timeout(Duration::from_secs(5), parked)
+        .await
+        .expect("shutdown ends the park")
+        .expect("parked task");
+    assert!(!resumed);
+}
+
+#[test]
+fn park_reasons_distinguish_runtime_from_revoked_bot() {
+    let (account, _) = account_fixture();
+    let installation = &account.providers[0];
+    let runtime = provider_setup_required("the configured Codex runtime is missing");
+    assert_eq!(
+        provider_park_reason(installation, &runtime),
+        (
+            PROVIDER_RUNTIME_SETUP,
+            "the configured Codex runtime is missing".to_string()
+        )
+    );
+    let revoked = inline_client::ClientRequestError::Backend(inline_client::BackendError::new(
+        ClientErrorCategory::AuthExpired,
+        "session revoked",
+    ));
+    let (reason, message) = provider_park_reason(installation, &revoked);
+    assert_eq!(reason, PROVIDER_CREDENTIAL_SETUP);
+    assert!(message.contains("inline setup codex"));
+}
+
+#[test]
+fn a_suspect_owner_end_with_a_valid_probe_restarts_the_owner_connection() {
+    // The owner client has stopped listening, so carrying on would be a
+    // silent outage: rebuild the connection unless the session is revoked.
+    assert_eq!(
+        owner_end_after_probe(SessionProbe::Valid),
+        OwnerConnectionEnd::Lost
+    );
+    assert_eq!(
+        owner_end_after_probe(SessionProbe::Inconclusive),
+        OwnerConnectionEnd::Lost
+    );
+    assert_eq!(
+        owner_end_after_probe(SessionProbe::Revoked),
+        OwnerConnectionEnd::Revoked
+    );
+    // The restart ends the service as a transient failure: the service
+    // manager restarts it after the persisted backoff, nothing parks.
+    let lost = owner_connection_lost_error();
+    assert!(lost.downcast_ref::<BridgeSetupRequired>().is_none());
+    assert_eq!(classify_failure(lost.as_ref()), FailureClass::Transient);
+}
+
+#[test]
+fn bridge_v2_flag_leaves_providers_without_a_v2_driver_on_v1() {
+    assert!(v2_enabled_in(Some("all"), "codex"));
+    assert!(v2_enabled_in(Some("codex, claude"), "claude"));
+    assert!(!v2_enabled_in(Some("codex"), "claude"));
+    // OpenCode has a v2 adapter; application-major gating happens separately.
+    assert!(v2_enabled_in(Some("all"), "opencode"));
+    assert!(v2_enabled_in(Some("opencode"), "opencode"));
+}
+
+#[test]
+fn bridge_v2_is_the_default_for_qualified_providers_with_an_explicit_rollback() {
+    for provider in ["codex", "claude", "opencode", "amp"] {
+        assert!(v2_enabled_in(None, provider));
+        for setting in ["off", "false", "0", ""] {
+            assert!(!v2_enabled_in(Some(setting), provider));
+        }
+    }
+    assert!(!v2_enabled_in(Some("codex"), "claude"));
+    assert!(!v2_enabled_in(None, "unknown"));
+    assert!(!v2_enabled_in(Some("all"), "unknown"));
+}
+
+#[test]
+fn opencode_routing_preserves_legacy_versions_and_respects_v2_rollback() {
+    for setting in [None, Some("all"), Some("opencode"), Some("off")] {
+        assert!(!opencode_uses_v2(setting, "0.15.0").unwrap());
+        assert!(!opencode_uses_v2(setting, "1.19.4").unwrap());
+    }
+    assert!(opencode_uses_v2(None, "opencode v2.0.32").unwrap());
+    assert!(opencode_uses_v2(Some("all"), "2.0.32").unwrap());
+    assert!(!opencode_uses_v2(Some("off"), "2.0.32").unwrap());
+    assert!(!opencode_uses_v2(Some("codex"), "2.0.32").unwrap());
+    assert!(opencode_uses_v2(None, "unknown").is_err());
+    assert!(opencode_uses_v2(None, "3.0.0").is_err());
+}

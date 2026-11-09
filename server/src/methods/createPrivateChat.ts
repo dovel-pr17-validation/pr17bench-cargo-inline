@@ -1,0 +1,284 @@
+import { syncChatAccess } from "@in/server/modules/authorization/chatAccessSync"
+import { db } from "@in/server/db"
+import { chatTitleFields } from "@in/server/modules/encryption/chatTitleStorage"
+import { chats, dialogs, type DbChat, type DbDialog, type DbUserWithProfile } from "@in/server/db/schema"
+import {
+  encodeChatInfo,
+  encodeDialogInfo,
+  TChatInfo,
+  TDialogInfo,
+  encodeMinUserInfo,
+  TMinUserInfo,
+} from "@in/server/api-types"
+import { InlineError } from "@in/server/types/errors"
+import { Log } from "@in/server/utils/log"
+import type { Static } from "elysia"
+import { Type } from "@sinclair/typebox"
+import type { HandlerContext } from "@in/server/controllers/helpers"
+import { and, eq } from "drizzle-orm"
+import type { Update, User } from "@inline-chat/protocol/core"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { RealtimeUpdates } from "@in/server/realtime/message"
+import { UsersModel } from "@in/server/db/models/users"
+import { UpdatesModel, type UpdateSeqAndDate } from "@in/server/db/models/updates"
+import { UpdateBucket } from "@in/server/db/schema/updates"
+import type { ServerUpdate } from "@in/server/protocol/server"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { dialogOpenDefaultsForChat } from "@in/server/modules/dialogOpen"
+
+export const Input = Type.Object({
+  userId: Type.String(),
+  // TODO: Require access_hash to avoid spam
+})
+
+export const Response = Type.Object({
+  chat: TChatInfo,
+  dialog: TDialogInfo,
+  user: TMinUserInfo,
+})
+
+export const handler = async (
+  input: Static<typeof Input>,
+  context: HandlerContext,
+  options: { peerForCurrentUser?: User } = {},
+): Promise<Static<typeof Response>> => {
+  const peerId = Number(input.userId)
+  if (isNaN(peerId)) {
+    throw new InlineError(InlineError.ApiError.PEER_INVALID)
+  }
+
+  // For self-chat, both minUserId and maxUserId will be currentUserId
+  const isSelfChat = peerId === context.currentUserId
+  const minUserId = isSelfChat ? context.currentUserId : Math.min(context.currentUserId, peerId)
+  const maxUserId = isSelfChat ? context.currentUserId : Math.max(context.currentUserId, peerId)
+
+  const currentUser = await UsersModel.getUserWithProfile(context.currentUserId)
+
+  if (!currentUser) {
+    Log.shared.error("Failed to get current user")
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+
+  const currentUserName = currentUser?.firstName
+  const title = isSelfChat ? `${currentUserName} (You)` : null
+
+  // Insert first so concurrent requests agree on which call created the chat.
+  const [insertedChat] = await db.transaction(async (tx) => {
+    const inserted = await tx
+      .insert(chats)
+      .values({
+        ...chatTitleFields(title, { spaceId: null }),
+        type: "private",
+        date: new Date(),
+        minUserId,
+        maxUserId,
+      })
+      .onConflictDoNothing()
+      .returning()
+    if (inserted[0]) await syncChatAccess(tx, { kind: "chats", chatIds: [inserted[0].id] })
+    return inserted
+  })
+
+  const createdChat = insertedChat !== undefined
+  const [chat] = insertedChat
+    ? [insertedChat]
+    : await db
+        .update(chats)
+        .set(chatTitleFields(title, { spaceId: null }))
+        .where(and(eq(chats.type, "private"), eq(chats.minUserId, minUserId), eq(chats.maxUserId, maxUserId)))
+        .returning()
+
+  if (!chat) {
+    Log.shared.error("Failed to create private chat")
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+
+  let d: DbDialog[] = []
+  // Create or update dialog for current user only
+  if (minUserId === maxUserId) {
+    let [dialog] = await db
+      .insert(dialogs)
+      .values({
+        chatId: chat.id,
+        userId: context.currentUserId,
+        peerUserId: context.currentUserId,
+        date: new Date(),
+        ...dialogOpenDefaultsForChat(chat),
+      })
+      .onConflictDoNothing()
+      .returning()
+
+    if (!dialog) {
+      dialog = await db._query.dialogs.findFirst({
+        where: and(
+          eq(dialogs.userId, context.currentUserId),
+          eq(dialogs.peerUserId, context.currentUserId),
+          eq(dialogs.chatId, chat.id),
+        ),
+      })
+    }
+
+    if (!dialog) {
+      Log.shared.error("Failed to create dialog")
+      throw new InlineError(InlineError.ApiError.INTERNAL)
+    }
+    d = [dialog]
+  } else {
+    const result = await db
+      .insert(dialogs)
+      .values([
+        {
+          chatId: chat.id,
+          userId: minUserId,
+          peerUserId: maxUserId,
+          date: new Date(),
+          ...dialogOpenDefaultsForChat(chat),
+        },
+        {
+          chatId: chat.id,
+          userId: maxUserId,
+          peerUserId: minUserId,
+          date: new Date(),
+          ...dialogOpenDefaultsForChat(chat),
+        },
+      ])
+      .onConflictDoUpdate({
+        target: [dialogs.chatId, dialogs.userId],
+        set: { date: new Date() },
+      })
+      .returning()
+
+    if (!result) {
+      Log.shared.error("Failed to create dialog")
+      throw new InlineError(InlineError.ApiError.INTERNAL)
+    }
+    d = result
+  }
+
+  // Fetch peer users (both current user and the peer)
+  const user = await UsersModel.getUserWithProfile(peerId)
+
+  if (!user) {
+    Log.shared.error("Failed to get user")
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+
+  const [returningDialog] = d.filter((d) => d.userId === context.currentUserId)
+
+  if (!returningDialog) {
+    Log.shared.error("Failed to get dialog")
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+
+  const persistedUpdate = createdChat
+    ? await persistNewChatUpdate(chat.id, {
+        idOnlyUserForId: options.peerForCurrentUser ? context.currentUserId : undefined,
+      })
+    : undefined
+
+  // Push update to both users
+  pushUpdate({
+    chat,
+    user: currentUser,
+    pushToUserId: user.id,
+    update: persistedUpdate,
+  }).catch((error) => {
+    Log.shared.error("Failed to push update to user", { error })
+  })
+
+  pushUpdate({
+    chat,
+    user,
+    pushToUserId: context.currentUserId,
+    update: persistedUpdate,
+    encodedUser: options.peerForCurrentUser,
+  }).catch((error) => {
+    Log.shared.error("Failed to push update to user", { error })
+  })
+
+  return {
+    chat: encodeChatInfo(chat, { currentUserId: context.currentUserId }),
+    dialog: encodeDialogInfo({
+      ...returningDialog,
+      unreadCount: 0,
+    }),
+
+    // Deprecated
+    user: encodeMinUserInfo(user, { photoFile: user.photoFile ?? undefined }),
+  }
+}
+
+const pushUpdate = async (input: {
+  chat: DbChat
+  user: DbUserWithProfile
+  pushToUserId: number
+  update?: UpdateSeqAndDate
+  encodedUser?: User
+}) => {
+  const { chat, user, pushToUserId, update: persisted, encodedUser } = input
+
+  const encodingForUserId = pushToUserId
+  const encodedChat = await Encoders.chatForUser(chat, { encodingForUserId })
+  const update: Update = {
+    update: {
+      oneofKind: "newChat",
+      newChat: {
+        chat: encodedChat,
+        user:
+          encodedUser ??
+          Encoders.user({
+            user,
+            min: true,
+            photoFile: user.photoFile ?? undefined,
+          }),
+      },
+    },
+  }
+
+  if (persisted) {
+    update.seq = persisted.seq
+    update.date = encodeDateStrict(persisted.date)
+  }
+
+  RealtimeUpdates.pushToUser(pushToUserId, [update])
+}
+
+const persistNewChatUpdate = async (
+  chatId: number,
+  options: { idOnlyUserForId?: number },
+): Promise<UpdateSeqAndDate> => {
+  const chatUpdatePayload: ServerUpdate["update"] = {
+    oneofKind: "newChat",
+    newChat: {
+      chatId: BigInt(chatId),
+      idOnlyUserForId:
+        options.idOnlyUserForId !== undefined ? BigInt(options.idOnlyUserForId) : undefined,
+    },
+  }
+
+  const persisted = await db.transaction(async (tx): Promise<UpdateSeqAndDate> => {
+    const [chat] = await tx.select().from(chats).where(eq(chats.id, chatId)).for("update").limit(1)
+
+    if (!chat) {
+      throw new InlineError(InlineError.ApiError.CHAT_ID_INVALID)
+    }
+
+    const update = await UpdatesModel.insertUpdate(tx, {
+      update: chatUpdatePayload,
+      bucket: UpdateBucket.Chat,
+      entity: chat,
+    })
+
+    await tx
+      .update(chats)
+      .set({
+        updateSeq: update.seq,
+        lastUpdateDate: update.date,
+      })
+      .where(eq(chats.id, chatId))
+
+    return update
+  })
+
+  return persisted
+}

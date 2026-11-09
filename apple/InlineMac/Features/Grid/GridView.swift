@@ -1,0 +1,294 @@
+import InlineGrid
+import InlineKit
+import InlineProtocol
+import SwiftUI
+
+struct GridView: View {
+  @Environment(\.dependencies) private var dependencies
+  @Environment(\.nav) private var nav
+  @Environment(GridRoomService.self) private var store
+  @Environment(SidebarViewModel.self) private var sidebar
+  @State private var transcriptionNotice: GridTranscriptionNotice?
+  let spaceID: Int64
+
+  var body: some View {
+    let title = pageTitle
+
+    GridContent(
+      grid: store.grid(spaceID: spaceID),
+      isLoading: store.loadingSpaceIDs.contains(spaceID),
+      didFailLoading: store.failedLoadSpaceIDs.contains(spaceID),
+      localRoomID: localRoomID,
+      roomIdentity: store.displayIdentity(roomID:),
+      // Rooms stay live while a change is at the server; the newest tap wins.
+      isJoiningDisabled: store.callTransferEnabled && store.currentCall?.ownedByCurrentSession == false,
+      audioLevel: store.audioLevel,
+      isScreenSharing: { store.isScreenSharing(avatar: $0) },
+      connectionState: isJoiningInSpace || store.connectionRecoveryAttempt > 0
+        ? .connecting : store.media.connectionState,
+      onCreate: { store.createAndJoin(spaceID: spaceID) },
+      onRetry: { Task { await store.load(spaceID: spaceID) } },
+      onJoin: { roomID in
+        if store.callTransferEnabled, store.currentCall?.roomID == roomID {
+          store.moveCallHere()
+        } else {
+          store.join(roomID: roomID)
+        }
+      },
+      onLeave: { store.leaveCurrentRoom(spaceID: spaceID) },
+      onToggleMicrophone: { store.toggleMicrophone(spaceID: spaceID) },
+      onOpenScreenShare: { store.openScreenShare(for: $0) },
+      onStopScreenShare: store.stopScreenSharing,
+      onSetTitle: { roomID, title in Task { await store.setRoomTitle(roomID: roomID, title: title) } },
+      onSetLocked: { roomID, locked in Task { await store.toggleRoomLock(roomID: roomID, locked: locked) } },
+      onDelete: { roomID in Task { await store.deleteRoom(roomID: roomID) } }
+    )
+    .navigationTitle(title)
+    .toolbar(removing: .title)
+    .toolbar {
+      let titleItem =
+        MacToolbarItem(placement: .navigation, priority: .high, label: "") {
+          RouteToolbarSpacePickerTitleItem(
+            title: title,
+            selectedSpaceID: spaceID,
+            spaces: toolbarSpaces,
+            help: "Choose a Space Grid",
+            onSelect: { selectedSpaceID in
+              guard let selectedSpaceID else { return }
+              openGrid(spaceID: selectedSpaceID)
+            }
+          )
+        }
+
+      if #available(macOS 26.0, *) {
+        titleItem.sharedBackgroundVisibility(.hidden)
+      } else {
+        titleItem
+      }
+
+      if #available(macOS 26.0, *) {
+        ToolbarSpacer(.flexible)
+      } else {
+        ToolbarItem {
+          Spacer()
+        }
+      }
+
+      ToolbarItem {
+        GridAdvancedMenu(onManageHotkeys: openHotkeySettings)
+      }
+    }
+    .safeAreaInset(edge: .bottom) {
+      // Leaving is instant; while it settles there is nothing to resume.
+      if case .leave = store.pendingMembership {
+        EmptyView()
+      } else if isJoiningInSpace || (currentRoom != nil && hasLocalAdmissionInSpace) {
+        // Joining or switching keeps the controls: you are in the room from
+        // the first tap, and Leave stops a join that is still settling.
+        GridControlPill(
+          media: store.media,
+          onToggleMicrophone: { store.toggleMicrophone(spaceID: spaceID) },
+          onLeave: { store.leaveCurrentRoom(spaceID: spaceID) },
+          onSelectInput: store.setInputSelection,
+          onRefreshInputDevices: store.refreshInputDevices,
+          onSelectOutput: store.setOutputSelection,
+          onRefreshOutputDevices: store.refreshOutputDevices,
+          onToggleScreenShare: store.toggleScreenShare,
+          onSelectScreenCaptureSource: store.startScreenSharing,
+          onSelectScreenShareQualityProfile: store.setScreenShareQualityProfile,
+          onRefreshScreenCaptureSources: store.refreshScreenCaptureSources,
+          onStopScreenShare: store.stopScreenSharing,
+          onSetOutputVolume: store.setOutputVolume,
+          onRetryAudio: store.retryAudio,
+          transcription: admittedRoom.flatMap(transcriptionControl(room:)),
+          transcriptionNotice: admittedRoom.flatMap(visibleTranscriptionNotice(room:)),
+          onRetryTranscription: retryTranscription
+        )
+        .padding(.bottom, 18)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+      } else if store.pendingMembership?.isJoining == true {
+        // Joining in another space; a room switch is not a paused call to resume.
+        Button("Cancel") { store.withdrawLocalAdmission() }
+          .padding(.bottom, 18)
+      } else if store.callTransferEnabled, let call = store.currentCall, call.spaceID == spaceID {
+        HStack(spacing: 12) {
+          Button(call.ownedByCurrentSession ? "Resume here" : "Move here", systemImage: "arrow.down.to.line") {
+            store.moveCallHere()
+          }
+          .disabled(store.membershipMutationInFlight)
+          if store.membershipMutationInFlight {
+            Button("Cancel") { store.withdrawLocalAdmission() }
+          }
+        }
+        .padding(.bottom, 18)
+      } else if let room = currentRoom {
+        HStack(spacing: 12) {
+          Button("Resume here", systemImage: "arrow.down.to.line") { store.join(roomID: room.id) }
+            .disabled(store.membershipMutationInFlight)
+          if store.membershipMutationInFlight {
+            Button("Cancel") { store.withdrawLocalAdmission() }
+          }
+        }
+        .padding(.bottom, 18)
+      } else if store.membershipMutationInFlight {
+        Button("Cancel") { store.withdrawLocalAdmission() }
+          .padding(.bottom, 18)
+      }
+    }
+    .animation(.smoothSnappy, value: currentRoom?.id)
+    .animation(.smoothSnappy, value: localRoomID)
+    .onChange(of: currentRoom.map(GridTranscriptionCapture.init(room:))) { _, capture in
+      // A failure notice belongs to one room and capture state. The store's
+      // repair reload can land in the same update as a new notice, so keep one
+      // that already matches the new state.
+      if transcriptionNotice?.capture != capture {
+        transcriptionNotice = nil
+      }
+    }
+    .task(id: spaceID) {
+      await store.load(spaceID: spaceID)
+    }
+  }
+
+  private var currentRoom: GridRoom? {
+    guard let grid = store.grid(spaceID: spaceID) else { return nil }
+    if store.callTransferEnabled {
+      guard let call = store.currentCall, call.spaceID == spaceID else { return nil }
+      return grid.rooms.first { $0.id == call.roomID }
+    }
+    guard grid.hasCurrentRoomID else { return nil }
+    return grid.rooms.first { $0.id == grid.currentRoomID }
+  }
+
+  /// The room this Mac is in or is joining. A tapped room is yours at once,
+  /// before the server confirms it.
+  private var localRoomID: Int64? {
+    if let pending = store.pendingMembership {
+      guard pending.spaceID == spaceID, case let .join(_, roomID) = pending else { return nil }
+      return roomID
+    }
+    guard hasLocalAdmissionInSpace, let grid = store.grid(spaceID: spaceID), grid.hasCurrentRoomID else { return nil }
+    return grid.currentRoomID
+  }
+
+  private var isJoiningInSpace: Bool {
+    guard let pending = store.pendingMembership else { return false }
+    return pending.isJoining && pending.spaceID == spaceID
+  }
+
+  /// Room-level controls such as transcription wait for the admitted call.
+  private var admittedRoom: GridRoom? {
+    hasLocalAdmissionInSpace ? currentRoom : nil
+  }
+
+  private var hasLocalAdmissionInSpace: Bool {
+    guard store.hasLocalAdmission else { return false }
+    guard store.callTransferEnabled else { return true }
+    return store.currentCall?.ownedByCurrentSession == true && store.currentCall?.spaceID == spaceID
+  }
+
+  private var pageTitle: String {
+    guard let spaceName = sidebar.space(id: spaceID)?.displayName,
+          spaceName.isEmpty == false
+    else { return "Grid" }
+    return "\(spaceName) Grid"
+  }
+
+  private var toolbarSpaces: [RouteToolbarSpacePickerItem] {
+    store.orderedHomeSpaces.map { home in
+      RouteToolbarSpacePickerItem(
+        id: home.spaceID,
+        name: sidebar.space(id: home.spaceID)?.displayName ?? "Space",
+        menuDetail: home.activeAvatarCount > 0 ? "\(home.activeAvatarCount) active" : nil
+      )
+    }
+  }
+
+  private func openGrid(spaceID: Int64) {
+    guard spaceID != self.spaceID else { return }
+    store.recordGridOpened(spaceID: spaceID)
+    nav.openGrid(spaceId: spaceID)
+  }
+
+  private func transcriptionControl(room: GridRoom) -> GridTranscriptionControl? {
+    // The server reports transcription unavailable outside Pro Spaces, so the control stays hidden there.
+    guard room.transcriptionAvailable || room.transcriptionIsRunning else { return nil }
+    return GridTranscriptionControl(
+      room: room,
+      isBusy: store.pendingTranscriptionRequestIDs[room.id] != nil,
+      onSetTranscription: { enabled, destination in
+        setTranscription(roomID: room.id, enabled: enabled, destination: destination)
+      },
+      onOpenTranscript: {
+        guard let chatID = room.transcriptChatID else { return }
+        dependencies?.requestOpenChat(peer: .thread(id: chatID))
+      },
+      onListTranscripts: { try await store.listTranscripts(roomID: room.id) }
+    )
+  }
+
+  private func visibleTranscriptionNotice(room: GridRoom) -> GridTranscriptionNotice? {
+    guard let transcriptionNotice, transcriptionNotice.capture == GridTranscriptionCapture(room: room) else {
+      return nil
+    }
+    return transcriptionNotice
+  }
+
+  private func retryTranscription(_ notice: GridTranscriptionNotice) {
+    switch notice.retry {
+      case let .setTranscription(enabled, destination):
+        setTranscription(roomID: notice.roomID, enabled: enabled, destination: destination)
+    }
+  }
+
+  private func setTranscription(
+    roomID: Int64,
+    enabled: Bool,
+    destination: GridTranscriptionRequest.Destination
+  ) {
+    transcriptionNotice = nil
+    // Requests fence on the room's run, revision and generation, so read the
+    // room when the action runs rather than when its closure was made.
+    guard let room = currentRoom, room.id == roomID else { return }
+    Task {
+      do {
+        try await store.setTranscription(room: room, enabled: enabled, destination: destination)
+      } catch {
+        showTranscriptionNotice(.setTranscription(enabled: enabled, destination: destination), roomID: roomID)
+      }
+    }
+  }
+
+  /// Records a failure against the room as it is now, after the store's repair
+  /// reload, so the notice clears once the room or its capture state moves on.
+  private func showTranscriptionNotice(_ retry: GridTranscriptionNotice.Retry, roomID: Int64) {
+    guard let room = currentRoom, room.id == roomID else { return }
+    transcriptionNotice = GridTranscriptionNotice(retry: retry, capture: GridTranscriptionCapture(room: room))
+  }
+
+  private func openHotkeySettings() {
+    guard let dependencies else { return }
+    dependencies.appBridge.openSettings(
+      dependencies: dependencies,
+      selectedCategory: .hotkeys
+    )
+  }
+}
+
+private struct GridAdvancedMenu: View {
+  let onManageHotkeys: () -> Void
+
+  var body: some View {
+    Menu {
+      Button(action: onManageHotkeys) {
+        Label("Manage Hotkeys…", systemImage: "keyboard")
+      }
+    } label: {
+      Label("Grid Options", systemImage: "ellipsis")
+        .labelStyle(.iconOnly)
+    }
+    .menuIndicator(.hidden)
+    .tint(.primary)
+    .help("Grid Options")
+  }
+}

@@ -1,0 +1,327 @@
+import { gitCommitSha } from "@in/server/buildEnv"
+import {
+  checkDatabaseHealth,
+} from "@in/server/db"
+import {
+  getServerShutdownState,
+  type ShutdownSignal,
+} from "@in/server/lifecycle/shutdownState"
+import {
+  inlineProtocolClock,
+  type InlineProtocolClock,
+  type InlineProtocolClockHealth,
+} from "@in/server/modules/inlineProtocol/clockHealth"
+
+const DEFAULT_DATABASE_HEALTH_TIMEOUT_MS = 2_000
+const DATABASE_HEALTH_FRESHNESS_MS = 1_000
+
+interface CancellableHealthCheck
+  extends PromiseLike<unknown> {
+  readonly cancel?: () => void
+}
+
+export interface HealthDeps {
+  readonly checkDatabase: () =>
+    CancellableHealthCheck
+  readonly clock?: Pick<InlineProtocolClock, "sample">
+  readonly checkBroker?: () => boolean
+  readonly timeoutMs?: number
+  readonly monotonicClock?: () => number
+}
+
+export interface HealthLifecycleDeps {
+  readonly getShutdownState?: typeof getServerShutdownState
+}
+
+export interface HealthResponse {
+  readonly ok: boolean
+  readonly status: "ok" | "degraded"
+  readonly timestamp: number
+  readonly checks: {
+    readonly database: {
+      readonly ok: boolean
+      readonly latencyMs: number
+      readonly error?: "database_unavailable"
+    }
+    readonly clock: InlineProtocolClockHealth
+    readonly broker?: {
+      readonly ok: boolean
+      readonly error?: "broker_unavailable"
+    }
+  }
+}
+
+export interface HealthHttpResponse extends HealthResponse {
+  /** Source commit of the serving build, so monitors can detect origin version drift. */
+  readonly revision: string
+  readonly draining: boolean
+  readonly checks: HealthResponse["checks"] & {
+    readonly lifecycle: {
+      readonly ok: boolean
+      readonly error?: "shutting_down"
+      readonly signal?: ShutdownSignal
+    }
+  }
+}
+
+export interface LivenessHttpResponse {
+  readonly ok: boolean
+  readonly status: "ok" | "degraded"
+  readonly timestamp: number
+  readonly draining: boolean
+  readonly checks: {
+    readonly lifecycle: {
+      readonly ok: boolean
+      readonly error?: "shutting_down"
+      readonly signal?: ShutdownSignal
+    }
+  }
+}
+
+const defaultHealthDeps: HealthDeps = {
+  checkDatabase: checkDatabaseHealth,
+  clock: inlineProtocolClock,
+}
+
+const runBoundedDatabaseCheck = async (
+  deps: HealthDeps,
+): Promise<unknown> => {
+  const query = deps.checkDatabase()
+  const timeoutMs =
+    deps.timeoutMs ??
+    DEFAULT_DATABASE_HEALTH_TIMEOUT_MS
+  let timeoutId:
+    | ReturnType<typeof setTimeout>
+    | undefined
+
+  try {
+    return await new Promise<unknown>((resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(
+          new Error(
+            `Database health check exceeded ${timeoutMs}ms.`,
+          ),
+        )
+        try {
+          query.cancel?.()
+        } catch {
+          // The bounded readiness result is authoritative even if protocol-level cancellation fails.
+        }
+      }, timeoutMs)
+
+      void Promise.resolve(query).then(resolve, reject)
+    })
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId)
+    }
+  }
+}
+
+const checkDatabase = async (
+  deps: HealthDeps,
+): Promise<{
+  readonly health: HealthResponse["checks"]["database"]
+  readonly referenceTimeMillis?: number
+}> => {
+  const now = deps.monotonicClock ?? (() => performance.now())
+  const startedAt = now()
+  try {
+    const result = await runBoundedDatabaseCheck(deps)
+    const latencyMs = now() - startedAt
+    const row = Array.isArray(result) ? result[0] : undefined
+    const rawDatabaseTime = row && typeof row === "object"
+      ? (row as Record<string, unknown>)["database_time_millis"]
+      : undefined
+    const databaseTimeMillis = typeof rawDatabaseTime === "number"
+      ? rawDatabaseTime
+      : typeof rawDatabaseTime === "string"
+        ? Number(rawDatabaseTime)
+        : undefined
+    return {
+      health: {
+        ok: true,
+        latencyMs: Math.round(latencyMs),
+      },
+      ...(databaseTimeMillis !== undefined && Number.isFinite(databaseTimeMillis)
+        ? { referenceTimeMillis: databaseTimeMillis + latencyMs / 2 }
+        : {}),
+    }
+  } catch {
+    return {
+      health: {
+        ok: false,
+        latencyMs: Math.round(now() - startedAt),
+        error: "database_unavailable",
+      },
+    }
+  }
+}
+
+const resolveHealthDeps = (
+  deps?: Partial<HealthDeps>,
+): HealthDeps => ({
+  ...defaultHealthDeps,
+  ...deps,
+})
+
+export const runHealthChecks = async (
+  deps?: Partial<HealthDeps>,
+): Promise<HealthResponse> => {
+  const resolved = resolveHealthDeps(deps)
+  const databaseResult = await checkDatabase(resolved)
+  return healthResponse(resolved, databaseResult)
+}
+
+type DatabaseResult = Awaited<ReturnType<typeof checkDatabase>>
+
+/** Bound public readiness traffic to one database probe per freshness window. */
+export const makeHealthChecker = (
+  deps?: Partial<HealthDeps>,
+): ((responseDeps?: Pick<HealthDeps, "clock" | "checkBroker">) => Promise<HealthResponse>) => {
+  const resolved = resolveHealthDeps(deps)
+  const now = resolved.monotonicClock ?? (() => performance.now())
+  let cached: { result: DatabaseResult; sampledAt: number } | undefined
+  let inFlight: Promise<void> | undefined
+  let queryPending = false
+  const probeDeps: HealthDeps = {
+    ...resolved,
+    checkDatabase: () => {
+      const query = resolved.checkDatabase()
+      queryPending = true
+      void Promise.resolve(query).then(
+        () => { queryPending = false },
+        () => { queryPending = false },
+      )
+      return query
+    },
+  }
+
+  return async (responseDeps) => {
+    const age = cached ? now() - cached.sampledAt : Number.POSITIVE_INFINITY
+    if (!inFlight && (!cached || (!queryPending && (age < 0 || age >= DATABASE_HEALTH_FRESHNESS_MS)))) {
+      inFlight = checkDatabase(probeDeps).then((result) => {
+        cached = { result, sampledAt: now() }
+      }).finally(() => { inFlight = undefined })
+    }
+    if (inFlight) await inFlight
+    // A timed-out query can ignore cancellation. Keep its degraded result until
+    // it settles rather than accumulate replacement queries in the driver queue.
+    const sample = cached!
+    const elapsed = Math.max(0, now() - sample.sampledAt)
+    return healthResponse({ ...resolved, ...responseDeps }, {
+      ...sample.result,
+      ...(sample.result.referenceTimeMillis === undefined ? {} : {
+        // Advance the database UTC reference using monotonic time. Replaying
+        // the old timestamp would distort offset checks or latch a clock fault.
+        referenceTimeMillis: sample.result.referenceTimeMillis + elapsed,
+      }),
+    })
+  }
+}
+
+const healthResponse = (
+  resolved: HealthDeps,
+  databaseResult: DatabaseResult,
+): HealthResponse => {
+  const database = databaseResult.health
+  const clock = (resolved.clock ?? inlineProtocolClock).sample(
+    databaseResult.referenceTimeMillis,
+  )
+  const broker = resolved.checkBroker
+    ? (() => {
+      const ok = resolved.checkBroker?.() === true
+      return ok
+        ? { ok }
+        : { ok, error: "broker_unavailable" as const }
+    })()
+    : undefined
+  // Broker loss slows cross-instance delivery; the PostgreSQL recovery path
+  // keeps the API routable. Still expose the degradation for monitoring.
+  const ok = database.ok && clock.ok
+
+  return {
+    ok,
+    status: ok && (broker?.ok ?? true) ? "ok" : "degraded",
+    timestamp: Math.floor(Date.now() / 1000),
+    checks: {
+      database,
+      clock,
+      ...(broker === undefined ? {} : { broker }),
+    },
+  }
+}
+
+const lifecycleCheck = (
+  deps?: HealthLifecycleDeps,
+): LivenessHttpResponse => {
+  const shutdownState =
+    deps?.getShutdownState?.() ??
+    getServerShutdownState()
+
+  if (!shutdownState.shuttingDown) {
+    return {
+      ok: true,
+      status: "ok",
+      timestamp: Math.floor(Date.now() / 1000),
+      draining: false,
+      checks: {
+        lifecycle: {
+          ok: true,
+        },
+      },
+    }
+  }
+
+  return {
+    ok: false,
+    status: "degraded",
+    timestamp: Math.floor(Date.now() / 1000),
+    draining: true,
+    checks: {
+      lifecycle: {
+        ok: false,
+        error: "shutting_down",
+        signal:
+          shutdownState.signal ?? undefined,
+      },
+    },
+  }
+}
+
+export const runLivenessCheck = (
+  deps?: HealthLifecycleDeps,
+): LivenessHttpResponse => lifecycleCheck(deps)
+
+export const withLifecycleCheck = (
+  result: HealthResponse,
+  deps?: HealthLifecycleDeps,
+): HealthHttpResponse => {
+  const liveness = lifecycleCheck(deps)
+
+  if (liveness.ok) {
+    return {
+      ...result,
+      revision: gitCommitSha,
+      draining: false,
+      checks: {
+        ...result.checks,
+        lifecycle: liveness.checks.lifecycle,
+      },
+    }
+  }
+
+  return {
+    ...result,
+    revision: gitCommitSha,
+    ok: false,
+    status: "degraded",
+    draining: true,
+    checks: {
+      ...result.checks,
+      lifecycle: {
+        ...liveness.checks.lifecycle,
+      },
+    },
+  }
+}

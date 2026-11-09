@@ -1,0 +1,320 @@
+import { BotUpdatesModel } from "@in/server/db/models/botUpdates"
+import { botUpdateWaiters } from "@in/server/db/models/botUpdateWaiters"
+import { isTest } from "@in/server/env"
+import { IdleBackoff } from "@in/server/utils/idleBackoff"
+import { Log } from "@in/server/utils/log"
+import { resolveWebhookUrl } from "./webhookSecurity"
+import { request as httpsRequest, type RequestOptions } from "node:https"
+import type { ClientRequest, IncomingMessage } from "node:http"
+import { isIP } from "node:net"
+
+const log = new Log("botUpdates.delivery")
+const requestTimeoutMs = 10_000
+const workerPollIntervalMs = 2_500
+
+export const webhookRetryDelayMs = (attempt: number): number => {
+  const schedule = [10_000, 30_000, 120_000, 600_000, 1_800_000]
+  const base = schedule[Math.max(0, attempt - 1)] ?? Math.min(3_600_000, 1_800_000 * 2 ** Math.min(6, attempt - 5))
+  return base + Math.floor(base * Math.random() * 0.2)
+}
+
+const retryAfterMs = (status: number, header: string | string[] | undefined): number | undefined => {
+  if (status !== 429 && status !== 503) return undefined
+  const seconds = Number(Array.isArray(header) ? header[0] : header)
+  if (!Number.isFinite(seconds) || seconds < 1) return undefined
+  return Math.min(3_600_000, Math.floor(seconds * 1_000))
+}
+
+export type BotWebhookTransport = (input: {
+  rawUrl: string
+  body: string
+  headers: Record<string, string>
+  beforeConnect: () => Promise<boolean>
+}) => Promise<{ status: number; retryAfter?: string | string[] } | undefined>
+
+export function makeBotWebhookTransport(dependencies: {
+  resolve?: typeof resolveWebhookUrl
+  request?: (url: URL, options: RequestOptions, callback: (response: IncomingMessage) => void) => ClientRequest
+  timeoutMs?: number
+} = {}): BotWebhookTransport {
+  return async (input) => {
+    const target = await (dependencies.resolve ?? resolveWebhookUrl)(input.rawUrl)
+    if (!await input.beforeConnect()) return undefined
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const finish = (outcome: () => void) => {
+        if (settled) return
+        settled = true
+        clearTimeout(deadline)
+        outcome()
+      }
+      // Bun's Node HTTPS shim does not reliably honor a custom `lookup`, so
+      // connect to the validated literal address. The original hostname stays
+      // in Host and SNI/certificate verification; IP literals send no SNI.
+      const request = (dependencies.request ?? httpsRequest)(target.url, {
+        method: "POST",
+        agent: false,
+        hostname: target.address,
+        family: target.family,
+        servername: isIP(target.url.hostname.replace(/^\[|\]$/g, "")) ? "" : target.url.hostname,
+        headers: {
+          ...input.headers,
+          host: target.url.host,
+          "content-length": Buffer.byteLength(input.body).toString(),
+        },
+      }, (response) => {
+        // Only the status and Retry-After carry meaning; never wait on the body.
+        finish(() => resolve({ status: response.statusCode ?? 0, retryAfter: response.headers["retry-after"] }))
+        response.on("error", () => {})
+        response.destroy()
+      })
+      // One absolute deadline covers connect, TLS and response headers.
+      const deadline = setTimeout(() => {
+        request.destroy()
+        finish(() => reject(new Error("Webhook request timed out")))
+      }, dependencies.timeoutMs ?? requestTimeoutMs)
+      request.on("error", (error) => finish(() => reject(error)))
+      request.on("close", () => finish(() => reject(new Error("Webhook connection closed before a response"))))
+      request.end(input.body)
+    })
+  }
+}
+
+const postPinned = makeBotWebhookTransport()
+
+async function deliver(claim: Awaited<ReturnType<typeof BotUpdatesModel.claimWebhookDeliveries>>[number], transport: BotWebhookTransport) {
+  const url = claim.stream.webhookUrl
+  if (!url) return
+  try {
+    if (!(await BotUpdatesModel.canBotAccessUpdate(claim.stream.botUserId, claim.update))) {
+      await BotUpdatesModel.discardWebhookDelivery(claim)
+      log.warn("Discarded Bot webhook update after access loss", {
+        botUserId: claim.stream.botUserId,
+        updateId: claim.update.update_id,
+      })
+      return
+    }
+    const body = JSON.stringify(claim.update)
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "user-agent": "InlineBotWebhook/1.0",
+      "x-inline-update-id": String(claim.update.update_id),
+      "x-inline-attempt": String(claim.attemptCount + 1),
+    }
+    const secret = BotUpdatesModel.decryptWebhookSecret(claim.stream)
+    if (secret) headers["x-inline-bot-api-secret-token"] = secret
+    const response = await transport({ rawUrl: url, body, headers, beforeConnect: async () => {
+      if (!await BotUpdatesModel.isCurrentWebhookClaim(claim)) return false
+      if (!await BotUpdatesModel.canBotAccessUpdate(claim.stream.botUserId, claim.update)) {
+        await BotUpdatesModel.discardWebhookDelivery(claim)
+        return false
+      }
+      // Access reads can cross replacement or lease expiry. Fence once more
+      // after those reads, immediately before opening the external connection.
+      return BotUpdatesModel.isCurrentWebhookClaim(claim)
+    } })
+    if (!response) return
+    if (response.status >= 200 && response.status < 300) {
+      await BotUpdatesModel.markWebhookDelivered(claim)
+      return
+    }
+    const delay = retryAfterMs(response.status, response.retryAfter) ?? webhookRetryDelayMs(claim.attemptCount + 1)
+    await BotUpdatesModel.markWebhookFailed({
+      claim,
+      error: `HTTP ${response.status}`,
+      retryAt: new Date(Date.now() + delay),
+    })
+  } catch (error) {
+    await BotUpdatesModel.markWebhookFailed({
+      claim,
+      error: error instanceof Error ? error.message : String(error),
+      retryAt: new Date(Date.now() + webhookRetryDelayMs(claim.attemptCount + 1)),
+    })
+  }
+}
+
+export async function runBotWebhookDeliveryOnce(limit = 25, transport: BotWebhookTransport = postPinned): Promise<number> {
+  await Promise.all([
+    BotUpdatesModel.cleanupBotUpdateRows(),
+    BotUpdatesModel.cleanupBotMessageRoutes(),
+  ])
+  const claims = await BotUpdatesModel.claimWebhookDeliveries(limit)
+  await Promise.all(claims.map((claim) => deliver(claim, transport)))
+  return claims.length
+}
+
+export type BotWebhookDeliveryWorkerOptions = {
+  readonly clearIntervalFn?:
+    | typeof clearInterval
+    | undefined
+  readonly maximumIdleIntervalMs?: number | undefined
+  /** Subscribes to in-process "a Bot update was appended" wakes; returns the unsubscribe. */
+  readonly onWork?:
+    | ((listener: () => void) => () => void)
+    | undefined
+  readonly pollIntervalMs?: number | undefined
+  readonly runOnce?:
+    | (() => Promise<number>)
+    | undefined
+  readonly setIntervalFn?:
+    | typeof setInterval
+    | undefined
+}
+
+export class BotWebhookDeliveryWorker {
+  private readonly clearIntervalFn:
+    typeof clearInterval
+  private readonly pollIntervalMs: number
+  private readonly backoff: IdleBackoff
+  private readonly onWork:
+    (listener: () => void) => () => void
+  private readonly runOnce:
+    () => Promise<number>
+  private readonly setIntervalFn:
+    typeof setInterval
+  private inFlight:
+    | Promise<void>
+    | undefined
+  private interval:
+    | ReturnType<typeof setInterval>
+    | undefined
+  private unsubscribeWork:
+    | (() => void)
+    | undefined
+  private stopping = false
+
+  constructor(
+    options:
+      BotWebhookDeliveryWorkerOptions = {},
+  ) {
+    this.clearIntervalFn =
+      options.clearIntervalFn ??
+      clearInterval
+    this.pollIntervalMs = Math.max(
+      100,
+      options.pollIntervalMs ??
+        workerPollIntervalMs,
+    )
+    this.backoff = IdleBackoff.forInterval(
+      this.pollIntervalMs,
+      options.maximumIdleIntervalMs,
+    )
+    this.onWork =
+      options.onWork ??
+      botUpdateWaiters.onWake
+    this.runOnce =
+      options.runOnce ??
+      (() => runBotWebhookDeliveryOnce())
+    this.setIntervalFn =
+      options.setIntervalFn ??
+      setInterval
+  }
+
+  start(): boolean {
+    if (this.interval !== undefined) {
+      return false
+    }
+
+    this.stopping = false
+    // The timer keeps its base cadence; idle backoff only skips the three
+    // delivery queries on ticks that come before the next due poll.
+    this.interval = this.setIntervalFn(
+      () => {
+        if (
+          this.inFlight === undefined &&
+          this.backoff.due()
+        ) {
+          void this.pollOnce()
+        }
+      },
+      this.pollIntervalMs,
+    )
+    this.unsubscribeWork ??=
+      this.onWork(() => this.wake())
+    void this.pollOnce()
+    return true
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true
+    if (this.interval !== undefined) {
+      this.clearIntervalFn(this.interval)
+      this.interval = undefined
+    }
+    this.unsubscribeWork?.()
+    this.unsubscribeWork = undefined
+    await this.inFlight
+  }
+
+  /** A Bot update was appended in this process: poll at the next base interval. */
+  wake(): void {
+    this.backoff.reset()
+  }
+
+  /** Base intervals between polls; exposed for diagnostics and tests. */
+  get idleMultiplier(): number {
+    return this.backoff.multiplier
+  }
+
+  pollOnce(): Promise<void> {
+    if (this.stopping) {
+      return Promise.resolve()
+    }
+    if (this.inFlight !== undefined) {
+      return this.inFlight
+    }
+
+    let work: Promise<void>
+    work = this.drainOnce().finally(() => {
+      if (this.inFlight === work) {
+        this.inFlight = undefined
+      }
+    })
+    this.inFlight = work
+    return work
+  }
+
+  private async drainOnce(): Promise<void> {
+    try {
+      this.backoff.observe(
+        (await this.runOnce()) > 0,
+      )
+    } catch (error) {
+      this.backoff.observe(false)
+      log.error(
+        "Bot webhook delivery tick failed",
+        { error },
+      )
+    }
+  }
+}
+
+let worker:
+  | BotWebhookDeliveryWorker
+  | undefined
+
+export function startBotWebhookDeliveryWorker():
+  | BotWebhookDeliveryWorker
+  | null {
+  if (isTest) {
+    return null
+  }
+  worker ??=
+    new BotWebhookDeliveryWorker()
+  worker.start()
+  return worker
+}
+
+export async function stopBotWebhookDeliveryWorker(
+  ownedWorker:
+    | BotWebhookDeliveryWorker
+    | null = worker ?? null,
+): Promise<void> {
+  if (ownedWorker === null) {
+    return
+  }
+  await ownedWorker.stop()
+  if (worker === ownedWorker) {
+    worker = undefined
+  }
+}

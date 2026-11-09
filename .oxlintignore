@@ -1,0 +1,21 @@
+# Dependencies
+**/node_modules/
+
+# Build outputs / generated artifacts
+**/dist/
+**/build/
+**/.output/
+**/.tanstack/
+**/.react-router/
+**/.vite/
+**/.vite-temp/
+**/.cache/
+**/coverage/
+
+# Server artifacts
+**/drizzle/
+server/scripts/lint/fixtures/**
+scripts/lint/fixtures/**
+
+# Generated sources
+**/routeTree.gen.ts

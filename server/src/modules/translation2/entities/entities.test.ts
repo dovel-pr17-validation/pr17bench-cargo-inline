@@ -1,0 +1,400 @@
+import { describe, expect, test } from "bun:test"
+import { MessageEntity_Type, type MessageEntities, type MessageEntity } from "@inline-chat/protocol/core"
+import { entityPolicies, fromMd, toMd } from "."
+import { parseMarkdown } from "../../message/parseMarkdown"
+
+const base = (type: MessageEntity_Type, offset: number, length: number): MessageEntity => ({
+  type,
+  offset: BigInt(offset),
+  length: BigInt(length),
+  entity: { oneofKind: undefined },
+})
+
+const pack = (entities: MessageEntity[]): MessageEntities => ({ entities })
+
+describe("translation2 entity markdown registry", () => {
+  test("has an explicit policy for every MessageEntity_Type", () => {
+    const enumValues = Object.values(MessageEntity_Type).filter(
+      (value): value is MessageEntity_Type => typeof value === "number",
+    )
+
+    for (const value of enumValues) {
+      expect(Object.prototype.hasOwnProperty.call(entityPolicies, value)).toBe(true)
+    }
+  })
+})
+
+describe("translation2 entity toMd/fromMd", () => {
+  test("round-trips bold, italic, code, and pre entities", () => {
+    const text = "bold italic code block"
+    const entities = pack([
+      base(MessageEntity_Type.BOLD, 0, 4),
+      base(MessageEntity_Type.ITALIC, 5, 6),
+      base(MessageEntity_Type.CODE, 12, 4),
+      {
+        ...base(MessageEntity_Type.PRE, 17, 5),
+        entity: { oneofKind: "pre", pre: { language: "ts" } },
+      },
+    ])
+
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe("**bold** *italic* `code` ```ts\nblock```")
+
+    const parsed = fromMd(markdown)
+    expect(parsed.text).toBe(text)
+    expect(parsed.entities.entities).toEqual(entities.entities)
+  })
+
+  test("round-trips text links with nested formatting", () => {
+    const text = "open docs"
+    const entities = pack([
+      {
+        ...base(MessageEntity_Type.TEXT_URL, 0, text.length),
+        entity: { oneofKind: "textUrl", textUrl: { url: "https://example.com/docs" } },
+      },
+      base(MessageEntity_Type.BOLD, 5, 4),
+    ])
+
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe("[open **docs**](https://example.com/docs)")
+
+    const parsed = fromMd(markdown)
+    expect(parsed.text).toBe(text)
+    expect(parsed.entities.entities).toEqual(entities.entities)
+  })
+
+  test("round-trips Inline mention and thread links", () => {
+    const text = "Mo thread title"
+    const entities = pack([
+      {
+        ...base(MessageEntity_Type.MENTION, 0, 2),
+        entity: { oneofKind: "mention", mention: { userId: 42n } },
+      },
+      {
+        ...base(MessageEntity_Type.THREAD, 3, 6),
+        entity: { oneofKind: "thread", thread: { chatId: 99n } },
+      },
+      {
+        ...base(MessageEntity_Type.THREAD_TITLE, 10, 5),
+        entity: { oneofKind: "threadTitle", threadTitle: { spaceId: 7n, title: "Design" } },
+      },
+    ])
+
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe(
+      "[Mo](inline://user/42) [thread](inline://thread?id=99) [title](inline://thread?space_id=7&title=Design)",
+    )
+
+    const parsed = fromMd(markdown)
+    expect(parsed.text).toBe(text)
+    expect(parsed.entities.entities).toEqual(entities.entities)
+  })
+
+  test("keeps whitespace outside mention markdown labels", () => {
+    const text = "@Dena  @Test2  mentions"
+    const entities = pack([
+      {
+        ...base(MessageEntity_Type.MENTION, 0, 6),
+        entity: { oneofKind: "mention", mention: { userId: 10300n } },
+      },
+      {
+        ...base(MessageEntity_Type.MENTION, 7, 7),
+        entity: { oneofKind: "mention", mention: { userId: 10600n } },
+      },
+    ])
+
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe("[@Dena](inline://user/10300)  [@Test2](inline://user/10600)  mentions")
+
+    const parsed = fromMd(markdown)
+    expect(parsed.text).toBe(text)
+    expect(parsed.entities.entities).toEqual([
+      {
+        type: MessageEntity_Type.MENTION,
+        offset: 0n,
+        length: 5n,
+        entity: { oneofKind: "mention", mention: { userId: 10300n } },
+      },
+      {
+        type: MessageEntity_Type.MENTION,
+        offset: 7n,
+        length: 6n,
+        entity: { oneofKind: "mention", mention: { userId: 10600n } },
+      },
+    ])
+  })
+
+  test("round-trips Agent identity alongside formatting and UTF-16 offsets", () => {
+    const text = "😀 Maya and Mo"
+    const entities = pack([
+      {
+        ...base(MessageEntity_Type.MENTION, 3, 4),
+        entity: { oneofKind: "mention", mention: { userId: 42n, agentId: 9_007_199_254_740_993n } },
+      },
+      base(MessageEntity_Type.BOLD, 3, 4),
+      {
+        ...base(MessageEntity_Type.MENTION, 12, 2),
+        entity: { oneofKind: "mention", mention: { userId: 43n } },
+      },
+    ])
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe("😀 [**Maya**](inline://user?id=42&agent_id=9007199254740993) and [Mo](inline://user/43)")
+    expect(fromMd(markdown)).toEqual({ text, entities })
+  })
+
+  test("accepts existing user link forms with an Agent target", () => {
+    for (const url of [
+      "inline://user/42?agent_id=7",
+      "inline://user?id=42&agent_id=7",
+      "inline://user?user_id=42&agent_id=7",
+    ]) {
+      const parsed = fromMd(`[Maya](${url})`)
+      expect(parsed.text).toBe("Maya")
+      expect(parsed.entities.entities).toEqual([{
+        ...base(MessageEntity_Type.MENTION, 0, 4),
+        entity: { oneofKind: "mention", mention: { userId: 42n, agentId: 7n } },
+      }])
+    }
+  })
+
+  test("malformed Agent targets remain links instead of becoming backing-user mentions", () => {
+    for (const agentId of ["", "0", "-1", "1.5", "bad", "9223372036854775808"]) {
+      const url = `inline://user?id=42&agent_id=${agentId}`
+      const parsed = fromMd(`[Maya](${url})`)
+      expect(parsed.text).toBe("Maya")
+      expect(parsed.entities.entities).toEqual([{
+        ...base(MessageEntity_Type.TEXT_URL, 0, 4),
+        entity: { oneofKind: "textUrl", textUrl: { url } },
+      }])
+    }
+  })
+
+  test("invalid semantic targets never change entity kind during export", () => {
+    const target = "target"
+    const invalid: MessageEntity[] = [
+      { ...base(MessageEntity_Type.TEXT_URL, 0, target.length),
+        entity: { oneofKind: "textUrl", textUrl: { url: "inline://user/42" } } },
+      { ...base(MessageEntity_Type.MENTION, 0, target.length),
+        entity: { oneofKind: "mention", mention: { userId: 0n } } },
+      { ...base(MessageEntity_Type.MENTION, 0, target.length),
+        entity: { oneofKind: "mention", mention: { userId: 42n, agentId: 0n } } },
+      { ...base(MessageEntity_Type.MENTION, 0, target.length),
+        entity: { oneofKind: "mention", mention: { userId: 9_223_372_036_854_775_808n } } },
+      { ...base(MessageEntity_Type.GROUP_MENTION, 0, target.length),
+        entity: { oneofKind: "groupMention", groupMention: { groupId: 0n } } },
+      { ...base(MessageEntity_Type.GROUP_MENTION, 0, target.length),
+        entity: { oneofKind: "groupMention", groupMention: { groupId: 9_223_372_036_854_775_808n } } },
+      { ...base(MessageEntity_Type.THREAD, 0, target.length),
+        entity: { oneofKind: "thread", thread: { chatId: 0n } } },
+      { ...base(MessageEntity_Type.THREAD, 0, target.length),
+        entity: { oneofKind: "thread", thread: { chatId: 9_223_372_036_854_775_808n } } },
+      { ...base(MessageEntity_Type.THREAD_TITLE, 0, target.length),
+        entity: { oneofKind: "threadTitle", threadTitle: { spaceId: -1n, title: "Title" } } },
+      { ...base(MessageEntity_Type.THREAD_TITLE, 0, target.length),
+        entity: { oneofKind: "threadTitle", threadTitle: { spaceId: 9_223_372_036_854_775_808n, title: "Title" } } },
+      { ...base(MessageEntity_Type.THREAD_TITLE, 0, target.length),
+        entity: { oneofKind: "threadTitle", threadTitle: { spaceId: 0n, title: "   " } } },
+    ]
+
+    for (const entity of invalid) {
+      const markdown = toMd(target, pack([entity]))
+      expect(markdown).toBe(target)
+      expect(fromMd(markdown)).toEqual({ text: target, entities: pack([]) })
+    }
+  })
+
+  test("trims whitespace inside parsed mention link labels", () => {
+    const parsed = fromMd("[@Dena ](inline://user/10300)  [@Test2 ](inline://user/10600) , two mentions")
+
+    expect(parsed.text).toBe("@Dena   @Test2  , two mentions")
+    expect(parsed.entities.entities).toEqual([
+      {
+        type: MessageEntity_Type.MENTION,
+        offset: 0n,
+        length: 5n,
+        entity: { oneofKind: "mention", mention: { userId: 10300n } },
+      },
+      {
+        type: MessageEntity_Type.MENTION,
+        offset: 8n,
+        length: 6n,
+        entity: { oneofKind: "mention", mention: { userId: 10600n } },
+      },
+    ])
+  })
+
+  test("round-trips thread links whose visible label includes double brackets", () => {
+    const text = "Open [[Planning]] now"
+    const entities = pack([
+      {
+        ...base(MessageEntity_Type.THREAD, 5, 12),
+        entity: { oneofKind: "thread", thread: { chatId: 42n } },
+      },
+    ])
+
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe("Open [\\[\\[Planning\\]\\]](inline://thread?id=42) now")
+
+    const parsed = fromMd(markdown)
+    expect(parsed.text).toBe(text)
+    expect(parsed.entities.entities).toEqual(entities.entities)
+  })
+
+  test("parses raw double-bracket thread link labels from model output", () => {
+    const parsed = fromMd("Open [[Project **Plan**]](inline://thread?space_id=7&title=Project%20Plan) now")
+
+    expect(parsed.text).toBe("Open [[Project Plan]] now")
+    expect(parsed.entities.entities).toEqual([
+      {
+        type: MessageEntity_Type.THREAD_TITLE,
+        offset: 5n,
+        length: 16n,
+        entity: {
+          oneofKind: "threadTitle",
+          threadTitle: {
+            spaceId: 7n,
+            title: "Project Plan",
+          },
+        },
+      },
+      {
+        type: MessageEntity_Type.BOLD,
+        offset: 15n,
+        length: 4n,
+        entity: { oneofKind: undefined },
+      },
+    ])
+  })
+
+  test("round-trips home thread title links without space id", () => {
+    const text = "Open [[Personal]] now"
+    const entities = pack([
+      {
+        ...base(MessageEntity_Type.THREAD_TITLE, 5, 12),
+        entity: { oneofKind: "threadTitle", threadTitle: { spaceId: 0n, title: "Personal" } },
+      },
+    ])
+
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe("Open [\\[\\[Personal\\]\\]](inline://thread?title=Personal) now")
+
+    const parsed = fromMd(markdown)
+    expect(parsed.text).toBe(text)
+    expect(parsed.entities.entities).toEqual(entities.entities)
+  })
+
+  test("parses hashtag-looking labels inside thread links", () => {
+    const parsed = fromMd("Open [#thread](inline://thread?space_id=7&title=%23thread) now")
+
+    expect(parsed.text).toBe("Open #thread now")
+    expect(parsed.entities.entities).toEqual([
+      {
+        type: MessageEntity_Type.THREAD_TITLE,
+        offset: 5n,
+        length: 7n,
+        entity: {
+          oneofKind: "threadTitle",
+          threadTitle: {
+            spaceId: 7n,
+            title: "#thread",
+          },
+        },
+      },
+    ])
+  })
+
+  test("keeps UTF-16 offsets stable around emoji", () => {
+    const prefix = "😀 hi "
+    const text = `${prefix}Mo`
+    const entities = pack([
+      {
+        ...base(MessageEntity_Type.MENTION, prefix.length, 2),
+        entity: { oneofKind: "mention", mention: { userId: 42n } },
+      },
+    ])
+
+    expect(prefix.length).toBe(6)
+
+    const markdown = toMd(text, entities)
+    expect(markdown).toBe("😀 hi [Mo](inline://user/42)")
+
+    const parsed = fromMd(markdown)
+    expect(parsed.text).toBe(text)
+    expect(parsed.entities.entities).toEqual(entities.entities)
+  })
+
+  test("escapes markdown control characters in literal text", () => {
+    const text = "literal * [x](y) _ok_ `code`"
+    const markdown = toMd(text, undefined)
+
+    expect(markdown).toBe("literal \\* \\[x\\]\\(y\\) \\_ok\\_ \\`code\\`")
+    expect(fromMd(markdown).text).toBe(text)
+    expect(fromMd(markdown).entities.entities).toEqual([])
+  })
+
+  test("message and translation parsers preserve non-punctuation backslashes", () => {
+    for (const markdown of [String.raw`C:\notes\math`, String.raw`\α \9 \*literal\*`, "trailing\\"]) {
+      expect(fromMd(markdown).text).toBe(parseMarkdown(markdown).text)
+    }
+    expect(fromMd(String.raw`C:\notes\math`).text).toBe(String.raw`C:\notes\math`)
+  })
+
+  test("round-trips URLs with unbalanced parentheses and literal backslashes through both parsers", () => {
+    for (const url of ["https://example.com/a(b", "https://example.com/a)b", String.raw`https://example.com/a\q`,
+      String.raw`https://example.com/a\(b)c`]) {
+      const entities = pack([{
+        ...base(MessageEntity_Type.TEXT_URL, 0, 4),
+        entity: { oneofKind: "textUrl", textUrl: { url } },
+      }])
+      const markdown = toMd("link", entities)
+      expect(fromMd(markdown)).toEqual({ text: "link", entities })
+      expect(parseMarkdown(markdown)).toEqual({ text: "link", entities: entities.entities })
+    }
+  })
+
+  test("message and translation link parsing use the same punctuation escape rules", () => {
+    for (const markdown of [String.raw`[link](https://example.com/a\)b)`, String.raw`[link](https://example.com/a\q)`,
+      String.raw`[link](https://example.com/a(b)c)`]) {
+      const parsed = parseMarkdown(markdown)
+      expect(fromMd(markdown)).toEqual({ text: parsed.text, entities: pack(parsed.entities) })
+    }
+  })
+
+  test("detects literal entities after markdown parsing", () => {
+    const parsed = fromMd("Email a@b.com, visit https://inline.chat, run /start, ping @mo, call +1 555 123 4567")
+    const types = parsed.entities.entities.map((entity) => entity.type)
+
+    expect(types).toContain(MessageEntity_Type.EMAIL)
+    expect(types).toContain(MessageEntity_Type.URL)
+    expect(types).toContain(MessageEntity_Type.BOT_COMMAND)
+    expect(types).toContain(MessageEntity_Type.USERNAME_MENTION)
+    expect(types).toContain(MessageEntity_Type.PHONE_NUMBER)
+  })
+
+  test("does not detect the first segment of a URL path as a bot command", () => {
+    const parsed = fromMd("Open /web/something")
+
+    expect(parsed.entities.entities.some((entity) => entity.type === MessageEntity_Type.BOT_COMMAND)).toBe(false)
+  })
+
+  test("does not detect literal entities inside code", () => {
+    const parsed = fromMd("`Email a@b.com and run /start`")
+
+    expect(parsed.text).toBe("Email a@b.com and run /start")
+    expect(parsed.entities.entities).toEqual([
+      {
+        type: MessageEntity_Type.CODE,
+        offset: 0n,
+        length: 28n,
+        entity: { oneofKind: undefined },
+      },
+    ])
+  })
+
+  test("drops entities when translated markdown omits formatting", () => {
+    const parsed = fromMd("bonjour monde")
+
+    expect(parsed.text).toBe("bonjour monde")
+    expect(parsed.entities.entities).toEqual([])
+  })
+})

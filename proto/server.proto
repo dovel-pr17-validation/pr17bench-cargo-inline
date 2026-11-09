@@ -1,0 +1,450 @@
+syntax = "proto3";
+
+import "core.proto";
+
+package server;
+
+// Private, short-lived server fanout. The entire message is authenticated and
+// encrypted before publication. Updates are already projected for these exact
+// recipients; public client messages and durable journal formats are unchanged.
+message RealtimeDelivery {
+  uint32 version = 1;
+  string origin_boot_id = 2;
+  string event_id = 3;
+  int64 expires_at_ms = 4;
+  repeated int64 user_ids = 5;
+  optional int64 space_id = 6;
+  optional int64 skip_session_id = 7;
+  repeated Update updates = 8;
+  // Bounded ordered receiver lane. Included in the authenticated payload.
+  uint32 partition = 9;
+}
+
+message ServerUpdate {
+  int64 date = 1;
+  int32 seq = 2;
+  reserved 3;
+
+  oneof update {
+    // Chat updates
+
+    ServerChatUpdateNewMessage new_message = 4;
+    ServerChatUpdateEditMessage edit_message = 5;
+    ServerChatUpdateDeleteMessages delete_messages = 6;
+    ServerChatUpdateDeleteChat delete_chat = 7;
+    ServerChatUpdateParticipantDelete participant_delete = 8;
+    ServerChatUpdateParticipantAdd participant_add = 30;
+    ServerChatUpdateNewChat new_chat = 18;
+    ServerChatUpdateVisibility chat_visibility = 13;
+    ServerChatUpdateInfo chat_info = 15;
+    ServerChatUpdatePinnedMessages pinned_messages = 16;
+    ServerChatUpdateMoved chat_moved = 21;
+    ServerChatUpdateReaction reaction = 41;
+    ServerChatUpdateDeleteReaction reaction_deleted = 42;
+
+    // Space updates
+    ServerSpaceUpdateRemoveMember space_remove_member = 9;
+    ServerSpaceUpdateMemberUpdate space_member_update = 12;
+    ServerSpaceUpdateMemberAdd space_member_add = 19;
+    ServerSpaceUpdateClearHistory space_clear_history = 28;
+    ServerSpaceUpdateSettings space_settings = 38;
+
+    // User bucket updates
+    ServerUserUpdateSpaceMemberDelete user_space_member_delete = 10;
+    ServerUserUpdateChatParticipantDelete user_chat_participant_delete = 11;
+    ServerUserUpdateChatParticipantAdd user_chat_participant_add = 31;
+    ServerUserUpdateDialogArchived user_dialog_archived = 14;
+    ServerUserUpdateJoinSpace user_join_space = 17;
+    ServerUserUpdateReadMaxId user_read_max_id = 20;
+    ServerUserUpdateMarkAsUnread user_mark_as_unread = 22;
+    ServerUserUpdateDialogNotificationSettings user_dialog_notification_settings = 23;
+    ServerUserUpdateChatOpen user_chat_open = 24;
+    ServerUserUpdateMessageActionInvoked user_message_action_invoked = 25;
+    ServerUserUpdateMessageActionAnswered user_message_action_answered = 26;
+    ServerChatUpdateClearHistory clear_chat_history = 27;
+    ServerChatUpdateMessageAttachment message_attachment = 29;
+    ServerUserUpdateDialogFollowMode user_dialog_follow_mode = 32;
+    ServerUserUpdateUser updated_user = 33;
+    ServerChatUpdateParticipantGroupAdd participant_group_add = 34;
+    ServerChatUpdateParticipantGroupDelete participant_group_delete = 35;
+    ServerUserUpdateChatParticipantGroupAdd user_chat_participant_group_add = 36;
+    ServerUserUpdateChatParticipantGroupDelete user_chat_participant_group_delete = 37;
+    ServerUserUpdateChatPermissions user_chat_permissions = 39;
+    ServerUserUpdateDialogCollapsedMaxId user_dialog_collapsed_max_id = 40;
+    ServerUserUpdateSettings user_settings = 43;
+    ServerUserUpdateDialogFolder user_dialog_folder = 44;
+    ServerUserUpdateAddedToChat user_added_to_chat = 45;
+    ServerUserUpdateRemovedFromChat user_removed_from_chat = 46;
+    ChatAcknowledgement acknowledgement = 47;
+    UpdateDialogTranslation user_dialog_translation = 48;
+    UpdateSpaceProfile space_profile = 49;
+    ServerChatUpdateAgentSessionState agent_session_state = 50;
+    ServerChatUpdateAgentParticipation agent_participation = 51;
+    UpdateAgentGrant user_agent_grant = 52;
+    UpdateAgentRuntime user_agent_runtime = 53;
+    UpdateAgentSessionControl user_agent_session_control = 54;
+    UpdateAgentSettings user_agent_settings = 55;
+  }
+}
+
+// ------------------------------------------------------------
+// Chat updates
+// ------------------------------------------------------------
+
+// Update for a chat when a message is created
+message ServerChatUpdateNewMessage {
+  int64 chat_id = 1;
+  int64 msg_id = 2;
+}
+
+// Update for a chat when a message is edited
+message ServerChatUpdateEditMessage {
+  int64 chat_id = 1;
+  int64 msg_id = 2;
+}
+
+// Update for a chat when messages are deleted
+message ServerChatUpdateDeleteMessages {
+  int64 chat_id = 1;
+  repeated int64 msg_ids = 2;
+}
+
+// Update for a chat when history is cleared in bulk.
+message ServerChatUpdateClearHistory {
+  int64 chat_id = 1;
+
+  // If unset, all messages were deleted. If set, messages older than this Unix timestamp were deleted.
+  optional int64 before_date = 2;
+
+  bool delete_reply_threads = 3;
+
+  // Reply-thread chats deleted as a direct side effect of this clear.
+  repeated int64 deleted_chat_ids = 4;
+
+  // Reply-thread chats kept but detached from the deleted parent message.
+  repeated int64 orphaned_chat_ids = 5;
+
+  // Reply-thread chats kept but detached from both parent chat and parent message.
+  repeated int64 detached_chat_ids = 6;
+}
+
+// Update for a chat when it is deleted
+message ServerChatUpdateDeleteChat { int64 chat_id = 1; }
+
+// Update for a chat when it is created
+message ServerChatUpdateNewChat {
+  int64 chat_id = 1;
+  // Contact invitations must not reveal the peer profile to this recipient.
+  optional int64 id_only_user_for_id = 2;
+}
+
+// Update for a chat when a participant is removed
+message ServerChatUpdateParticipantDelete {
+  int64 chat_id = 1;
+  int64 user_id = 2;
+}
+
+// Update for a chat when a participant is added
+message ServerChatUpdateParticipantAdd {
+  int64 chat_id = 1;
+  ChatParticipant participant = 2;
+}
+
+// Update for a chat when a user group participant grant is added
+message ServerChatUpdateParticipantGroupAdd {
+  int64 chat_id = 1;
+  ChatParticipantGroup group_participant = 2;
+}
+
+// Update for a chat when a user group participant grant is removed
+message ServerChatUpdateParticipantGroupDelete {
+  int64 chat_id = 1;
+  int64 group_id = 2;
+}
+
+// Update for a chat when visibility changes
+message ServerChatUpdateVisibility {
+  int64 chat_id = 1;
+  bool is_public = 2;
+}
+
+// Update for a chat when pinned messages change
+message ServerChatUpdatePinnedMessages {
+  int64 chat_id = 1;
+  repeated int64 message_ids = 2;
+}
+
+// Update for a chat when title or emoji changes
+message ServerChatUpdateInfo {
+  int64 chat_id = 1;
+  optional string title = 2;
+  optional string emoji = 3;
+  optional AgentThreadContext agent_context = 4;
+}
+
+// Update for a chat when the thread moves between home and a space.
+//
+// NOTE: v1 supports only private threads and only home <-> space moves.
+// Keep the old/new space IDs for future cross-space moves.
+message ServerChatUpdateMoved {
+  int64 chat_id = 1;
+  optional int64 old_space_id = 2;
+  optional int64 new_space_id = 3;
+}
+
+// Update for a chat when an attachment is added or changed after the message was created.
+message ServerChatUpdateMessageAttachment {
+  int64 chat_id = 1;
+  int64 msg_id = 2;
+  int64 attachment_id = 3;
+}
+
+// A reaction mutation is part of the chat bucket so catch-up preserves its
+// order relative to other chat mutations.
+message ServerChatUpdateReaction { Reaction reaction = 1; }
+
+// Snapshot of an agent session's thin state. The client peer is encoded per
+// recipient from the chat.
+message ServerChatUpdateAgentSessionState {
+  int64 agent_session_id = 1;
+  int64 bot_user_id = 2;
+  AgentSessionProvider provider = 3;
+  optional int64 status_message_id = 4;
+  optional int64 parent_session_id = 5;
+  AgentSessionRelation relation = 6;
+  optional AgentSessionState state = 7;
+  optional string workspace_label = 8;
+  // The work's publication chat when it differs from this bucket's chat
+  // (after a move into a subthread).
+  optional int64 chat_id = 9;
+}
+
+// Snapshot of an agent's participation. The client peer is encoded per
+// recipient from the chat.
+message ServerChatUpdateAgentParticipation {
+  int64 bot_user_id = 1;
+  AgentParticipationMode mode = 2;
+  optional int64 joined_by = 3;
+  reserved 4;
+  int64 revision = 5;
+  int64 date = 6;
+  optional AgentOutputMode output_mode = 7;
+}
+
+message ServerChatUpdateDeleteReaction {
+  string emoji = 1;
+  int64 chat_id = 2;
+  int64 message_id = 3;
+  int64 user_id = 4;
+}
+
+// ------------------------------------------------------------
+// Space updates
+// ------------------------------------------------------------
+
+// Update for a space when a member is removed
+message ServerSpaceUpdateRemoveMember {
+  int64 space_id = 1;
+  int64 user_id = 2;
+  optional int64 member_id = 3;
+}
+
+// Update for a space when a member's access/role changes
+message ServerSpaceUpdateMemberUpdate { Member member = 1; }
+
+// Update for a space when a new member is added
+message ServerSpaceUpdateMemberAdd {
+  Member member = 1;
+  User user = 2;
+}
+
+// Update for a space when history is cleared across every chat/thread in the space.
+message ServerSpaceUpdateClearHistory {
+  int64 space_id = 1;
+
+  // If unset, all messages were deleted. If set, messages older than this Unix timestamp were deleted.
+  optional int64 before_date = 2;
+
+  bool delete_reply_threads = 3;
+
+  // Reply-thread chats deleted as a direct side effect of this clear.
+  repeated int64 deleted_chat_ids = 4;
+
+  // Reply-thread chats kept but detached from the deleted parent message.
+  repeated int64 orphaned_chat_ids = 5;
+
+  // Reply-thread chats kept but detached from both parent chat and parent message.
+  repeated int64 detached_chat_ids = 6;
+}
+
+// Update for a space when its settings change.
+message ServerSpaceUpdateSettings { SpaceSettings settings = 1; }
+
+// ------------------------------------------------------------
+// User bucket updates
+// ------------------------------------------------------------
+
+// Update for a user when they were removed from a space
+message ServerUserUpdateSpaceMemberDelete { int64 space_id = 1; }
+
+// Update for a user when they were removed from a chat
+message ServerUserUpdateChatParticipantDelete { int64 chat_id = 1; }
+
+// Update for a user when they were added to a chat
+message ServerUserUpdateChatParticipantAdd {
+  int64 chat_id = 1;
+  ChatParticipant participant = 2;
+}
+
+// Update for a user when a group granted them chat access
+message ServerUserUpdateChatParticipantGroupAdd {
+  int64 chat_id = 1;
+  ChatParticipantGroup group_participant = 2;
+}
+
+// Update for a user when a group chat access grant was removed
+message ServerUserUpdateChatParticipantGroupDelete {
+  int64 chat_id = 1;
+  int64 group_id = 2;
+}
+
+// Canonical effective-access transition for new durable user-bucket rows.
+message ServerUserUpdateAddedToChat {
+  int64 chat_id = 1;
+  optional ChatParticipant participant = 2;
+  optional ChatParticipantGroup group = 3;
+}
+
+// Canonical effective-access transition for new durable user-bucket rows.
+message ServerUserUpdateRemovedFromChat {
+  int64 chat_id = 1;
+  optional int64 group_id = 2;
+}
+
+// Update for a user when their effective permissions for a chat changed.
+message ServerUserUpdateChatPermissions {
+  int64 chat_id = 1;
+  ChatPermissions permissions = 2;
+}
+
+// Update for a user when a dialog is archived or unarchived
+message ServerUserUpdateDialogArchived {
+  Peer peer_id = 1;
+  bool archived = 2;
+}
+
+// Update for a user when they joined a space
+message ServerUserUpdateJoinSpace {
+  Space space = 1;
+  Member member = 2;
+}
+
+// Update for a user when they read messages up to a certain ID in a dialog.
+//
+// This is stored in the user bucket so read state can be repaired via catch-up after reconnect.
+message ServerUserUpdateReadMaxId {
+  Peer peer_id = 1;
+  int64 read_max_id = 2;
+  int32 unread_count = 3;
+}
+
+// Update for a user when a dialog is marked/unmarked as unread.
+message ServerUserUpdateMarkAsUnread {
+  Peer peer_id = 1;
+  bool unread_mark = 2;
+}
+
+// Update for a user when per-chat notification settings change.
+message ServerUserUpdateDialogNotificationSettings {
+  Peer peer_id = 1;
+  optional DialogNotificationSettings notification_settings = 2;
+}
+
+// Update for a user when reply-thread follow mode changes.
+message ServerUserUpdateDialogFollowMode {
+  Peer peer_id = 1;
+  optional DialogFollowMode follow_mode = 2;
+}
+
+// Update for a user's personal history-collapse boundary.
+message ServerUserUpdateDialogCollapsedMaxId {
+  Peer peer_id = 1;
+  optional int64 max_id = 2;
+}
+
+// Update for a user when their profile/account fields change.
+message ServerUserUpdateUser { User user = 1; }
+
+// Update for a user when their account-wide settings change. This full
+// snapshot is kept in the durable user bucket so reconnect/catch-up preserves
+// the same order as the settings write.
+message ServerUserUpdateSettings { UserSettings settings = 1; }
+
+// Atomic personal folder definition/membership projection for a user.
+message ServerUserUpdateDialogFolder {
+  oneof folder_change {
+    DialogFolder folder = 1;
+    int64 deleted_folder_id = 2;
+  }
+  repeated Dialog dialogs = 3;
+}
+
+// ------------------------------------------------------------
+// Server-only stored payloads
+// ------------------------------------------------------------
+
+message StoredSpaceSettings {
+  int64 space_id = 1;
+  optional bool grid_enabled = 2;
+}
+
+// Canonical encrypted server payload for a structural message. Markdown and
+// remote image origins are deliberately not stored here.
+message StoredBlockContent {
+  string text = 1;
+  optional MessageEntities entities = 2;
+  BlockContent block_content = 3;
+}
+
+message SystemMessage {
+  oneof event {
+    ThreadBacklinkSystemMessage thread_backlink = 1;
+    PinnedMessageSystemMessage pinned_message = 2;
+    MessageServiceGridTranscript grid_transcript = 3;
+  }
+}
+
+message ThreadBacklinkSystemMessage {
+  int64 graph_link_id = 1;
+  optional int64 source_chat_id = 2;
+  optional string source_title = 3;
+}
+
+message PinnedMessageSystemMessage {
+  int64 pinned_message_global_id = 1;
+  optional int64 pinned_message_id = 2;
+}
+
+// Update for a user when a chat becomes chat-list-visible for them.
+message ServerUserUpdateChatOpen {
+  Chat chat = 1;
+  Dialog dialog = 2;
+  optional User user = 3;
+}
+
+// Update for a bot user when someone invokes a callback action on its message.
+message ServerUserUpdateMessageActionInvoked {
+  int64 chat_id = 1;
+  int64 message_id = 2;
+  int64 actor_user_id = 3;
+  string action_id = 4;
+  bytes data = 5;
+  // Form submission with every secret value removed and marked redacted.
+  optional MessageFormSubmission form = 6;
+}
+
+// Update for a user when bot answers a previously invoked action.
+message ServerUserUpdateMessageActionAnswered {
+  int64 interaction_id = 1;
+  optional MessageActionResponseUi ui = 2;
+}

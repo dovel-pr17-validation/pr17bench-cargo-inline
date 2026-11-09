@@ -1,0 +1,1092 @@
+import {
+  InlineProtocolAuthorizationInvalidated,
+  InlineProtocolSessionRevoked,
+  InlineProtocolServerSession,
+  acceptObfuscatedClientHeader,
+  decodeAbridgedFrame,
+  encodeAbridgedPacket,
+  encodeAbridgedQuickAck,
+  type HandshakeRsaServerKey,
+  type InlineProtocolServerApplicationTask,
+  type ObfuscatedServerHeader,
+  type ServerApplicationAuthorization,
+  type ServerApplicationDispatcher,
+  type ServerAuthorizationKeyRepository,
+  type ServerReplayRepository,
+} from "@inline-chat/protocol/server"
+import {
+  RealtimeV3Update,
+  ServerProtocolMessage,
+} from "@inline-chat/protocol/core"
+import type { Server, ServerWebSocket } from "bun"
+import productionTrustRoots from "@inline-chat/protocol/trust-roots/inline-protocol-production.json"
+import { gunzipSync, gzipSync } from "node:zlib"
+import { isIP } from "node:net"
+import { randomBytes } from "node:crypto"
+import { installNodeAesBackend } from "@inline-chat/protocol/secure/node"
+import { InlineProtocolReplayRepository, PermanentAuthorizationKeyRepository } from "@in/server/db/models/inlineProtocol"
+import { makeAuthorizationKeyCipher } from "@in/server/modules/inlineProtocol/keyCipher"
+import { InlineProtocolAuthorizationKeys } from "@in/server/modules/inlineProtocol/authorizationKeys"
+import { TemporaryAuthorizationKeyStore } from "@in/server/modules/inlineProtocol/temporaryKeys"
+import { makeInlineProtocolReplayRepository } from "@in/server/modules/inlineProtocol/replay"
+import { makeReplayResultCipher } from "@in/server/modules/inlineProtocol/replayCipher"
+import { makeInlineProtocolRsaSigner } from "@in/server/modules/inlineProtocol/rsaSigner"
+import { InlineProtocolAuthOperations } from "@in/server/modules/inlineProtocol/auth"
+import { InlineProtocolOperations } from "@in/server/modules/inlineProtocol/operations"
+import { makeInlineProtocolApplicationDispatcher } from "@in/server/modules/inlineProtocol/application"
+import {
+  inlineProtocolReplayPolicy,
+  inlineProtocolResultCompressible,
+} from "@in/server/modules/inlineProtocol/replayPolicy"
+import type { InlineProtocolEnabledConfiguration } from "@in/server/modules/inlineProtocol/config"
+import {
+  inlineProtocolClock,
+  type InlineProtocolClock,
+} from "@in/server/modules/inlineProtocol/clockHealth"
+import {
+  connectionManager,
+  ConnVersion,
+  REALTIME_CLOSE_SESSION_REVOKED,
+  REALTIME_CLOSE_SESSION_REVOKED_REASON,
+} from "@in/server/ws/connections"
+import { sessionAuthority } from "@in/server/modules/auth/sessionAuthority"
+import type { RealtimeRequestMetadata } from "@in/server/realtime/types"
+import type { TrustedClientIpHeader } from "./middleware"
+import { Log } from "@in/server/utils/log"
+import { BoundedLogAggregator } from "@in/server/utils/logging/boundedLogAggregator"
+
+// Record and carrier AES through node:crypto; the portable backend costs one key
+// schedule per 16-byte block and dominated transfer CPU on the event loop.
+installNodeAesBackend()
+
+const REALTIME_V3_PATH = "/realtime/v3"
+const INLINE_PROTOCOL_VERIFICATION_PATH = "/.well-known/inline-protocol"
+const PROTOCOL_CLOSE_CODE = 1002
+const PROTOCOL_CLOSE_REASON = "Protocol error"
+const OVERLOAD_CLOSE_CODE = 1013
+const OVERLOAD_CLOSE_REASON = "Realtime V3 overloaded"
+const BACKPRESSURE_LIMIT = 16 * 1024 * 1024
+// Native V3 permits 64 pending RPCs and queues up to 256 writes, including service
+// traffic. Admit that bounded burst before serialized decryption; application
+// concurrency and the independent inbound byte budget still bound retained work.
+const MAX_QUEUED_INBOUND_FRAMES = 256
+const MAX_QUEUED_INBOUND_BYTES = 32 * 1024 * 1024
+const MAX_QUEUED_OUTBOUND_RECORDS = 4096
+const MAX_QUEUED_OUTBOUND_BYTES = 32 * 1024 * 1024
+// Key establishment alone does not authenticate an account. Keep an admission
+// lease through login, including permanent-key service traffic, in two phases.
+// Key exchange stays tightly bounded. An established socket then moves to the
+// wider pending-login budget, so people waiting on a login challenge behind one
+// NAT do not block each other's handshakes or authenticated reconnects.
+// Registered account connections release the lease immediately.
+const MAX_CONCURRENT_HANDSHAKES = 256
+const MAX_CONCURRENT_HANDSHAKES_PER_IP = 8
+const MAX_PENDING_LOGINS = 2_048
+const MAX_PENDING_LOGINS_PER_IP = 64
+// Native and hosted login challenges last ten minutes. This absolute lifetime
+// leaves time for handshake/provider work without letting pings renew admission.
+const ACCOUNT_AUTHENTICATION_TIMEOUT_MS = 15 * 60 * 1_000
+// Key establishment is a few round trips; an idle socket must not keep the
+// login-phase lifetime before it has proven possession of any key.
+const HANDSHAKE_PHASE_TIMEOUT_MS = 30_000
+// Login, browser-login, upgrade and bind requests are a few KiB. Bound the
+// carrier and record work an unauthenticated peer can demand per frame.
+const MAX_UNREGISTERED_FRAME_BYTES = 64 * 1024
+// A dedicated transfer socket exists only while files move.
+const TRANSFER_SOCKET_IDLE_TIMEOUT_MS = 120_000
+const HANDSHAKE_RATE_WINDOW_MS = 60_000
+const MAX_HANDSHAKE_STARTS_PER_WINDOW = 4_096
+const MAX_HANDSHAKE_STARTS_PER_IP_PER_WINDOW = 60
+const MAX_CONCURRENT_APPLICATIONS = 512
+const MAX_CONCURRENT_APPLICATIONS_PER_AUTHORITY = 64
+const MAX_BUFFERED_APPLICATION_UPDATE_BYTES = 256 * 1024 * 1024
+const OVERLOAD_LOG_WINDOW_MS = 60_000
+export const realtimeV3Log = new Log("InlineProtocol.V3")
+
+export type InlineProtocolRuntime = {
+  rsaKeys: readonly HandshakeRsaServerKey[]
+  authorizationKeys: ServerAuthorizationKeyRepository & {
+    invalidateAccountSession?: (userId: number, accountSessionId: number) => void
+  }
+  replay: ServerReplayRepository
+  operations: InlineProtocolOperations
+  clock: Pick<InlineProtocolClock, "assertHealthy" | "nowMilliseconds">
+  close: () => void
+}
+
+export type InlineProtocolWebSocketData = {
+  readonly protocol: "inline-v3"
+  readonly id: string
+  readonly metadata?: RealtimeRequestMetadata
+  handshakeAdmissionIp?: string
+  pendingLoginAdmission?: boolean
+  closed: boolean
+  state?: InlineProtocolConnectionState
+}
+
+type InlineProtocolConnectionState = {
+  session: InlineProtocolServerSession
+  carrier?: ObfuscatedServerHeader
+  queue: Promise<void>
+  outboundQueue: Promise<void>
+  applicationTasks: Set<Promise<void>>
+  inboundQueuedFrames: number
+  inboundQueuedBytes: number
+  outboundQueuedRecords: number
+  outboundQueuedBytes: number
+  resumeOutbound?: () => void
+  compatibilityQueuedUpdates: number
+  overloaded: boolean
+  registered: boolean
+  /** Set with `registered` for a transfer-only socket, which connectionManager never sees. */
+  transfer?: {
+    userId: number
+    accountSessionId: number
+    idleTimeout?: ReturnType<typeof setTimeout>
+    activeApplications: number
+  }
+  authenticationTimeout?: ReturnType<typeof setTimeout>
+  handshakeTimeout?: ReturnType<typeof setTimeout>
+}
+
+export interface InlineProtocolRealtimeTransport {
+  readonly beginDrain: () => void
+  readonly handleVerification: (request: Request) => Response | undefined
+  readonly tryUpgrade: (request: Request, server: Server<InlineProtocolWebSocketData>) => boolean
+  readonly rejectUnsupportedUpgrade: (request: Request) => Response | undefined
+  readonly websocket: Bun.WebSocketHandler<InlineProtocolWebSocketData>
+  readonly shutdown: () => Promise<void>
+}
+
+const metadataValue = (value: string | null): string | undefined => {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed.slice(0, 512) : undefined
+}
+
+const requestMetadata = (
+  request: Request,
+  server: Server<InlineProtocolWebSocketData>,
+  trustedHeader: TrustedClientIpHeader | undefined,
+): RealtimeRequestMetadata | undefined => {
+  const forwarded = trustedHeader ? metadataValue(request.headers.get(trustedHeader)) : undefined
+  const trustedIp = forwarded && isIP(forwarded) !== 0 ? forwarded : undefined
+  const value: RealtimeRequestMetadata = {
+    ip: trustedIp ?? server.requestIP(request)?.address,
+    userAgent: metadataValue(request.headers.get("user-agent")),
+    origin: metadataValue(request.headers.get("origin")),
+    host: metadataValue(request.headers.get("host")),
+  }
+  return Object.values(value).some((entry) => entry !== undefined) ? value : undefined
+}
+
+const bytesForFrame = (message: Buffer<ArrayBuffer>): Uint8Array =>
+  new Uint8Array(message.buffer, message.byteOffset, message.byteLength)
+
+const closeProtocol = (socket: ServerWebSocket<InlineProtocolWebSocketData>): void => {
+  if (socket.data.state) {
+    socket.data.state.overloaded = true
+    socket.data.state.resumeOutbound?.()
+  }
+  if (!socket.data.closed) socket.close(PROTOCOL_CLOSE_CODE, PROTOCOL_CLOSE_REASON)
+}
+
+const closeOverloaded = (socket: ServerWebSocket<InlineProtocolWebSocketData>): void => {
+  if (socket.data.state) {
+    socket.data.state.overloaded = true
+    socket.data.state.resumeOutbound?.()
+  }
+  if (!socket.data.closed) socket.close(OVERLOAD_CLOSE_CODE, OVERLOAD_CLOSE_REASON)
+}
+
+const closeAuthorizationInvalidated = (socket: ServerWebSocket<InlineProtocolWebSocketData>): void => {
+  if (!socket.data.closed) {
+    // A missing process-local temporary key is recoverable. Only confirmed session authority
+    // revocation or an ownership-proven revoked binding may emit session_revoked_confirmed.
+    realtimeV3Log.warn("Inline Protocol V3 authorization unavailable", {
+      connectionId: socket.data.id,
+    })
+    socket.close(REALTIME_CLOSE_SESSION_REVOKED, "authorization_unavailable")
+  }
+}
+
+/**
+ * Application admission is keyed by account session once one is bound, so the
+ * main socket and a transfer-only socket (different temporary keys) share it.
+ */
+export const inlineProtocolApplicationAuthorityKey = (authorization: ServerApplicationAuthorization): string =>
+  authorization.accountSessionId === undefined
+    ? `auth:${Buffer.from(authorization.authKeyId).toString("hex")}`
+    : `account:${authorization.accountSessionId}`
+
+export const makeInlineProtocolRuntime = (
+  configuration: InlineProtocolEnabledConfiguration,
+): InlineProtocolRuntime => {
+  const nowSeconds = () => Math.floor(Date.now() / 1_000)
+  const signer = makeInlineProtocolRsaSigner(configuration.rsaPrivateKeysJson, {
+    requiredPublicRing: configuration.requireCanonicalPublicRing
+      ? productionTrustRoots.rsaPublicKeyRing
+      : undefined,
+  })
+  const permanent = new PermanentAuthorizationKeyRepository(
+    makeAuthorizationKeyCipher(configuration.authKeyKekRing),
+  )
+  const temporary = new TemporaryAuthorizationKeyStore(nowSeconds)
+  const replay = makeInlineProtocolReplayRepository(new InlineProtocolReplayRepository({
+    ...(configuration.replayResultKeyRing ? { cipher: makeReplayResultCipher(configuration.replayResultKeyRing) } : {}),
+    encryptWrites: configuration.encryptReplayResults,
+  }))
+  const authorizationKeys = new InlineProtocolAuthorizationKeys(permanent, temporary)
+  // Local revocations and reconciled cross-process revocations drop cached
+  // permanent authority at once; the cache TTL only bounds reconciliation lag.
+  const stopAuthorityInvalidation = sessionAuthority.onInvalidate((identity) => {
+    authorizationKeys.invalidateAccountSession(identity.userId, identity.sessionId)
+  })
+  return {
+    rsaKeys: signer.handshakeKeys,
+    authorizationKeys,
+    replay,
+    operations: new InlineProtocolOperations(
+      new InlineProtocolAuthOperations(configuration.authCodePepperRing),
+    ),
+    clock: inlineProtocolClock,
+    close: () => {
+      stopAuthorityInvalidation()
+      replay.close()
+      authorizationKeys.clearTemporary()
+    },
+  }
+}
+
+export const makeInlineProtocolRealtimeTransport = (
+  runtime: InlineProtocolRuntime,
+  {
+    clientIpHeader,
+    maximumBufferedApplicationUpdateBytes = MAX_BUFFERED_APPLICATION_UPDATE_BYTES,
+    applicationDispatcherFactory = (input) => makeInlineProtocolApplicationDispatcher({
+      operations: runtime.operations,
+      authorizationKeys: runtime.authorizationKeys,
+      ...input,
+    }),
+  }: {
+    clientIpHeader?: TrustedClientIpHeader
+    maximumBufferedApplicationUpdateBytes?: number
+    applicationDispatcherFactory?: (input: {
+      connectionId: string
+      metadata?: RealtimeRequestMetadata
+      onAuthorized: (
+        authorization: ServerApplicationAuthorization,
+        options?: { transferOnly: boolean },
+      ) => boolean
+    }) => ServerApplicationDispatcher
+  } = {},
+): InlineProtocolRealtimeTransport => {
+  if (!Number.isSafeInteger(maximumBufferedApplicationUpdateBytes) ||
+      maximumBufferedApplicationUpdateBytes < 1) {
+    throw new RangeError("Invalid Inline Protocol application-update byte budget")
+  }
+  const sockets = new Set<ServerWebSocket<InlineProtocolWebSocketData>>()
+  const drainingConnections = new Set<Promise<void>>()
+  const handshakeCapacityRejectedRequests = new WeakSet<Request>()
+  const handshakesByIp = new Map<string, number>()
+  const handshakeStartsByIp = new Map<string, number>()
+  const pendingLoginsByIp = new Map<string, number>()
+  let activeHandshakes = 0
+  let activePendingLogins = 0
+  let handshakeStarts = 0
+  let handshakeRateWindow = -1
+  let activeApplications = 0
+  const activeApplicationsByAuthority = new Map<string, number>()
+  let bufferedApplicationUpdateBytes = 0
+  let accepting = true
+  // Transfer sockets by account session, closed with the session's authority.
+  const transferSockets = new Map<string, Set<ServerWebSocket<InlineProtocolWebSocketData>>>()
+  const transferKey = (userId: number, accountSessionId: number) => `${userId}:${accountSessionId}`
+  const overloadLogs = new BoundedLogAggregator(OVERLOAD_LOG_WINDOW_MS, 8)
+
+  const warnOverload = (
+    key: string,
+    message: string,
+    metadata: Record<string, unknown>,
+  ): void => {
+    const decision = overloadLogs.record(key)
+    if (!decision.emit) return
+    realtimeV3Log.warn(message, {
+      ...metadata,
+      suppressedCount: decision.suppressedCount,
+    })
+  }
+
+  const applicationAuthorityKey = inlineProtocolApplicationAuthorityKey
+
+  const tryAcquireApplication = (
+    authorization: ServerApplicationAuthorization,
+  ): (() => void) | undefined => {
+    const authorityKey = applicationAuthorityKey(authorization)
+    const authorityApplications = activeApplicationsByAuthority.get(authorityKey) ?? 0
+    if (activeApplications >= MAX_CONCURRENT_APPLICATIONS ||
+        authorityApplications >= MAX_CONCURRENT_APPLICATIONS_PER_AUTHORITY) {
+      warnOverload("application", "Inline Protocol V3 application admission overloaded", {
+        activeApplications,
+        globalCapacity: MAX_CONCURRENT_APPLICATIONS,
+        authorityApplications,
+        authorityCapacity: MAX_CONCURRENT_APPLICATIONS_PER_AUTHORITY,
+        authorityKind: authorization.accountSessionId === undefined ? "auth-key" : "account-session",
+      })
+      return undefined
+    }
+    activeApplications += 1
+    activeApplicationsByAuthority.set(authorityKey, authorityApplications + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      activeApplications = Math.max(0, activeApplications - 1)
+      const remaining = (activeApplicationsByAuthority.get(authorityKey) ?? 1) - 1
+      if (remaining <= 0) activeApplicationsByAuthority.delete(authorityKey)
+      else activeApplicationsByAuthority.set(authorityKey, remaining)
+    }
+  }
+
+  const tryReserveApplicationUpdateBytes = (bytes: number): (() => void) | undefined => {
+    if (!Number.isSafeInteger(bytes) || bytes < 0 ||
+        bufferedApplicationUpdateBytes + bytes > maximumBufferedApplicationUpdateBytes) return undefined
+    bufferedApplicationUpdateBytes += bytes
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      bufferedApplicationUpdateBytes = Math.max(0, bufferedApplicationUpdateBytes - bytes)
+    }
+  }
+
+  const handshakeAdmissionIp = (metadata: RealtimeRequestMetadata | undefined): string =>
+    metadata?.ip ?? "unknown"
+
+  const refreshHandshakeRateWindow = (): void => {
+    const currentWindow = Math.floor(runtime.clock.nowMilliseconds() / HANDSHAKE_RATE_WINDOW_MS)
+    if (currentWindow === handshakeRateWindow) return
+    handshakeRateWindow = currentWindow
+    handshakeStarts = 0
+    handshakeStartsByIp.clear()
+  }
+
+  const canAdmitHandshake = (ip: string): boolean => {
+    refreshHandshakeRateWindow()
+    return activeHandshakes < MAX_CONCURRENT_HANDSHAKES &&
+      (handshakesByIp.get(ip) ?? 0) < MAX_CONCURRENT_HANDSHAKES_PER_IP &&
+      handshakeStarts < MAX_HANDSHAKE_STARTS_PER_WINDOW &&
+      (handshakeStartsByIp.get(ip) ?? 0) < MAX_HANDSHAKE_STARTS_PER_IP_PER_WINDOW
+  }
+
+  const reserveHandshake = (ip: string): void => {
+    activeHandshakes += 1
+    handshakesByIp.set(ip, (handshakesByIp.get(ip) ?? 0) + 1)
+    handshakeStarts += 1
+    handshakeStartsByIp.set(ip, (handshakeStartsByIp.get(ip) ?? 0) + 1)
+  }
+
+  const releaseAdmissionForIp = (byIp: Map<string, number>, ip: string): void => {
+    const current = byIp.get(ip) ?? 0
+    if (current <= 1) byIp.delete(ip)
+    else byIp.set(ip, current - 1)
+  }
+
+  const releaseHandshake = (socket: ServerWebSocket<InlineProtocolWebSocketData>): void => {
+    const ip = socket.data.handshakeAdmissionIp
+    if (!ip) return
+    if (socket.data.pendingLoginAdmission) {
+      releaseAdmissionForIp(pendingLoginsByIp, ip)
+      activePendingLogins = Math.max(0, activePendingLogins - 1)
+    } else {
+      releaseAdmissionForIp(handshakesByIp, ip)
+      activeHandshakes = Math.max(0, activeHandshakes - 1)
+    }
+    socket.data.handshakeAdmissionIp = undefined
+    socket.data.pendingLoginAdmission = undefined
+  }
+
+  // Moves an established, not yet registered socket out of the handshake budget.
+  const tryRetainPendingLogin = (socket: ServerWebSocket<InlineProtocolWebSocketData>): boolean => {
+    const ip = socket.data.handshakeAdmissionIp
+    if (!ip || socket.data.pendingLoginAdmission) return true
+    if (activePendingLogins >= MAX_PENDING_LOGINS ||
+        (pendingLoginsByIp.get(ip) ?? 0) >= MAX_PENDING_LOGINS_PER_IP) return false
+    releaseAdmissionForIp(handshakesByIp, ip)
+    activeHandshakes = Math.max(0, activeHandshakes - 1)
+    pendingLoginsByIp.set(ip, (pendingLoginsByIp.get(ip) ?? 0) + 1)
+    activePendingLogins += 1
+    socket.data.pendingLoginAdmission = true
+    return true
+  }
+
+  const clearAuthenticationTimeout = (state: InlineProtocolConnectionState | undefined): void => {
+    clearHandshakeTimeout(state)
+    if (state?.authenticationTimeout === undefined) return
+    clearTimeout(state.authenticationTimeout)
+    state.authenticationTimeout = undefined
+  }
+
+  const clearHandshakeTimeout = (state: InlineProtocolConnectionState | undefined): void => {
+    if (state?.handshakeTimeout === undefined) return
+    clearTimeout(state.handshakeTimeout)
+    state.handshakeTimeout = undefined
+  }
+
+  const clockHealthy = (): boolean => {
+    try {
+      runtime.clock.assertHealthy()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const enqueue = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    operation: () => Promise<void>,
+    { allowClosed = false }: { allowClosed?: boolean } = {},
+  ): Promise<void> => {
+    const state = socket.data.state
+    if (!state || (socket.data.closed && !allowClosed)) return Promise.resolve()
+    const queuedAt = performance.now()
+    state.queue = state.queue.then(async () => {
+      if (socket.data.closed && !allowClosed) return
+      const queueWaitMs = Math.round(performance.now() - queuedAt)
+      if (queueWaitMs >= 100) {
+        realtimeV3Log.trace("Inline Protocol V3 session queue delayed", {
+          connectionId: socket.data.id,
+          queueWaitMs,
+        })
+      }
+      await operation()
+    }).catch((error) => {
+      realtimeV3Log.trace("Inline Protocol V3 connection failed", {
+        connectionId: socket.data.id,
+        error,
+      })
+      if (error instanceof InlineProtocolSessionRevoked) {
+        if (!socket.data.closed) socket.close(REALTIME_CLOSE_SESSION_REVOKED, "session_revoked_confirmed")
+      } else if (error instanceof InlineProtocolAuthorizationInvalidated) {
+        closeAuthorizationInvalidated(socket)
+      } else {
+        closeProtocol(socket)
+      }
+    })
+    return state.queue
+  }
+
+  const enqueueOutbound = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    records: number,
+    bytes: number,
+    operation: (carrier: ObfuscatedServerHeader) => Promise<void>,
+  ): Promise<void> => {
+    const state = socket.data.state
+    if (!state || socket.data.closed || state.overloaded) return Promise.resolve()
+    if (state.outboundQueuedRecords + records > MAX_QUEUED_OUTBOUND_RECORDS ||
+        state.outboundQueuedBytes + bytes > MAX_QUEUED_OUTBOUND_BYTES) {
+      warnOverload("outbound", "Inline Protocol V3 outbound queue overloaded", {
+        queuedRecords: state.outboundQueuedRecords,
+        queuedBytes: state.outboundQueuedBytes,
+        incomingRecords: records,
+        incomingBytes: bytes,
+      })
+      closeOverloaded(socket)
+      return Promise.resolve()
+    }
+    state.outboundQueuedRecords += records
+    state.outboundQueuedBytes += bytes
+    state.outboundQueue = state.outboundQueue.then(async () => {
+      try {
+        if (socket.data.closed || state.overloaded) return
+        runtime.clock.assertHealthy()
+        if (!state.carrier) throw new RangeError("Inline Protocol carrier is unavailable")
+        await operation(state.carrier)
+      } finally {
+        state.outboundQueuedRecords -= records
+        state.outboundQueuedBytes -= bytes
+      }
+    }).catch((error) => {
+      realtimeV3Log.trace("Inline Protocol V3 outbound carrier failed", {
+        connectionId: socket.data.id,
+        error,
+      })
+      closeProtocol(socket)
+    })
+    return state.outboundQueue
+  }
+
+  const sendCarrierBytes = async (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    bytes: Uint8Array,
+  ): Promise<void> => {
+    const state = socket.data.state!
+    // The carrier has already advanced. A failed send must terminate it, never retry it.
+    const sent = socket.sendBinary(bytes, false)
+    if (sent === 0) throw new RangeError("Carrier write dropped")
+    if (sent !== -1) return
+    // -1 was accepted by Bun. Retain the remaining work within the existing queue budget
+    // and resume only on drain. A slow/disappeared reader cannot hold this queue forever.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => { closeOverloaded(socket) }, 30_000)
+      timer.unref?.()
+      state.resumeOutbound = () => {
+        clearTimeout(timer)
+        state.resumeOutbound = undefined
+        resolve()
+      }
+    })
+    if (socket.data.closed || state.overloaded) throw new RangeError("Carrier closed under pressure")
+  }
+
+  const sendRecords = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    records: readonly Uint8Array[],
+  ): Promise<void> => enqueueOutbound(
+    socket,
+    records.length,
+    records.reduce((total, record) => total + record.length + 4, 0),
+    async (carrier) => {
+      for (const record of records) {
+        if (socket.data.closed || socket.data.state?.overloaded) return
+        await sendCarrierBytes(socket, carrier.outbound.process(encodeAbridgedPacket(record)))
+      }
+    },
+  )
+
+  const sendQuickAck = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    quickAckId: number,
+  ): Promise<void> => enqueueOutbound(socket, 1, 4, (carrier) =>
+    sendCarrierBytes(socket, carrier.outbound.process(encodeAbridgedQuickAck(quickAckId))),
+  )
+
+  const closeDestroyedSessionAfterWrites = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+  ): void => {
+    const state = socket.data.state
+    if (!state || socket.data.closed || !state.session.destroyed) return
+    state.outboundQueue = state.outboundQueue.then(() => {
+      if (!socket.data.closed) socket.close(1000, "Protocol session closed")
+    })
+  }
+
+  const scheduleApplicationTask = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    task: InlineProtocolServerApplicationTask,
+  ): void => {
+    const state = socket.data.state
+    if (!state) return
+    const handlerStartedAt = performance.now()
+    const transfer = state.transfer
+    if (transfer) {
+      transfer.activeApplications += 1
+      scheduleTransferIdle(socket, transfer)
+    }
+    const execution = (async () => {
+      const completion = await task.dispatch()
+      const responseDurationMs = Math.round(performance.now() - handlerStartedAt)
+      realtimeV3Log.trace("Inline Protocol V3 application response ready", {
+        connectionId: socket.data.id,
+        requestMessageId: task.messageId.toString(),
+        responseDurationMs,
+        executionPending: completion.settlement !== undefined,
+        inFlightApplications: state.applicationTasks.size,
+      })
+      const finalize = async (
+        applicationCompletion: Awaited<ReturnType<InlineProtocolServerApplicationTask["dispatch"]>>,
+        executionPending: boolean,
+      ): Promise<void> => enqueue(socket, async () => {
+        const finalizationStartedAt = performance.now()
+        const finalized = await applicationCompletion.finalize()
+        const finalizationDurationMs = Math.round(performance.now() - finalizationStartedAt)
+        realtimeV3Log.trace("Inline Protocol V3 application finalized", {
+          connectionId: socket.data.id,
+          requestMessageId: task.messageId.toString(),
+          responseDurationMs,
+          executionPending,
+          finalizationDurationMs,
+          responseCount: finalized.responses.length,
+          releasedApplicationCount: finalized.applicationTasks.length,
+        })
+        if (!socket.data.closed) void sendRecords(socket, finalized.responses)
+        for (const released of finalized.applicationTasks) scheduleApplicationTask(socket, released)
+        closeDestroyedSessionAfterWrites(socket)
+      }, { allowClosed: true })
+      await finalize(completion, completion.settlement !== undefined)
+      if (completion.settlement) {
+        const settlement = await completion.settlement
+        await finalize(settlement, false)
+      }
+    })().catch((error) => {
+      realtimeV3Log.trace("Inline Protocol V3 application dispatch failed", {
+        connectionId: socket.data.id,
+        requestMessageId: task.messageId.toString(),
+        error,
+      })
+      closeProtocol(socket)
+    })
+    state.applicationTasks.add(execution)
+    void execution.finally(() => {
+      state.applicationTasks.delete(execution)
+      const current = state.transfer
+      if (current) {
+        current.activeApplications = Math.max(0, current.activeApplications - 1)
+        scheduleTransferIdle(socket, current)
+      }
+    })
+  }
+
+  const drainConnectionState = async (state: InlineProtocolConnectionState): Promise<void> => {
+    await state.queue
+    while (state.applicationTasks.size > 0) {
+      await Promise.allSettled(state.applicationTasks)
+      await state.queue
+    }
+    await state.outboundQueue
+  }
+
+  const trackClosedConnection = (state: InlineProtocolConnectionState): void => {
+    const draining = drainConnectionState(state)
+    drainingConnections.add(draining)
+    void draining.finally(() => drainingConnections.delete(draining))
+  }
+
+  const scheduleTransferIdle = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    transfer: NonNullable<InlineProtocolConnectionState["transfer"]>,
+  ): void => {
+    if (transfer.idleTimeout !== undefined) clearTimeout(transfer.idleTimeout)
+    transfer.idleTimeout = undefined
+    if (transfer.activeApplications > 0 || socket.data.closed) return
+    transfer.idleTimeout = setTimeout(() => {
+      transfer.idleTimeout = undefined
+      if (transfer.activeApplications > 0 || socket.data.closed) return
+      close(socket)
+      socket.close(1000, "Transfer connection idle")
+    }, TRANSFER_SOCKET_IDLE_TIMEOUT_MS)
+    transfer.idleTimeout.unref?.()
+  }
+
+  /**
+   * A transfer-only socket authenticates with the same bound key and account
+   * session fence as the main socket but is never registered for update
+   * fan-out, presence or presentation capabilities. Admission is keyed by the
+   * account session, so it shares every budget with the main socket.
+   */
+  const registerTransferConnection = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    userId: number,
+    accountSessionId: number,
+  ): boolean => {
+    const state = socket.data.state
+    if (!accepting || socket.data.closed || !state) return false
+    const identity = { userId, sessionId: accountSessionId }
+    if (state.registered) {
+      // A main socket cannot become a transfer socket, nor change identity.
+      const transfer = state.transfer
+      if (transfer && transfer.userId === userId && transfer.accountSessionId === accountSessionId &&
+          sessionAuthority.allows(identity)) return true
+      realtimeV3Log.warn("Inline Protocol V3 transfer authority closed", {
+        userId,
+        sessionId: accountSessionId,
+        reason: !transfer ? "main_socket" : sessionAuthority.isKnownInvalidated(identity) ? "revoked" : "unverified",
+      })
+      if (transfer) {
+        close(socket)
+        socket.close(PROTOCOL_CLOSE_CODE, PROTOCOL_CLOSE_REASON)
+      }
+      return false
+    }
+    // No fresh session lookup happens here, so the authority must already be
+    // verified for a live main connection of this account session.
+    if (!sessionAuthority.allows(identity)) return false
+    state.registered = true
+    state.transfer = { userId, accountSessionId, activeApplications: 0 }
+    clearAuthenticationTimeout(state)
+    releaseHandshake(socket)
+    const key = transferKey(userId, accountSessionId)
+    let sockets = transferSockets.get(key)
+    if (!sockets) {
+      sockets = new Set()
+      transferSockets.set(key, sockets)
+    }
+    sockets.add(socket)
+    scheduleTransferIdle(socket, state.transfer)
+    return true
+  }
+
+  const stopTransferInvalidation = sessionAuthority.onInvalidate((identity) => {
+    const sockets = transferSockets.get(transferKey(identity.userId, identity.sessionId))
+    // close() removes each socket from the set, so iterate over a copy.
+    for (const socket of Array.from(sockets ?? [])) {
+      if (socket.data.closed) continue
+      close(socket)
+      socket.close(REALTIME_CLOSE_SESSION_REVOKED, "session_revoked_confirmed")
+    }
+  })
+
+  const registerAuthenticatedConnection = (
+    socket: ServerWebSocket<InlineProtocolWebSocketData>,
+    userId: number,
+    accountSessionId: number,
+    transferOnly = false,
+  ): boolean => {
+    const state = socket.data.state
+    if (!accepting || socket.data.closed || !state) return false
+    if (transferOnly || state.transfer) return registerTransferConnection(socket, userId, accountSessionId)
+    if (state.registered) {
+      // The dispatcher calls this fence before every RPC. Do not refresh the
+      // authority timestamp here: that would let traffic hide an unavailable
+      // session revalidation. It only closes the narrow revoke/admit race.
+      const connection = connectionManager.getConnection(socket.data.id)
+      const sameIdentity = connection?.userId === userId && connection.sessionId === accountSessionId
+      const identity = { userId, sessionId: accountSessionId }
+      if (sameIdentity && sessionAuthority.allows(identity)) return true
+      const closeReason = !sameIdentity ? "identity_mismatch" :
+        sessionAuthority.isKnownInvalidated(identity) ? "revoked" : "unverified"
+      realtimeV3Log.warn("Inline Protocol V3 registered authority closed", {
+        userId,
+        sessionId: accountSessionId,
+        reason: closeReason,
+      })
+      connectionManager.closeConnection(socket.data.id, {
+        authenticationInvalidated: closeReason === "revoked",
+      })
+      return false
+    }
+    const compatibilitySocket = {
+      id: socket.data.id,
+      close: (code?: number, reason?: string) => socket.close(
+        code,
+        code === REALTIME_CLOSE_SESSION_REVOKED && reason === REALTIME_CLOSE_SESSION_REVOKED_REASON
+          // Older V3 servers also sent session_revoked for forgotten temporary keys. Only the
+          // confirmed reason can trigger client credential destruction across mixed versions.
+          ? "session_revoked_confirmed" : reason,
+      ),
+      raw: {
+        sendBinary: (bytes: Uint8Array) => {
+          let payload: Uint8Array
+          try {
+            const legacy = ServerProtocolMessage.fromBinary(bytes)
+            if (legacy.body.oneofKind !== "message") return bytes.length
+            payload = RealtimeV3Update.toBinary({ message: legacy.body.message })
+          } catch (error) {
+            realtimeV3Log.trace("Inline Protocol V3 compatibility update was malformed", {
+              connectionId: socket.data.id,
+              error,
+            })
+            closeProtocol(socket)
+            return 0
+          }
+          const releaseUpdateBytes = tryReserveApplicationUpdateBytes(payload.length)
+          if (!releaseUpdateBytes) {
+            warnOverload("retained-update", "Inline Protocol V3 compatibility update capacity exceeded", {
+              updateBytes: payload.length,
+              bufferedUpdateBytes: bufferedApplicationUpdateBytes,
+              updateCapacity: maximumBufferedApplicationUpdateBytes,
+            })
+            closeOverloaded(socket)
+            return 0
+          }
+          if (state.compatibilityQueuedUpdates >= MAX_QUEUED_OUTBOUND_RECORDS) {
+            releaseUpdateBytes()
+            warnOverload("compatibility-update", "Inline Protocol V3 compatibility update queue overloaded", {
+              queuedUpdates: state.compatibilityQueuedUpdates,
+              updateCapacity: MAX_QUEUED_OUTBOUND_RECORDS,
+            })
+            closeOverloaded(socket)
+            return 0
+          }
+          state.compatibilityQueuedUpdates += 1
+          void enqueue(socket, async () => {
+            await sendRecords(socket, [state.session.sendApplicationUpdate(payload)])
+          }).finally(() => {
+            state.compatibilityQueuedUpdates -= 1
+            releaseUpdateBytes()
+          })
+          return bytes.length
+        },
+      },
+    }
+    connectionManager.addConnection(compatibilitySocket as never, ConnVersion.REALTIME_V3)
+    if (!connectionManager.authenticateConnection(socket.data.id, userId, accountSessionId, 3)) {
+      // authenticateConnection closes and removes the compatibility socket
+      // when its session-authority admission fence rejects this registration.
+      return false
+    }
+    state.registered = true
+    clearAuthenticationTimeout(state)
+    releaseHandshake(socket)
+    // V3 authorization carries the account session but not its client type.
+    // The manager coalesces this lookup across reconnecting sockets and tracks
+    // it for controlled teardown.
+    connectionManager.hydrateAuthenticatedClientType(userId, accountSessionId)
+    return true
+  }
+
+  const open = (socket: ServerWebSocket<InlineProtocolWebSocketData>): void => {
+    const session = new InlineProtocolServerSession({
+      rsaKeys: runtime.rsaKeys,
+      authorizationKeys: runtime.authorizationKeys,
+      replay: runtime.replay,
+      application: applicationDispatcherFactory({
+        connectionId: socket.data.id,
+        metadata: socket.data.metadata,
+        onAuthorized: (authorization, options) => {
+          if (authorization.userId === undefined || authorization.accountSessionId === undefined) return false
+          return registerAuthenticatedConnection(
+            socket, authorization.userId, authorization.accountSessionId, options?.transferOnly === true,
+          )
+        },
+      }),
+      randomBytes: (length) => Uint8Array.from(randomBytes(length)),
+      nowMilliseconds: () => runtime.clock.nowMilliseconds(),
+      gunzip: (packed, maximumOutputBytes) => Uint8Array.from(gunzipSync(packed, {
+        maxOutputLength: maximumOutputBytes,
+      })),
+      carrierProfile: "websocket",
+      dc: 1,
+      tryAcquireApplication,
+      tryReserveApplicationUpdateBytes,
+      replayPolicy: inlineProtocolReplayPolicy,
+      gzip: (data) => Uint8Array.from(gzipSync(data)),
+      compressResult: inlineProtocolResultCompressible,
+    })
+    const state: InlineProtocolConnectionState = {
+      queue: Promise.resolve(),
+      outboundQueue: Promise.resolve(),
+      applicationTasks: new Set(),
+      inboundQueuedFrames: 0,
+      inboundQueuedBytes: 0,
+      outboundQueuedRecords: 0,
+      outboundQueuedBytes: 0,
+      compatibilityQueuedUpdates: 0,
+      overloaded: false,
+      registered: false,
+      session,
+    }
+    socket.data.state = state
+    sockets.add(socket)
+    state.authenticationTimeout = setTimeout(() => {
+      if (!accepting || socket.data.closed || state.registered) return
+      // Retire the transport synchronously, even if Bun's close callback arrives
+      // later. Already dispatched applications still finish durable settlement.
+      close(socket)
+      socket.close(1001, "Account authentication deadline exceeded")
+    }, ACCOUNT_AUTHENTICATION_TIMEOUT_MS)
+    state.handshakeTimeout = setTimeout(() => {
+      state.handshakeTimeout = undefined
+      if (!accepting || socket.data.closed || state.registered || state.session.hasEstablishedAuthorization) return
+      close(socket)
+      socket.close(1001, "Key establishment deadline exceeded")
+    }, HANDSHAKE_PHASE_TIMEOUT_MS)
+  }
+
+  const receive = (socket: ServerWebSocket<InlineProtocolWebSocketData>, message: string | Buffer<ArrayBuffer>): void => {
+    if (!accepting) { socket.close(1001, "Server draining"); return }
+    if (typeof message === "string") {
+      closeProtocol(socket)
+      return
+    }
+    const state = socket.data.state
+    if (!state) {
+      closeProtocol(socket)
+      return
+    }
+    if (state.overloaded) return
+    const frameBytes = message.byteLength
+    // Clients verify a cached or new key with a round trip before sending transfer RPCs,
+    // so a bound key is known here even before connection_init registers the socket.
+    if (frameBytes > MAX_UNREGISTERED_FRAME_BYTES && !state.registered && !state.session.hasAccountAuthority) {
+      closeProtocol(socket)
+      return
+    }
+    if (state.inboundQueuedFrames >= MAX_QUEUED_INBOUND_FRAMES ||
+        state.inboundQueuedBytes + frameBytes > MAX_QUEUED_INBOUND_BYTES) {
+      warnOverload("inbound", "Inline Protocol V3 inbound queue overloaded", {
+        queuedFrames: state.inboundQueuedFrames,
+        queuedBytes: state.inboundQueuedBytes,
+        incomingBytes: frameBytes,
+      })
+      closeOverloaded(socket)
+      return
+    }
+    state.inboundQueuedFrames += 1
+    state.inboundQueuedBytes += frameBytes
+    const frame = bytesForFrame(message).slice()
+    enqueue(socket, async () => {
+      try {
+        runtime.clock.assertHealthy()
+        if (!state.carrier) {
+          if (frame.length !== 64) throw new RangeError("Inline Protocol header must be exactly one frame")
+          state.carrier = acceptObfuscatedClientHeader(frame, 1)
+          return
+        }
+        const decoded = decodeAbridgedFrame(state.carrier.inbound.process(frame))
+        if (decoded.kind !== "packet") throw new RangeError("Clients cannot send quick-ACK responses")
+        if (decoded.quickAckRequested && decoded.payload.slice(0, 8).every((byte) => byte === 0)) {
+          throw new RangeError("Quick ACK is unavailable for unencrypted handshake packets")
+        }
+        const accepted = await state.session.receiveConcurrent(decoded.payload, decoded.quickAckRequested
+          ? { onQuickAck: (quickAckId) => { void sendQuickAck(socket, quickAckId) } }
+        : undefined)
+        if (state.session.hasEstablishedAuthorization) clearHandshakeTimeout(state)
+        if (state.session.hasEstablishedAuthorization && !tryRetainPendingLogin(socket)) {
+          warnOverload("pending-login", "Inline Protocol V3 pending-login admission overloaded", {
+            activePendingLogins,
+            globalCapacity: MAX_PENDING_LOGINS,
+            perIpCapacity: MAX_PENDING_LOGINS_PER_IP,
+          })
+          closeOverloaded(socket)
+          return
+        }
+        // This only records local activity; the presence owner persists it in
+        // coarse batches, never as a session query or write per V3 frame.
+        if (state.registered && !state.transfer) connectionManager.markConnectionActivity(socket.data.id)
+        void sendRecords(socket, accepted.responses)
+        for (const task of accepted.applicationTasks) scheduleApplicationTask(socket, task)
+        closeDestroyedSessionAfterWrites(socket)
+      } finally {
+        state.inboundQueuedFrames -= 1
+        state.inboundQueuedBytes -= frameBytes
+      }
+    })
+  }
+
+  const close = (socket: ServerWebSocket<InlineProtocolWebSocketData>): void => {
+    if (socket.data.closed) return
+    socket.data.closed = true
+    clearAuthenticationTimeout(socket.data.state)
+    socket.data.state?.resumeOutbound?.()
+    releaseHandshake(socket)
+    sockets.delete(socket)
+    if (socket.data.state) {
+      socket.data.state.session.disconnect()
+      const transfer = socket.data.state.transfer
+      if (transfer) {
+        if (transfer.idleTimeout !== undefined) clearTimeout(transfer.idleTimeout)
+        transfer.idleTimeout = undefined
+        const key = transferKey(transfer.userId, transfer.accountSessionId)
+        const sockets = transferSockets.get(key)
+        sockets?.delete(socket)
+        if (sockets?.size === 0) transferSockets.delete(key)
+      } else if (socket.data.state.registered) {
+        connectionManager.removeConnection(socket.data.id)
+      }
+      trackClosedConnection(socket.data.state)
+    }
+  }
+
+  return {
+    beginDrain: () => { accepting = false },
+    handleVerification: (request) => {
+      const url = new URL(request.url)
+      if (request.method !== "GET" || url.pathname !== INLINE_PROTOCOL_VERIFICATION_PATH) return undefined
+      let serverTime: number | undefined
+      try {
+        serverTime = Math.floor(runtime.clock.nowMilliseconds() / 1_000)
+      } catch {
+        serverTime = undefined
+      }
+      const ready = serverTime !== undefined
+      return Response.json({
+        protocol: "Inline Protocol",
+        protocolVersion: 1,
+        applicationContract: "Realtime V3",
+        applicationContractVersion: 3,
+        status: ready ? "ready" : "degraded",
+        ...(serverTime === undefined ? {} : { serverTime }),
+        websocketPath: REALTIME_V3_PATH,
+        rsaPublicKeyRing: runtime.rsaKeys.map((key) => ({
+          modulus: Buffer.from(key.modulus).toString("base64url"),
+          exponent: Buffer.from(key.exponent).toString("base64url"),
+          fingerprint: key.fingerprint.toString(),
+        })),
+      }, {
+        status: ready ? 200 : 503,
+        headers: {
+          "access-control-allow-origin": "*",
+          "cache-control": "no-store",
+        },
+      })
+    },
+    tryUpgrade: (request, server) => {
+      if (!accepting || new URL(request.url).pathname !== REALTIME_V3_PATH || !clockHealthy()) return false
+      const metadata = requestMetadata(request, server, clientIpHeader)
+      const ip = handshakeAdmissionIp(metadata)
+      if (!canAdmitHandshake(ip)) {
+        warnOverload("handshake", "Inline Protocol V3 handshake admission overloaded", {
+          activeHandshakes,
+          globalCapacity: MAX_CONCURRENT_HANDSHAKES,
+          activeHandshakesForIp: handshakesByIp.get(ip) ?? 0,
+          perIpCapacity: MAX_CONCURRENT_HANDSHAKES_PER_IP,
+          startsInWindow: handshakeStarts,
+          globalStartsPerWindow: MAX_HANDSHAKE_STARTS_PER_WINDOW,
+          startsForIpInWindow: handshakeStartsByIp.get(ip) ?? 0,
+          perIpStartsPerWindow: MAX_HANDSHAKE_STARTS_PER_IP_PER_WINDOW,
+        })
+        handshakeCapacityRejectedRequests.add(request)
+        return false
+      }
+      const upgraded = server.upgrade(request, {
+        data: {
+          protocol: "inline-v3",
+          id: crypto.randomUUID(),
+          metadata,
+          handshakeAdmissionIp: ip,
+          closed: false,
+        },
+      })
+      if (upgraded) reserveHandshake(ip)
+      return upgraded
+    },
+    rejectUnsupportedUpgrade: (request) => {
+      if (new URL(request.url).pathname !== REALTIME_V3_PATH) return undefined
+      if (!clockHealthy()) return new Response("Protocol clock unavailable.", { status: 503 })
+      if (handshakeCapacityRejectedRequests.has(request)) {
+        return new Response("Realtime V3 handshake capacity exceeded.", { status: 503 })
+      }
+      return undefined
+    },
+    websocket: {
+      backpressureLimit: BACKPRESSURE_LIMIT,
+      closeOnBackpressureLimit: true,
+      idleTimeout: 480,
+      perMessageDeflate: false,
+      sendPings: true,
+      open,
+      message: receive,
+      close,
+      drain: (socket) => socket.data.state?.resumeOutbound?.(),
+    },
+    shutdown: async () => {
+      accepting = false
+      stopTransferInvalidation()
+      const active = [...sockets]
+      const activeStates = active.flatMap((socket) => socket.data.state ? [socket.data.state] : [])
+      for (const socket of active) {
+        clearAuthenticationTimeout(socket.data.state)
+        if (socket.data.state) {
+          socket.data.state.overloaded = true
+          socket.data.state.session.disconnect()
+        }
+        socket.data.state?.resumeOutbound?.()
+        socket.close(1001, "Server shutting down")
+      }
+      await Promise.allSettled(activeStates.map(drainConnectionState))
+      while (drainingConnections.size > 0) {
+        await Promise.allSettled(drainingConnections)
+      }
+      sockets.clear()
+      handshakesByIp.clear()
+      handshakeStartsByIp.clear()
+      activeHandshakes = 0
+      handshakeStarts = 0
+      activeApplications = 0
+      activeApplicationsByAuthority.clear()
+      bufferedApplicationUpdateBytes = 0
+      runtime.close()
+    },
+  }
+}

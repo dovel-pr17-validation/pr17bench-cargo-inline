@@ -1,0 +1,543 @@
+import Auth
+import Foundation
+import GRDB
+import InlineProtocol
+import Logger
+
+public enum ChatType: String, Codable, Sendable {
+  case privateChat = "private"
+  case thread
+}
+
+public enum ChatCreateState: String, Codable, DatabaseValueConvertible, Sendable {
+  case pending
+  case failed
+}
+
+public struct ApiChat: Codable, Hashable, Sendable {
+  public var id: Int64
+  public var date: Int
+  public var title: String?
+  public var type: String
+  public var spaceId: Int64?
+  public var threadNumber: Int?
+  public var number: Int?
+  public var peer: Peer?
+  public var lastMsgId: Int64?
+  public var emoji: String?
+  public var publicThread: Bool?
+  public var createdBy: Int64?
+  public var untitled: Bool?
+  public var parentChatId: Int64?
+  public var parentMessageId: Int64?
+  public var canUpdateInfo: Bool?
+}
+
+public struct Chat: FetchableRecord, Identifiable, Codable, Hashable, PersistableRecord, Sendable {
+  public var id: Int64
+  public var date: Date
+  public var type: ChatType
+  public var title: String?
+  public var spaceId: Int64?
+  public var number: Int?
+  public var peerUserId: Int64?
+  public var lastMsgId: Int64?
+  public var emoji: String?
+  public var isPublic: Bool?
+  public var createdBy: Int64?
+  public var isUntitled: Bool?
+  public var parentChatId: Int64? = nil
+  public var parentMessageId: Int64? = nil
+  public var canUpdateInfo: Bool?
+  public var createState: ChatCreateState?
+  public var participantRosterComplete: Bool = false
+  /// Serialized InlineProtocol.AgentThreadContext. The provider session stays
+  /// outside Inline; this is only the durable, user-selected Chat preset.
+  public var agentContext: Data?
+
+  public enum Columns {
+    static let id = Column(CodingKeys.id)
+    static let date = Column(CodingKeys.date)
+    static let type = Column(CodingKeys.type)
+    static let title = Column(CodingKeys.title)
+    static let spaceId = Column(CodingKeys.spaceId)
+    static let number = Column(CodingKeys.number)
+    static let peerUserId = Column(CodingKeys.peerUserId)
+    static let lastMsgId = Column(CodingKeys.lastMsgId)
+    static let emoji = Column(CodingKeys.emoji)
+    static let isPublic = Column(CodingKeys.isPublic)
+    static let createdBy = Column(CodingKeys.createdBy)
+    static let isUntitled = Column(CodingKeys.isUntitled)
+    static let parentChatId = Column(CodingKeys.parentChatId)
+    static let parentMessageId = Column(CodingKeys.parentMessageId)
+    static let canUpdateInfo = Column(CodingKeys.canUpdateInfo)
+    static let createState = Column(CodingKeys.createState)
+    static let participantRosterComplete = Column(CodingKeys.participantRosterComplete)
+    public static let agentContext = Column(CodingKeys.agentContext)
+  }
+
+  public static let space = belongsTo(Space.self)
+  public var space: QueryInterfaceRequest<Space> {
+    request(for: Chat.space)
+  }
+
+  public static let lastMessage = hasOne(
+    Message.self,
+    using: ForeignKey(["chatId", "messageId"], to: ["id", "lastMsgId"])
+  )
+
+  public var lastMessage: QueryInterfaceRequest<Message> {
+    request(for: Chat.lastMessage)
+  }
+
+  public static let messages = hasMany(
+    Message.self
+  )
+
+  public var messages: QueryInterfaceRequest<Message> {
+    request(for: Chat.messages)
+  }
+
+  public static let peerUser = belongsTo(
+    User.self,
+    using: ForeignKey([Columns.peerUserId], to: [User.Columns.id])
+  )
+
+  public var peerUser: QueryInterfaceRequest<User> {
+    request(for: Chat.peerUser)
+  }
+
+  public init(
+    id: Int64 = Int64.random(in: 1 ... 50_000), date: Date, type: ChatType, title: String?,
+    spaceId: Int64?, number: Int? = nil, peerUserId: Int64? = nil, lastMsgId: Int64? = nil, emoji: String? = nil,
+    isPublic: Bool? = nil,
+    createdBy: Int64? = nil,
+    isUntitled: Bool? = nil,
+    parentChatId: Int64? = nil,
+    parentMessageId: Int64? = nil,
+    canUpdateInfo: Bool? = nil,
+    createState: ChatCreateState? = nil,
+    participantRosterComplete: Bool = false,
+    agentContext: Data? = nil
+  ) {
+    self.id = id
+    self.date = date
+    self.type = type
+    self.title = title
+    self.spaceId = spaceId
+    self.number = number
+    self.peerUserId = peerUserId
+    self.lastMsgId = lastMsgId
+    self.emoji = emoji
+    self.isPublic = isPublic
+    self.createdBy = createdBy
+    self.isUntitled = isUntitled
+    self.parentChatId = parentChatId
+    self.parentMessageId = parentMessageId
+    self.canUpdateInfo = canUpdateInfo
+    self.createState = createState
+    self.participantRosterComplete = participantRosterComplete
+    self.agentContext = agentContext
+  }
+}
+
+public extension Chat {
+  var agentThreadContext: InlineProtocol.AgentThreadContext? {
+    guard let agentContext else { return nil }
+    return try? InlineProtocol.AgentThreadContext(serializedBytes: agentContext)
+  }
+
+  static func serializedAgentContext(_ context: InlineProtocol.AgentThreadContext?) -> Data? {
+    guard let context else { return nil }
+    return try? context.serializedData()
+  }
+
+  var humanReadableTitle: String? {
+    if let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+       trimmed.isEmpty == false
+    {
+      return trimmed
+    }
+    return type == .thread ? "New thread" : nil
+  }
+
+  /// Provisional, presentation-only label for a numbered thread in an official scope.
+  /// Keep the format centralized so the experiment can be renamed or removed mechanically.
+  var threadReferenceLabel: String? {
+    threadReference?.label
+  }
+
+  var threadReference: ThreadReference? {
+    guard type == .thread,
+          spaceId != nil || createdBy != nil,
+          let number
+    else { return nil }
+    return ThreadReference(chatId: id, number: number)
+  }
+
+  var peerId: InlineProtocol.Peer {
+    if let peerUserId {
+      .with { $0.user.userID = peerUserId }
+    } else {
+      .with { $0.chat.chatID = id }
+    }
+  }
+
+  var inputPeerId: InlineProtocol.InputPeer {
+    if let peerUserId {
+      .with { $0.user.userID = peerUserId }
+    } else {
+      .with { $0.chat.chatID = id }
+    }
+  }
+
+  /// Navigation peer for a link keyed by this chat's stable database ID.
+  /// Private chats navigate by their other user; all other chats use the chat ID.
+  var deepLinkPeer: Peer? {
+    switch type {
+    case .privateChat:
+      guard let peerUserId else { return nil }
+      return .user(id: peerUserId)
+    case .thread:
+      return .thread(id: id)
+    }
+  }
+
+  var isReplyThread: Bool {
+    parentMessageId != nil
+  }
+}
+
+public struct ThreadReference: Codable, Hashable, Sendable {
+  public let chatId: Int64
+  public let number: Int
+
+  public init(chatId: Int64, number: Int) {
+    self.chatId = chatId
+    self.number = number
+  }
+
+  public var label: String { "#\(number)" }
+}
+
+// MARK: - Preview
+
+public extension Chat {
+  static let preview = Self(
+    id: Int64.random(in: 1 ... 50_000),
+    date: Date(),
+    type: .privateChat,
+    title: "Preview Chat",
+    spaceId: nil,
+    peerUserId: nil,
+    lastMsgId: nil,
+    emoji: nil
+  )
+}
+
+public extension Chat {
+//  enum CodingKeys: String, CodingKey {
+//    case id
+//    case date
+//    case type
+//    case title
+//    case spaceId
+//    case peerUserId
+//    case lastMsgId
+//    case emoji
+//  }
+//
+//  init(from decoder: Decoder) throws {
+//    let container = try decoder.container(keyedBy: CodingKeys.self)
+//    id = try container.decode(Int64.self, forKey: .id)
+//    date = try container.decode(Date.self, forKey: .date)
+//    type = try container.decode(ChatType.self, forKey: .type)
+//    title = try container.decodeIfPresent(String.self, forKey: .title)
+//    spaceId = try container.decodeIfPresent(Int64.self, forKey: .spaceId)
+//    peerUserId = try container.decodeIfPresent(Int64.self, forKey: .peerUserId)
+//    lastMsgId = try container.decodeIfPresent(Int64.self, forKey: .lastMsgId)
+//    emoji = try container.decodeIfPresent(String.self, forKey: .emoji)
+//  }
+}
+
+public extension Chat {
+  init(from: ApiChat) {
+    id = from.id
+    date = Self.fromTimestamp(from: from.date)
+    if let titleValue = from.title, !titleValue.isEmpty {
+      title = titleValue
+    } else {
+      title = nil
+    }
+    isPublic = from.publicThread
+    createdBy = from.createdBy
+    isUntitled = from.untitled
+    parentChatId = from.parentChatId
+    parentMessageId = from.parentMessageId
+    canUpdateInfo = from.canUpdateInfo
+    spaceId = from.spaceId
+    number = from.number ?? from.threadNumber
+    type = from.type == "private" ? .privateChat : .thread
+    peerUserId =
+      if let peer = from.peer {
+        switch peer {
+          case let .user(id):
+            id
+          case .thread:
+            nil
+        }
+      } else {
+        nil
+      }
+    lastMsgId = from.lastMsgId
+    emoji = from.emoji
+    createState = nil
+    agentContext = nil
+  }
+
+  static func fromTimestamp(from: Int) -> Date {
+    Date(timeIntervalSince1970: Double(from))
+  }
+}
+
+public extension Chat {
+  init(from: InlineProtocol.Chat) {
+    id = from.id
+    date = from.hasDate ? Date(timeIntervalSince1970: Double(from.date)) : Date(timeIntervalSince1970: Double(0))
+    title = from.title.isEmpty ? nil : from.title
+    spaceId = from.hasSpaceID ? from.spaceID : nil
+    number = from.hasNumber ? Int(from.number) : nil
+    lastMsgId = from.hasLastMsgID ? from.lastMsgID : nil
+    emoji = from.hasEmoji ? from.emoji : nil
+    isPublic = from.hasIsPublic ? from.isPublic : nil
+    createdBy = from.hasCreatedBy ? from.createdBy : nil
+    isUntitled = from.hasUntitled ? from.untitled : nil
+    parentChatId = from.hasParentChatID ? from.parentChatID : nil
+    parentMessageId = from.hasParentMessageID ? from.parentMessageID : nil
+    canUpdateInfo = from.hasPermissions ? from.permissions.canUpdateInfo : nil
+    createState = nil
+    agentContext = from.hasAgentContext ? Self.serializedAgentContext(from.agentContext) : nil
+
+    if case let .user(peerUser) = from.peerID.type {
+      peerUserId = peerUser.userID
+      type = .privateChat
+    } else {
+      peerUserId = nil
+      type = .thread
+    }
+  }
+}
+
+public extension Chat {
+  func ensurePeerUserExists(_ db: Database) throws {
+    guard let peerUserId else { return }
+    guard try User.fetchOne(db, id: peerUserId) == nil else { return }
+    try User(id: peerUserId, email: nil, firstName: nil).save(db)
+  }
+
+  private mutating func mergeLocalFieldsForFullSave(_ db: Database) throws {
+    guard let existing = try Chat.fetchOne(db, key: id) else { return }
+    if agentContext == nil {
+      agentContext = existing.agentContext
+    }
+    if let title, title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+      return
+    }
+    guard let existingTitle = existing.title,
+          existingTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    else {
+      return
+    }
+
+    title = existingTitle
+    isUntitled = existing.isUntitled
+  }
+
+  @discardableResult
+  func saveFull(_ db: Database) throws -> Chat {
+    var chat = self
+    try chat.mergeLocalFieldsForFullSave(db)
+    try chat.save(db)
+    return chat
+  }
+
+  mutating func saveWithValidLastMsg(_ db: Database) throws {
+    try ensurePeerUserExists(db)
+    try mergeLocalFieldsForFullSave(db)
+
+    if let existing = try Chat.fetchOne(db, key: id), lastMsgId == nil {
+      lastMsgId = existing.lastMsgId
+    }
+
+    guard let localLastMsgId = lastMsgId else {
+      try save(db)
+      return
+    }
+
+    let hasLastMessage = try Message
+      .filter(Column("chatId") == id)
+      .filter(Column("messageId") == localLastMsgId)
+      .fetchCount(db) > 0
+
+    if hasLastMessage {
+      try save(db)
+      return
+    }
+
+    lastMsgId = nil
+    try save(db)
+  }
+
+  static func getByPeerId(db: Database, peerId: Peer) throws -> Chat? {
+    switch peerId {
+      case let .user(id):
+        // Fetch private chat
+        try Chat
+          .filter(Column("peerUserId") == id)
+          .fetchOne(db)
+
+      case let .thread(id):
+        // Fetch thread chat
+        try Chat.filter(Column("id") == id).fetchOne(db)
+    }
+  }
+
+  static func getByPeerId(peerId: Peer) throws -> Chat? {
+    try AppDatabase.shared.reader.read { db in
+      try getByPeerId(db: db, peerId: peerId)
+    }
+  }
+}
+
+public extension Chat {
+  /// Removes a confirmed chat projection under the account lease that initiated it.
+  static func deleteFromLocalDatabase(
+    peerId: Peer,
+    databaseWriter: any DatabaseWriter,
+    auth: AuthHandle,
+    accountToken: AuthAccountMutationToken
+  ) async throws {
+    try await databaseWriter.write { db in
+      try auth.validateAccountMutation(accountToken)
+      let dialogId = Dialog.getDialogId(peerId: peerId)
+      let chat = try getByPeerId(db: db, peerId: peerId)
+      let dialog = try Dialog.fetchOne(db, key: dialogId)
+      guard chat != nil || dialog != nil else { return }
+      if let chat {
+        try deleteLocalChatData(db, chatId: chat.id)
+        try Dialog.deleteOne(db, key: dialogId)
+      } else {
+        try SyncRemovalRevision.advance(db)
+        try Dialog.deleteOne(db, key: dialogId)
+      }
+    }
+  }
+
+  /// Deletes this chat and its dialog from the local database.
+  /// - Throws: Any database error.
+  func deleteFromLocalDatabase() async throws {
+    try await AppDatabase.shared.dbWriter.write { db in
+      try SyncRemovalRevision.advance(db)
+
+      var chat = self
+      chat.lastMsgId = nil
+      try chat.save(db)
+
+      // Delete all messages for this chat (should be handled by cascade, but explicit for clarity)
+      try Message.filter(Column("chatId") == self.id).deleteAll(db)
+      // Delete the dialog for this chat (by peerId)
+      let dialogId = Dialog.getDialogId(peerId: self.peerId.toPeer())
+      try Dialog.filter(Column("id") == dialogId).deleteAll(db)
+      // Delete the chat itself
+      try Chat.filter(Column("id") == self.id).deleteAll(db)
+    }
+  }
+}
+
+public extension Chat {
+  struct ChatWithLastMessage: FetchableRecord, PersistableRecord, Codable, Hashable, Sendable {
+    public var id: Int64
+    public var lastMsgId: Int64?
+    public var lastMsgDate: Date?
+  }
+
+  static func shouldAdvanceLastMessage(
+    currentLastMsgId: Int64?,
+    currentLastMsgDate: Date?,
+    newLastMsgId: Int64,
+    newDate: Date
+  ) -> Bool {
+    guard let currentLastMsgDate else { return true }
+
+    if newDate > currentLastMsgDate {
+      return true
+    }
+
+    if newDate < currentLastMsgDate {
+      return false
+    }
+
+    // Same second: advance only if the incoming message id is newer.
+    guard let currentLastMsgId else {
+      return true
+    }
+    return newLastMsgId > currentLastMsgId
+  }
+
+  static func updateLastMsgId(_ db: Database, chatId: Int64, lastMsgId: Int64, date: Date) throws {
+//    _ = try Chat
+//      .filter(Column("id") == chatId)
+//      .joining(optional: Chat.lastMessage.filter(Column("date") > date))
+//      .updateAll(db, [
+//        Column("lastMsgId").set(to: lastMsgId),
+//      ])
+
+    let chat = try Chat
+      .filter(Column("id") == chatId)
+      .annotated(
+        withOptional: Chat.lastMessage
+          .select(Column("date").forKey("lastMsgDate"))
+      )
+      .asRequest(of: ChatWithLastMessage.self)
+      .fetchOne(db)
+
+    if let chat, shouldAdvanceLastMessage(
+      currentLastMsgId: chat.lastMsgId,
+      currentLastMsgDate: chat.lastMsgDate,
+      newLastMsgId: lastMsgId,
+      newDate: date
+    ) {
+      Log.shared.debug(
+        "Updating lastMsgId for chat \(chatId) to \(lastMsgId) with date \(String(describing: chat.lastMsgDate))"
+      )
+      _ = try Chat
+        .filter(Column("id") == chatId)
+        .updateAll(db, [
+          Column("lastMsgId").set(to: lastMsgId),
+      ])
+    }
+  }
+
+  static func updateLastMsgIds(_ db: Database, messages: [Message]) throws {
+    var newestByChatId: [Int64: Message] = [:]
+
+    for message in messages where !message.isGridTranscript {
+      if let current = newestByChatId[message.chatId],
+         !shouldAdvanceLastMessage(
+           currentLastMsgId: current.messageId,
+           currentLastMsgDate: current.date,
+           newLastMsgId: message.messageId,
+           newDate: message.date
+         )
+      {
+        continue
+      }
+
+      newestByChatId[message.chatId] = message
+    }
+
+    for message in newestByChatId.values {
+      try updateLastMsgId(db, chatId: message.chatId, lastMsgId: message.messageId, date: message.date)
+    }
+  }
+}

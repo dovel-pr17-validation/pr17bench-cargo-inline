@@ -1,0 +1,221 @@
+import InlineKit
+import SwiftUI
+
+enum ToastType {
+  case info
+  case success
+  case loading
+  case error
+
+  var duration: Double {
+    switch self {
+      case .success: 4.0
+      case .info: 4.0
+      case .loading: .infinity
+      case .error: 4.0
+    }
+  }
+}
+
+enum ToastPlacement: Equatable {
+  case topCenter(offset: CGFloat)
+  case bottomCenter(offset: CGFloat)
+
+  static let standard = ToastPlacement.bottomCenter(offset: 120)
+}
+
+struct ToastData: Identifiable {
+  let id = UUID()
+  let message: String
+  let description: String?
+  let type: ToastType
+  var action: (() -> Void)?
+  var actionTitle: String?
+  var systemImage: String?
+  var shouldStayVisible: Bool = false
+  var progressStep: Int = 0
+  var totalSteps: Int = 4
+  var countdownStartDate: Date?
+  var countdownDuration: TimeInterval?
+  var placement: ToastPlacement?
+
+  init(
+    message: String,
+    description: String? = nil,
+    type: ToastType,
+    action: (() -> Void)? = nil,
+    actionTitle: String? = nil,
+    systemImage: String? = nil,
+    shouldStayVisible: Bool = false,
+    progressStep: Int = 0,
+    totalSteps: Int = 4,
+    countdownStartDate: Date? = nil,
+    countdownDuration: TimeInterval? = nil,
+    placement: ToastPlacement? = nil
+  ) {
+    self.message = message
+    self.description = description
+    self.type = type
+    self.action = action
+    self.actionTitle = actionTitle
+    self.systemImage = systemImage
+    self.shouldStayVisible = shouldStayVisible
+    self.progressStep = progressStep
+    self.totalSteps = totalSteps
+    self.countdownStartDate = countdownStartDate
+    self.countdownDuration = countdownDuration
+    self.placement = placement
+  }
+}
+
+class ToastManager: ObservableObject {
+  static let shared = ToastManager()
+
+  @Published private(set) var currentToast: ToastData?
+  private var timer: Timer?
+  private var progressToastId: UUID?
+
+  private init() {}
+
+  func showToast(
+    _ message: String,
+    description: String? = nil,
+    type: ToastType,
+    systemImage: String? = nil,
+    action: (() -> Void)? = nil,
+    actionTitle: String? = nil,
+    shouldStayVisible: Bool = false,
+    placement: ToastPlacement? = nil
+  ) {
+    timer?.invalidate()
+    timer = nil
+
+    // If this is a progress update for an existing progress toast, update smoothly
+    if let currentToast,
+       currentToast.shouldStayVisible,
+       currentToast.type == .info,
+       type == .info,
+       shouldStayVisible
+    {
+      updateProgressToast(message: message, systemImage: systemImage)
+      return
+    }
+
+    // If current toast is info and should stay visible, only replace it with success or error
+    if let currentToast,
+       currentToast.shouldStayVisible,
+       currentToast.type == .info,
+       type != .success, type != .error
+    {
+      return
+    }
+
+    let newToast = ToastData(
+      message: message,
+      description: description,
+      type: type,
+      action: action,
+      actionTitle: actionTitle,
+      systemImage: systemImage,
+      shouldStayVisible: shouldStayVisible,
+      placement: placement
+    )
+
+    // Store the ID for progress tracking
+    if type == .info, shouldStayVisible {
+      progressToastId = newToast.id
+    } else {
+      progressToastId = nil
+    }
+
+    withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+      currentToast = newToast
+    }
+
+    if type != .loading, !shouldStayVisible {
+      setupTimer(duration: type.duration)
+    }
+  }
+
+  func showUndoCountdown(
+    _ message: String,
+    duration: TimeInterval = 5,
+    actionTitle: String = "Undo",
+    placement: ToastPlacement? = nil,
+    action: @escaping () -> Void
+  ) {
+    timer?.invalidate()
+    timer = nil
+
+    let newToast = ToastData(
+      message: message,
+      description: nil,
+      type: .info,
+      action: action,
+      actionTitle: actionTitle,
+      systemImage: nil,
+      shouldStayVisible: true,
+      countdownStartDate: Date(),
+      countdownDuration: duration,
+      placement: placement
+    )
+    progressToastId = nil
+
+    withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+      currentToast = newToast
+    }
+  }
+
+  func updateProgressToast(message: String, systemImage: String? = nil) {
+    guard let currentToast,
+          currentToast.shouldStayVisible,
+          currentToast.type == .info else { return }
+
+    let updatedToast = ToastData(
+      message: message,
+      description: currentToast.description,
+      type: currentToast.type,
+      action: currentToast.action,
+      actionTitle: currentToast.actionTitle,
+      systemImage: systemImage ?? currentToast.systemImage,
+      shouldStayVisible: currentToast.shouldStayVisible,
+      countdownStartDate: currentToast.countdownStartDate,
+      countdownDuration: currentToast.countdownDuration,
+      placement: currentToast.placement
+    )
+
+    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+      self.currentToast = updatedToast
+    }
+  }
+
+  func showProgressStep(_ step: Int, message: String, systemImage: String? = nil) {
+    guard step >= 1, step <= 4 else { return }
+
+    let progressMessage = message
+    showToast(
+      progressMessage,
+      type: .info,
+      systemImage: systemImage,
+      shouldStayVisible: true
+    )
+  }
+
+  func hideToast() {
+    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+      currentToast = nil
+    }
+    timer?.invalidate()
+    timer = nil
+    progressToastId = nil
+  }
+
+  private func setupTimer(duration: Double) {
+    timer?.invalidate()
+    timer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+      withAnimation(.linear(duration: 0.2)) {
+        self?.hideToast()
+      }
+    }
+  }
+}

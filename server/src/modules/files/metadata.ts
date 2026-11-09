@@ -1,0 +1,339 @@
+import { ApiError, InlineError } from "@in/server/types/errors"
+import { Log } from "@in/server/utils/log"
+import {
+  resolveVoiceMimeType,
+  validVoiceExtensions,
+} from "@in/server/modules/files/voiceMime"
+import sharp from "sharp"
+import { MEDIA_UPLOAD_MAX_BYTES } from "./limits"
+
+export { MEDIA_UPLOAD_MAX_BYTES } from "./limits"
+
+const log = new Log("modules/files/metadata")
+const validPhotoMimeTypes = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+const validPhotoExtensions = ["jpg", "jpeg", "png", "gif", "webp"]
+const maxFileSize = MEDIA_UPLOAD_MAX_BYTES.photo
+const maxPhotoDimensionSum = 15_000
+const maxPhotoAspectRatio = 20
+
+// Get the width and height of a photo and validate the dimensions
+export const getPhotoMetadataAndValidate = async (
+  file: File,
+): Promise<{ width: number; height: number; mimeType: string; fileName: string; extension: string }> => {
+  const fileName = file.name || "photo"
+  const size = file.size
+  const mimeType = file.type.trim()
+  let extension = fileName.split(".").pop()?.toLowerCase()
+
+  if (size === 0) {
+    throw badRequest("Uploaded photo is empty")
+  }
+
+  if (size > maxFileSize) {
+    throw new InlineError(InlineError.ApiError.FILE_TOO_LARGE)
+  }
+
+  if (!mimeType) {
+    throw badRequest("Uploaded photo is missing MIME type")
+  }
+
+  // Validate the extension
+  if (extension && !validPhotoExtensions.includes(extension)) {
+    throw new InlineError(InlineError.ApiError.PHOTO_INVALID_EXTENSION)
+  }
+  extension = extension ?? "jpg"
+
+  // Validate the mime type
+  if (!mimeType.startsWith("image/")) {
+    throw new InlineError(InlineError.ApiError.PHOTO_INVALID_TYPE)
+  }
+
+  if (!validPhotoMimeTypes.includes(mimeType)) {
+    throw new InlineError(InlineError.ApiError.PHOTO_INVALID_TYPE)
+  }
+
+  let width: number | undefined
+  let height: number | undefined
+
+  // Get original metadata including orientation
+  try {
+    const pipeline = sharp(await file.arrayBuffer())
+    const originalMetadata = await pipeline.metadata()
+
+    // Swap dimensions if needed based on EXIF orientation
+    const shouldSwap =
+      originalMetadata.orientation && originalMetadata.orientation >= 5 && originalMetadata.orientation <= 8
+    width = shouldSwap ? originalMetadata.height : originalMetadata.width
+    height = shouldSwap ? originalMetadata.width : originalMetadata.height
+
+    // Continue processing with auto-orientation
+    await pipeline.rotate().toBuffer() // Ensures image data is properly oriented
+  } catch (error) {
+    log.error("Photo metadata extraction failed", {
+      error,
+      fileName,
+      fileSize: size,
+      mimeType,
+      extension,
+    })
+    throw new InlineError(ApiError.PHOTO_INVALID_TYPE)
+  }
+
+  // Validate the dimensions
+  if (typeof width !== "number" || typeof height !== "number") {
+    throw photoDimensionsError("We couldn't read this image's dimensions. Try resaving it or send it as a file.")
+  }
+
+  if (width + height > maxPhotoDimensionSum) {
+    log.warn("Rejecting photo with oversized dimensions", {
+      fileName,
+      width,
+      height,
+      maxPhotoDimensionSum,
+    })
+    throw photoDimensionsError("This image is too large to send as a photo. Send it as a file instead.")
+  }
+
+  const ratio = Math.max(width / height, height / width)
+  if (ratio > maxPhotoAspectRatio) {
+    log.warn("Rejecting photo with extreme aspect ratio", {
+      fileName,
+      width,
+      height,
+      ratio,
+      maxPhotoAspectRatio,
+    })
+    throw photoDimensionsError("This image is too wide or too tall to send as a photo. Send it as a file instead.")
+  }
+
+  return { width, height, mimeType, fileName, extension }
+}
+
+const validVideoMimeTypes = ["video/mp4"]
+const validVideoExtensions = ["mp4"]
+const maxVideoFileSize = MEDIA_UPLOAD_MAX_BYTES.video
+
+export const getVideoMetadataAndValidate = async (
+  file: File,
+  width: number,
+  height: number,
+  duration: number,
+): Promise<{
+  width: number
+  height: number
+  duration: number
+  mimeType: string
+  fileName: string
+  extension: string
+}> => {
+  // TODO: Implement video metadata extraction using ffmpeg or similar
+  // For now, we'll do basic file validation
+
+  let fileName = file.name || "video"
+  let size = file.size
+  let mimeType = file.type.trim()
+  let extension = fileName.split(".").pop()?.toLowerCase()
+
+  if (size === 0) {
+    throw badRequest("Uploaded video is empty")
+  }
+
+  if (!mimeType) {
+    throw badRequest("Uploaded video is missing MIME type")
+  }
+
+  if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0) {
+    log.error("Invalid video dimensions", { width, height, duration, fileName, size, mimeType })
+    throw new InlineError(InlineError.ApiError.VIDEO_INVALID_DIMENSIONS)
+  }
+
+  if (!Number.isInteger(duration) || duration < 0) {
+    log.error("Invalid video duration", { width, height, duration, fileName, size, mimeType })
+    throw badRequest("Invalid video duration: expected integer >= 0")
+  }
+
+  // Validate the extension
+  if (extension && !validVideoExtensions.includes(extension)) {
+    throw new InlineError(InlineError.ApiError.VIDEO_INVALID_EXTENSION)
+  }
+  extension = extension ?? "mp4"
+
+  // Validate file size
+  if (size > maxVideoFileSize) {
+    throw new InlineError(InlineError.ApiError.FILE_TOO_LARGE)
+  }
+
+  // Validate the mime type
+  if (!mimeType.startsWith("video/")) {
+    throw new InlineError(InlineError.ApiError.VIDEO_INVALID_TYPE)
+  }
+
+  if (!validVideoMimeTypes.includes(mimeType)) {
+    throw new InlineError(InlineError.ApiError.VIDEO_INVALID_TYPE)
+  }
+
+  // TODO: Extract actual video metadata using ffmpeg
+
+  return { width, height, duration, mimeType, fileName, extension }
+}
+
+const maxDocumentFileSize = MEDIA_UPLOAD_MAX_BYTES.document
+
+export const getDocumentMetadataAndValidate = async (
+  file: File,
+): Promise<{ mimeType: string; fileName: string; extension: string }> => {
+  // it contains %20 stuff so we need to decode it
+  let fileName = decodeFileName(file.name, "document")
+
+  let size = file.size
+  let mimeType = file.type.trim()
+  let extension = extractDocumentExtension(fileName)
+
+  if (size === 0) {
+    throw badRequest("Uploaded document is empty")
+  }
+
+  extension = normalizeDocumentExtension(extension)
+  mimeType = mimeType || inferDocumentMimeType(extension)
+
+  // Validate file size
+  if (size > maxDocumentFileSize) {
+    throw new InlineError(InlineError.ApiError.FILE_TOO_LARGE)
+  }
+
+  return { mimeType, fileName, extension }
+}
+
+const maxVoiceFileSize = MEDIA_UPLOAD_MAX_BYTES.voice
+const maxVoiceWaveformBytes = 2048
+const documentMimeTypesByExtension: Record<string, string> = {
+  csv: "text/csv",
+  html: "text/html",
+  htm: "text/html",
+  js: "text/javascript",
+  json: "application/json",
+  md: "text/markdown",
+  ovpn: "application/x-openvpn-profile",
+  pdf: "application/pdf",
+  py: "text/x-python",
+  sh: "application/x-sh",
+  svg: "image/svg+xml",
+  txt: "text/plain",
+  xml: "application/xml",
+  yaml: "application/yaml",
+  yml: "application/yaml",
+  zip: "application/zip",
+}
+
+export const getVoiceMetadataAndValidate = async (
+  file: File,
+  duration: number,
+  waveform: Uint8Array,
+): Promise<{
+  duration: number
+  waveform: Uint8Array
+  mimeType: string
+  fileName: string
+  extension: string
+}> => {
+  const fileName = decodeFileName(file.name, "voice")
+  const size = file.size
+  const mimeType = file.type.trim().toLowerCase()
+  let extension = fileName.split(".").pop()?.toLowerCase()
+
+  if (size === 0) {
+    throw badRequest("Uploaded voice message is empty")
+  }
+
+  if (!mimeType) {
+    throw badRequest("Uploaded voice message is missing MIME type")
+  }
+
+  if (!Number.isInteger(duration) || duration < 0) {
+    throw badRequest("Invalid voice duration: expected integer >= 0")
+  }
+
+  if (waveform.length === 0) {
+    throw badRequest("Voice upload requires a non-empty waveform")
+  }
+
+  if (waveform.length > maxVoiceWaveformBytes) {
+    throw badRequest(`Voice waveform exceeds max size of ${maxVoiceWaveformBytes} bytes`)
+  }
+
+  if (!extension || !validVoiceExtensions.includes(extension)) {
+    throw badRequest("Voice upload requires .ogg, .oga, .m4a, or .mp4 extension")
+  }
+
+  if (size > maxVoiceFileSize) {
+    throw new InlineError(InlineError.ApiError.FILE_TOO_LARGE)
+  }
+
+  const voiceMime = resolveVoiceMimeType({ mimeType, extension })
+  if (!voiceMime.ok && voiceMime.reason === "unsupported-mime") {
+    throw badRequest("Voice upload requires audio/ogg, audio/mp4, or audio/x-m4a MIME type")
+  }
+
+  if (!voiceMime.ok) {
+    throw badRequest("Voice upload MIME type does not match file extension")
+  }
+
+  return {
+    duration,
+    waveform,
+    mimeType: voiceMime.mimeType,
+    fileName,
+    extension,
+  }
+}
+
+function decodeFileName(fileName: string | undefined, fallback: string): string {
+  const raw = fileName?.trim()
+  if (!raw) return fallback
+  try {
+    return decodeURIComponent(raw)
+  } catch (error) {
+    log.error("Failed to decode filename", { error, raw })
+    return raw
+  }
+}
+
+function inferDocumentMimeType(extension: string): string {
+  const normalized = extension.trim().toLowerCase()
+  if (!normalized) {
+    return "application/octet-stream"
+  }
+
+  return documentMimeTypesByExtension[normalized] ?? "application/octet-stream"
+}
+
+function extractDocumentExtension(fileName: string): string | undefined {
+  const trimmed = fileName.trim()
+  const lastDot = trimmed.lastIndexOf(".")
+  if (lastDot <= 0 || lastDot === trimmed.length - 1) {
+    return undefined
+  }
+
+  return trimmed.slice(lastDot + 1).toLowerCase()
+}
+
+function normalizeDocumentExtension(extension: string | undefined): string {
+  const normalized = extension?.trim().toLowerCase()
+  if (!normalized) {
+    return ""
+  }
+
+  return normalized
+}
+
+function badRequest(description: string): InlineError {
+  const error = new InlineError(ApiError.BAD_REQUEST)
+  error.description = description
+  return error
+}
+
+function photoDimensionsError(description: string): InlineError {
+  const error = new InlineError(ApiError.PHOTO_INVALID_DIMENSIONS)
+  error.description = description
+  return error
+}

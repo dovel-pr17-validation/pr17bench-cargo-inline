@@ -1,0 +1,2713 @@
+
+import Auth
+import Combine
+import GRDB
+import InlineIOSUI
+import InlineKit
+import InlineTheme
+import struct InlineProtocol.MessageAction
+import struct InlineProtocol.MessageActionRow
+import struct InlineProtocol.MessageEntities
+import struct InlineProtocol.MessageEntity
+import InlineUI
+import Logger
+import SwiftUI
+import TextProcessing
+import Translation
+import UIKit
+
+private enum MessageActionInvokeError: Error {
+  case invalidResponse
+}
+
+enum MessageDisplayMode: Equatable {
+  case normal
+  case threadAnchor
+}
+
+class UIMessageView: UIView {
+  // MARK: - Properties
+
+  private(set) var fullMessage: FullMessage
+  let spaceId: Int64?
+  let displayMode: MessageDisplayMode
+  private let maximumBubbleContentWidth: CGFloat
+  var initialMetadataStatus: MessageSendingStatus?
+  var bubbleTailSide: MessageBubbleTailSide
+  private(set) var theme: IOSThemeSnapshot
+  private var translationCancellable: AnyCancellable?
+  private var messageActionLoadingCancellable: AnyCancellable?
+  private var messageActionAnsweredCancellable: AnyCancellable?
+  private var messageActionGrantsCancellable: AnyCancellable?
+  var messageActionButtonsById: [String: MessageActionButton] = [:]
+  private var bubbleHorizontalConstraint: NSLayoutConstraint?
+  private var isTranslating = false {
+    didSet {
+      if isTranslating {
+        startShineAnimation()
+      } else {
+        stopShineAnimation()
+      }
+    }
+  }
+
+  private var shineEffectView: ShineEffectView?
+  private weak var linkLongPressGesture: UILongPressGestureRecognizer?
+  private weak var bubbleDoubleTapGesture: UITapGestureRecognizer?
+  private weak var backgroundDoubleTapGesture: UITapGestureRecognizer?
+
+  var onReactionsMenu: ((FullMessage) -> Void)?
+  var linkTapHandler: ((URL) -> Void)?
+  var onPhotoTap: ((FullMessage, UIView, UIImage?, URL) -> Void)? {
+    didSet {
+      bindPhotoTapHandlerIfNeeded()
+    }
+  }
+
+  var interaction: UIContextMenuInteraction?
+
+  static let attributedCache: NSCache<NSString, NSAttributedString> = {
+    let cache = NSCache<NSString, NSAttributedString>()
+    cache.countLimit = 1_000
+    return cache
+  }()
+  private static let singleLineWidthCache: NSCache<NSString, NSNumber> = {
+    let cache = NSCache<NSString, NSNumber>()
+    cache.countLimit = 1_000
+    return cache
+  }()
+  private static let maxInlineReactionUsers = 3
+  private lazy var reactionGroups: [GroupedReaction] = fullMessage.groupedReactions
+  private var pendingAnimatedReactionEmoji: String?
+
+  var outgoing: Bool {
+    fullMessage.message.out == true
+  }
+
+  var bubbleColor: UIColor {
+    if isEmojiOnlyMessage || isSticker || shouldClearBubbleForMedia {
+      UIColor.clear
+    } else if outgoing {
+      // Show red bubble for failed messages using theme-aware color
+      if message.status == .failed {
+        UIColor.systemRed
+      } else {
+        theme.outgoingBubble.uiColor
+      }
+    } else {
+      theme.incomingBubble.uiColor
+    }
+  }
+
+  var textColor: UIColor {
+    outgoing ? .white : theme.incomingText.uiColor
+  }
+
+  var forwardHeaderTextColor: UIColor {
+    if outgoing, bubbleColor != .clear {
+      return .white
+    }
+    return theme.primary.uiColor
+  }
+
+  private var forwardHeaderIsPrivate: Bool {
+    fullMessage.forwardHeaderIsPrivate
+  }
+
+  var forwardHeaderText: String {
+    fullMessage.forwardHeaderText
+  }
+
+  var shouldShowForwardHeader: Bool {
+    fullMessage.showsForwardHeader
+  }
+
+  var message: Message {
+    fullMessage.message
+  }
+
+  var shouldShowFloatingMetadata: Bool {
+    (message.hasPhoto || message.hasVideo) && !message.hasText && !shouldShowReactionsInsideBubble
+  }
+
+  private var hasAcknowledgement: Bool {
+    displayMode != .threadAnchor
+      && !message.isServiceMessage
+      && !fullMessage.acknowledgementActors.isEmpty
+  }
+
+  private var shouldClearBubbleForMedia: Bool {
+    shouldShowFloatingMetadata
+      && message.forwardFromUserId == nil
+      && message.repliedToMessageId == nil
+  }
+
+  private var supportsContinuousBubbleGradient: Bool {
+    !message.isServiceMessage
+      && message.status != .failed
+      && !isEmojiOnlyMessage
+      && !isSticker
+      && !shouldClearBubbleForMedia
+  }
+
+  var isSticker: Bool {
+    fullMessage.message.isSticker == true
+  }
+
+  private var hasMedia: Bool {
+    message.hasPhoto || message.hasVideo
+  }
+
+  private var hasLargeURLPreview: Bool {
+    fullMessage.attachments.contains { attachment in
+      guard let preview = attachment.urlPreview else { return false }
+      return URLPreviewView.preferredMode(for: preview, photoInfo: attachment.photoInfo) == .large
+    }
+  }
+
+  var shouldShowVoiceMessage: Bool {
+    message.hasVoice
+  }
+
+  /// The voice row is the bubble's last line, with no metadata footer below it.
+  private var isVoiceOnlyMessage: Bool {
+    shouldShowVoiceMessage && !message.hasText && !shouldShowReactionsInsideBubble
+  }
+
+  private var isMediaOnlyMessage: Bool {
+    hasMedia && !message.hasText
+  }
+
+  private var shouldPadForwardHeader: Bool {
+    hasMedia
+  }
+
+  private var shouldUseStandardMediaReplyPadding: Bool {
+    isMediaOnlyMessage && message.repliedToMessageId != nil && !shouldShowReactionsInsideBubble
+  }
+
+  private var shouldShowReactionsOutsideBubble: Bool {
+    shouldShowReactionsOutsideBubble(for: fullMessage)
+  }
+
+  private func shouldShowReactionsOutsideBubble(for fullMessage: FullMessage) -> Bool {
+    let message = fullMessage.message
+    let hasMedia = message.hasPhoto || message.hasVideo
+    return (hasMedia || message.isSticker == true) && !message.hasText && !fullMessage.reactions.isEmpty
+  }
+
+  private var shouldShowReactionsInsideBubble: Bool {
+    !fullMessage.reactions.isEmpty && !shouldShowReactionsOutsideBubble
+  }
+
+  private var shouldShareReactionRowWithMetadata: Bool {
+    shouldShareReactionRowWithMetadata(for: reactionGroups)
+  }
+
+  private func shouldShareReactionRowWithMetadata(for groups: [GroupedReaction]) -> Bool {
+    guard shouldShowReactionsInsideBubble,
+          groups.count == 1,
+          let reactionGroup = groups.first,
+          reactionGroup.reactions.count <= Self.maxInlineReactionUsers
+    else { return false }
+
+    return message.hasText &&
+      !hasMedia &&
+      !isEmojiOnlyMessage &&
+      message.repliedToMessageId == nil &&
+      !shouldShowForwardHeader &&
+      !shouldShowVoiceMessage &&
+      message.documentId == nil &&
+      fullMessage.file == nil &&
+      fullMessage.attachments.isEmpty &&
+      !shouldShowReplyThreadSummary &&
+      !hasMessageActionRows
+  }
+
+  lazy var messageActionRows: [MessageActionRow] = makeMessageActionRows()
+
+  private func makeMessageActionRows() -> [MessageActionRow] {
+    guard let actions = message.actions else { return [] }
+
+    return actions.rows.compactMap { row in
+      let filtered = row.actions.filter { action in
+        !action.actionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+          !action.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+          action.action != nil
+      }
+      guard !filtered.isEmpty else { return nil }
+
+      var cleaned = MessageActionRow()
+      cleaned.actions = filtered
+      return cleaned
+    }
+  }
+
+  var hasMessageActionRows: Bool {
+    !messageActionRows.isEmpty
+  }
+
+  var shouldShowReplyThreadSummary: Bool {
+    displayMode != .threadAnchor && message.hasReplyThreadSummary
+  }
+
+  var shouldUseWhiteReplyThreadSummary: Bool {
+    outgoing && bubbleColor != .clear
+  }
+
+  var isEmojiOnlyMessage: Bool {
+    if message.repliedToMessageId != nil || message.forwardFromUserId != nil {
+      return false
+    }
+    guard let text = message.text else { return false }
+    if text.containsOnlyEmojis {
+      return true
+    } else {
+      return false
+    }
+  }
+
+  var isSingleEmojiMessage: Bool {
+    guard let text = message.text else { return false }
+    return isEmojiOnlyMessage && text.count == 1
+  }
+
+  var isTripleEmojiMessage: Bool {
+    guard let text = message.text else { return false }
+    return isEmojiOnlyMessage && text.count <= 3
+  }
+
+  var isMultiline: Bool {
+    if requiresMultilineContentLayout { return true }
+    guard let text = fullMessage.displayText else { return false }
+
+    if text.contains("\n") || text.containsEmoji {
+      return true
+    }
+
+    return textMetadataLayoutMode != .inline
+  }
+
+  private var requiresMultilineContentLayout: Bool {
+    hasAcknowledgement ||
+      hasMessageActionRows ||
+      !fullMessage.reactions.isEmpty ||
+      shouldShowVoiceMessage ||
+      fullMessage.message.documentId != nil ||
+      fullMessage.file != nil ||
+      fullMessage.photoInfo != nil ||
+      fullMessage.videoInfo != nil ||
+      !fullMessage.attachments.isEmpty
+  }
+
+  private var textMetadataLayoutMode: MessageTextLayoutMode {
+    guard let text = fullMessage.displayText,
+          !text.contains("\n"),
+          !text.containsEmoji
+    else { return .multiline }
+
+    return MessageTextLayoutPolicy.mode(
+      textWidth: singleLineTextWidth,
+      metadataWidth: MessageTimeAndStatus.measuredWidth(for: fullMessage, compatibleWith: traitCollection),
+      maximumBubbleContentWidth: maximumBubbleContentWidth,
+      horizontalPadding: StackPadding.leading,
+      spacing: StackPadding.inlineTextMetadataSpacing
+    )
+  }
+
+  private var usesPlainTextMultilineLayout: Bool {
+    guard !requiresMultilineContentLayout,
+          let text = fullMessage.displayText,
+          !text.containsEmoji
+    else { return false }
+
+    return text.contains("\n") || textMetadataLayoutMode != .inline
+  }
+
+  private var shouldUseTransparentOutgoingReactions: Bool {
+    outgoing && (isEmojiOnlyMessage || isMediaOnlyMessage)
+  }
+
+  private var transparentOutgoingReactionOverrides: (primary: UIColor, secondary: UIColor) {
+    let baseColor = theme.incomingBubble.uiColor
+    let primary = darkenedColor(baseColor, amount: 0.08)
+    let secondary = darkenedColor(baseColor, amount: 0.04)
+    return (primary, secondary)
+  }
+
+  private func darkenedColor(_ color: UIColor, amount: CGFloat) -> UIColor {
+    UIColor { trait in
+      let resolved = color.resolvedColor(with: trait)
+      var r: CGFloat = 0
+      var g: CGFloat = 0
+      var b: CGFloat = 0
+      var a: CGFloat = 0
+      guard resolved.getRed(&r, green: &g, blue: &b, alpha: &a) else { return resolved }
+      return UIColor(
+        red: max(r - amount, 0),
+        green: max(g - amount, 0),
+        blue: max(b - amount, 0),
+        alpha: a
+      )
+    }
+  }
+
+  // MARK: - UI Components
+
+  let bubbleView = createBubbleView()
+  lazy var containerStack = createContainerStack()
+  lazy var singleLineContainer = createSingleLineStack()
+  lazy var multiLineContainer = createMultiLineStack()
+  lazy var messageLabel = createMessageLabel()
+  lazy var unsupportedLabel = createUnsupportedLabel()
+  lazy var embedView = createEmbedView()
+  lazy var forwardHeaderLabel = createForwardHeaderLabel()
+  lazy var photoView = createPhotoView()
+  lazy var newPhotoView = createNewPhotoView()
+  lazy var videoView = createVideoView()
+  lazy var floatingMetadataView = createFloatingMetadataView()
+  lazy var documentView = createDocumentView()
+  lazy var voiceMessageViewController = createVoiceMessageViewController()
+  lazy var messageAttachmentEmbed = createMessageAttachmentEmbed()
+  lazy var metadataView = createMessageTimeAndStatus()
+  lazy var messageActionsContainer = createMessageActionsContainer()
+  lazy var replyThreadSummaryView = createReplyThreadSummaryView()
+  lazy var serviceContainerView = createServiceContainerView()
+  lazy var serviceLabel = createServiceLabel()
+  private weak var metadataContainerView: UIStackView?
+
+  lazy var reactionsFlowView: ReactionsFlowView = {
+    let overrides = shouldUseTransparentOutgoingReactions ? transparentOutgoingReactionOverrides : nil
+    let view = ReactionsFlowView(
+      outgoing: outgoing,
+      reactionBackgroundPrimaryOverride: overrides?.primary,
+      reactionBackgroundSecondaryOverride: overrides?.secondary
+    )
+    view.isUserInteractionEnabled = true
+    view.onReactionTap = { [weak self] emoji in
+      guard let self else { return }
+
+      if let reaction = fullMessage.reactions
+        .filter({ $0.reaction.emoji == emoji && $0.reaction.userId == Auth.shared.getCurrentUserId() ?? 0 }).first
+      {
+        Transactions.shared.mutate(transaction: .deleteReaction(.init(
+          message: message,
+          emoji: emoji,
+          peerId: message.peerId,
+          chatId: message.chatId
+        )))
+      } else {
+        Transactions.shared.mutate(transaction: .addReaction(.init(
+          message: message,
+          emoji: emoji,
+          userId: Auth.shared.getCurrentUserId() ?? 0,
+          peerId: message.peerId
+        )))
+      }
+    }
+    return view
+  }()
+
+  let acknowledgementView = MessageAcknowledgementView()
+  private var acknowledgementWidthConstraint: NSLayoutConstraint?
+
+  // MARK: - Initialization
+
+  deinit {
+    translationCancellable?.cancel()
+    messageActionLoadingCancellable?.cancel()
+    messageActionAnsweredCancellable?.cancel()
+    messageActionGrantsCancellable?.cancel()
+  }
+
+  init(
+    fullMessage: FullMessage,
+    spaceId: Int64?,
+    displayMode: MessageDisplayMode = .normal,
+    bubbleTailSide: MessageBubbleTailSide = .none,
+    maximumBubbleContentWidth: CGFloat,
+    theme: IOSThemeSnapshot,
+    animatedReactionEmoji: String? = nil,
+    initialMetadataStatus: MessageSendingStatus? = nil,
+    buildHierarchy: Bool = true
+  ) {
+    self.fullMessage = fullMessage
+    self.spaceId = spaceId
+    self.displayMode = displayMode
+    self.bubbleTailSide = bubbleTailSide
+    self.maximumBubbleContentWidth = maximumBubbleContentWidth
+    self.theme = theme
+    self.pendingAnimatedReactionEmoji = animatedReactionEmoji
+    self.initialMetadataStatus = initialMetadataStatus
+
+    super.init(frame: .zero)
+
+    acknowledgementView.onToggle = { [weak self] in
+      self?.toggleAcknowledgement()
+    }
+    handleLinkTap()
+    if buildHierarchy {
+      setupViews()
+      registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (view: UIMessageView, _: UITraitCollection) in
+        view.refreshMessageTypography()
+        if view.message.isServiceMessage {
+          view.serviceLabel.font = .preferredFont(forTextStyle: .caption1, compatibleWith: view.traitCollection)
+          view.serviceLabel.attributedText = view.serviceAttributedText()
+        }
+        view.invalidateIntrinsicContentSize()
+        view.setNeedsLayout()
+      }
+    }
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func handleLinkTap() {
+    linkTapHandler = { [weak self] url in
+      if let target = Self.inlineMentionTarget(from: url) {
+        if let agentId = target.agentId,
+           let peer = self?.message.peerId
+        {
+          Task { @MainActor in
+            guard !(await BotAgentMentionNavigator.open(
+              agentId: agentId,
+              botUserId: target.userId,
+              peer: peer
+            )) else { return }
+            NotificationCenter.default.post(
+              name: Notification.Name("MentionTapped"),
+              object: nil,
+              userInfo: ["userId": target.userId]
+            )
+          }
+          return
+        }
+        NotificationCenter.default.post(
+          name: Notification.Name("MentionTapped"),
+          object: nil,
+          userInfo: ["userId": target.userId]
+        )
+        return
+      }
+
+      InAppBrowser.shared.open(url, from: self?.findViewController())
+    }
+  }
+
+  private func presentLinkActionSheet(for linkTarget: LinkContextMenuTarget) {
+    presentLinkActionSheet(
+      url: linkTarget.url,
+      sourceView: messageLabel,
+      sourceRect: linkTarget.rectInMessageLabel
+    )
+  }
+
+  func presentLinkActionSheet(url: URL, sourceView: UIView, sourceRect: CGRect) {
+    guard let viewController = findViewController() else {
+      InAppBrowser.shared.open(url)
+      return
+    }
+
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+
+    let alert = UIAlertController(
+      title: nil,
+      message: url.absoluteString,
+      preferredStyle: .actionSheet
+    )
+
+    alert.addAction(UIAlertAction(title: "Open", style: .default) { _ in
+      InAppBrowser.shared.open(url, from: viewController)
+    })
+
+    alert.addAction(UIAlertAction(title: "Copy Link", style: .default) { _ in
+      UIPasteboard.general.string = url.absoluteString
+      ToastManager.shared.showToast(
+        "Copied link",
+        type: .success,
+        systemImage: "doc.on.doc"
+      )
+    })
+
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+    if let popover = alert.popoverPresentationController {
+      popover.sourceView = sourceView
+      popover.sourceRect = sourceRect
+      popover.permittedArrowDirections = []
+    }
+
+    viewController.present(alert, animated: true)
+  }
+
+  func setupViews() {
+    if message.isServiceMessage {
+      setupServiceMessage()
+      return
+    }
+
+    bubbleView.isUserInteractionEnabled = true
+    messageLabel.isUserInteractionEnabled = true
+    containerStack.isUserInteractionEnabled = true
+
+    addSubview(bubbleView)
+    bubbleView.contentView.addSubview(containerStack)
+
+    setupForwardHeaderIfNeeded()
+    setupReplyViewIfNeeded()
+    setupFileViewIfNeeded()
+    setupPhotoViewIfNeeded()
+    setupVideoViewIfNeeded()
+    setupDocumentViewIfNeeded()
+    setupMessageContainer()
+    setupReplyThreadSummaryIfNeeded()
+    setupMessageActionsIfNeeded()
+    setupExternalReactionsIfNeeded()
+
+    addGestureRecognizer()
+    setupDoubleTapGestureRecognizer()
+    setupAppearance()
+    setupConstraints()
+    setupTranslationObserver()
+  }
+
+  private func setupServiceMessage() {
+    serviceLabel.attributedText = serviceAttributedText()
+    serviceLabel.isUserInteractionEnabled = true
+    serviceLabel.addGestureRecognizer(UITapGestureRecognizer(
+      target: self,
+      action: #selector(handleServiceMessageTap)
+    ))
+    addSubview(serviceContainerView)
+    serviceContainerView.addSubview(serviceLabel)
+
+    NSLayoutConstraint.activate([
+      serviceContainerView.centerXAnchor.constraint(equalTo: centerXAnchor),
+      serviceContainerView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+      serviceContainerView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+      // A multiline label cannot reliably self-size when both its wrapping width and its
+      // container width are inferred from one another. UICollectionView repeatedly invalidates
+      // that circular layout on iOS 26 and eventually trips its feedback-loop assertion.
+      serviceContainerView.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.9),
+
+      serviceLabel.topAnchor.constraint(equalTo: serviceContainerView.topAnchor, constant: 6),
+      serviceLabel.leadingAnchor.constraint(equalTo: serviceContainerView.leadingAnchor, constant: 10),
+      serviceLabel.trailingAnchor.constraint(equalTo: serviceContainerView.trailingAnchor, constant: -10),
+      serviceLabel.bottomAnchor.constraint(equalTo: serviceContainerView.bottomAnchor, constant: -6),
+    ])
+  }
+
+  func serviceAttributedText() -> NSAttributedString {
+    let segments = fullMessage.serviceDisplaySegments ?? [
+      MessageServiceDisplaySegment(text: message.serviceFallbackText
+        ?? message.text
+        ?? message.stringRepresentationPlain),
+    ]
+    let text = NSMutableAttributedString()
+
+    for segment in segments {
+      text.append(serviceAttributedText(for: segment))
+    }
+
+    return text
+  }
+
+  private func serviceAttributedText(for segment: MessageServiceDisplaySegment) -> NSAttributedString {
+    let paragraphStyle = NSMutableParagraphStyle()
+    paragraphStyle.alignment = .center
+    paragraphStyle.lineBreakMode = .byWordWrapping
+
+    var attributes: [NSAttributedString.Key: Any] = [
+      .font: serviceLabel.font ?? UIFont.preferredFont(forTextStyle: .caption1),
+      .foregroundColor: serviceTextColor(for: segment.tone),
+      .paragraphStyle: paragraphStyle,
+    ]
+
+    switch segment.link {
+      case let .user(userId):
+        attributes[.mentionUserId] = userId
+      case let .thread(chatId):
+        attributes[.threadLink] = ThreadLinkTarget.chatId(chatId)
+      case nil:
+        break
+    }
+
+    return NSAttributedString(string: segment.text, attributes: attributes)
+  }
+
+  private func serviceTextColor(for tone: MessageServiceDisplaySegment.Tone) -> UIColor {
+    switch tone {
+      case .primary:
+        return .label
+      case .secondary:
+        return theme.incomingSecondaryText.uiColor
+      case .tertiary:
+        return .tertiaryLabel
+    }
+  }
+
+  func setupTranslationObserver() {
+    translationCancellable = TranslatingStatePublisher.shared.publisher.sink { [weak self] translatingSet in
+      guard let self else { return }
+      let isCurrentlyTranslating = translatingSet.contains { translating in
+        translating.messageId == self.message.messageId && translating.peerId == self.message.peerId
+      }
+
+      if isCurrentlyTranslating != isTranslating {
+        isTranslating = isCurrentlyTranslating
+      }
+    }
+  }
+
+  private func startShineAnimation() {
+    if shineEffectView == nil {
+      let shineHost = bubbleView.contentView
+      let shineView = ShineEffectView(frame: shineHost.bounds)
+      shineView.translatesAutoresizingMaskIntoConstraints = false
+      shineView.layer.cornerRadius = MessageBubbleView.cornerRadius
+      shineView.layer.masksToBounds = true
+      shineHost.addSubview(shineView)
+
+      NSLayoutConstraint.activate([
+        shineView.topAnchor.constraint(equalTo: shineHost.topAnchor),
+        shineView.leadingAnchor.constraint(equalTo: shineHost.leadingAnchor),
+        shineView.trailingAnchor.constraint(equalTo: shineHost.trailingAnchor),
+        shineView.bottomAnchor.constraint(equalTo: shineHost.bottomAnchor),
+      ])
+
+      shineEffectView = shineView
+      shineView.startAnimation()
+    }
+  }
+
+  public func stopShineAnimation() {
+    shineEffectView?.stopAnimation()
+    shineEffectView?.removeFromSuperview()
+    shineEffectView = nil
+  }
+
+  public func refreshAppearance() {
+    setupAppearance()
+  }
+
+  func applyTheme(_ theme: IOSThemeSnapshot) {
+    guard self.theme != theme else { return }
+    self.theme = theme
+    if message.isServiceMessage {
+      serviceLabel.attributedText = serviceAttributedText()
+      return
+    }
+    setupAppearance()
+    forwardHeaderLabel.textColor = forwardHeaderTextColor
+  }
+
+  func updateContinuousBubbleGradient(in viewport: UIView) {
+    guard supportsContinuousBubbleGradient else { return }
+
+    let bubbleFrame = bubbleView.convert(bubbleView.bounds, to: viewport).standardized
+    let viewportBounds = viewport.bounds.standardized
+    guard bubbleFrame.height > 0, viewportBounds.height > 0 else { return }
+
+    guard let vector = ThemeCatalog.bubbleGradientVector(
+      bubbleMinY: Double(bubbleFrame.minY),
+      bubbleHeight: Double(bubbleFrame.height),
+      viewportMinY: Double(viewportBounds.minY),
+      viewportHeight: Double(viewportBounds.height)
+    ) else { return }
+    bubbleView.updateContinuousGradient(
+      startY: CGFloat(vector.startY),
+      endY: CGFloat(vector.endY)
+    )
+  }
+
+  func reset() {
+    // Cancel translation state observation
+    translationCancellable?.cancel()
+    translationCancellable = nil
+
+    // Remove shine effect
+    stopShineAnimation()
+
+    // Reset appearance-related properties
+    bubbleView.backgroundColor = bubbleColor
+    updateBubbleShape()
+    messageLabel.textColor = textColor
+
+    // Re-setup translation state observation
+    setupTranslationObserver()
+  }
+
+  func highlightMediaOverlay() {
+    if fullMessage.photoInfo != nil {
+      newPhotoView.showHighlight()
+    }
+    if fullMessage.videoInfo != nil {
+      videoView.showHighlight()
+    }
+  }
+
+  func clearMediaHighlight() {
+    if fullMessage.photoInfo != nil {
+      newPhotoView.clearHighlight()
+    }
+    if fullMessage.videoInfo != nil {
+      videoView.clearHighlight()
+    }
+  }
+
+  func createURLPreviewView(for attachment: FullAttachment) -> URLPreviewView {
+    let previewView = URLPreviewView()
+    previewView.translatesAutoresizingMaskIntoConstraints = false
+    configureURLPreviewView(previewView, for: attachment)
+    return previewView
+  }
+
+  func configureURLPreviewView(_ previewView: URLPreviewView, for attachment: FullAttachment) {
+    guard let preview = attachment.urlPreview else { return }
+    previewView.configure(
+      with: preview,
+      photoInfo: attachment.photoInfo,
+      authorPhotoInfo: attachment.authorPhotoInfo,
+      parentViewController: findViewController(),
+      outgoing: outgoing,
+      mode: URLPreviewView.preferredMode(for: preview, photoInfo: attachment.photoInfo),
+      reloadMessageOnFinish: message,
+      canRemove: outgoing && attachment.attachment.attachmentId != nil,
+      onRemove: { [weak self] in
+        self?.removeURLPreviewAttachment(attachment)
+      },
+      neverShowPreviewActionProvider: { [weak self] in
+        self?.makeURLPreviewExclusionAction(for: attachment)
+      }
+    )
+  }
+
+  private func makeURLPreviewExclusionAction(for attachment: FullAttachment) -> URLPreviewView.NeverShowPreviewAction? {
+    MessageViewActions.neverShowPreviewAction(for: attachment, in: message)
+  }
+
+  private func removeURLPreviewAttachment(_ attachment: FullAttachment) {
+    MessageViewActions.removeURLPreview(attachment, from: message)
+  }
+
+  private func addURLPreviewView(for attachment: FullAttachment, to stack: UIStackView) {
+    let spacing = stack.spacing / 2
+    if let previousView = stack.arrangedSubviews.last {
+      stack.setCustomSpacing(spacing, after: previousView)
+    }
+
+    let previewView = createURLPreviewView(for: attachment)
+    stack.addArrangedSubview(previewView)
+    stack.setCustomSpacing(spacing, after: previewView)
+  }
+
+  func addFloatingMetadata(relativeTo mediaView: UIView) {
+    if hasAcknowledgement, shouldShowReactionsOutsideBubble {
+      addSubview(floatingMetadataView)
+      return
+    }
+    bubbleView.contentView.addSubview(floatingMetadataView)
+
+    let padding: CGFloat = 12
+    var constraints = [
+      floatingMetadataView.bottomAnchor.constraint(equalTo: mediaView.bottomAnchor, constant: -10),
+    ]
+
+    if hasAcknowledgement, !shouldShowReactionsOutsideBubble {
+      installAcknowledgementView(in: bubbleView.contentView)
+      constraints += [
+        acknowledgementView.rightAnchor.constraint(
+          equalTo: bubbleView.contentView.rightAnchor,
+          constant: -padding
+        ),
+        acknowledgementView.bottomAnchor.constraint(equalTo: floatingMetadataView.bottomAnchor),
+        floatingMetadataView.rightAnchor.constraint(
+          equalTo: acknowledgementView.leftAnchor,
+          constant: -5
+        ),
+      ]
+    } else {
+      constraints.append(
+        floatingMetadataView.trailingAnchor.constraint(
+          equalTo: bubbleView.contentView.trailingAnchor,
+          constant: -padding
+        )
+      )
+    }
+
+    NSLayoutConstraint.activate(constraints)
+  }
+
+  func setupReactionsIfNeeded(animatedEmoji: String? = nil) {
+    guard !fullMessage.reactions.isEmpty else { return }
+
+    let emojiToAnimate = animatedEmoji ?? pendingAnimatedReactionEmoji
+    pendingAnimatedReactionEmoji = nil
+
+    // Configure reactions using groupedReactions from FullMessage
+    reactionsFlowView.configure(
+      with: reactionGroups,
+      animatedEmoji: emojiToAnimate
+    )
+  }
+
+  func canUpdateReactionsInPlace(to updatedMessage: FullMessage) -> Bool {
+    guard !fullMessage.reactions.isEmpty, !updatedMessage.reactions.isEmpty else { return false }
+
+    let currentIsOutside = shouldShowReactionsOutsideBubble
+    let updatedIsOutside = shouldShowReactionsOutsideBubble(for: updatedMessage)
+    guard currentIsOutside == updatedIsOutside else { return false }
+
+    return shouldShareReactionRowWithMetadata
+      == shouldShareReactionRowWithMetadata(for: updatedMessage.groupedReactions)
+  }
+
+  func updateReactions(to updatedMessage: FullMessage, animatedEmoji: String?) {
+    fullMessage = updatedMessage
+    reactionGroups = updatedMessage.groupedReactions
+    reactionsFlowView.configure(with: reactionGroups, animatedEmoji: animatedEmoji)
+    setNeedsLayout()
+  }
+
+  func updateDeliveryAcknowledgement(to updatedMessage: FullMessage) {
+    fullMessage = updatedMessage
+
+    if shouldShowFloatingMetadata {
+      floatingMetadataView.updateMessage(updatedMessage, animated: true)
+    } else {
+      metadataView.updateMessage(updatedMessage, animated: true)
+    }
+  }
+
+  func updateAcknowledgement(to updatedMessage: FullMessage) {
+    fullMessage = updatedMessage
+    acknowledgementView.configure(updatedMessage)
+    acknowledgementWidthConstraint?.constant = updatedMessage.acknowledgementPillWidth
+    setNeedsLayout()
+  }
+
+  func canUpdateAcknowledgementInPlace(to updatedMessage: FullMessage) -> Bool {
+    let wasVisible = hasAcknowledgement
+    let isVisible = displayMode != .threadAnchor
+      && !updatedMessage.message.isServiceMessage
+      && !updatedMessage.acknowledgementActors.isEmpty
+    guard wasVisible == isVisible else { return false }
+    return !isVisible
+      || abs(fullMessage.acknowledgementPillWidth - updatedMessage.acknowledgementPillWidth) <= 0.5
+  }
+
+  private func configureAcknowledgementView() {
+    acknowledgementView.configure(fullMessage)
+    acknowledgementView.translatesAutoresizingMaskIntoConstraints = false
+    acknowledgementView.setContentHuggingPriority(.required, for: .horizontal)
+    acknowledgementView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+    guard acknowledgementWidthConstraint == nil else { return }
+    let widthConstraint = acknowledgementView.widthAnchor.constraint(
+      equalToConstant: fullMessage.acknowledgementPillWidth
+    )
+    acknowledgementWidthConstraint = widthConstraint
+    NSLayoutConstraint.activate([
+      widthConstraint,
+      acknowledgementView.heightAnchor.constraint(equalToConstant: 16),
+    ])
+  }
+
+  private func installAcknowledgementView(in container: UIView) {
+    guard hasAcknowledgement else { return }
+    configureAcknowledgementView()
+    if acknowledgementView.superview == nil {
+      container.addSubview(acknowledgementView)
+    }
+  }
+
+  private func addAcknowledgementIfNeeded(to stack: UIStackView) {
+    guard hasAcknowledgement else { return }
+    configureAcknowledgementView()
+    stack.addArrangedSubview(acknowledgementView)
+  }
+
+  func replaceFullMessageSnapshot(_ updatedMessage: FullMessage) {
+    fullMessage = updatedMessage
+    reactionGroups = updatedMessage.groupedReactions
+  }
+
+  func animateInitialDeliveryAcknowledgementIfNeeded() {
+    guard initialMetadataStatus != nil else { return }
+    initialMetadataStatus = nil
+
+    if shouldShowFloatingMetadata {
+      floatingMetadataView.updateMessage(fullMessage, animated: true)
+    } else {
+      metadataView.updateMessage(fullMessage, animated: true)
+    }
+  }
+
+  private func setupExternalReactionsIfNeeded() {
+    guard shouldShowReactionsOutsideBubble else { return }
+    addSubview(reactionsFlowView)
+    setupReactionsIfNeeded()
+    reactionsFlowView.setContentHuggingPriority(.required, for: .horizontal)
+    reactionsFlowView.setContentCompressionResistancePriority(.required, for: .horizontal)
+  }
+
+  private func setupExternalReactionsConstraints() {
+    let spacing: CGFloat = 3
+    let bottomPadding: CGFloat = spacing + 2
+    let bottomConstraint = reactionsFlowView.bottomAnchor.constraint(
+      equalTo: bottomAnchor,
+      constant: -bottomPadding
+    )
+    var constraints: [NSLayoutConstraint] = [
+      reactionsFlowView.topAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: spacing),
+      bottomConstraint,
+      reactionsFlowView.widthAnchor.constraint(lessThanOrEqualTo: bubbleView.contentView.widthAnchor),
+    ]
+
+    if hasAcknowledgement {
+      installAcknowledgementView(in: self)
+      reactionsFlowView.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+      var reactionRightAnchor = acknowledgementView.leftAnchor
+      if shouldShowFloatingMetadata {
+        reactionRightAnchor = floatingMetadataView.leftAnchor
+        constraints += [
+          floatingMetadataView.rightAnchor.constraint(
+            equalTo: acknowledgementView.leftAnchor,
+            constant: -5
+          ),
+          floatingMetadataView.bottomAnchor.constraint(equalTo: reactionsFlowView.bottomAnchor),
+        ]
+      }
+      constraints += [
+        reactionsFlowView.leftAnchor.constraint(equalTo: bubbleView.contentView.leftAnchor),
+        reactionsFlowView.rightAnchor.constraint(
+          lessThanOrEqualTo: reactionRightAnchor,
+          constant: -6
+        ),
+        acknowledgementView.rightAnchor.constraint(equalTo: bubbleView.contentView.rightAnchor),
+        acknowledgementView.bottomAnchor.constraint(equalTo: reactionsFlowView.bottomAnchor),
+      ]
+    } else if outgoing {
+      constraints.append(reactionsFlowView.trailingAnchor.constraint(equalTo: bubbleView.contentView.trailingAnchor))
+      constraints.append(reactionsFlowView.leadingAnchor.constraint(greaterThanOrEqualTo: bubbleView.contentView.leadingAnchor))
+    } else {
+      constraints.append(reactionsFlowView.leadingAnchor.constraint(equalTo: bubbleView.contentView.leadingAnchor))
+      constraints.append(reactionsFlowView.trailingAnchor.constraint(lessThanOrEqualTo: bubbleView.contentView.trailingAnchor))
+    }
+
+    NSLayoutConstraint.activate(constraints)
+  }
+
+  func setupMessageActionsIfNeeded() {
+    guard hasMessageActionRows else { return }
+
+    if messageActionsContainer.superview == nil {
+      addSubview(messageActionsContainer)
+    }
+
+    messageActionButtonsById.removeAll(keepingCapacity: true)
+    messageActionsContainer.arrangedSubviews.forEach { subview in
+      messageActionsContainer.removeArrangedSubview(subview)
+      subview.removeFromSuperview()
+    }
+
+    for row in messageActionRows {
+      let rowStack = createMessageActionRowStack()
+      for action in row.actions {
+        let button = createMessageActionButton(for: action)
+        rowStack.addArrangedSubview(button)
+        messageActionButtonsById[button.actionId] = button
+      }
+      messageActionsContainer.addArrangedSubview(rowStack)
+    }
+
+    setupMessageActionStateSubscriptions()
+    updateMessageActionButtonsLoadingState()
+  }
+
+  func setupMessageActionStateSubscriptions() {
+    messageActionLoadingCancellable?.cancel()
+    messageActionAnsweredCancellable?.cancel()
+    messageActionGrantsCancellable?.cancel()
+
+    // Grants load once per bot; re-render so buttons the viewer cannot use
+    // turn disabled with their reason.
+    messageActionGrantsCancellable = AgentGrantStore.shared.$accessByBotUserID
+      .map { [botUserID = message.fromId] in $0[botUserID] }
+      .removeDuplicates()
+      .dropFirst()
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.refreshMessageActionPresentations()
+      }
+
+    messageActionLoadingCancellable = MessageActionInteractionState.shared.loadingPublisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.updateMessageActionButtonsLoadingState()
+      }
+
+    messageActionAnsweredCancellable = MessageActionInteractionState.shared.answeredPublisher
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] event in
+        guard let self else { return }
+        guard event.key.peerId == message.peerId, event.key.messageId == message.messageId else { return }
+
+        if let toastText = event.toastText {
+          ToastManager.shared.showToast(
+            toastText,
+            type: .info
+          )
+        }
+        if let alert = event.alert {
+          MessageActionPerformer.presentAlert(alert, from: self)
+        }
+      }
+  }
+
+  func refreshMessageActionPresentations() {
+    for row in messageActionRows {
+      for action in row.actions {
+        messageActionButtonsById[action.actionID]?.configure(
+          action: action,
+          outgoing: outgoing,
+          presentation: MessageActionPerformer.presentation(for: action, message: message)
+        )
+      }
+    }
+    updateMessageActionButtonsLoadingState()
+  }
+
+  func updateMessageActionButtonsLoadingState() {
+    guard !messageActionButtonsById.isEmpty else { return }
+
+    for (actionId, button) in messageActionButtonsById {
+      let key = MessageActionInteractionState.LoadingKey(
+        peerId: message.peerId,
+        messageId: message.messageId,
+        rev: message.rev,
+        actionId: actionId
+      )
+      let isLoading = MessageActionInteractionState.shared.isLoading(key: key)
+
+      button.refreshStyle()
+      button.setLoading(isLoading)
+    }
+  }
+
+  @objc func handleMessageActionButtonTap(_ sender: MessageActionButton) {
+    guard let action = sender.messageAction else { return }
+
+    let presentation = MessageActionPerformer.presentation(for: action, message: message)
+    MessageActionPerformer.run(presentation, from: self) { [weak self] in
+      if presentation.intent == .callback {
+        self?.invokeMessageCallbackAction(action)
+      } else {
+        MessageActionPerformer.performLocal(presentation.intent)
+      }
+    }
+  }
+
+  private func invokeMessageCallbackAction(_ action: MessageAction) {
+    let actionId = action.actionID.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !actionId.isEmpty else { return }
+
+    let loadingKey = MessageActionInteractionState.LoadingKey(
+      peerId: message.peerId,
+      messageId: message.messageId,
+      rev: message.rev,
+      actionId: actionId
+    )
+
+    guard MessageActionInteractionState.shared.begin(key: loadingKey) else { return }
+    updateMessageActionButtonsLoadingState()
+
+    Task {
+      do {
+        let result = try await Api.realtime.send(
+          .invokeMessageAction(
+            peerId: message.peerId,
+            messageId: message.messageId,
+            actionId: actionId
+          )
+        )
+
+        guard case let .invokeMessageAction(response) = result else {
+          throw MessageActionInvokeError.invalidResponse
+        }
+
+        await MainActor.run {
+          MessageActionInteractionState.shared.attachInteractionId(
+            response.interactionID,
+            for: loadingKey
+          )
+        }
+      } catch {
+        await MainActor.run {
+          MessageActionInteractionState.shared.fail(key: loadingKey)
+          ToastManager.shared.showToast(
+            "Action failed",
+            type: .error,
+            systemImage: "exclamationmark.triangle"
+          )
+        }
+      }
+    }
+  }
+
+  private func setupMessageActionsConstraints() {
+    var constraints: [NSLayoutConstraint] = [
+      messageActionsContainer.topAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: 4),
+      messageActionsContainer.widthAnchor.constraint(lessThanOrEqualTo: bubbleView.contentView.widthAnchor),
+    ]
+
+    if outgoing {
+      constraints.append(messageActionsContainer.trailingAnchor.constraint(equalTo: bubbleView.contentView.trailingAnchor))
+      constraints.append(messageActionsContainer.leadingAnchor.constraint(greaterThanOrEqualTo: bubbleView.contentView.leadingAnchor))
+    } else {
+      constraints.append(messageActionsContainer.leadingAnchor.constraint(equalTo: bubbleView.contentView.leadingAnchor))
+      constraints.append(messageActionsContainer.trailingAnchor.constraint(lessThanOrEqualTo: bubbleView.contentView.trailingAnchor))
+    }
+
+    NSLayoutConstraint.activate(constraints)
+  }
+
+  func setupReplyThreadSummaryIfNeeded() {
+    guard shouldShowReplyThreadSummary, let summary = message.threadCard else { return }
+
+    replyThreadSummaryView.configure(
+      kind: summary.kind,
+      messageCount: summary.messageCount,
+      recentAuthors: recentReplyThreadAuthors(),
+      hasUnread: summary.hasUnread,
+      outgoing: shouldUseWhiteReplyThreadSummary,
+      title: fullMessage.threadCardTitle
+    )
+    replyThreadSummaryView.onTap = { [weak self] in
+      guard let self else { return }
+      ReplyThreadNavigator.open(message: message, source: .summary) { [weak self] loading in
+        self?.replyThreadSummaryView.setLoading(loading)
+      }
+    }
+    replyThreadSummaryView.contextMenuProvider = { [weak self] in
+      self?.makeReplyThreadSummaryMenu()
+    }
+
+    containerStack.addArrangedSubview(replyThreadSummaryView)
+  }
+
+  func makeReplyThreadSummaryMenu() -> UIMenu {
+    let isDisabled = message.status == .sending || message.status == .failed
+    let attributes: UIMenuElement.Attributes = isDisabled ? [.disabled] : []
+
+    let openAction = UIAction(
+      title: message.isSubthreadPlacement ? "Open Subthread" : "Open Thread",
+      image: UIImage(systemName: "arrow.turn.down.right"),
+      attributes: attributes
+    ) { [weak self] _ in
+      guard let self else { return }
+      ReplyThreadNavigator.open(message: message, source: .menu)
+    }
+
+    let copyLinkAction = UIAction(
+      title: "Copy Link",
+      image: UIImage(systemName: "link"),
+      attributes: attributes
+    ) { [weak self] _ in
+      guard let self else { return }
+      ReplyThreadNavigator.copyLink(message: message)
+    }
+
+    let addToInboxAction = UIAction(
+      title: "Open",
+      subtitle: "Add to Open Chats",
+      image: UIImage(systemName: "tray.and.arrow.down"),
+      attributes: attributes
+    ) { [weak self] _ in
+      guard let self else { return }
+      ReplyThreadNavigator.addToInbox(message: message)
+    }
+
+    var actions: [UIMenuElement] = [openAction, copyLinkAction, addToInboxAction]
+    if message.isSubthreadPlacement {
+      actions.append(UIAction(
+        title: "Delete",
+        image: UIImage(systemName: "trash"),
+        attributes: .destructive
+      ) { [weak self] _ in
+        self?.showDeleteConfirmation()
+      })
+    }
+
+    return UIMenu(children: actions)
+  }
+
+  func recentReplyThreadAuthors() -> [UserInfo] {
+    let userIds = message.replyThreadRecentReplierUserIds
+    let users = ObjectCache.shared.get(userIds.map(ObjectID.user))
+    return userIds.map { userId in
+      users.user(userId) ?? UserInfo(
+        user: User(id: userId, email: nil, firstName: nil)
+      )
+    }
+  }
+
+  func setupReplyViewIfNeeded() {
+    guard message.repliedToMessageId != nil else { return }
+
+    let replyHostView: UIView
+    if shouldUseStandardMediaReplyPadding {
+      let replyContainer = UIView()
+      replyContainer.translatesAutoresizingMaskIntoConstraints = false
+      replyContainer.layoutMargins = UIEdgeInsets(
+        top: StackPadding.replyInset,
+        left: StackPadding.replyInset,
+        bottom: StackPadding.replyInset,
+        right: StackPadding.replyInset
+      )
+      replyContainer.insetsLayoutMarginsFromSafeArea = false
+
+      embedView.translatesAutoresizingMaskIntoConstraints = false
+      replyContainer.addSubview(embedView)
+      NSLayoutConstraint.activate([
+        embedView.topAnchor.constraint(equalTo: replyContainer.layoutMarginsGuide.topAnchor),
+        embedView.leadingAnchor.constraint(equalTo: replyContainer.layoutMarginsGuide.leadingAnchor),
+        embedView.trailingAnchor.constraint(equalTo: replyContainer.layoutMarginsGuide.trailingAnchor),
+        embedView.bottomAnchor.constraint(equalTo: replyContainer.layoutMarginsGuide.bottomAnchor),
+      ])
+
+      containerStack.addArrangedSubview(replyContainer)
+      containerStack.setCustomSpacing(StackPadding.replyBottomSpacing, after: replyContainer)
+      replyHostView = replyContainer
+    } else {
+      containerStack.addArrangedSubview(embedView)
+      replyHostView = embedView
+    }
+
+    let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleEmbedViewTap))
+    replyHostView.isUserInteractionEnabled = true
+    replyHostView.addGestureRecognizer(tapGesture)
+
+    if let embeddedMessage = fullMessage.repliedToMessage {
+      embedView.configure(
+        embeddedMessage: embeddedMessage,
+        kind: .replyInMessage,
+        outgoing: outgoing,
+        isOnlyEmoji: isEmojiOnlyMessage,
+        thumbnailReloadMessage: fullMessage.message,
+        quote: fullMessage.leadingReplyQuote?.text
+      )
+    } else {
+      embedView.showNotLoaded(kind: .replyInMessage, outgoing: outgoing, isOnlyEmoji: isEmojiOnlyMessage)
+      ensureRepliedMessageCachedOnce()
+    }
+  }
+
+  func ensureRepliedMessageCachedOnce() {
+    guard let repliedId = message.repliedToMessageId, repliedId > 0 else { return }
+    let peer = message.peerId
+    let chatId = message.chatId
+
+    Task.detached(priority: .utility) {
+      await TargetMessagesFetcher.shared.ensureCachedOnce(peer: peer, chatId: chatId, messageIds: [repliedId])
+    }
+  }
+
+  private func setupForwardHeaderIfNeeded() {
+    guard shouldShowForwardHeader else { return }
+    forwardHeaderLabel.textColor = forwardHeaderTextColor
+    forwardHeaderLabel.text = forwardHeaderText
+    if shouldPadForwardHeader {
+      let headerContainer = UIView()
+      headerContainer.translatesAutoresizingMaskIntoConstraints = false
+      headerContainer.layoutMargins = UIEdgeInsets(
+        top: StackPadding.forwardHeaderVertical,
+        left: StackPadding.leading,
+        bottom: StackPadding.forwardHeaderVertical,
+        right: StackPadding.trailing
+      )
+      headerContainer.insetsLayoutMarginsFromSafeArea = false
+      forwardHeaderLabel.translatesAutoresizingMaskIntoConstraints = false
+      headerContainer.addSubview(forwardHeaderLabel)
+      NSLayoutConstraint.activate([
+        forwardHeaderLabel.topAnchor.constraint(equalTo: headerContainer.layoutMarginsGuide.topAnchor),
+        forwardHeaderLabel.leadingAnchor.constraint(equalTo: headerContainer.layoutMarginsGuide.leadingAnchor),
+        forwardHeaderLabel.trailingAnchor.constraint(equalTo: headerContainer.layoutMarginsGuide.trailingAnchor),
+        forwardHeaderLabel.bottomAnchor.constraint(equalTo: headerContainer.layoutMarginsGuide.bottomAnchor),
+      ])
+      containerStack.addArrangedSubview(headerContainer)
+      containerStack.setCustomSpacing(StackPadding.forwardHeaderSpacing, after: headerContainer)
+    } else {
+      containerStack.addArrangedSubview(forwardHeaderLabel)
+      containerStack.setCustomSpacing(StackPadding.forwardHeaderSpacing, after: forwardHeaderLabel)
+    }
+  }
+
+  @objc  func handleForwardHeaderTap() {
+    MessageViewActions.openForwardSource(of: fullMessage)
+  }
+
+  @objc func handleEmbedViewTap() {
+    MessageViewActions.openRepliedMessage(of: fullMessage)
+  }
+
+  func setupFileViewIfNeeded() {
+    guard fullMessage.file != nil else { return }
+
+    containerStack.addArrangedSubview(photoView)
+  }
+
+  func setupPhotoViewIfNeeded() {
+    guard fullMessage.photoInfo != nil else { return }
+
+    containerStack.addArrangedSubview(newPhotoView)
+    bindPhotoTapHandlerIfNeeded()
+
+    if shouldShowFloatingMetadata {
+      addFloatingMetadata(relativeTo: newPhotoView)
+    }
+  }
+
+  func bindPhotoTapHandlerIfNeeded() {
+    guard fullMessage.photoInfo != nil else { return }
+    guard let onPhotoTap else {
+      newPhotoView.onTap = nil
+      return
+    }
+
+    newPhotoView.onTap = { [weak self] message, sourceView, sourceImage, url in
+      guard let self else { return }
+      onPhotoTap(message, sourceView, sourceImage, url)
+    }
+  }
+
+  func setupVideoViewIfNeeded() {
+    guard fullMessage.videoInfo != nil else { return }
+
+    containerStack.addArrangedSubview(videoView)
+
+    if shouldShowFloatingMetadata {
+      addFloatingMetadata(relativeTo: videoView)
+    }
+  }
+
+  func setupDocumentViewIfNeeded() {
+    guard fullMessage.documentInfo != nil || shouldShowVoiceMessage else { return }
+
+    if shouldShowVoiceMessage {
+      containerStack.addArrangedSubview(voiceMessageViewController.view)
+      return
+    }
+
+    containerStack.addArrangedSubview(documentView)
+  }
+
+  func setupMessageContainer() {
+    if isMultiline {
+      setupMultilineMessage()
+    } else {
+      setupSingleLineMessage()
+    }
+  }
+
+  func setupMultilineMessage() {
+    if hasMedia, message.hasText || shouldShowReactionsInsideBubble {
+      let innerContainer = UIStackView()
+      innerContainer.axis = .vertical
+      innerContainer.isUserInteractionEnabled = true
+      innerContainer.translatesAutoresizingMaskIntoConstraints = false
+      innerContainer.layoutMargins = UIEdgeInsets(
+        top: 0,
+        left: StackPadding.leading,
+        bottom: 0,
+        right: StackPadding.trailing
+      )
+
+      innerContainer.spacing = 4
+      innerContainer.isLayoutMarginsRelativeArrangement = true
+      innerContainer.insetsLayoutMarginsFromSafeArea = false
+
+      if message.hasText {
+        innerContainer.addArrangedSubview(messageLabel)
+      }
+
+      // Insert URLPreviewView(s) for attachments with urlPreview
+      for attachment in fullMessage.attachments {
+        if let externalTask = attachment.externalTask, let userInfo = attachment.userInfo {
+          messageAttachmentEmbed.configure(
+            userInfo: userInfo,
+            outgoing: outgoing,
+            url: URL(string: externalTask.url ?? ""),
+            issueIdentifier: nil,
+            title: externalTask.title,
+            externalTask: externalTask,
+            messageId: message.messageId,
+            chatId: message.chatId
+          )
+          innerContainer.addArrangedSubview(messageAttachmentEmbed)
+        }
+        if attachment.urlPreview != nil {
+          addURLPreviewView(for: attachment, to: innerContainer)
+        }
+      }
+
+      if shouldShowReactionsInsideBubble {
+        setupReactionsIfNeeded()
+      }
+
+      if shouldShowReactionsInsideBubble, hasAcknowledgement {
+        addReactionMetadataFooter(to: innerContainer)
+      } else {
+        let metadataContainer = UIStackView()
+        metadataContainer.axis = .horizontal
+        metadataContainer.semanticContentAttribute = .forceLeftToRight
+        metadataContainer.translatesAutoresizingMaskIntoConstraints = false
+        metadataContainer.addArrangedSubview(UIView())
+        metadataContainer.addArrangedSubview(metadataView)
+        addAcknowledgementIfNeeded(to: metadataContainer)
+        metadataContainerView = metadataContainer
+
+        if shouldShowReactionsInsideBubble {
+          if isEmojiOnlyMessage {
+            innerContainer.addArrangedSubview(metadataContainer)
+            innerContainer.addArrangedSubview(reactionsFlowView)
+          } else {
+            innerContainer.addArrangedSubview(reactionsFlowView)
+            innerContainer.addArrangedSubview(metadataContainer)
+          }
+          applyEmojiReactionSpacing(to: innerContainer)
+        } else {
+          innerContainer.addArrangedSubview(metadataContainer)
+        }
+      }
+
+      applyReactionMetadataSpacing(to: innerContainer)
+      containerStack.addArrangedSubview(innerContainer)
+    } else {
+      if message.hasText {
+        multiLineContainer.addArrangedSubview(messageLabel)
+      }
+
+      // Insert URLPreviewView(s) for attachments with urlPreview
+      for attachment in fullMessage.attachments {
+        if let externalTask = attachment.externalTask, let userInfo = attachment.userInfo {
+          messageAttachmentEmbed.configure(
+            userInfo: userInfo,
+            outgoing: outgoing,
+            url: URL(string: externalTask.url ?? ""),
+            issueIdentifier: nil,
+            title: externalTask.title,
+            externalTask: externalTask,
+            messageId: message.messageId,
+            chatId: message.chatId
+          )
+          multiLineContainer.addArrangedSubview(messageAttachmentEmbed)
+        }
+        if attachment.urlPreview != nil {
+          addURLPreviewView(for: attachment, to: multiLineContainer)
+        }
+      }
+      if shouldShowReactionsInsideBubble {
+        setupReactionsIfNeeded()
+      }
+      let sharesReactionRowWithMetadata = shouldShareReactionRowWithMetadata
+        || (hasAcknowledgement && shouldShowReactionsInsideBubble)
+
+      if isEmojiOnlyMessage, shouldShowReactionsInsideBubble, !hasAcknowledgement {
+        if message.hasText || isSticker {
+          setupMultilineMetadata()
+        }
+        multiLineContainer.addArrangedSubview(reactionsFlowView)
+        applyEmojiReactionSpacing(to: multiLineContainer)
+      } else {
+        if sharesReactionRowWithMetadata {
+          addReactionMetadataFooter(to: multiLineContainer)
+        } else if shouldShowReactionsInsideBubble {
+          multiLineContainer.addArrangedSubview(reactionsFlowView)
+          applyEmojiReactionSpacing(to: multiLineContainer)
+        }
+
+        if !sharesReactionRowWithMetadata && (message.hasText || isSticker) {
+          setupMultilineMetadata()
+        }
+      }
+      if !sharesReactionRowWithMetadata {
+        applyReactionMetadataSpacing(to: multiLineContainer)
+      }
+      if !multiLineContainer.arrangedSubviews.isEmpty {
+        containerStack.addArrangedSubview(multiLineContainer)
+      }
+    }
+  }
+
+  private func addReactionMetadataFooter(to stack: UIStackView) {
+    let arrangedSubviews: [UIView]
+    if hasAcknowledgement {
+      arrangedSubviews = [reactionsFlowView, UIView(), metadataView, acknowledgementView]
+      configureAcknowledgementView()
+    } else {
+      arrangedSubviews = [reactionsFlowView, metadataView]
+    }
+
+    let footer = UIStackView(arrangedSubviews: arrangedSubviews)
+    footer.axis = .horizontal
+    if hasAcknowledgement {
+      footer.semanticContentAttribute = .forceLeftToRight
+    }
+    footer.alignment = .bottom
+    footer.distribution = hasAcknowledgement ? .fill : .equalSpacing
+    footer.spacing = StackPadding.inlineReactionMetadataSpacing
+    footer.translatesAutoresizingMaskIntoConstraints = false
+
+    reactionsFlowView.setContentHuggingPriority(
+      hasAcknowledgement ? .defaultLow : .required,
+      for: .horizontal
+    )
+    reactionsFlowView.setContentCompressionResistancePriority(
+      hasAcknowledgement ? .defaultHigh : .required,
+      for: .horizontal
+    )
+    metadataView.setContentHuggingPriority(.required, for: .horizontal)
+    metadataView.setContentCompressionResistancePriority(.required, for: .horizontal)
+    if hasAcknowledgement {
+      footer.setCustomSpacing(5, after: metadataView)
+    }
+
+    metadataContainerView = footer
+    stack.addArrangedSubview(footer)
+  }
+
+  private func applyEmojiReactionSpacing(to stack: UIStackView) {
+    guard isEmojiOnlyMessage, shouldShowReactionsInsideBubble else { return }
+
+    if stack.arrangedSubviews.contains(messageLabel) {
+      stack.setCustomSpacing(2, after: messageLabel)
+    }
+
+    if let metadataContainerView, stack.arrangedSubviews.contains(metadataContainerView) {
+      stack.setCustomSpacing(12, after: metadataContainerView)
+    } else if stack.arrangedSubviews.contains(reactionsFlowView) {
+      stack.setCustomSpacing(12, after: reactionsFlowView)
+    }
+  }
+
+  private func applyReactionMetadataSpacing(to stack: UIStackView) {
+    guard shouldShowReactionsInsideBubble else { return }
+    guard let metadataContainerView else { return }
+
+    let reactionsIndex = stack.arrangedSubviews.firstIndex { $0 === reactionsFlowView }
+    let metadataIndex = stack.arrangedSubviews.firstIndex { $0 === metadataContainerView }
+    guard let reactionsIndex, let metadataIndex, reactionsIndex != metadataIndex else { return }
+
+    let extraSpacing = isEmojiOnlyMessage
+      ? StackPadding.emojiReactionMetadataExtraSpacing
+      : StackPadding.reactionMetadataExtraSpacing
+    let spacing = stack.spacing + extraSpacing
+    if reactionsIndex < metadataIndex {
+      stack.setCustomSpacing(spacing, after: reactionsFlowView)
+    } else {
+      stack.setCustomSpacing(spacing, after: metadataContainerView)
+    }
+  }
+
+  func setupMultilineMetadata() {
+    let metadataContainer = UIStackView()
+    metadataContainer.axis = .horizontal
+    if hasAcknowledgement {
+      metadataContainer.semanticContentAttribute = .forceLeftToRight
+    }
+    metadataContainer.addArrangedSubview(UIView()) // Spacer
+    if isEmojiOnlyMessage || isSticker || shouldShowFloatingMetadata {
+      metadataContainer.addSubview(floatingMetadataView)
+      let floatingTopOffset: CGFloat = if isSticker {
+        -30
+      } else if isEmojiOnlyMessage, shouldShowReactionsInsideBubble {
+        -6
+      } else {
+        -18
+      }
+      // Reserve extra footer height as the timestamp grows, keeping the original
+      // overlap with the emoji/sticker rather than covering more of the artwork.
+      // FloatingMetadataView adds 3 points above and below the timestamp.
+      let defaultMetadataHeight = ceil(UIFont.systemFont(ofSize: 11).lineHeight) + 6
+      var constraints = [
+        floatingMetadataView.leadingAnchor.constraint(greaterThanOrEqualTo: metadataContainer.leadingAnchor),
+        floatingMetadataView.bottomAnchor.constraint(
+          equalTo: metadataContainer.bottomAnchor,
+          constant: floatingTopOffset + defaultMetadataHeight
+        ),
+        metadataContainer.heightAnchor.constraint(
+          greaterThanOrEqualTo: floatingMetadataView.heightAnchor,
+          constant: -defaultMetadataHeight
+        ),
+      ]
+      if hasAcknowledgement {
+        installAcknowledgementView(in: metadataContainer)
+        constraints += [
+          acknowledgementView.rightAnchor.constraint(equalTo: metadataContainer.rightAnchor, constant: -4),
+          acknowledgementView.bottomAnchor.constraint(equalTo: floatingMetadataView.bottomAnchor),
+          floatingMetadataView.rightAnchor.constraint(equalTo: acknowledgementView.leftAnchor, constant: -5),
+        ]
+      } else {
+        constraints.append(
+          floatingMetadataView.trailingAnchor.constraint(equalTo: metadataContainer.trailingAnchor, constant: -4)
+        )
+      }
+      NSLayoutConstraint.activate(constraints)
+    } else {
+      metadataContainer.addArrangedSubview(metadataView)
+      addAcknowledgementIfNeeded(to: metadataContainer)
+    }
+    metadataContainerView = metadataContainer
+    multiLineContainer.addArrangedSubview(metadataContainer)
+
+    if usesPlainTextMultilineLayout {
+      multiLineContainer.setCustomSpacing(StackPadding.plainTextMetadataSpacing, after: messageLabel)
+    }
+  }
+
+  func setupSingleLineMessage() {
+    singleLineContainer.addArrangedSubview(messageLabel)
+    singleLineContainer.addArrangedSubview(metadataView)
+    containerStack.addArrangedSubview(singleLineContainer)
+  }
+
+  func addGestureRecognizer() {
+    messageLabel.isUserInteractionEnabled = true
+
+    // Tap opens links and handles mention/code shortcuts.
+    let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTextViewTap))
+    let longPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(handleTextViewLongPress))
+    longPressGesture.delegate = self
+    tapGesture.require(toFail: longPressGesture)
+
+    messageLabel.addGestureRecognizer(tapGesture)
+    messageLabel.addGestureRecognizer(longPressGesture)
+    linkLongPressGesture = longPressGesture
+  }
+
+  func setupDoubleTapGestureRecognizer() {
+    let doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap))
+    doubleTapGesture.numberOfTapsRequired = 2
+    doubleTapGesture.delegate = self
+    bubbleDoubleTapGesture = doubleTapGesture
+
+    if let interaction {
+      interaction.view?.gestureRecognizers?.forEach { gesture in
+        doubleTapGesture.require(toFail: gesture)
+      }
+    }
+
+    bubbleView.addGestureRecognizer(doubleTapGesture)
+
+    let backgroundDoubleTapGesture = UITapGestureRecognizer(
+      target: self,
+      action: #selector(handleBackgroundDoubleTap)
+    )
+    backgroundDoubleTapGesture.numberOfTapsRequired = 2
+    backgroundDoubleTapGesture.delegate = self
+    self.backgroundDoubleTapGesture = backgroundDoubleTapGesture
+
+    if let interaction {
+      interaction.view?.gestureRecognizers?.forEach { gesture in
+        backgroundDoubleTapGesture.require(toFail: gesture)
+      }
+    }
+
+    addGestureRecognizer(backgroundDoubleTapGesture)
+  }
+
+  @objc func handleServiceMessageTap(_ gesture: UITapGestureRecognizer) {
+    guard let attributedText = serviceLabel.attributedText else { return }
+    guard let characterIndex = serviceCharacterIndex(at: gesture.location(in: serviceLabel)) else { return }
+
+    if let userId = attributedText.attribute(.mentionUserId, at: characterIndex, effectiveRange: nil) as? Int64 {
+      if let agentId = attributedText.attribute(.mentionAgentId, at: characterIndex, effectiveRange: nil) as? Int64 {
+        Task { @MainActor in
+          guard !(await BotAgentMentionNavigator.open(
+            agentId: agentId,
+            botUserId: userId,
+            peer: message.peerId
+          )) else { return }
+          NotificationCenter.default.post(
+            name: Notification.Name("NavigateToUser"),
+            object: nil,
+            userInfo: ["userId": userId]
+          )
+        }
+        return
+      }
+      NotificationCenter.default.post(
+        name: Notification.Name("NavigateToUser"),
+        object: nil,
+        userInfo: ["userId": userId]
+      )
+      return
+    }
+
+    if let threadTarget = attributedText
+      .attribute(.threadLink, at: characterIndex, effectiveRange: nil) as? ThreadLinkTarget
+    {
+      ThreadLinkNavigator.open(target: threadTarget)
+    }
+  }
+
+  private func serviceCharacterIndex(at point: CGPoint) -> Int? {
+    guard let attributedText = serviceLabel.attributedText, attributedText.length > 0 else {
+      return nil
+    }
+
+    let textStorage = NSTextStorage(attributedString: attributedText)
+    let layoutManager = NSLayoutManager()
+    let textContainer = NSTextContainer(size: serviceLabel.bounds.size)
+    textContainer.lineFragmentPadding = 0
+    textContainer.maximumNumberOfLines = serviceLabel.numberOfLines
+    textContainer.lineBreakMode = serviceLabel.lineBreakMode
+
+    layoutManager.addTextContainer(textContainer)
+    textStorage.addLayoutManager(layoutManager)
+    layoutManager.ensureLayout(for: textContainer)
+
+    let glyphRange = layoutManager.glyphRange(for: textContainer)
+    guard glyphRange.length > 0 else { return nil }
+
+    let textRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+    let offset = CGPoint(
+      x: (serviceLabel.bounds.width - textRect.width) * 0.5 - textRect.origin.x,
+      y: (serviceLabel.bounds.height - textRect.height) * 0.5 - textRect.origin.y
+    )
+    let location = CGPoint(x: point.x - offset.x, y: point.y - offset.y)
+    guard textRect.insetBy(dx: -6, dy: -6).contains(location) else { return nil }
+
+    let glyphIndex = layoutManager.glyphIndex(for: location, in: textContainer)
+    guard glyphIndex < layoutManager.numberOfGlyphs else { return nil }
+
+    let glyphRect = layoutManager.boundingRect(
+      forGlyphRange: NSRange(location: glyphIndex, length: 1),
+      in: textContainer
+    )
+    guard glyphRect.insetBy(dx: -8, dy: -8).contains(location) else { return nil }
+
+    let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+    guard characterIndex >= 0, characterIndex < attributedText.length else { return nil }
+    return characterIndex
+  }
+
+  @objc func handleTextViewTap(_ gesture: UITapGestureRecognizer) {
+    let tapLocation = gesture.location(in: messageLabel)
+
+    if let codeTextView = messageLabel as? CodeBlockTextView,
+       let codeRange = codeTextView.codeBlockRange(at: tapLocation)
+    {
+      let codeText = (messageLabel.text as NSString).substring(with: codeRange)
+      UIPasteboard.general.string = codeText
+      ToastManager.shared.showToast(
+        "Copied code",
+        type: .success,
+        systemImage: "doc.on.doc"
+      )
+      return
+    }
+
+    guard let characterIndex = interactiveCharacterIndex(at: tapLocation) else {
+      return
+    }
+
+    // Check if tap is on a mention first
+    if let attributedText = messageLabel.attributedText {
+      var foundMention = false
+      attributedText.enumerateAttribute(.mentionUserId, in: NSRange(
+        location: 0,
+        length: attributedText.length
+      )) { value, range, _ in
+        if NSLocationInRange(characterIndex, range),
+          let userId = value as? Int64
+        {
+          if let agentId = attributedText.attribute(.mentionAgentId, at: characterIndex, effectiveRange: nil) as? Int64 {
+            foundMention = true
+            Task { @MainActor in
+              guard !(await BotAgentMentionNavigator.open(
+                agentId: agentId,
+                botUserId: userId,
+                peer: message.peerId
+              )) else { return }
+              NotificationCenter.default.post(
+                name: Notification.Name("MentionTapped"),
+                object: nil,
+                userInfo: ["userId": userId]
+              )
+            }
+            return
+          }
+          NotificationCenter.default.post(
+            name: Notification.Name("MentionTapped"),
+            object: nil,
+            userInfo: ["userId": userId]
+          )
+          foundMention = true
+          return
+        }
+      }
+
+      if !foundMention,
+         let groupId = attributedText.attribute(.mentionGroupId, at: characterIndex, effectiveRange: nil) as? Int64
+      {
+        NotificationCenter.default.post(
+          name: .userGroupMentionTapped,
+          object: nil,
+          userInfo: ["target": UserGroupMentionTarget(groupId: groupId, spaceId: spaceId)]
+        )
+        return
+      }
+
+      // If not a mention, check for links
+      if !foundMention {
+        if let threadTarget = attributedText
+          .attribute(.threadLink, at: characterIndex, effectiveRange: nil) as? ThreadLinkTarget
+        {
+          ThreadLinkNavigator.open(target: threadTarget)
+          return
+        }
+
+        var inlineCodeRange = NSRange(location: 0, length: 0)
+        if let isInlineCode = attributedText.attribute(
+          .inlineCode,
+          at: characterIndex,
+          effectiveRange: &inlineCodeRange
+        ) as? Bool, isInlineCode {
+          let inlineCodeText = (attributedText.string as NSString).substring(with: inlineCodeRange)
+          UIPasteboard.general.string = inlineCodeText
+          ToastManager.shared.showToast(
+            "Copied code",
+            type: .success,
+            systemImage: "doc.on.doc"
+          )
+          return
+        }
+
+        var commandRange = NSRange(location: 0, length: 0)
+        if let command = attributedText.attribute(.botCommand, at: characterIndex, effectiveRange: &commandRange) as? String,
+           commandRange.length > 0
+        {
+          let commandText = command.isEmpty
+            ? (attributedText.string as NSString).substring(with: commandRange)
+            : command
+          sendBotCommand(commandText)
+          return
+        }
+
+        if let email = attributedText.attribute(.emailAddress, at: characterIndex, effectiveRange: nil) as? String {
+          UIPasteboard.general.string = email
+          ToastManager.shared.showToast(
+            "Copied email",
+            type: .success,
+            systemImage: "doc.on.doc"
+          )
+          return
+        }
+
+        if let phoneNumber = attributedText
+          .attribute(.phoneNumber, at: characterIndex, effectiveRange: nil) as? String
+        {
+          UIPasteboard.general.string = phoneNumber
+          ToastManager.shared.showToast(
+            "Copied number",
+            type: .success,
+            systemImage: "doc.on.doc"
+          )
+          return
+        }
+
+        if let url = linkURL(at: characterIndex, in: attributedText) {
+          linkTapHandler?(url)
+          return
+        }
+      }
+    }
+  }
+
+  func sendBotCommand(_ command: String) {
+    Task {
+      do {
+        try await Api.realtime.send(.sendMessage(
+          text: command,
+          peerId: message.peerId,
+          chatId: message.chatId,
+          replyToMsgId: nil,
+          isSticker: nil,
+          entities: botCommandEntities(for: command)
+        ))
+      } catch {
+        ToastManager.shared.showToast(
+          "Failed to send command",
+          type: .error,
+          systemImage: "exclamationmark.triangle.fill"
+        )
+      }
+    }
+  }
+
+  private func botCommandEntities(for command: String) -> MessageEntities {
+    var entity = MessageEntity()
+    entity.type = .botCommand
+    entity.offset = 0
+    entity.length = Int64((command as NSString).length)
+
+    var entities = MessageEntities()
+    entities.entities = [entity]
+    return entities
+  }
+
+  struct LinkContextMenuTarget {
+    let url: URL
+    let rectInMessageLabel: CGRect
+  }
+
+  @objc private func handleTextViewLongPress(_ gesture: UILongPressGestureRecognizer) {
+    guard gesture.state == .began else { return }
+    let pressLocation = gesture.location(in: messageLabel)
+    guard let linkTarget = linkContextMenuTarget(at: pressLocation) else { return }
+    presentLinkActionSheet(for: linkTarget)
+  }
+
+  override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    if gestureRecognizer === linkLongPressGesture {
+      return linkContextMenuTarget(at: gestureRecognizer.location(in: messageLabel)) != nil
+    }
+
+    if gestureRecognizer === bubbleDoubleTapGesture {
+      guard INUserSettings.current.messageGestures.doubleTapAction != .none else { return false }
+      return !isExclusiveMessageTapTarget(at: gestureRecognizer.location(in: self))
+    }
+
+    if gestureRecognizer === backgroundDoubleTapGesture {
+      guard INUserSettings.current.messageGestures.doubleTapAction != .none else { return false }
+      let location = gestureRecognizer.location(in: self)
+      guard !bubbleView.frame.contains(location) else { return false }
+      return !isExclusiveMessageTapTarget(at: location)
+    }
+
+    return true
+  }
+
+  private func isExclusiveMessageTapTarget(at point: CGPoint) -> Bool {
+    if hasInteractiveTextTarget(atPointInMessageView: point) {
+      return true
+    }
+
+    guard let hitView = hitTest(point, with: nil) else {
+      return false
+    }
+
+    var currentView: UIView? = hitView
+    while let view = currentView, view !== self {
+      if view === messageLabel {
+        return hasInteractiveTextTarget(atPointInMessageView: point)
+      }
+
+      let handlesOwnTap = view is UIControl ||
+        view is URLPreviewView ||
+        view is MessageAttachmentEmbed ||
+        view is DocumentView ||
+        view is NewPhotoView ||
+        view is NewVideoView ||
+        view is PhotoView ||
+        view is EmbedMessageView ||
+        view is ReactionsFlowView
+
+      if handlesOwnTap {
+        return true
+      }
+
+      if view !== bubbleView,
+         !(view is UITextView),
+         view.gestureRecognizers?.contains(where: { $0 is UITapGestureRecognizer }) == true {
+        return true
+      }
+
+      currentView = view.superview
+    }
+
+    return false
+  }
+
+  func linkContextMenuTarget(atPointInMessageView pointInMessageView: CGPoint) -> LinkContextMenuTarget? {
+    let pointInMessageLabel = convert(pointInMessageView, to: messageLabel)
+    return linkContextMenuTarget(at: pointInMessageLabel)
+  }
+
+  func linkURL(atPointInMessageView pointInMessageView: CGPoint) -> URL? {
+    linkContextMenuTarget(atPointInMessageView: pointInMessageView)?.url
+  }
+
+  private func interactiveCharacterIndex(at point: CGPoint, hitSlop: CGFloat = 2) -> Int? {
+    guard messageLabel.bounds.contains(point) else { return nil }
+
+    let textContainer = messageLabel.textContainer
+    let layoutManager = messageLabel.layoutManager
+    let containerPoint = CGPoint(
+      x: point.x - messageLabel.textContainerInset.left + messageLabel.contentOffset.x,
+      y: point.y - messageLabel.textContainerInset.top + messageLabel.contentOffset.y
+    )
+
+    layoutManager.ensureLayout(for: textContainer)
+
+    let usedRect = layoutManager.usedRect(for: textContainer)
+    guard usedRect.insetBy(dx: -hitSlop, dy: -hitSlop).contains(containerPoint) else {
+      return nil
+    }
+
+    var fraction: CGFloat = 0
+    let glyphIndex = layoutManager.glyphIndex(
+      for: containerPoint,
+      in: textContainer,
+      fractionOfDistanceThroughGlyph: &fraction
+    )
+    guard glyphIndex < layoutManager.numberOfGlyphs else { return nil }
+
+    let glyphRect = layoutManager.boundingRect(
+      forGlyphRange: NSRange(location: glyphIndex, length: 1),
+      in: textContainer
+    )
+    guard glyphRect.insetBy(dx: -hitSlop, dy: -hitSlop).contains(containerPoint) else {
+      return nil
+    }
+
+    let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+    guard let attributedText = messageLabel.attributedText,
+          characterIndex >= 0,
+          characterIndex < attributedText.length
+    else {
+      return nil
+    }
+
+    return characterIndex
+  }
+
+  func hasInteractiveTextTarget(atPointInMessageView pointInMessageView: CGPoint) -> Bool {
+    let point = convert(pointInMessageView, to: messageLabel)
+
+    if let codeTextView = messageLabel as? CodeBlockTextView,
+       codeTextView.codeBlockRange(at: point) != nil {
+      return true
+    }
+
+    guard let characterIndex = interactiveCharacterIndex(at: point),
+          let attributedText = messageLabel.attributedText
+    else {
+      return false
+    }
+
+    if attributedText.attribute(.mentionUserId, at: characterIndex, effectiveRange: nil) != nil {
+      return true
+    }
+
+    if attributedText.attribute(.mentionGroupId, at: characterIndex, effectiveRange: nil) != nil {
+      return true
+    }
+
+    if attributedText.attribute(.threadLink, at: characterIndex, effectiveRange: nil) != nil {
+      return true
+    }
+
+    if attributedText.attribute(.inlineCode, at: characterIndex, effectiveRange: nil) != nil {
+      return true
+    }
+
+    if attributedText.attribute(.botCommand, at: characterIndex, effectiveRange: nil) != nil {
+      return true
+    }
+
+    if attributedText.attribute(.emailAddress, at: characterIndex, effectiveRange: nil) != nil {
+      return true
+    }
+
+    if attributedText.attribute(.phoneNumber, at: characterIndex, effectiveRange: nil) != nil {
+      return true
+    }
+
+    return linkURL(at: characterIndex, in: attributedText) != nil
+  }
+
+  private func linkContextMenuTarget(at point: CGPoint) -> LinkContextMenuTarget? {
+    guard let characterIndex = interactiveCharacterIndex(at: point),
+          let attributedText = messageLabel.attributedText,
+          let linkTarget = linkTarget(at: characterIndex, in: attributedText)
+    else {
+      return nil
+    }
+
+    let textContainer = messageLabel.textContainer
+    let layoutManager = messageLabel.layoutManager
+    layoutManager.ensureLayout(for: textContainer)
+
+    let glyphRange = layoutManager.glyphRange(forCharacterRange: linkTarget.range, actualCharacterRange: nil)
+    var linkRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+    linkRect.origin.x += messageLabel.textContainerInset.left - messageLabel.contentOffset.x
+    linkRect.origin.y += messageLabel.textContainerInset.top - messageLabel.contentOffset.y
+    linkRect = linkRect.insetBy(dx: -2, dy: -2)
+
+    let clippedRect = linkRect.intersection(messageLabel.bounds.insetBy(dx: -2, dy: -2))
+    guard !clippedRect.isNull, !clippedRect.isEmpty else { return nil }
+
+    return LinkContextMenuTarget(url: linkTarget.url, rectInMessageLabel: clippedRect)
+  }
+
+  func linkURL(at characterIndex: Int, in attributedText: NSAttributedString) -> URL? {
+    linkTarget(at: characterIndex, in: attributedText)?.url
+  }
+
+  private func linkTarget(at characterIndex: Int, in attributedText: NSAttributedString) -> (url: URL, range: NSRange)? {
+    guard characterIndex >= 0, characterIndex < attributedText.length else { return nil }
+    if attributedText.attribute(.mentionUserId, at: characterIndex, effectiveRange: nil) != nil {
+      return nil
+    }
+    var effectiveRange = NSRange(location: 0, length: 0)
+    let linkValue = attributedText.attribute(.link, at: characterIndex, effectiveRange: &effectiveRange)
+    guard let url = resolveLinkURL(from: linkValue) else { return nil }
+    return (url, effectiveRange)
+  }
+
+  private func resolveLinkURL(from value: Any?) -> URL? {
+    if let url = value as? URL {
+      if LinkDetector.isSupportedLinkURL(url) {
+        return url
+      }
+    }
+
+    guard let urlString = value as? String else {
+      return nil
+    }
+
+    if let url = URL(string: urlString) {
+      if LinkDetector.isSupportedLinkURL(url) {
+        return url
+      }
+    }
+
+    if urlString.contains("://") {
+      return nil
+    }
+
+    guard let url = URL(string: "https://\(urlString)"),
+          let scheme = url.scheme?.lowercased(),
+          ["http", "https"].contains(scheme)
+    else {
+      return nil
+    }
+
+    return url
+  }
+
+  private static func inlineMentionTarget(from url: URL) -> (userId: Int64, agentId: Int64?)? {
+    guard url.scheme?.lowercased() == "inline", url.host?.lowercased() == "user" else {
+      return nil
+    }
+
+    if let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+      let queryId = components.queryItems?.first {
+        let name = $0.name.lowercased()
+        return name == "id" || name == "user_id"
+      }?.value
+      if let queryId, let userId = Int64(queryId), userId > 0 {
+        let agentId = components.queryItems?
+          .first { $0.name.lowercased() == "agent_id" }?
+          .value
+          .flatMap(Int64.init)
+        return (userId, agentId.flatMap { $0 > 0 ? $0 : nil })
+      }
+    }
+
+    guard let userIdString = url.pathComponents.last, let userId = Int64(userIdString), userId > 0 else {
+      return nil
+    }
+    let agentId = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+      .first { $0.name.lowercased() == "agent_id" }?
+      .value
+      .flatMap(Int64.init)
+    return (userId, agentId.flatMap { $0 > 0 ? $0 : nil })
+  }
+
+  @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+    guard INUserSettings.current.messageGestures.doubleTapAction != .none else { return }
+    performMessageGestureAction(INUserSettings.current.messageGestures.doubleTapAction)
+  }
+
+  @objc private func handleBackgroundDoubleTap(_ gesture: UITapGestureRecognizer) {
+    guard INUserSettings.current.messageGestures.doubleTapAction != .none else { return }
+    let location = gesture.location(in: self)
+    guard !bubbleView.frame.contains(location) else { return }
+    guard bubbleView.frame.minY <= location.y, location.y <= bubbleView.frame.maxY else { return }
+
+    performMessageGestureAction(INUserSettings.current.messageGestures.doubleTapAction)
+  }
+
+  func performMessageGestureAction(_ action: MessageGestureAction) {
+    guard displayMode != .threadAnchor else { return }
+    switch action {
+    case .none:
+      return
+    case .toggleAck:
+      toggleAcknowledgement()
+    case .reply:
+      guard fullMessage.canReply else { return }
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      ChatState.shared.setReplyingMessageId(peer: message.peerId, id: message.messageId)
+    case .reactionsMenu:
+      onReactionsMenu?(fullMessage)
+    case .toggleHeart, .toggleThumbsUp:
+      guard let baseEmoji = action.reactionEmoji else { return }
+      let emoji = EmojiSkinTonePreferenceStore.current().applying(to: baseEmoji)
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      reactionsFlowView.onReactionTap?(emoji)
+    }
+  }
+
+  private func toggleAcknowledgement() {
+    guard displayMode != .threadAnchor, let action = fullMessage.acknowledgementAction(
+      currentUserId: Auth.shared.getCurrentUserId()
+    ) else { return }
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    let targetMessage = fullMessage
+    Task {
+      do {
+        try await Api.realtime.send(.acknowledgeMessages(message: targetMessage, action: action))
+      } catch {
+        Log.scoped("Acknowledgement").error("Failed to update Ack", error: error)
+        ToastManager.shared.showToast(
+          "Could not update Ack",
+          type: .error,
+          systemImage: "exclamationmark.triangle.fill"
+        )
+      }
+    }
+  }
+
+  enum StackPadding {
+    static let top: CGFloat = 8
+    static let leading: CGFloat = 12
+    static let bottom: CGFloat = 8
+    static let trailing: CGFloat = 12
+    static let inlineTextMetadataSpacing: CGFloat = 6
+    static let plainTextMetadataSpacing: CGFloat = 6
+    static let replyInset: CGFloat = 6
+    static let replyBottomSpacing: CGFloat = 0
+    static let reactionMetadataExtraSpacing: CGFloat = 4
+    static let emojiReactionMetadataExtraSpacing: CGFloat = 8
+    static let inlineReactionMetadataSpacing: CGFloat = 6
+    static let forwardHeaderVertical: CGFloat = 6
+    static let forwardHeaderSpacing: CGFloat = 1
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    if let acknowledgementWidthConstraint {
+      let width = min(fullMessage.acknowledgementPillWidth, max(fullMessage.acknowledgementMinimumPillWidth, bubbleView.contentView.bounds.width))
+      if acknowledgementWidthConstraint.constant != width { acknowledgementWidthConstraint.constant = width }
+    }
+  }
+
+  func setupConstraints() {
+    let bottomPadding: CGFloat
+    if isEmojiOnlyMessage {
+      bottomPadding = 6
+    } else if usesPlainTextMultilineLayout || isVoiceOnlyMessage {
+      bottomPadding = StackPadding.bottom
+    } else if isMultiline {
+      bottomPadding = 14
+    } else {
+      bottomPadding = StackPadding.bottom
+    }
+
+    let padding = NSDirectionalEdgeInsets(
+      top: isEmojiOnlyMessage ? 6 : StackPadding.top,
+      leading: isEmojiOnlyMessage ? 0 : StackPadding.leading,
+      bottom: bottomPadding,
+      trailing: isEmojiOnlyMessage ? 0 : StackPadding.trailing
+    )
+
+    let bubbleWidthConstraint: NSLayoutConstraint = switch MessageBubbleWidthPolicy.mode(
+      hasLargeURLPreview: hasLargeURLPreview
+    ) {
+    case .contentSizedUpToMaximum:
+      bubbleView.contentView.widthAnchor.constraint(
+        lessThanOrEqualTo: widthAnchor,
+        multiplier: MessageBubbleWidthPolicy.maximumWidthFraction
+      )
+    case .fixedMaximum:
+      bubbleView.contentView.widthAnchor.constraint(
+        equalTo: widthAnchor,
+        multiplier: MessageBubbleWidthPolicy.maximumWidthFraction
+      )
+    }
+    bubbleWidthConstraint.identifier = "message-bubble-width"
+
+    let baseConstraints: [NSLayoutConstraint] = [
+      bubbleView.topAnchor.constraint(equalTo: topAnchor),
+      bubbleWidthConstraint,
+      bubbleView.contentView.heightAnchor.constraint(
+        greaterThanOrEqualToConstant: MessageBubbleView.minimumBodyHeight
+      ),
+    ]
+
+    let withoutFileConstraints: [NSLayoutConstraint] = [
+      containerStack.topAnchor.constraint(
+        equalTo: bubbleView.contentView.topAnchor,
+        constant: padding.top
+      ),
+      containerStack.leadingAnchor.constraint(
+        equalTo: bubbleView.contentView.leadingAnchor,
+        constant: padding.leading
+      ),
+      containerStack.trailingAnchor.constraint(
+        equalTo: bubbleView.contentView.trailingAnchor,
+        constant: -padding.trailing
+      ),
+      containerStack.bottomAnchor.constraint(
+        equalTo: bubbleView.contentView.bottomAnchor,
+        constant: -padding.bottom
+      ).withPriority(.defaultHigh),
+    ]
+
+    let withFileConstraints: [NSLayoutConstraint] = [
+      containerStack.topAnchor.constraint(
+        equalTo: bubbleView.contentView.topAnchor,
+        constant: 0
+      ),
+      containerStack.leadingAnchor.constraint(
+        equalTo: bubbleView.contentView.leadingAnchor,
+        constant: 0
+      ),
+      containerStack.trailingAnchor.constraint(
+        equalTo: bubbleView.contentView.trailingAnchor,
+        constant: 0
+      ),
+      containerStack.bottomAnchor.constraint(
+        equalTo: bubbleView.contentView.bottomAnchor,
+        constant: 0
+      ).withPriority(.defaultHigh),
+    ]
+
+    let withFileAndTextConstraints: [NSLayoutConstraint] = [
+      containerStack.topAnchor.constraint(
+        equalTo: bubbleView.contentView.topAnchor,
+        constant: 0
+      ),
+      containerStack.leadingAnchor.constraint(
+        equalTo: bubbleView.contentView.leadingAnchor,
+        constant: 0
+      ),
+      containerStack.trailingAnchor.constraint(
+        equalTo: bubbleView.contentView.trailingAnchor,
+        constant: 0
+      ),
+      containerStack.bottomAnchor.constraint(
+        equalTo: bubbleView.contentView.bottomAnchor,
+        constant: -padding.bottom
+      ).withPriority(.defaultHigh),
+    ]
+
+    let hasTextOrReactions = message.hasText || shouldShowReactionsInsideBubble
+
+    let constraints: [NSLayoutConstraint] = switch (hasMedia, hasTextOrReactions) {
+      case (true, false):
+        // Photo only (no text, no reactions)
+        withFileConstraints
+      case (true, true):
+        // Photo with text or reactions
+        withFileAndTextConstraints
+      default:
+        // Text only
+        withoutFileConstraints
+    }
+
+    NSLayoutConstraint.activate(baseConstraints + constraints)
+
+    if hasMessageActionRows {
+      setupMessageActionsConstraints()
+    }
+
+    if shouldShowReactionsOutsideBubble {
+      setupExternalReactionsConstraints()
+    } else if hasMessageActionRows {
+      messageActionsContainer.bottomAnchor.constraint(equalTo: bottomAnchor).isActive = true
+    } else {
+      bubbleView.bottomAnchor.constraint(equalTo: bottomAnchor).isActive = true
+    }
+    updateBubbleHorizontalConstraint(for: bubbleTailSide)
+    bubbleHorizontalConstraint?.isActive = true
+  }
+
+  func setupAppearance() {
+    bubbleView.backgroundColor = bubbleColor
+    updateBubbleShape()
+
+    if !supportsContinuousBubbleGradient {
+      bubbleView.clearContinuousGradient()
+    } else {
+      let lighting = outgoing ? theme.outgoingLighting : theme.incomingLighting
+      bubbleView.configureContinuousGradient(
+        topAlpha: CGFloat(lighting.top),
+        bottomAlpha: CGFloat(lighting.bottom)
+      )
+    }
+
+    updateMessageLabelText()
+    acknowledgementView.refreshAppearance(activeColor: theme.primary.uiColor)
+    updateReactionBackgroundOverridesForCurrentMessage()
+  }
+
+  private func refreshMessageTypography() {
+    updateMessageLabelText()
+    guard !message.isServiceMessage, !requiresMultilineContentLayout,
+          !isEmojiOnlyMessage else { return }
+    let wasMultiline = multiLineContainer.superview != nil
+    guard wasMultiline != isMultiline else { return }
+    let oldContainer = wasMultiline ? multiLineContainer : singleLineContainer
+    guard let index = containerStack.arrangedSubviews.firstIndex(of: oldContainer) else { return }
+    messageLabel.removeFromSuperview()
+    metadataView.removeFromSuperview()
+    for child in oldContainer.arrangedSubviews {
+      oldContainer.removeArrangedSubview(child)
+      child.removeFromSuperview()
+    }
+    oldContainer.removeFromSuperview()
+    setupMessageContainer()
+    let newContainer = isMultiline ? multiLineContainer : singleLineContainer
+    containerStack.removeArrangedSubview(newContainer)
+    containerStack.insertArrangedSubview(newContainer, at: index)
+  }
+
+  func updateMessageLabelText() {
+    messageLabel.attributedText = attributedMessageText()
+  }
+
+  func updateReactionBackgroundOverridesForCurrentMessage() {
+    guard !fullMessage.reactions.isEmpty else { return }
+    let overrides = shouldUseTransparentOutgoingReactions ? transparentOutgoingReactionOverrides : nil
+    reactionsFlowView.reactionBackgroundPrimaryOverride = overrides?.primary
+    reactionsFlowView.reactionBackgroundSecondaryOverride = overrides?.secondary
+  }
+
+  private var singleLineTextWidth: CGFloat {
+    guard let cacheKey = attributedMessageCacheKey,
+          let attributedString = attributedMessageText(),
+          attributedString.length > 0
+    else {
+      return 0
+    }
+
+    if let cachedWidth = Self.singleLineWidthCache.object(forKey: cacheKey) {
+      return CGFloat(cachedWidth.doubleValue)
+    }
+
+    let width = ceil(attributedString.boundingRect(
+      with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+      options: [.usesLineFragmentOrigin, .usesFontLeading],
+      context: nil
+    ).width)
+    Self.singleLineWidthCache.setObject(NSNumber(value: Double(width)), forKey: cacheKey)
+    return width
+  }
+
+  private var attributedMessageCacheKey: NSString? {
+    guard let text = fullMessage.displayText else { return nil }
+
+    let entities = fullMessage.translationEntities ?? fullMessage.message.entities
+    return [
+      "\(entities)",
+      "\(message.stableId)",
+      text,
+      theme.preset.rawValue,
+      theme.variant.rawValue,
+      traitCollection.preferredContentSizeCategory.rawValue,
+      outgoing ? "outgoing" : "incoming",
+    ].joined(separator: "-") as NSString
+  }
+
+  var messageBodyFont: UIFont {
+    if isEmojiOnlyMessage {
+      return .systemFont(ofSize: isSingleEmojiMessage ? 80 : isTripleEmojiMessage ? 70 : 32)
+    }
+    return ChatTypography.font(17, compatibleWith: traitCollection)
+  }
+
+  func attributedMessageText() -> NSAttributedString? {
+    guard let text = fullMessage.displayText,
+          let cacheKey = attributedMessageCacheKey
+    else { return nil }
+
+    /// Use cache if available
+    if let cachedString = Self.attributedCache.object(forKey: cacheKey) {
+      return cachedString
+    }
+
+    let entities = fullMessage.translationEntities ?? fullMessage.message.entities
+    let font = messageBodyFont
+
+    let codeBlockBackgroundColor = outgoing ? nil : textColor.withAlphaComponent(0.05)
+    let inlineCodeBackgroundColor = outgoing ? nil : textColor.withAlphaComponent(0.06)
+
+    /// Apply entities to text and create an NSAttributedString
+    let attributedString = ProcessEntities.toAttributedString(
+      text: text,
+      entities: entities,
+      configuration: .init(
+        font: font,
+        palette: .init(
+          primaryColor: textColor,
+          linkColor: outgoing ? .white : theme.primary.uiColor,
+          secondaryColor: outgoing ? UIColor.white.withAlphaComponent(0.7) : theme.incomingSecondaryText.uiColor
+        ),
+        codeBlockBackgroundColor: codeBlockBackgroundColor,
+        inlineCodeBackgroundColor: inlineCodeBackgroundColor
+      )
+    )
+
+    detectAndStyleLinks(in: text, attributedString: attributedString)
+
+    Self.attributedCache.setObject(attributedString, forKey: cacheKey)
+    return attributedString
+  }
+
+  private func updateBubbleShape() {
+    bubbleView.configure(side: bubbleTailSide)
+  }
+
+  func updateBubbleTail(side: MessageBubbleTailSide, animated: Bool) {
+    guard bubbleTailSide != side else { return }
+    bubbleTailSide = side
+    updateBubbleHorizontalConstraint(for: side)
+    bubbleHorizontalConstraint?.isActive = true
+    bubbleView.configure(side: side, animated: animated)
+
+    guard animated else {
+      layoutIfNeeded()
+      return
+    }
+
+    UIView.animate(
+      withDuration: 0.16,
+      delay: 0,
+      options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseOut]
+    ) {
+      self.layoutIfNeeded()
+    }
+  }
+
+  private func updateBubbleHorizontalConstraint(for side: MessageBubbleTailSide) {
+    bubbleHorizontalConstraint?.isActive = false
+
+    let tailWidth = MessageBubbleView.tailWidth(for: side)
+    let resolvedSide: MessageBubbleTailSide = if side != .none {
+      side
+    } else {
+      outgoing ? .trailing : .leading
+    }
+
+    let constraint: NSLayoutConstraint = switch resolvedSide {
+    case .none, .trailing:
+      bubbleView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2 + tailWidth)
+    case .leading:
+      bubbleView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2 - tailWidth)
+    }
+
+    bubbleHorizontalConstraint = constraint
+  }
+
+  private var resolvedBubbleTailSide: MessageBubbleTailSide {
+    if bubbleTailSide != .none {
+      return bubbleTailSide
+    }
+    return outgoing ? .trailing : .leading
+  }
+
+  func detectAndStyleLinks(in text: String, attributedString: NSMutableAttributedString) {
+    // Use centralized LinkDetector for consistent link detection
+    LinkDetector.shared.applyLinkStyling(
+      to: attributedString,
+      linkColor: outgoing ? .white : theme.primary.uiColor
+    )
+  }
+
+  // func detectAndStyleMentions(in text: String, attributedString: NSMutableAttributedString) {
+  //   if let entities = fullMessage.message.entities {
+  //     for entity in entities.entities {
+  //       let range = NSRange(location: Int(entity.offset), length: Int(entity.length))
+
+  //       // Validate range is within bounds
+  //       guard range.location >= 0, range.location + range.length <= text.utf16.count else {
+  //         continue
+  //       }
+
+  //       switch entity.type {
+  //         case .mention:
+  //           if case let .mention(mention) = entity.entity {
+  //             let mentionColor = MessageRichTextRenderer.mentionColor(for: outgoing)
+  //             attributedString.addAttributes([
+  //               .foregroundColor: mentionColor,
+  //               .mentionUserId: mention.userID,
+  //             ], range: range)
+  //           }
+
+  //         case .bold:
+  //           // Apply bold formatting using existing attributes
+  //           let existingAttributes = attributedString.attributes(at: range.location, effectiveRange: nil)
+  //           let currentFont = existingAttributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: 17)
+  //           let boldFont = UIFont.boldSystemFont(ofSize: currentFont.pointSize)
+  //           attributedString.addAttribute(.font, value: boldFont, range: range)
+
+  //         default:
+  //           break
+  //       }
+  //     }
+  //   }
+  // }
+
+  func showDeleteConfirmation() {
+    guard let viewController = findViewController() else { return }
+
+    let alert = UIAlertController(
+      title: "Delete Message",
+      message: "Are you sure you want to delete this message?",
+      preferredStyle: .alert
+    )
+
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+    alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+      guard let self else { return }
+      Task {
+        let _ = Transactions.shared.mutate(
+          transaction: .deleteMessage(
+            .init(
+              messageIds: [self.message.messageId],
+              peerId: self.message.peerId,
+              chatId: self.message.chatId
+            )
+          )
+        )
+      }
+    })
+
+    viewController.present(alert, animated: true)
+  }
+
+  func findViewController() -> UIViewController? {
+    var responder: UIResponder? = self
+    while let nextResponder = responder?.next {
+      responder = nextResponder
+      if let viewController = responder as? UIViewController {
+        return viewController
+      }
+    }
+    return nil
+  }
+
+  func sendAnimationTextView() -> UITextView {
+    messageLabel
+  }
+}

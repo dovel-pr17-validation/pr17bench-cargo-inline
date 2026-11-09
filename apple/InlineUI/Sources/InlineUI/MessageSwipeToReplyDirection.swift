@@ -1,0 +1,3 @@
+import InlineKit
+
+public typealias MessageSwipeToReplyDirection = InlineKit.MessageSwipeToReplyDirection

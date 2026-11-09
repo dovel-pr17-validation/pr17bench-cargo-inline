@@ -1,0 +1,181 @@
+import { and, eq, inArray, isNotNull, isNull } from "drizzle-orm"
+import { db } from "@in/server/db"
+import { integrations, members, spaces } from "@in/server/db/schema"
+import { type Static, Type } from "@sinclair/typebox"
+import { TInputId } from "@in/server/types/methods"
+import { Authorize } from "@in/server/utils/authorize"
+import type { HandlerContext } from "@in/server/controllers/helpers"
+import { InlineError } from "@in/server/types/errors"
+
+export const Input = Type.Object({
+  userId: TInputId,
+  spaceId: Type.Optional(TInputId),
+})
+
+export const Response = Type.Object({
+  hasLinearConnected: Type.Boolean(),
+  hasNotionConnected: Type.Boolean(),
+  hasIntegrationAccess: Type.Boolean(),
+  linearTeamId: Type.Optional(Type.String()),
+  notionDatabaseId: Type.Optional(Type.String()),
+  notionSpaces: Type.Optional(
+    Type.Array(
+      Type.Object({
+        spaceId: Type.Integer(),
+        spaceName: Type.String(),
+      }),
+    ),
+  ),
+  linearSpaces: Type.Optional(
+    Type.Array(
+      Type.Object({
+        spaceId: Type.Integer(),
+        spaceName: Type.String(),
+      }),
+    ),
+  ),
+})
+
+type Input = Static<typeof Input>
+type Response = Static<typeof Response>
+
+export const handler = async (input: Input, context: HandlerContext): Promise<Response> => {
+  let userId = context.currentUserId
+  const spaceId = normalizeSpaceId(input.spaceId)
+
+  let hasLinearConnected = false
+  let hasNotionConnected = false
+  let hasIntegrationAccess = false
+  let linearTeamId: string | undefined = undefined
+  let notionDatabaseId: string | undefined = undefined
+  let notionSpaces: Array<{ spaceId: number; spaceName: string }> | undefined
+  let linearSpaces: Array<{ spaceId: number; spaceName: string }> | undefined
+
+  // Check Linear integrations for this user (fallback for legacy rows)
+  const linearByUser = await db
+    .select({ id: integrations.id })
+    .from(integrations)
+    .where(and(
+      eq(integrations.userId, userId),
+      isNull(integrations.spaceId),
+      eq(integrations.provider, "linear"),
+      usableCredentials,
+    ))
+  hasLinearConnected = linearByUser.length > 0
+
+  // Check Notion integrations (space-specific)
+  if (spaceId) {
+    // Check if user is a member of the space
+    await Authorize.spaceMember(spaceId, context.currentUserId)
+
+    const spaceIntegrations = await db
+      .select({ integration: integrations })
+      .from(integrations)
+      .innerJoin(spaces, eq(integrations.spaceId, spaces.id))
+      .where(and(
+        eq(integrations.spaceId, spaceId),
+        eq(spaces.isPublic, false),
+        isNull(spaces.deleted),
+        usableCredentials,
+      ))
+      .then((rows) => rows.map((row) => row.integration))
+    hasNotionConnected = spaceIntegrations.some((integration) => integration.provider === "notion")
+    hasLinearConnected = spaceIntegrations.some((integration) => integration.provider === "linear")
+    linearTeamId = spaceIntegrations.find((integration) => integration.provider === "linear")?.linearTeamId ?? undefined
+    notionDatabaseId =
+      spaceIntegrations.find((integration) => integration.provider === "notion")?.notionDatabaseId ?? undefined
+
+    // User has integration access if they're a member of this space and it has integrations
+    hasIntegrationAccess = spaceIntegrations.length > 0
+  } else {
+    // If no specific spaceId provided, check if user is member of any space with Notion integration
+    // Get all spaces the user is a member of
+    const userSpaces = await db
+      .select({ spaceId: members.spaceId })
+      .from(members)
+      .where(eq(members.userId, context.currentUserId))
+
+    if (userSpaces.length > 0) {
+      const spaceIds = userSpaces.map((space) => space.spaceId)
+
+      // Get spaces with Notion integrations
+      const spacesWithNotion = await db
+        .select({
+          spaceId: integrations.spaceId,
+          spaceName: spaces.name,
+        })
+        .from(integrations)
+        .innerJoin(spaces, eq(integrations.spaceId, spaces.id))
+        .where(and(
+          inArray(integrations.spaceId, spaceIds),
+          eq(integrations.provider, "notion"),
+          eq(spaces.isPublic, false),
+          isNull(spaces.deleted),
+          usableCredentials,
+        ))
+
+      hasNotionConnected = spacesWithNotion.length > 0
+      if (hasNotionConnected) {
+        notionSpaces = spacesWithNotion.map((space) => ({
+          spaceId: space.spaceId!,
+          spaceName: space.spaceName,
+        }))
+      }
+
+      // Check for any Linear integrations in these spaces
+      const spacesWithLinear = await db
+        .select({
+          spaceId: integrations.spaceId,
+          spaceName: spaces.name,
+        })
+        .from(integrations)
+        .innerJoin(spaces, eq(integrations.spaceId, spaces.id))
+        .where(and(
+          inArray(integrations.spaceId, spaceIds),
+          eq(integrations.provider, "linear"),
+          eq(spaces.isPublic, false),
+          isNull(spaces.deleted),
+          usableCredentials,
+        ))
+
+      hasLinearConnected = spacesWithLinear.length > 0
+      if (hasLinearConnected) {
+        linearSpaces = spacesWithLinear.map((space) => ({
+          spaceId: space.spaceId!,
+          spaceName: space.spaceName,
+        }))
+      }
+
+      hasIntegrationAccess = hasNotionConnected || hasLinearConnected
+    }
+  }
+
+  return {
+    hasLinearConnected,
+    hasNotionConnected,
+    hasIntegrationAccess,
+    linearTeamId,
+    notionDatabaseId,
+    notionSpaces,
+    linearSpaces,
+  }
+}
+
+const usableCredentials = and(
+  isNotNull(integrations.accessTokenEncrypted),
+  isNotNull(integrations.accessTokenIv),
+  isNotNull(integrations.accessTokenTag),
+)
+
+const normalizeSpaceId = (value: Input["spaceId"]): number | undefined => {
+  if (value === undefined) {
+    return undefined
+  }
+
+  const spaceId = Number(value)
+  if (!Number.isSafeInteger(spaceId)) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  return spaceId > 0 ? spaceId : undefined
+}

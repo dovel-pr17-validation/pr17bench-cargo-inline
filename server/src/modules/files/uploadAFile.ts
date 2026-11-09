@@ -1,0 +1,229 @@
+import { nanoid } from "nanoid"
+import { type FileTypes } from "@in/server/modules/files/types"
+import { generateFileUniqueId } from "@in/server/modules/files/fileId"
+import { uploadToBucket } from "@in/server/modules/files/uploadToBucket"
+import { PartHasher } from "@in/server/modules/files/partHashes"
+import { filePartHashes, files, type DbNewFile } from "@in/server/db/schema"
+import { encrypt } from "@in/server/modules/encryption/encryption"
+import { db } from "@in/server/db"
+import { FILES_PATH_PREFIX } from "@in/server/modules/files/path"
+import { ApiError, InlineError } from "@in/server/types/errors"
+import { Log } from "@in/server/utils/log"
+
+const log = new Log("modules/files/uploadAFile")
+
+export interface FileMetadata {
+  width?: number
+  height?: number
+  extension: string
+  mimeType: string
+  fileName: string
+}
+
+export type FileObjectIdentity = {
+  fileUniqueId: string
+  path: string
+}
+
+export function createFileObjectIdentity(
+  fileType: FileTypes,
+  extension: string,
+): FileObjectIdentity {
+  const fileUniqueId = generateFileUniqueId(fileType)
+  const normalizedExtension = extension.trim().toLowerCase()
+  const suffix = normalizedExtension ? `.${normalizedExtension}` : ""
+  return {
+    fileUniqueId,
+    path: `${fileUniqueId}/${nanoid(32)}${suffix}`,
+  }
+}
+
+export type UploadedFileObject = {
+  dbFile: {
+    fileUniqueId: string
+    userId: number
+    pathEncrypted: Buffer
+    pathIv: Buffer
+    pathTag: Buffer
+    nameEncrypted: Buffer
+    nameIv: Buffer
+    nameTag: Buffer
+    fileType: FileTypes
+    fileSize: number
+    width?: number
+    height?: number
+    mimeType: string
+  }
+  fileUniqueId: string
+  path: string
+  prefix?: string
+  /** Range hashes of the bytes written; insert with the file row when present. */
+  partHashes?: Buffer
+}
+
+export function prepareFileObjectRecord(
+  fileSize: number,
+  fileType: FileTypes,
+  metadata: FileMetadata,
+  context: { userId: number },
+  identity?: FileObjectIdentity,
+): UploadedFileObject {
+  const normalizedMetadata = normalizeMetadata(metadata)
+  if (!Number.isSafeInteger(fileSize) || fileSize <= 0) throw badRequest("Uploaded file is empty")
+  const fileUniqueId = identity?.fileUniqueId ?? generateFileUniqueId(fileType)
+  const suffix = normalizedMetadata.extension ? `.${normalizedMetadata.extension}` : ""
+  const prefix = identity ? undefined : nanoid(32)
+  const path = identity?.path ?? `${fileUniqueId}/${prefix}${suffix}`
+  const encryptedPath = encrypt(path)
+  const encryptedName = encrypt(normalizedMetadata.fileName)
+  return {
+    fileUniqueId,
+    path,
+    prefix,
+    dbFile: {
+      fileUniqueId,
+      userId: context.userId,
+      pathEncrypted: encryptedPath.encrypted,
+      pathIv: encryptedPath.iv,
+      pathTag: encryptedPath.authTag,
+      nameEncrypted: encryptedName.encrypted,
+      nameIv: encryptedName.iv,
+      nameTag: encryptedName.authTag,
+      fileType,
+      fileSize,
+      width: normalizedMetadata.width,
+      height: normalizedMetadata.height,
+      mimeType: normalizedMetadata.mimeType,
+    },
+  }
+}
+
+export async function uploadFileObject(
+  file: File,
+  fileType: FileTypes,
+  metadata: FileMetadata,
+  context: { userId: number },
+  identity?: FileObjectIdentity,
+  signal?: AbortSignal,
+): Promise<UploadedFileObject> {
+  let normalizedMetadata = metadata
+  try {
+    normalizedMetadata = normalizeMetadata(metadata)
+    if (file.size === 0) throw badRequest("Uploaded file is empty")
+
+    log.info("Starting file upload", {
+      fileType,
+      fileSize: file.size,
+      extension: normalizedMetadata.extension,
+      mimeType: normalizedMetadata.mimeType,
+      width: normalizedMetadata.width,
+      height: normalizedMetadata.height,
+      userId: context.userId,
+    })
+
+    const prepared = prepareFileObjectRecord(file.size, fileType, normalizedMetadata, context, identity)
+    const partHasher = new PartHasher()
+    try {
+      await uploadToBucket(file, {
+        path: `${FILES_PATH_PREFIX}/${prepared.path}`,
+        type: normalizedMetadata.mimeType,
+        signal,
+        observe: (chunk) => partHasher.update(chunk),
+      })
+      // Anchors native range downloads of this file to the bytes we sent.
+      prepared.partHashes = partHasher.finish(file.size)
+      log.info("File uploaded to bucket successfully", { fileType, userId: context.userId })
+    } catch (error) {
+      const storageError = describeStorageError(error)
+      log.error("Failed to upload file to bucket", {
+        error,
+        fileType,
+        fileSize: file.size,
+        mimeType: normalizedMetadata.mimeType,
+        extension: normalizedMetadata.extension,
+        storageError,
+      })
+      throw new Error("Failed to upload file to storage", { cause: error as Error })
+    }
+
+    log.info("File metadata encrypted successfully")
+    return prepared
+  } catch (error) {
+    log.error("File upload failed", {
+      error,
+      fileType,
+      fileSize: file.size,
+      mimeType: normalizedMetadata.mimeType,
+      extension: normalizedMetadata.extension,
+      userId: context.userId,
+    })
+    throw error
+  }
+}
+
+export async function uploadFile(
+  file: File,
+  fileType: FileTypes,
+  metadata: FileMetadata,
+  context: { userId: number },
+): Promise<{ dbFile: DbNewFile; fileUniqueId: string; prefix: string }> {
+  const prepared = await uploadFileObject(file, fileType, metadata, context)
+  if (!prepared.prefix) throw new Error("Generated file upload is missing its object prefix")
+
+  // Save to DB
+  try {
+    const [dbFile] = await db.insert(files).values(prepared.dbFile).returning()
+    if (!dbFile) {
+      throw new Error("No file returned from database")
+    }
+    if (prepared.partHashes) {
+      // Without the row, range downloads hash the bytes they read; never fail the upload for it.
+      await db.insert(filePartHashes).values({ fileId: dbFile.id, hashes: prepared.partHashes })
+        .onConflictDoNothing({ target: filePartHashes.fileId })
+        .catch((error) => log.warn("Failed to record file part hashes", { error }))
+    }
+    log.info("File saved to database successfully", { fileUniqueId: prepared.fileUniqueId })
+    return { dbFile, fileUniqueId: prepared.fileUniqueId, prefix: prepared.prefix }
+  } catch (error) {
+    log.error("Failed to save file to database", { error, fileUniqueId: prepared.fileUniqueId })
+    throw new Error("Failed to save file to database", { cause: error as Error })
+  }
+}
+
+function normalizeMetadata(metadata: FileMetadata): FileMetadata {
+  const extension = metadata.extension.trim().toLowerCase()
+  const mimeType = metadata.mimeType.trim()
+  if (!mimeType) {
+    throw badRequest("Upload metadata is missing MIME type")
+  }
+
+  const fileName = metadata.fileName.trim()
+  if (!fileName) {
+    throw badRequest("Upload metadata is missing file name")
+  }
+
+  return {
+    ...metadata,
+    extension,
+    mimeType,
+    fileName,
+  }
+}
+
+function badRequest(description: string): InlineError {
+  const error = new InlineError(ApiError.BAD_REQUEST)
+  error.description = description
+  return error
+}
+
+function describeStorageError(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) {
+    return { message: String(error) }
+  }
+
+  return {
+    name: error.name,
+    message: error.message,
+    cause: error.cause,
+  }
+}

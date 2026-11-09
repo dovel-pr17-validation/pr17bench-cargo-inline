@@ -1,0 +1,433 @@
+import { syncChatAccess } from "@in/server/modules/authorization/chatAccessSync"
+import { chatTitleFields } from "@in/server/modules/encryption/chatTitleStorage"
+import { db } from "@in/server/db"
+import { chats, chatParticipants, userNotDeleted, users, type DbChat, type DbDialog } from "@in/server/db/schema"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { AccessGuardsCache } from "@in/server/modules/authorization/accessGuardsCache"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import {
+  getAnchorMessageForChat,
+  getChatById,
+  getDialogForUser,
+  buildDefaultReplyThreadTitle,
+  ensureLinkedSubthreadDialogs,
+  isSubthreadParentMessage,
+  isLinkedSubthread,
+  persistMessageRepliesUpdate,
+  pushMessageRepliesUpdate,
+} from "@in/server/modules/subthreads"
+import {
+  DIALOG_FOLLOWING,
+  getUnfollowedDialogUserIds,
+  setDialogFollowModeForUsers,
+} from "@in/server/modules/dialogFollow"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { UpdatesModel, type UpdateSeqAndDate } from "@in/server/db/models/updates"
+import { UpdateBucket } from "@in/server/db/schema/updates"
+import type { ServerUpdate } from "@in/server/protocol/server"
+import type { AgentThreadContext, Chat, Dialog, Message } from "@inline-chat/protocol/core"
+import { allocateThreadNumber } from "@in/server/modules/threadNumbers"
+import { and, eq, inArray } from "drizzle-orm"
+import { queueReplyThreadGraphMaterialization } from "@in/server/modules/threadGraph"
+import { encodeAgentThreadContext, validateAgentThreadContext } from "@in/server/modules/agentConfiguration"
+import { getBotUserIdsForChatScope, getPublicSpaceBotUserIds } from "@in/server/functions/bot.peerDiscovery"
+
+type Input = {
+  parentChatId: bigint
+  parentMessageId?: bigint
+  title?: string
+  description?: string
+  emoji?: string
+  participants?: { userId: bigint }[]
+  agentContext?: AgentThreadContext
+}
+
+type Output = {
+  chat: Chat
+  dialog?: Dialog
+  anchorMessage?: Message
+}
+
+type InitialParticipant = {
+  chatId: number
+  userId: number
+  date: Date
+}
+
+export async function createSubthread(input: Input, context: FunctionContext): Promise<Output> {
+  const parentChatId = Number(input.parentChatId)
+  if (!Number.isSafeInteger(parentChatId) || parentChatId <= 0) {
+    throw RealtimeRpcError.ChatIdInvalid()
+  }
+
+  const parentMessageId = input.parentMessageId !== undefined ? Number(input.parentMessageId) : undefined
+  if (parentMessageId !== undefined && (!Number.isSafeInteger(parentMessageId) || parentMessageId <= 0)) {
+    throw RealtimeRpcError.MessageIdInvalid()
+  }
+
+  const parentChat = await getChatById(parentChatId)
+  if (!parentChat) {
+    throw RealtimeRpcError.ChatIdInvalid()
+  }
+
+  await AccessGuards.ensureChatAccess(parentChat, context.currentUserId)
+
+  const anchorMessage =
+    parentMessageId !== undefined
+      ? await getAnchorMessageForChat({ parentChatId, parentMessageId })
+      : undefined
+
+  if (parentMessageId !== undefined && !anchorMessage) {
+    throw RealtimeRpcError.MessageIdInvalid()
+  }
+  if (anchorMessage && await isSubthreadParentMessage(anchorMessage.globalId)) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  const directParticipantUserIds = uniquePositiveUserIds(input.participants ?? [])
+  if (parentChat.publicThread !== true && !directParticipantUserIds.includes(context.currentUserId)) {
+    directParticipantUserIds.push(context.currentUserId)
+  }
+  await ensureUsersExist(directParticipantUserIds)
+
+  const agentContext = input.agentContext
+    ? await validateAgentThreadContext(input.agentContext, {
+        bindingActorUserId: context.currentUserId,
+        operation: "create_subthread",
+      })
+    : undefined
+  if (agentContext) {
+    const botUserId = Number(agentContext.botUserId)
+    if (
+      parentChat.spaceId !== null &&
+      parentChat.publicThread === true &&
+      !(await getPublicSpaceBotUserIds(parentChat.spaceId)).includes(botUserId)
+    ) {
+      throw RealtimeRpcError.UserIdInvalid()
+    }
+    const visibleBotIds = new Set([
+      ...directParticipantUserIds,
+      ...await getBotUserIdsForChatScope(parentChat, context.currentUserId),
+    ])
+    if (!visibleBotIds.has(botUserId)) throw RealtimeRpcError.UserIdInvalid()
+  }
+
+  if (parentMessageId !== undefined) {
+    const existingReplyThread = await db.query.chats.findFirst({
+      where: {
+        parentChatId,
+        parentMessageId,
+      },
+    })
+
+    if (existingReplyThread) {
+      requireMatchingAgentContext(existingReplyThread, agentContext)
+      await ensureLinkedSubthreadDialogs({
+        chat: existingReplyThread,
+        userIds: [context.currentUserId],
+        chatListHidden: true,
+      })
+      await autoFollowCreatedReplyThread({
+        chat: existingReplyThread,
+        currentUserId: context.currentUserId,
+        anchorMessage,
+      })
+      queueReplyThreadGraphMaterialization({
+        replyThread: existingReplyThread,
+        parentChat,
+        parentMessageGlobalId: anchorMessage?.globalId ?? null,
+      })
+
+      return encodeSubthreadResult({
+        chat: existingReplyThread,
+        currentUserId: context.currentUserId,
+      })
+    }
+  }
+
+  const explicitTitle = normalizeOptionalString(input.title)
+  const title =
+    explicitTitle ??
+    (parentMessageId !== undefined
+      ? buildDefaultReplyThreadTitle(anchorMessage)
+      : undefined)
+  const description = normalizeOptionalString(input.description)
+  const emoji = normalizeOptionalString(input.emoji)
+  const chat = await createSubthreadChat({
+    parentChat,
+    parentMessageId,
+    title,
+    isUntitled: explicitTitle === undefined,
+    description,
+    emoji,
+    createdBy: context.currentUserId,
+    directParticipantUserIds,
+    agentContext,
+  })
+
+  const { dialogs: materializedDialogs } =
+    parentMessageId !== undefined
+      ? await autoFollowCreatedReplyThread({
+          chat,
+          currentUserId: context.currentUserId,
+          anchorMessage,
+        })
+      : await ensureLinkedSubthreadDialogs({
+          chat,
+          userIds: [context.currentUserId],
+          chatListHidden: true,
+        })
+
+  if (!isLinkedSubthread(chat)) {
+    await persistNewChatUpdate(chat.id)
+  }
+
+  if (parentMessageId !== undefined) {
+    const parentSummaryUpdate = await persistMessageRepliesUpdate({
+      parentChatId,
+      parentMessageId,
+    })
+
+    await pushMessageRepliesUpdate({
+      parentChatId,
+      parentMessageId,
+      currentUserId: context.currentUserId,
+      update: parentSummaryUpdate,
+    })
+    queueReplyThreadGraphMaterialization({
+      replyThread: chat,
+      parentChat,
+      parentMessageGlobalId: anchorMessage?.globalId ?? null,
+    })
+  }
+
+  return encodeSubthreadResult({
+    chat,
+    currentUserId: context.currentUserId,
+    dialog: materializedDialogs.find((dialog) => dialog.userId === context.currentUserId),
+    anchorMessage,
+  })
+}
+
+async function autoFollowCreatedReplyThread(input: {
+  chat: DbChat
+  currentUserId: number
+  anchorMessage?: Awaited<ReturnType<typeof getAnchorMessageForChat>>
+}): Promise<{ dialogs: DbDialog[] }> {
+  const userIds = new Set<number>([input.currentUserId])
+
+  if (input.anchorMessage?.fromId != null) {
+    userIds.add(input.anchorMessage.fromId)
+  }
+
+  const unfollowedUserIds = new Set(
+    await getUnfollowedDialogUserIds({
+      chatId: input.chat.id,
+      userIds: Array.from(userIds),
+    }),
+  )
+  const followUserIds = Array.from(userIds).filter((userId) => !unfollowedUserIds.has(userId))
+  if (followUserIds.length === 0) {
+    return { dialogs: [] }
+  }
+
+  const { dialogs } = await setDialogFollowModeForUsers({
+    chat: input.chat,
+    userIds: followUserIds,
+    followMode: DIALOG_FOLLOWING,
+  })
+
+  return { dialogs }
+}
+
+async function encodeSubthreadResult(input: {
+  chat: DbChat
+  currentUserId: number
+  dialog?: DbDialog | undefined
+  anchorMessage?: Awaited<ReturnType<typeof getAnchorMessageForChat>>
+}): Promise<Output> {
+  const dialog = input.dialog ?? (await getDialogForUser(input.chat.id, input.currentUserId))
+
+  const anchorMessage = input.anchorMessage ?? (await getAnchorMessageForChat(input.chat))
+
+  return {
+    chat: await Encoders.chatForUser(input.chat, { encodingForUserId: input.currentUserId }),
+    dialog: dialog ? Encoders.dialog(dialog, { unreadCount: 0 }) : undefined,
+    anchorMessage: anchorMessage
+      ? Encoders.fullMessage({
+          message: anchorMessage,
+          encodingForUserId: input.currentUserId,
+          encodingForPeer: {
+            inputPeer: {
+              type: {
+                oneofKind: "chat",
+                chat: { chatId: BigInt(input.chat.parentChatId ?? input.chat.id) },
+              },
+            },
+          },
+        })
+      : undefined,
+  }
+}
+
+async function createSubthreadChat(input: {
+  parentChat: DbChat
+  parentMessageId?: number
+  title?: string
+  isUntitled: boolean
+  description?: string
+  emoji?: string
+  createdBy: number
+  directParticipantUserIds: number[]
+  agentContext?: AgentThreadContext
+}): Promise<DbChat> {
+  try {
+    const result = await db.transaction(async (tx): Promise<{
+      chat: DbChat
+      participants: InitialParticipant[]
+    }> => {
+      const spaceId = input.parentChat.spaceId ?? null
+      const threadNumber = await allocateThreadNumber(
+        tx,
+        spaceId !== null ? { type: "space", id: spaceId } : { type: "user", id: input.createdBy },
+      )
+
+      const [chat] = await tx
+        .insert(chats)
+        .values({
+          type: "thread",
+          spaceId,
+          ...chatTitleFields(input.title ?? null, { spaceId, createdBy: input.createdBy }),
+          isUntitled: input.isUntitled ? true : null,
+          description: input.description ?? null,
+          emoji: input.emoji ?? null,
+          createdBy: input.createdBy,
+          publicThread: input.parentChat.publicThread ?? false,
+          parentChatId: input.parentChat.id,
+          parentMessageId: input.parentMessageId ?? null,
+          threadNumber,
+          agentContext: input.agentContext ? encodeAgentThreadContext(input.agentContext) : null,
+        })
+        .returning()
+
+      if (!chat) {
+        throw RealtimeRpcError.InternalError()
+      }
+      await syncChatAccess(tx, { kind: "chats", chatIds: [chat.id] })
+
+      let participants: InitialParticipant[] = []
+      if (input.directParticipantUserIds.length > 0) {
+        participants = input.directParticipantUserIds.map((userId) => ({
+          chatId: chat.id,
+          userId,
+          date: new Date(),
+        }))
+
+        await tx.insert(chatParticipants).values(participants).onConflictDoNothing()
+      }
+
+      return { chat, participants }
+    })
+
+    result.participants.forEach((participant) => {
+      AccessGuardsCache.setChatParticipant(participant.chatId, participant.userId)
+    })
+    return result.chat
+  } catch (error) {
+    if (
+      input.parentMessageId !== undefined &&
+      error instanceof Error &&
+      error.message.includes("reply_thread_parent_unique")
+    ) {
+      const existingReplyThread = await db.query.chats.findFirst({
+        where: {
+          parentChatId: input.parentChat.id,
+          parentMessageId: input.parentMessageId,
+        },
+      })
+
+      if (existingReplyThread) {
+        requireMatchingAgentContext(existingReplyThread, input.agentContext)
+        return existingReplyThread
+      }
+    }
+
+    throw error
+  }
+}
+
+function requireMatchingAgentContext(chat: DbChat, requested: AgentThreadContext | undefined): void {
+  if (!requested) return
+  const requestedBytes = encodeAgentThreadContext(requested)
+  if (!chat.agentContext || !Buffer.from(chat.agentContext).equals(requestedBytes)) {
+    throw RealtimeRpcError.BadRequest()
+  }
+}
+
+async function ensureUsersExist(userIds: number[]): Promise<void> {
+  if (userIds.length === 0) {
+    return
+  }
+
+  const existingUsers = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(inArray(users.id, userIds), userNotDeleted()))
+
+  if (existingUsers.length !== userIds.length) {
+    throw RealtimeRpcError.UserIdInvalid()
+  }
+}
+
+function normalizeOptionalString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed && trimmed.length > 0 ? trimmed : undefined
+}
+
+function uniquePositiveUserIds(participants: { userId: bigint }[]): number[] {
+  const result = new Set<number>()
+
+  for (const participant of participants) {
+    const userId = Number(participant.userId)
+    if (!Number.isSafeInteger(userId) || userId <= 0) {
+      throw RealtimeRpcError.UserIdInvalid()
+    }
+    result.add(userId)
+  }
+
+  return Array.from(result)
+}
+
+async function persistNewChatUpdate(chatId: number): Promise<UpdateSeqAndDate> {
+  const chatUpdatePayload: ServerUpdate["update"] = {
+    oneofKind: "newChat",
+    newChat: {
+      chatId: BigInt(chatId),
+    },
+  }
+
+  return db.transaction(async (tx): Promise<UpdateSeqAndDate> => {
+    const [chat] = await tx.select().from(chats).where(eq(chats.id, chatId)).for("update").limit(1)
+
+    if (!chat) {
+      throw RealtimeRpcError.ChatIdInvalid()
+    }
+
+    const update = await UpdatesModel.insertUpdate(tx, {
+      update: chatUpdatePayload,
+      bucket: UpdateBucket.Chat,
+      entity: chat,
+    })
+
+    await tx
+      .update(chats)
+      .set({
+        updateSeq: update.seq,
+        lastUpdateDate: update.date,
+      })
+      .where(eq(chats.id, chatId))
+
+    return update
+  })
+}

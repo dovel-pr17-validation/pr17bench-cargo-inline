@@ -1,0 +1,686 @@
+import Auth
+import Foundation
+import GRDB
+import InlineProtocol
+import Logger
+import MultipartFormDataKit
+import RealtimeV2
+
+#if os(iOS)
+import UIKit
+#endif
+
+public struct SendMessageAttachment: Codable, Sendable {
+  let media: FileMediaItem
+
+  // internal state
+  fileprivate var uploaded: Bool = false
+  fileprivate var randomId: Int64?
+}
+
+/// Resends using the original media rows so durable uploads reconcile their
+/// existing client identity after a lost response or processing timeout.
+@MainActor
+public enum FailedMessageResender {
+  private static var activeMessages: Set<String> = []
+
+  public static func mediaItems(for message: FullMessage) -> [FileMediaItem] {
+    var items: [FileMediaItem] = []
+    if let photo = message.photoInfo { items.append(.photo(photo)) }
+    if let video = message.videoInfo { items.append(.video(video)) }
+    if let document = message.documentInfo { items.append(.document(document)) }
+    if let voice = message.message.voiceContent { items.append(.voice(voice)) }
+    return items
+  }
+
+  public static func resend(_ fullMessage: FullMessage) async throws {
+    try await resend(fullMessage, database: .shared, auth: Auth.shared.handle) {
+      Transactions.shared.mutate(transaction: .sendMessage($0))
+    }
+  }
+
+  static func resend(
+    _ fullMessage: FullMessage, database: AppDatabase, auth: AuthHandle,
+    beforeAdmission: (@MainActor () async throws -> Void)? = nil,
+    admit: @MainActor (TransactionSendMessage) -> Bool
+  ) async throws {
+    let message = fullMessage.message
+    guard message.status == .failed, message.out == true else { return }
+    let account = try auth.beginAccountMutation()
+    guard message.fromId == account.userID else { return }
+    let key = "\(account.userID):\(message.chatId):\(message.messageId)"
+    guard activeMessages.insert(key).inserted else { return }
+    defer { activeMessages.remove(key) }
+    let stillFailed = try await database.dbWriter.read { db in
+      try auth.validateAccountMutation(account)
+      let stored = try Message.fetchOne(db, key: ["messageId": message.messageId, "chatId": message.chatId])
+      return stored?.status == .failed && stored?.fromId == account.userID
+    }
+    guard stillFailed else { return }
+    try await beforeAdmission?()
+    try auth.validateAccountMutation(account)
+    // Admit before deleting. An account transition or rejected admission leaves
+    // the recoverable failed row and its original media untouched.
+    guard admit(.init(
+      text: message.text, peerId: message.peerId, chatId: message.chatId,
+      mediaItems: mediaItems(for: fullMessage), replyToMsgId: message.repliedToMessageId,
+      isSticker: message.isSticker, entities: message.entities
+    )) else { return }
+    let deleted = try await database.dbWriter.write { db in
+      try auth.validateAccountMutation(account)
+      guard let stored = try Message.fetchOne(db, key: [
+        "messageId": message.messageId, "chatId": message.chatId,
+      ]), stored.status == .failed, stored.fromId == account.userID else { return false }
+      try Message.deleteMessages(db, messageIds: [message.messageId], chatId: message.chatId)
+      return true
+    }
+    try auth.validateAccountMutation(account)
+    if deleted { MessagesPublisher.shared.messagesDeleted(messageIds: [message.messageId], peer: message.peerId) }
+  }
+}
+
+@MainActor
+public enum PendingMessageCanceller {
+  @discardableResult
+  public static func cancel(_ fullMessage: FullMessage) -> Bool {
+    let message = fullMessage.message
+    guard message.status == .sending, message.messageId < 0,
+          let account = try? Auth.shared.handle.beginAccountMutation(),
+          account.userID == message.fromId else { return false }
+    let transactionID = message.transactionId.flatMap { $0.isEmpty ? nil : $0 }
+    guard transactionID != nil || message.randomId != nil else { return false }
+    // The send may already be on its way; if it lands anyway, it's deleted there.
+    if let randomID = message.randomId {
+      CancelledSends.shared.record(randomId: randomID, chatId: message.chatId, peerId: message.peerId)
+    }
+    if let transactionID { Transactions.shared.cancel(transactionId: transactionID) }
+    let media = FailedMessageResender.mediaItems(for: fullMessage)
+    Task {
+      do {
+        try Auth.shared.handle.validateAccountMutation(account)
+        for item in media { try await FileUploader.shared.cancel(media: item, accountToken: account) }
+        if transactionID == nil, let randomID = message.randomId {
+          await Api.realtime.cancelTransaction(where: {
+            guard $0.transaction.method == .sendMessage,
+                  case let .sendMessage(input) = $0.transaction.input else { return false }
+            return input.randomID == randomID
+          })
+        }
+        let deleted = try await AppDatabase.shared.dbWriter.write { db in
+          try Auth.shared.handle.validateAccountMutation(account)
+          guard let stored = try Message.fetchOne(db, key: [
+            "messageId": message.messageId, "chatId": message.chatId,
+          ]), stored.status == .sending, stored.fromId == account.userID else { return false }
+          try Message.deleteMessages(db, messageIds: [message.messageId], chatId: message.chatId)
+          return true
+        }
+        try Auth.shared.handle.validateAccountMutation(account)
+        if deleted { MessagesPublisher.shared.messagesDeleted(messageIds: [message.messageId], peer: message.peerId) }
+      } catch { Log.shared.error("Failed to cancel pending media message", error: error) }
+    }
+    return true
+  }
+}
+
+enum SendMessageUploadCoordinator {
+  static func beginOrJoinUpload<T>(
+    _ startUpload: () async throws -> T
+  ) async throws -> T? {
+    try Task.checkCancellation()
+    do {
+      return try await startUpload()
+    } catch FileUploadError.uploadAlreadyInProgress {
+      return nil
+    }
+  }
+
+  static func waitForUpload(_ task: Task<UploadResult, any Error>) async throws -> UploadResult {
+    try Task.checkCancellation()
+    let (results, continuation) = AsyncStream<Result<UploadResult, any Error>>.makeStream(
+      bufferingPolicy: .bufferingNewest(1)
+    )
+    let waiter = Task {
+      continuation.yield(await task.result)
+      continuation.finish()
+    }
+    defer {
+      waiter.cancel()
+      continuation.finish()
+    }
+
+    // Uploads can be shared by multiple sends. Cancel this wait without stopping
+    // another message's transfer; AsyncStream wakes a cancelled iterator.
+    var iterator = results.makeAsyncIterator()
+    guard let result = await iterator.next() else { throw CancellationError() }
+    try Task.checkCancellation()
+    return try result.get()
+  }
+}
+
+public struct TransactionSendMessage: Transaction {
+  // Properties
+  public var text: String? = nil
+  public var peerId: Peer
+  public var chatId: Int64
+  public var attachments: [SendMessageAttachment]
+  public var replyToMsgId: Int64? = nil
+  public var isSticker: Bool? = nil
+  public var entities: MessageEntities? = nil
+  public var sendMode: MessageSendMode? = nil
+
+  // Config
+  public var id = UUID().uuidString
+  public var config = TransactionConfig(maxRetries: 30, retryDelay: 4, executionTimeout: 600)
+  public var date = Date()
+
+  // State
+  public var randomId: Int64
+  public var peerUserId: Int64? = nil
+  public var peerThreadId: Int64? = nil
+  public var temporaryMessageId: Int64
+
+  enum CodingKeys: String, CodingKey {
+    case text
+    case peerId
+    case chatId
+    case attachments
+    case replyToMsgId
+    case isSticker
+    case entities
+    case sendMode
+    case id
+    case config
+    case date
+    case randomId
+    case peerUserId
+    case peerThreadId
+    case temporaryMessageId
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    text = try container.decodeIfPresent(String.self, forKey: .text)
+    peerId = try container.decode(Peer.self, forKey: .peerId)
+    chatId = try container.decode(Int64.self, forKey: .chatId)
+    attachments = try container.decodeIfPresent([SendMessageAttachment].self, forKey: .attachments) ?? []
+    replyToMsgId = try container.decodeIfPresent(Int64.self, forKey: .replyToMsgId)
+    isSticker = try container.decodeIfPresent(Bool.self, forKey: .isSticker)
+    entities = try container.decodeIfPresent(MessageEntities.self, forKey: .entities)
+    if let rawValue = try container.decodeIfPresent(Int.self, forKey: .sendMode) {
+      sendMode = MessageSendMode(rawValue: rawValue) ?? .modeUnspecified
+    } else {
+      sendMode = nil
+    }
+    id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+    let decodedConfig = try container.decodeIfPresent(TransactionConfig.self, forKey: .config)
+      ?? TransactionConfig(maxRetries: 30, retryDelay: 4, executionTimeout: 600)
+    config = Self.sendConfiguration(decodedConfig, hasAttachments: !attachments.isEmpty)
+    date = try container.decodeIfPresent(Date.self, forKey: .date) ?? Date()
+    randomId = try container.decode(Int64.self, forKey: .randomId)
+    peerUserId = try container.decodeIfPresent(Int64.self, forKey: .peerUserId)
+    peerThreadId = try container.decodeIfPresent(Int64.self, forKey: .peerThreadId)
+    temporaryMessageId = try container.decode(Int64.self, forKey: .temporaryMessageId)
+
+    if peerUserId == nil, case let .user(id) = peerId {
+      peerUserId = id
+    }
+    if peerThreadId == nil, case let .thread(id) = peerId {
+      peerThreadId = id
+    }
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encodeIfPresent(text, forKey: .text)
+    try container.encode(peerId, forKey: .peerId)
+    try container.encode(chatId, forKey: .chatId)
+    try container.encode(attachments, forKey: .attachments)
+    try container.encodeIfPresent(replyToMsgId, forKey: .replyToMsgId)
+    try container.encodeIfPresent(isSticker, forKey: .isSticker)
+    try container.encodeIfPresent(entities, forKey: .entities)
+    if let sendMode = sendMode {
+      try container.encode(sendMode.rawValue, forKey: .sendMode)
+    }
+    try container.encode(id, forKey: .id)
+    try container.encode(config, forKey: .config)
+    try container.encode(date, forKey: .date)
+    try container.encode(randomId, forKey: .randomId)
+    try container.encodeIfPresent(peerUserId, forKey: .peerUserId)
+    try container.encodeIfPresent(peerThreadId, forKey: .peerThreadId)
+    try container.encode(temporaryMessageId, forKey: .temporaryMessageId)
+  }
+
+  public init(
+    text: String?,
+    peerId: Peer,
+    chatId: Int64,
+    mediaItems: [FileMediaItem] = [],
+    replyToMsgId: Int64? = nil,
+    isSticker: Bool? = nil,
+    entities: MessageEntities? = nil,
+    sendMode: MessageSendMode? = nil
+  ) {
+    self.text = text
+    self.peerId = peerId
+    self.chatId = chatId
+    self.isSticker = isSticker
+    self.entities = entities
+    self.sendMode = sendMode
+    attachments = mediaItems.map { SendMessageAttachment(media: $0) }
+    config = Self.sendConfiguration(config, hasAttachments: !attachments.isEmpty)
+    self.replyToMsgId = replyToMsgId
+    randomId = Int64.random(in: 0 ... Int64.max)
+    peerUserId = if case let .user(id) = peerId { id } else { nil }
+    peerThreadId = if case let .thread(id) = peerId { id } else { nil }
+    temporaryMessageId = -1 * randomId
+
+    if !attachments.isEmpty {
+      // iterate over attachments and attach random id to all
+      for i in 0 ..< attachments.count {
+        if i == 0 {
+          attachments[0].randomId = randomId
+        } else {
+          Log.shared.warning("Multiple attachments in send message transaction not supported yet")
+          // self.attachments[i].randomId = Int64.random(in: Int64.min ... Int64.max)
+        }
+      }
+    }
+  }
+
+  private static func sendConfiguration(_ config: TransactionConfig, hasAttachments: Bool) -> TransactionConfig {
+    guard hasAttachments else { return config }
+    // Upload parts have bounded RPC stall timeouts, and final send has its own
+    // RPC timeout. An overall deadline would fail a healthy large transfer.
+    // Apply this on decode too so persisted sends do not retain the old deadline.
+    return TransactionConfig(maxRetries: config.maxRetries, retryDelay: config.retryDelay, executionTimeout: 0)
+  }
+
+  // Methods
+  public func optimistic() {
+    let media = attachments.first?.media
+    let voiceContent = media?.asVoiceContent()
+    Log.shared.debug("Optimistic send message \(media.debugDescription)")
+    guard let currentUserId = Auth.getCurrentUserId() else {
+      Log.shared.error("Skipping optimistic send message because current user id is missing")
+      return
+    }
+
+    let message = Message(
+      messageId: temporaryMessageId,
+      randomId: randomId,
+      fromId: currentUserId,
+      date: date,
+      text: text,
+      peerUserId: peerUserId,
+      peerThreadId: peerThreadId,
+      chatId: chatId,
+      out: true,
+      status: .sending,
+      repliedToMessageId: replyToMsgId,
+      fileId: nil,
+      photoId: media?.asPhotoId(),
+      videoId: media?.asVideoId(),
+      documentId: media?.asDocumentId(),
+      contentPayload: voiceContent.map { voiceContent in
+        Client_MessageContentPayload.with {
+          $0.voice = voiceContent
+        }
+      },
+      blockContentPayload: .literalBlocks(text: text, entities: entities),
+      transactionId: id,
+      isSticker: isSticker,
+      entities: entities
+    )
+
+    // When I remove this task, or make it a sync call, I get frame drops in very fast sending
+    // (mo a few months later) TRADE OFFS BABY
+    // Task { @MainActor in
+
+    Task(priority: .userInitiated) { // off main actor for db write
+      let newMessage = try? AppDatabase.shared.dbWriter.write { db in
+        do {
+          // Save message
+          try message.save(db)
+
+          // Update last message id
+          try Chat
+            .updateLastMsgId(
+              db,
+              chatId: message.chatId,
+              lastMsgId: message.messageId,
+              date: message.date
+            )
+
+          // Fetch full message for update
+          return try FullMessage.queryRequest()
+            .filter(Column("messageId") == message.messageId)
+            .filter(Column("chatId") == message.chatId)
+            .fetchOne(db)
+        } catch {
+          Log.shared.error("Failed to save and fetch message", error: error)
+          return nil
+        }
+      }
+
+      Task(priority: .userInitiated) { @MainActor in
+        if let newMessage {
+          MessagesPublisher.shared.messageAddedSync(fullMessage: newMessage, peer: peerId)
+        } else {
+          Log.shared.error("Failed to save message and push update")
+        }
+      }
+    }
+  }
+
+  public func execute() async throws -> [InlineProtocol.Update] {
+    try Task.checkCancellation()
+    // clear typing...
+    Task {
+      await ComposeActions.shared.stoppedTyping(for: peerId)
+    }
+
+    let date = Date()
+    var inputMedia: InputMedia? = nil
+
+    // upload attachments and construct input media
+    if let attachment = attachments.first {
+      switch attachment.media {
+        case let .photo(photoInfo):
+//          let clearUploadState = await ComposeActions.shared.startPhotoUpload(for: peerId)
+//          defer {
+//            Task { @MainActor in
+//              clearUploadState()
+//            }
+//          }
+
+          guard let localPhotoId = photoInfo.photo.id else {
+            throw FileUploadError.invalidPhotoId
+          }
+
+          _ = try await SendMessageUploadCoordinator.beginOrJoinUpload {
+            try await FileUploader.shared.uploadPhoto(photoInfo: photoInfo)
+          }
+
+          if let photoServerId = try await FileUploader.shared.waitForUpload(photoLocalId: localPhotoId)?.photoId {
+            inputMedia = .fromPhotoId(photoServerId)
+          }
+
+        case let .video(videoInfo):
+          // Start video upload status
+//          let clearUploadState = await ComposeActions.shared.startVideoUpload(for: peerId)
+//          defer {
+//            Task { @MainActor in
+//              clearUploadState()
+//            }
+//          }
+
+          let localVideoId = try await FileUploader.shared.resolveLocalVideoId(for: videoInfo.video)
+
+          _ = try await SendMessageUploadCoordinator.beginOrJoinUpload {
+            try await FileUploader.shared.uploadVideo(videoInfo: videoInfo)
+          }
+
+          if let videoServerId = try await FileUploader.shared.waitForUpload(videoLocalId: localVideoId)?.videoId {
+            inputMedia = .fromVideoId(videoServerId)
+          }
+
+        case let .document(documentInfo):
+          let localDocumentIdForNotifications = documentInfo.document.id
+          guard let localDocumentId = documentInfo.document.id else {
+            throw FileUploadError.invalidDocumentId
+          }
+
+          if let localDocumentIdForNotifications {
+            Log.shared.debug("📤 Sending DocumentUploadStarted notification for document ID: \(localDocumentIdForNotifications)")
+            Task { @MainActor in
+              NotificationCenter.default.post(
+                name: NSNotification.Name("DocumentUploadStarted"),
+                object: nil,
+                userInfo: ["documentId": localDocumentIdForNotifications]
+              )
+            }
+          }
+
+          do {
+            _ = try await SendMessageUploadCoordinator.beginOrJoinUpload {
+              try await FileUploader.shared.uploadDocument(documentInfo: documentInfo)
+            }
+
+            if let documentServerId = try await FileUploader.shared.waitForUpload(documentLocalId: localDocumentId)?
+              .documentId
+            {
+              inputMedia = .fromDocumentId(documentServerId)
+            }
+
+            Task { @MainActor in
+              NotificationCenter.default.post(
+                name: NSNotification.Name("DocumentUploadCompleted"),
+                object: nil,
+                userInfo: ["documentId": localDocumentId]
+              )
+            }
+          } catch {
+            // Notify UI that document upload failed
+            if let localDocumentIdForNotifications {
+              Task { @MainActor in
+                NotificationCenter.default.post(
+                  name: NSNotification.Name("DocumentUploadFailed"),
+                  object: nil,
+                  userInfo: ["documentId": localDocumentIdForNotifications, "error": error]
+                )
+              }
+            } else {
+              Log.shared.warning("Unable to post DocumentUploadFailed notification without a local document ID")
+            }
+            throw error
+          }
+
+        case let .voice(voiceContent):
+          let localVoiceId = voiceContent.voiceID
+          guard localVoiceId != 0 else {
+            throw FileUploadError.invalidVoiceId
+          }
+
+          _ = try await SendMessageUploadCoordinator.beginOrJoinUpload {
+            try await FileUploader.shared.uploadVoice(voiceContent: voiceContent)
+          }
+
+          if let voiceServerId = try await FileUploader.shared.waitForUpload(voiceLocalId: localVoiceId)?.voiceId {
+            inputMedia = .fromVoiceId(voiceServerId)
+          }
+      }
+    }
+
+    try Task.checkCancellation()
+
+    // input for send message
+    let input: SendMessageInput = .with {
+      $0.peerID = peerId.toInputPeer()
+      $0.randomID = randomId
+      $0.temporarySendDate = optimisticMessageTimestamp(for: date)
+      $0.isSticker = isSticker ?? false
+
+      if let text { $0.message = text }
+      if let replyToMsgId { $0.replyToMsgID = replyToMsgId }
+      if let inputMedia { $0.media = inputMedia }
+      if let entities { $0.entities = entities }
+      if let sendMode { $0.sendMode = sendMode }
+    }
+
+    // Keep upload persistence/retries here while finalizing through the primary socket.
+    let result_ = try await Api.realtime.callRpcDirect(
+      method: .sendMessage,
+      input: .sendMessage(input)
+    )
+
+    guard case let .sendMessage(result) = result_ else {
+      throw SendMessageError.failed
+    }
+
+    return result.updates
+  }
+
+  public func shouldRetryOnFail(error: Error) -> Bool {
+    if let error = error as? NativeMediaUploadError {
+      switch error {
+      case .emptySource, .fileTooLarge, .invalidGeometry, .sourceChanged, .canceled, .expired, .processingTimedOut:
+        return false
+      case let .rejected(_, retryable):
+        return retryable
+      case .unauthenticated, .unexpectedResponse:
+        return true
+      }
+    }
+
+    if let error = error as? APIError {
+      switch error {
+        case let .error(_, errorCode, _):
+          if let errorCode, (400 ... 499).contains(errorCode), errorCode != 429 {
+            return false
+          }
+          return true
+        case let .httpError(statusCode):
+          if (400 ... 499).contains(statusCode), statusCode != 429 {
+            return false
+          }
+          return true
+        case .invalidURL:
+          return false
+        case .invalidResponse, .decodingError, .networkError, .rateLimited:
+          return true
+      }
+    }
+
+    if let error = error as? RealtimeAPIError {
+      switch error {
+        case let .rpcError(_, _, code):
+          switch code {
+            case 400, 401:
+              return false
+
+            default:
+              return true
+          }
+        default:
+          return true
+      }
+    }
+
+    if let error = error as? RealtimeDirectRpcError {
+      switch error {
+      case let .rpcError(_, _, code):
+        return code != 400 && code != 401
+      case .notAuthorized:
+        return false
+      case .notConnected, .timeout, .commitOutcomeUnknown, .capacityExceeded, .unknown:
+        return true
+      }
+    }
+
+    return true
+  }
+
+  public func retryLimit(for error: Error) -> Int {
+    if case .unexpectedResponse = error as? NativeMediaUploadError { return 2 }
+    return config.maxRetries
+  }
+
+  public func didSucceed(result: [InlineProtocol.Update]) async {
+    await Api.realtime.applyUpdates(result)
+
+    #if os(iOS)
+    Task(priority: .userInitiated) { @MainActor in
+      SendMessageFeedback.shared.playHapticFeedback()
+    }
+    #endif
+  }
+
+  public func didFail(error: Error?) async {
+    Log.shared.error("Failed to send message", error: error)
+
+    if !attachments.isEmpty {
+      NotificationCenter.default.post(
+        name: .mediaSendFailed,
+        object: nil,
+        userInfo: [
+          "chatId": chatId,
+          "temporaryMessageId": temporaryMessageId,
+          "message": mediaSendFailureDescription(error: error),
+        ]
+      )
+    }
+
+    guard let currentUserId = Auth.getCurrentUserId() else {
+      return
+    }
+    // Mark as failed
+    do {
+      let message = try await AppDatabase.shared.dbWriter.write { db in
+        try Message
+          .filter(Column("randomId") == randomId && Column("fromId") == currentUserId)
+          .updateAll(
+            db,
+            Column("status").set(to: MessageSendingStatus.failed.rawValue)
+          )
+        return try Message.fetchOne(db, key: ["messageId": temporaryMessageId, "chatId": chatId])
+      }
+
+      // Update UI
+      if let message {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+          MessagesPublisher.shared
+            .messageUpdatedSync(message: message, peer: peerId, animated: true)
+        }
+      }
+    } catch {
+      Log.shared.error("Failed to update message status on failure", error: error)
+    }
+  }
+
+  public func rollback() async {
+    do {
+      // Remove from database and update chat state
+      let _ = try await AppDatabase.shared.dbWriter.write { db in
+        try Message.deleteMessages(db, messageIds: [temporaryMessageId], chatId: chatId)
+      }
+
+      // Remove from cache
+      await MessagesPublisher.shared
+        .messagesDeleted(messageIds: [temporaryMessageId], peer: peerId)
+    } catch {
+      Log.shared.error("Failed to rollback send message", error: error)
+    }
+  }
+
+  enum SendMessageError: Error {
+    case failed
+  }
+
+  private func mediaSendFailureDescription(error: Error?) -> String {
+    let itemName = attachments.first.map { attachmentName(for: $0.media) } ?? "attachment"
+
+    guard let error else {
+      return "Couldn't send \(itemName)."
+    }
+
+    let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+    if detail.isEmpty {
+      return "Couldn't send \(itemName)."
+    }
+
+    return "Couldn't send \(itemName). \(detail)"
+  }
+
+  private func attachmentName(for media: FileMediaItem) -> String {
+    switch media {
+      case .photo:
+        "photo"
+      case .video:
+        "video"
+      case .document:
+        "file"
+      case .voice:
+        "voice message"
+    }
+  }
+}

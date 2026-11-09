@@ -1,0 +1,476 @@
+import AppKit
+import Auth
+import InlineKit
+
+enum MainWindowDestination: Hashable, Codable {
+  case chat(peer: Peer)
+  case grid(spaceID: Int64)
+
+  var route: Nav3Route {
+    switch self {
+    case let .chat(peer):
+      .chat(peer: peer)
+    case let .grid(spaceID):
+      .grid(spaceId: spaceID)
+    }
+  }
+}
+
+@MainActor
+final class MainWindowOpenCoordinator {
+  static let shared = MainWindowOpenCoordinator()
+
+  private struct WindowEntry {
+    weak var window: NSWindow?
+    weak var toastPresenter: (any ToastPresenting)?
+    var selectedPeer: Peer?
+    let isViewingChat: @MainActor (Peer) -> Bool
+    let route: @MainActor (MainWindowDestination) -> Void
+    let openCommandBar: @MainActor () -> Void
+    let toggleCommandBar: @MainActor () -> Void
+    let toggleSidebar: @MainActor () -> Void
+    let createNewThread: @MainActor () -> Void
+    let goBack: @MainActor () -> Void
+    let goForward: @MainActor () -> Void
+    let canGoBack: @MainActor () -> Bool
+    let canGoForward: @MainActor () -> Bool
+    var navigateChat: (@MainActor (_ offset: Int) -> Void)?
+    var renameThread: (@MainActor () -> Bool)?
+    var chatMenuContext: ChatMenuContext?
+    var spaceMenuContext: SpaceMenuContext?
+  }
+
+  private var pendingDestination: MainWindowDestination?
+  private var pendingDestinationAccount: AuthAccountMutationToken?
+  private var openMainWindow: (() -> Void)?
+  private var openOnboardingWindow: (() -> Void)?
+  private var windows: [UUID: WindowEntry] = [:]
+  private var sidebarNavigation: [UUID: @MainActor (_ offset: Int) -> Void] = [:]
+  private var threadRenaming: [UUID: @MainActor () -> Bool] = [:]
+  private var chatMenuContexts: [UUID: ChatMenuContext] = [:]
+  private var spaceMenuContexts: [UUID: SpaceMenuContext] = [:]
+
+  func register(
+    openMainWindow: @escaping () -> Void,
+    openOnboardingWindow: (() -> Void)? = nil
+  ) {
+    self.openMainWindow = openMainWindow
+    self.openOnboardingWindow = openOnboardingWindow
+  }
+
+  func registerWindow(
+    id: UUID,
+    window: NSWindow?,
+    toastPresenter: (any ToastPresenting)?,
+    selectedPeer: Peer?,
+    isViewingChat: @escaping @MainActor (Peer) -> Bool,
+    route: @escaping @MainActor (MainWindowDestination) -> Void,
+    openCommandBar: @escaping @MainActor () -> Void,
+    toggleCommandBar: @escaping @MainActor () -> Void,
+    toggleSidebar: @escaping @MainActor () -> Void,
+    createNewThread: @escaping @MainActor () -> Void,
+    goBack: @escaping @MainActor () -> Void,
+    goForward: @escaping @MainActor () -> Void,
+    canGoBack: @escaping @MainActor () -> Bool,
+    canGoForward: @escaping @MainActor () -> Bool
+  ) {
+    guard let window else {
+      unregisterWindow(id: id)
+      return
+    }
+
+    windows[id] = WindowEntry(
+      window: window,
+      toastPresenter: toastPresenter,
+      selectedPeer: selectedPeer,
+      isViewingChat: isViewingChat,
+      route: route,
+      openCommandBar: openCommandBar,
+      toggleCommandBar: toggleCommandBar,
+      toggleSidebar: toggleSidebar,
+      createNewThread: createNewThread,
+      goBack: goBack,
+      goForward: goForward,
+      canGoBack: canGoBack,
+      canGoForward: canGoForward,
+      navigateChat: sidebarNavigation[id],
+      renameThread: threadRenaming[id],
+      chatMenuContext: chatMenuContexts[id],
+      spaceMenuContext: spaceMenuContexts[id]
+    )
+  }
+
+  func unregisterWindow(id: UUID) {
+    windows.removeValue(forKey: id)
+    sidebarNavigation.removeValue(forKey: id)
+    threadRenaming.removeValue(forKey: id)
+    chatMenuContexts.removeValue(forKey: id)
+    spaceMenuContexts.removeValue(forKey: id)
+  }
+
+  func updateSelectedPeer(id: UUID, peer: Peer?) {
+    guard var entry = windows[id] else { return }
+    entry.selectedPeer = peer
+    windows[id] = entry
+  }
+
+  func hasActivePeer(_ peer: Peer) -> Bool {
+    removeClosedWindows()
+    return windows.values.contains { entry in
+      entry.window != nil && entry.selectedPeer == peer
+    }
+  }
+
+  func isViewingChat(_ peer: Peer) -> Bool {
+    guard NSApp.isActive, let window = NSApp.keyWindow,
+          window.attachedSheet == nil, let entry = entry(for: window)
+    else { return false }
+    return entry.isViewingChat(peer)
+  }
+
+  func registerSidebarNavigation(
+    id: UUID,
+    navigate: @escaping @MainActor (_ offset: Int) -> Void
+  ) {
+    sidebarNavigation[id] = navigate
+    guard var entry = windows[id] else { return }
+    entry.navigateChat = navigate
+    windows[id] = entry
+  }
+
+  func unregisterSidebarNavigation(id: UUID) {
+    sidebarNavigation.removeValue(forKey: id)
+    guard var entry = windows[id] else { return }
+    entry.navigateChat = nil
+    windows[id] = entry
+  }
+
+  func registerRenameThread(
+    id: UUID,
+    rename: @escaping @MainActor () -> Bool
+  ) {
+    threadRenaming[id] = rename
+    guard var entry = windows[id] else { return }
+    entry.renameThread = rename
+    windows[id] = entry
+  }
+
+  func unregisterRenameThread(id: UUID) {
+    threadRenaming.removeValue(forKey: id)
+    guard var entry = windows[id] else { return }
+    entry.renameThread = nil
+    windows[id] = entry
+  }
+
+  func registerChatMenuContext(id: UUID, context: ChatMenuContext) {
+    chatMenuContexts[id] = context
+    guard var entry = windows[id] else { return }
+    entry.chatMenuContext = context
+    windows[id] = entry
+  }
+
+  func unregisterChatMenuContext(id: UUID, peer: Peer? = nil) {
+    if let peer, chatMenuContexts[id]?.peer != peer { return }
+    chatMenuContexts.removeValue(forKey: id)
+    guard var entry = windows[id] else { return }
+    entry.chatMenuContext = nil
+    windows[id] = entry
+  }
+
+  func updateSpaceMenuContext(id: UUID, context: SpaceMenuContext) {
+    spaceMenuContexts[id] = context
+    guard var entry = windows[id] else { return }
+    entry.spaceMenuContext = context
+    windows[id] = entry
+  }
+
+  func unregisterSpaceMenuContext(id: UUID) {
+    spaceMenuContexts.removeValue(forKey: id)
+    guard var entry = windows[id] else { return }
+    entry.spaceMenuContext = nil
+    windows[id] = entry
+  }
+
+  func resetWindows() {
+    pendingDestination = nil
+    pendingDestinationAccount = nil
+    windows.removeAll()
+    sidebarNavigation.removeAll()
+    threadRenaming.removeAll()
+    chatMenuContexts.removeAll()
+    spaceMenuContexts.removeAll()
+  }
+
+  func openWindow(_ destination: MainWindowDestination, expectedAccount: AuthAccountMutationToken? = nil) {
+    if let expectedAccount, (try? Auth.shared.handle.validateAccountMutation(expectedAccount)) == nil { return }
+    if routeExistingWindow(to: destination) {
+      return
+    }
+
+    openNewWindow(destination, expectedAccount: expectedAccount)
+  }
+
+  func openNewWindow(_ destination: MainWindowDestination, expectedAccount: AuthAccountMutationToken? = nil) {
+    pendingDestination = destination
+    pendingDestinationAccount = expectedAccount
+    openMainWindow?()
+  }
+
+  func openTab(_ destination: MainWindowDestination) {
+    pendingDestination = destination
+    pendingDestinationAccount = nil
+    openTab()
+  }
+
+  @discardableResult
+  func createNewThread() -> Bool {
+    if let entry = activeEntry() {
+      focus(entry)
+      entry.createNewThread()
+      return true
+    }
+
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      openMainWindow?()
+
+      for _ in 0 ..< 5 {
+        await Task.yield()
+        guard let entry = activeEntry() else { continue }
+        focus(entry)
+        entry.createNewThread()
+        return
+      }
+    }
+
+    return false
+  }
+
+  func openTab() {
+    guard let currentWindow = NSApp.keyWindow,
+          entry(for: currentWindow) != nil,
+          let windowController = currentWindow.windowController
+    else {
+      openMainWindow?()
+      return
+    }
+
+    windowController.newWindowForTab(nil)
+  }
+
+  @discardableResult
+  func selectTab(at position: Int) -> Bool {
+    guard position > 0, let tabGroup = tabGroupForSelection() else { return false }
+
+    let index = position - 1
+    let windows = tabGroup.windows
+    guard windows.indices.contains(index) else { return false }
+
+    let window = windows[index]
+    guard tabGroup.selectedWindow !== window else { return true }
+
+    tabGroup.selectedWindow = window
+    window.makeKeyAndOrderFront(nil)
+    return true
+  }
+
+  func openDefaultWindow() {
+    openMainWindow?()
+  }
+
+  @discardableResult
+  func openCommandBar() -> Bool {
+    guard let entry = activeEntry() else {
+      openMainWindow?()
+      return false
+    }
+
+    entry.openCommandBar()
+    focus(entry)
+    return true
+  }
+
+  @discardableResult
+  func toggleCommandBar() -> Bool {
+    guard let entry = activeEntry() else {
+      openMainWindow?()
+      return false
+    }
+
+    entry.toggleCommandBar()
+    focus(entry)
+    return true
+  }
+
+  @discardableResult
+  func toggleSidebar() -> Bool {
+    guard let entry = activeEntry() else { return false }
+    entry.toggleSidebar()
+    return true
+  }
+
+  @discardableResult
+  func navigateChat(offset: Int) -> Bool {
+    guard let entry = activeEntry(),
+          let navigateChat = entry.navigateChat
+    else { return false }
+
+    navigateChat(offset)
+    return true
+  }
+
+  @discardableResult
+  func goBack() -> Bool {
+    guard let entry = activeEntry(), entry.canGoBack() else { return false }
+    entry.goBack()
+    return true
+  }
+
+  @discardableResult
+  func goForward() -> Bool {
+    guard let entry = activeEntry(), entry.canGoForward() else { return false }
+    entry.goForward()
+    return true
+  }
+
+  @discardableResult
+  func renameThread() -> Bool {
+    guard let entry = activeEntry(),
+          let renameThread = entry.renameThread
+    else { return false }
+
+    focus(entry)
+    return renameThread()
+  }
+
+  var activeChatMenuContext: ChatMenuContext? {
+    activeEntry()?.chatMenuContext
+  }
+
+  var activeSpaceMenuContext: SpaceMenuContext? {
+    activeEntry()?.spaceMenuContext
+  }
+
+  @discardableResult
+  func performChatMenuCommand(_ command: ChatMenuCommand) -> Bool {
+    guard let entry = activeEntry(),
+          let context = entry.chatMenuContext,
+          context.isEnabled(command)
+    else { return false }
+
+    context.perform(command)
+    return true
+  }
+
+  var activeToastPresenter: (any ToastPresenting)? {
+    activeEntry()?.toastPresenter
+  }
+
+  var canNavigateChat: Bool {
+    activeEntry()?.navigateChat != nil
+  }
+
+  var canRenameThread: Bool {
+    activeEntry()?.renameThread != nil
+  }
+
+  var hasActiveWindow: Bool {
+    activeEntry() != nil
+  }
+
+  var canGoBack: Bool {
+    activeEntry()?.canGoBack() ?? false
+  }
+
+  var canGoForward: Bool {
+    activeEntry()?.canGoForward() ?? false
+  }
+
+  func openLaunchWindow(topLevelRoute: TopLevelRoute) {
+    switch topLevelRoute {
+    case .main:
+      openDefaultWindow()
+    case .loading, .onboarding:
+      openOnboarding()
+    }
+  }
+
+  func openOnboarding() {
+    if let openOnboardingWindow {
+      openOnboardingWindow()
+    } else {
+      openMainWindow?()
+    }
+  }
+
+  func consumePendingDestination() -> MainWindowDestination? {
+    defer { pendingDestination = nil; pendingDestinationAccount = nil }
+    if let account = pendingDestinationAccount,
+       (try? Auth.shared.handle.validateAccountMutation(account)) == nil { return nil }
+    return pendingDestination
+  }
+
+  private func routeExistingWindow(to destination: MainWindowDestination) -> Bool {
+    removeClosedWindows()
+
+    if let entry = entry(for: NSApp.keyWindow) {
+      route(destination, using: entry)
+      return true
+    }
+
+    if let entry = windows.values.first(where: { $0.window?.isVisible == true }) {
+      route(destination, using: entry)
+      return true
+    }
+
+    return false
+  }
+
+  private func activeEntry() -> WindowEntry? {
+    removeClosedWindows()
+
+    if let entry = entry(for: NSApp.keyWindow) {
+      return entry
+    }
+
+    return windows.values.first { $0.window?.isVisible == true }
+  }
+
+  private func entry(for window: NSWindow?) -> WindowEntry? {
+    guard let window else { return nil }
+    return windows.values.first { $0.window === window }
+  }
+
+  private func tabGroupForSelection() -> NSWindowTabGroup? {
+    if let window = NSApp.keyWindow, entry(for: window) != nil {
+      return window.tabGroup
+    }
+
+    removeClosedWindows()
+    return windows.values.first { $0.window?.isVisible == true }?.window?.tabGroup
+  }
+
+  private func route(_ destination: MainWindowDestination, using entry: WindowEntry) {
+    entry.route(destination)
+    focus(entry)
+  }
+
+  private func focus(_ entry: WindowEntry) {
+    entry.window?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  private func removeClosedWindows() {
+    windows = windows.filter { _, entry in
+      entry.window?.isVisible == true || entry.window != nil
+    }
+    sidebarNavigation = sidebarNavigation.filter { id, _ in
+      windows[id] != nil
+    }
+    threadRenaming = threadRenaming.filter { id, _ in
+      windows[id] != nil
+    }
+    chatMenuContexts = chatMenuContexts.filter { id, _ in windows[id] != nil }
+    spaceMenuContexts = spaceMenuContexts.filter { id, _ in windows[id] != nil }
+  }
+}

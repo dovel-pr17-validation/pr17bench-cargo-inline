@@ -1,0 +1,190 @@
+"""
+Validate Sparkle appcast output.
+
+Checks:
+  - at least one <item>
+  - sparkle:version + sparkle:shortVersionString present
+  - enclosure has url + sparkle:edSignature + length
+  - optional: require short version, hardware, minimum OS, URL, and length for one selected build
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+
+
+def sparkle_tag(name: str) -> str:
+    return f"{{{SPARKLE_NS}}}{name}"
+
+
+def find_sparkle_child(item: ET.Element, name: str) -> ET.Element | None:
+    element = item.find(sparkle_tag(name))
+    if element is None:
+        element = item.find(f"sparkle:{name}", {"sparkle": SPARKLE_NS})
+    return element
+
+
+def item_version(item: ET.Element) -> str:
+    version = find_sparkle_child(item, "version")
+    if version is None:
+        return ""
+    return (version.text or "").strip()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--appcast", required=True)
+    parser.add_argument("--require-build")
+    parser.add_argument("--require-url")
+    parser.add_argument("--require-short-version")
+    parser.add_argument("--require-length")
+    parser.add_argument("--require-hardware")
+    parser.add_argument("--require-minimum-system-version")
+    args = parser.parse_args()
+
+    appcast_path = Path(args.appcast)
+    if not appcast_path.exists():
+        print(f"Appcast not found: {appcast_path}", file=sys.stderr)
+        return 1
+
+    try:
+        tree = ET.parse(appcast_path)
+    except ET.ParseError as error:
+        print(f"Appcast XML parse error: {error}", file=sys.stderr)
+        return 1
+
+    root = tree.getroot()
+    def has_sparkle_namespace() -> bool:
+        for el in root.iter():
+            if isinstance(el.tag, str) and el.tag.startswith(f"{{{SPARKLE_NS}}}"):
+                return True
+            for attr in el.attrib:
+                if attr.startswith(f"{{{SPARKLE_NS}}}"):
+                    return True
+        return False
+
+    if not has_sparkle_namespace():
+        print("Appcast missing Sparkle namespace usage", file=sys.stderr)
+        return 1
+
+    channels = root.findall("channel")
+    if root.tag != "rss" or len(channels) != 1:
+        print("Appcast must have exactly one <rss><channel> feed", file=sys.stderr)
+        return 1
+    channel = channels[0]
+
+    items = channel.findall("item")
+    if not items:
+        print("Appcast has no <item> entries", file=sys.stderr)
+        return 1
+
+    matching_build_items = [item for item in items if item_version(item) == args.require_build] if args.require_build else []
+
+    if args.require_build:
+        if not matching_build_items:
+            print(f"Appcast missing build {args.require_build}", file=sys.stderr)
+            return 1
+        if len(matching_build_items) != 1:
+            print(f"Appcast has duplicate entries for build {args.require_build}", file=sys.stderr)
+            return 1
+
+    selected_items = matching_build_items if args.require_build else items
+
+    if args.require_short_version:
+        if not any(
+            (find_sparkle_child(item, "shortVersionString") is not None)
+            and (
+                (find_sparkle_child(item, "shortVersionString").text or "").strip()
+                == args.require_short_version
+            )
+            for item in selected_items
+        ):
+            selected = f" for build {args.require_build}" if args.require_build else ""
+            print(f"Appcast missing short version {args.require_short_version}{selected}", file=sys.stderr)
+            return 1
+
+    if args.require_url:
+        if not any(
+            (item.find("enclosure") is not None)
+            and (item.find("enclosure").get("url") == args.require_url)
+            for item in selected_items
+        ):
+            selected = f" for build {args.require_build}" if args.require_build else ""
+            print(f"Appcast missing enclosure URL {args.require_url}{selected}", file=sys.stderr)
+            return 1
+
+    if args.require_length:
+        if not any(
+            (item.find("enclosure") is not None)
+            and (item.find("enclosure").get("length") == args.require_length)
+            for item in selected_items
+        ):
+            selected = f" for build {args.require_build}" if args.require_build else ""
+            print(f"Appcast missing enclosure length {args.require_length}{selected}", file=sys.stderr)
+            return 1
+
+    if args.require_hardware:
+        if not any(
+            (find_sparkle_child(item, "hardwareRequirements") is not None)
+            and ((find_sparkle_child(item, "hardwareRequirements").text or "").strip() == args.require_hardware)
+            for item in selected_items
+        ):
+            print(f"Appcast missing hardware requirement {args.require_hardware}", file=sys.stderr)
+            return 1
+
+    if args.require_minimum_system_version:
+        if not any(
+            (find_sparkle_child(item, "minimumSystemVersion") is not None)
+            and (
+                (find_sparkle_child(item, "minimumSystemVersion").text or "").strip()
+                == args.require_minimum_system_version
+            )
+            for item in selected_items
+        ):
+            selected = f" for build {args.require_build}" if args.require_build else ""
+            print(
+                f"Appcast missing minimum system version {args.require_minimum_system_version}{selected}",
+                file=sys.stderr,
+            )
+            return 1
+
+    for item in items:
+        version_el = find_sparkle_child(item, "version")
+        short_el = find_sparkle_child(item, "shortVersionString")
+        if version_el is None or not (version_el.text or "").strip():
+            print("Missing sparkle:version", file=sys.stderr)
+            return 1
+        if short_el is None or not (short_el.text or "").strip():
+            print("Missing sparkle:shortVersionString", file=sys.stderr)
+            return 1
+
+        enclosure = item.find("enclosure")
+        if enclosure is None:
+            print("Missing enclosure", file=sys.stderr)
+            return 1
+
+        url = enclosure.get("url")
+        if not url:
+            print("Missing enclosure url", file=sys.stderr)
+            return 1
+
+        edsig = enclosure.get(sparkle_tag("edSignature")) or enclosure.get("sparkle:edSignature")
+        if not edsig:
+            print("Missing sparkle:edSignature", file=sys.stderr)
+            return 1
+
+        length = enclosure.get("length")
+        if not length:
+            print("Missing enclosure length", file=sys.stderr)
+            return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

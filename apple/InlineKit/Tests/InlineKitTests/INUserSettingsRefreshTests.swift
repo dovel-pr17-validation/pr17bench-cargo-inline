@@ -1,0 +1,700 @@
+import Foundation
+@testable import InlineKit
+import InlineProtocol
+import Testing
+
+@Suite("User settings refresh", .serialized)
+@MainActor
+struct INUserSettingsRefreshTests {
+  @Test("iPad hardware Return defaults on and preserves local choices", arguments: [nil, false, true] as [Bool?])
+  func hardwareReturnIsLocal(savedChoice: Bool?) async throws {
+    let harness = try makeHarness()
+    defer { harness.removeUserDefaults() }
+    #expect(harness.settings.compose.sendWithReturnOnIPad)
+    if let savedChoice {
+      harness.settings.compose.sendWithReturnOnIPad = savedChoice
+    }
+    let expected = savedChoice ?? true
+    #expect(ComposeSettingsManager(localDefaults: harness.userDefaults).sendWithReturnOnIPad == expected)
+    harness.settings.updateFromServer(.with {
+      $0.composeSettings.replacePastedLinksWithTitles = true
+    })
+    #expect(harness.settings.compose.sendWithReturnOnIPad == expected)
+    // Let the actual shared-settings debounce complete; a local toggle must never reach it.
+    try await Task.sleep(for: .milliseconds(400))
+    #expect(await harness.saver.callCount == 0)
+    let relaunched = INUserSettings(
+      userDefaults: harness.userDefaults,
+      currentUserID: { 1 },
+      fetchNotificationSettings: { nil },
+      saveNotificationSettings: { _ in Issue.record("Local Return preference unexpectedly synced") }
+    )
+    #expect(relaunched.compose.sendWithReturnOnIPad == expected)
+    let encoded = try JSONEncoder().encode(relaunched.compose)
+    let values = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    #expect(values["sendWithReturnOnIPad"] == nil)
+    #expect(relaunched.compose.toProtocol().replacePastedLinksWithTitles)
+  }
+
+  @Test("gesture edits sync while local overrides never publish")
+  func gestureSyncAndLocalOverride() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+    let gestures = harness.settings.messageGestures
+    #expect(gestures.syncEnabled)
+    gestures.doubleTapAction = .reply
+    gestures.holdAction = .toggleHeart
+    gestures.swipeToReplyDirection = .leftToRight
+    await harness.saver.waitForCalls(1)
+    let saved = await harness.saver.savedValues.last?.messageGestures
+    #expect(saved?.doubleTapAction == .reply)
+    #expect(saved?.holdAction == .toggleHeart)
+    #expect(saved?.swipeToReplyDirection == .leftToRight)
+    await harness.saver.succeed()
+    for _ in 0..<20 { await Task.yield() }
+
+    gestures.syncEnabled = false
+    gestures.doubleTapAction = .none
+    harness.settings.compose.replacePastedLinksWithTitles = true
+    await harness.saver.waitForCalls(2)
+    let localSave = await harness.saver.savedValues.last
+    #expect(localSave?.messageGestures == nil)
+    await harness.saver.succeed()
+    for _ in 0..<20 { await Task.yield() }
+
+    var remote = MessageGestureValues()
+    remote.doubleTapAction = .toggleThumbsUp
+    harness.settings.updateFromServer(.with { $0.messageGestureSettings = remote.toProtocol() })
+    #expect(gestures.doubleTapAction == .none)
+    gestures.syncEnabled = true
+    #expect(gestures.doubleTapAction == .toggleThumbsUp)
+    #expect(await harness.saver.callCount == 2)
+  }
+
+  @Test("remote gestures are retained while an unrelated setting saves", arguments: [true, false])
+  func remoteGesturesDuringUnrelatedSave(syncEnabled: Bool) async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+    let gestures = harness.settings.messageGestures
+    gestures.syncEnabled = syncEnabled
+    if !syncEnabled { gestures.doubleTapAction = .none }
+    harness.settings.compose.replacePastedLinksWithTitles = true
+    await harness.saver.waitForCalls(1)
+    var remote = MessageGestureValues()
+    remote.doubleTapAction = .reply
+    harness.settings.updateFromServer(.with { $0.messageGestureSettings = remote.toProtocol() })
+    #expect(harness.settings.compose.replacePastedLinksWithTitles)
+    #expect(gestures.doubleTapAction == (syncEnabled ? .reply : .none))
+    gestures.syncEnabled = true
+    #expect(gestures.doubleTapAction == .reply)
+    #expect(await harness.saver.savedValues.last?.messageGestures == nil)
+    await harness.saver.succeed()
+
+    let relaunched = INUserSettings(
+      userDefaults: harness.userDefaults,
+      currentUserID: { 1 },
+      fetchNotificationSettings: { nil },
+      saveNotificationSettings: { _ in }
+    )
+    #expect(relaunched.messageGestures.doubleTapAction == .reply)
+  }
+
+  @Test("opting out keeps a queued shared edit separate from later local edits")
+  func optingOutDuringDebounce() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+    let gestures = harness.settings.messageGestures
+    gestures.doubleTapAction = .reply
+    gestures.syncEnabled = false
+    gestures.doubleTapAction = .toggleHeart
+    await harness.saver.waitForCalls(1)
+    #expect(await harness.saver.savedValues.last?.messageGestures?.doubleTapAction == .reply)
+    #expect(gestures.doubleTapAction == .toggleHeart)
+    await harness.saver.succeed()
+    gestures.syncEnabled = true
+    #expect(gestures.doubleTapAction == .reply)
+  }
+
+  @Test("failed gesture edits survive relaunch and retry before refresh")
+  func pendingGestureSurvivesRelaunch() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+    harness.settings.messageGestures.doubleTapAction = .reply
+    await harness.saver.waitForCalls(1)
+    await harness.saver.fail()
+    for _ in 0..<20 { await Task.yield() }
+
+    let fetcher = ControlledNotificationSettingsFetcher()
+    let saver = ControlledNotificationSettingsSaver(isControlled: true)
+    let relaunched = INUserSettings(
+      userDefaults: harness.userDefaults,
+      currentUserID: { 1 },
+      fetchNotificationSettings: { try await fetcher.fetch() },
+      saveNotificationSettings: { try await saver.save($0) }
+    )
+    #expect(relaunched.messageGestures.doubleTapAction == .reply)
+    let refresh = Task { await relaunched.refresh(reason: .authenticatedScene) }
+    await saver.waitForCalls(1)
+    let saved = try #require(await saver.savedValues.last)
+    #expect(saved.messageGestures?.doubleTapAction == .reply)
+    #expect(await fetcher.callCount == 0)
+    await saver.succeed()
+    await fetcher.waitForCalls(1)
+    await fetcher.succeed(saved)
+    await refresh.value
+    #expect(relaunched.messageGestures.doubleTapAction == .reply)
+  }
+
+  @Test("link shortening stays opt-in for new and older settings, preserving saved choices")
+  func linkShorteningRemainsOptIn() throws {
+    #expect(!ComposeSettingsManager().replacePastedLinksWithTitles)
+    #expect(!ComposeSettingsManager(from: InlineProtocol.ComposeSettings()).replacePastedLinksWithTitles)
+    let missing = try JSONDecoder().decode(ComposeSettingsManager.self, from: Data("{}".utf8))
+    #expect(!missing.replacePastedLinksWithTitles)
+    for enabled in [false, true] {
+      let settings = ComposeSettingsManager(replacePastedLinksWithTitles: enabled)
+      let saved = try JSONEncoder().encode(settings)
+      #expect(try JSONDecoder().decode(ComposeSettingsManager.self, from: saved).replacePastedLinksWithTitles == enabled)
+      #expect(ComposeSettingsManager(from: settings.toProtocol()).replacePastedLinksWithTitles == enabled)
+    }
+  }
+
+  @Test("global settings mutations share a durable account-local execution lane")
+  func globalSettingsMutationsAreDurableAndOrdered() throws {
+    let all = NotificationSettingsManager()
+    all.mode = .all
+    let none = NotificationSettingsManager()
+    none.mode = .none
+
+    let first = UpdateUserSettingsTransaction(notificationSettings: all)
+    let second = UpdateUserSettingsTransaction(notificationSettings: none)
+
+    #expect(first.executionKey == second.executionKey)
+    let type = first.type
+    guard case .mutation = type else {
+      Issue.record("Expected a mutation transaction")
+      return
+    }
+    #expect(first.reconnectReplayPolicy == nil)
+  }
+
+  @Test("legacy notification transactions do not overwrite privacy")
+  func legacyNotificationTransactionKeepsPrivacyAbsent() throws {
+    let notification = NotificationSettingsManager()
+    let legacyContext = try JSONDecoder().decode(
+      UpdateUserSettingsTransaction.Context.self,
+      from: JSONEncoder().encode(
+        UpdateUserSettingsTransaction.Context(notificationSettings: notification)
+      )
+    )
+    let transaction = UpdateUserSettingsTransaction(
+      notificationSettings: legacyContext.notificationSettings,
+      privacySettings: legacyContext.privacySettings
+    )
+
+    guard case let .updateUserSettings(input) = transaction.input(from: transaction.context) else {
+      Issue.record("Expected an updateUserSettings input")
+      return
+    }
+    #expect(input.userSettings.hasNotificationSettings)
+    #expect(!input.userSettings.hasPrivacySettings)
+    #expect(!input.userSettings.hasComposeSettings)
+  }
+
+  @Test("saves compose edits through the shared user-settings lane")
+  func savesComposeEdits() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+
+    harness.settings.compose.replacePastedLinksWithTitles = true
+
+    await harness.saver.waitForCalls(1)
+    let savedValues = await harness.saver.savedValues
+    #expect(savedValues.last?.replacePastedLinksWithTitles == true)
+    await harness.saver.succeed()
+  }
+
+  @Test("coalesces concurrent refreshes for the same account")
+  func coalescesConcurrentRefreshes() async throws {
+    let harness = try makeHarness()
+    defer { harness.removeUserDefaults() }
+
+    let first = Task {
+      await harness.settings.refresh(reason: .authenticatedScene)
+    }
+    let second = Task {
+      await harness.settings.refresh(reason: .notificationPresentation)
+    }
+
+    await harness.fetcher.waitForCalls(1)
+    let callCount = await harness.fetcher.callCount
+    #expect(callCount == 1)
+
+    await harness.fetcher.succeed(NotificationSettingsValues(
+      mode: .none,
+      silent: true,
+      disableDmNotifications: true
+    ))
+    await first.value
+    await second.value
+
+    #expect(harness.settings.notification.mode == .none)
+    #expect(harness.settings.notification.silent)
+    #expect(harness.settings.notification.disableDmNotifications)
+  }
+
+  @Test("notification presentation replaces a stale cached value with the server value")
+  func notificationPresentationRefreshesCachedValue() async throws {
+    let harness = try makeHarness(cachedMode: .all)
+    defer { harness.removeUserDefaults() }
+
+    #expect(harness.settings.notification.mode == .all)
+
+    let refresh = Task {
+      await harness.settings.refresh(reason: .notificationPresentation)
+    }
+    await harness.fetcher.waitForCalls(1)
+    await harness.fetcher.succeed(
+      NotificationSettingsValues(
+        mode: .onlyMentions,
+        silent: false,
+        disableDmNotifications: true
+      )
+    )
+    await refresh.value
+
+    #expect(harness.settings.notification.mode == .onlyMentions)
+    #expect(harness.settings.notification.disableDmNotifications)
+  }
+
+  @Test("keeps a local edit made while refresh is in flight")
+  func rejectsResponseAfterLocalEdit() async throws {
+    let harness = try makeHarness()
+    defer { harness.removeUserDefaults() }
+
+    let refresh = Task {
+      await harness.settings.refresh(reason: .notificationPresentation)
+    }
+    await harness.fetcher.waitForCalls(1)
+
+    harness.settings.notification.mode = .onlyMentions
+    await harness.fetcher.succeed(NotificationSettingsValues(
+      mode: .none,
+      silent: false,
+      disableDmNotifications: false
+    ))
+    await refresh.value
+
+    #expect(harness.settings.notification.mode == .onlyMentions)
+
+    // Let the injected no-op debounce complete before releasing the harness.
+    try await Task.sleep(for: .milliseconds(350))
+  }
+
+  @Test("saves privacy edits through the shared user-settings lane")
+  func savesPrivacyEdits() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+
+    harness.settings.privacy.shareTimeZone = false
+    harness.settings.privacy.appearInGlobalSearch = false
+
+    await harness.saver.waitForCalls(1)
+    let savedValues = await harness.saver.savedValues
+    #expect(savedValues.last?.shareTimeZone == false)
+    #expect(savedValues.last?.appearInGlobalSearch == false)
+    await harness.saver.succeed()
+  }
+
+  @Test("rejects a response fetched for a previous account")
+  func rejectsResponseAfterAccountSwitch() async throws {
+    let harness = try makeHarness()
+    defer { harness.removeUserDefaults() }
+
+    let refresh = Task {
+      await harness.settings.refresh(reason: .authenticatedScene)
+    }
+    await harness.fetcher.waitForCalls(1)
+
+    harness.account.userID = 2
+    await harness.fetcher.succeed(NotificationSettingsValues(
+      mode: .none,
+      silent: false,
+      disableDmNotifications: false
+    ))
+    await refresh.value
+
+    #expect(harness.settings.notification.mode == .all)
+  }
+
+  @Test("preserves cached settings when refresh fails")
+  func preservesCacheAfterFailure() async throws {
+    let harness = try makeHarness(cachedMode: .mentions)
+    defer { harness.removeUserDefaults() }
+
+    let refresh = Task {
+      await harness.settings.refresh(reason: .notificationPresentation)
+    }
+    await harness.fetcher.waitForCalls(1)
+    await harness.fetcher.fail()
+    await refresh.value
+
+    #expect(harness.settings.notification.mode == .mentions)
+  }
+
+  @Test("rejects a deferred live update received for a previous account")
+  func rejectsDeferredLiveUpdateAfterAccountSwitch() throws {
+    let harness = try makeHarness()
+    defer { harness.removeUserDefaults() }
+
+    harness.account.userID = 2
+    harness.settings.updateFromServer(
+      .with { $0.notificationSettings = .with { $0.mode = .none } },
+      receivingUserID: 1
+    )
+
+    #expect(harness.settings.notification.mode == .all)
+  }
+
+  @Test("isolates cached settings when the authenticated account changes")
+  func isolatesCacheAcrossAccounts() async throws {
+    let harness = try makeHarness()
+    defer { harness.removeUserDefaults() }
+
+    let firstRefresh = Task {
+      await harness.settings.refresh(reason: .authenticatedScene)
+    }
+    await harness.fetcher.waitForCalls(1)
+    await harness.fetcher.succeed(NotificationSettingsValues(
+      mode: .none,
+      silent: true,
+      disableDmNotifications: false
+    ))
+    await firstRefresh.value
+    #expect(harness.settings.notification.mode == .none)
+
+    harness.account.userID = 2
+    let secondRefresh = Task {
+      await harness.settings.refresh(reason: .authenticatedScene)
+    }
+    await harness.fetcher.waitForCalls(2)
+    #expect(harness.settings.notification.mode == .all)
+    await harness.fetcher.fail()
+    await secondRefresh.value
+    #expect(harness.settings.notification.mode == .all)
+
+    harness.account.userID = 1
+    let restoredRefresh = Task {
+      await harness.settings.refresh(reason: .authenticatedScene)
+    }
+    await harness.fetcher.waitForCalls(3)
+    #expect(harness.settings.notification.mode == .none)
+    await harness.fetcher.fail()
+    await restoredRefresh.value
+    #expect(harness.settings.notification.mode == .none)
+  }
+
+  @Test("retries a failed local save on the next refresh trigger")
+  func retriesFailedLocalSave() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+
+    harness.settings.notification.mode = .onlyMentions
+    await harness.saver.waitForCalls(1)
+    await harness.saver.fail()
+
+    let refresh = Task {
+      await harness.settings.refresh(reason: .notificationPresentation)
+    }
+    await harness.saver.waitForCalls(2)
+    let fetchCountWhilePending = await harness.fetcher.callCount
+    #expect(fetchCountWhilePending == 0)
+    await harness.saver.succeed()
+
+    await harness.fetcher.waitForCalls(1)
+    await harness.fetcher.succeed(NotificationSettingsValues(
+      mode: .onlyMentions,
+      silent: false,
+      disableDmNotifications: true
+    ))
+    await refresh.value
+
+    #expect(harness.settings.notification.mode == .onlyMentions)
+  }
+
+  @Test("a refresh started with a local edit flushes the edited value")
+  func immediateRefreshFlushesEditedValue() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+
+    harness.settings.notification.mode = .none
+    let refresh = Task {
+      await harness.settings.refresh(reason: .notificationPresentation)
+    }
+
+    await harness.saver.waitForCalls(1)
+    let savedValues = await harness.saver.savedValues
+    #expect(savedValues.first?.mode == NotificationMode.none)
+    await harness.saver.succeed()
+    await harness.fetcher.waitForCalls(1)
+    await harness.fetcher.succeed(NotificationSettingsValues(
+      mode: .none,
+      silent: false,
+      disableDmNotifications: false
+    ))
+    await refresh.value
+
+    #expect(harness.settings.notification.mode == .none)
+  }
+
+  @Test("keeps a pending local edit ahead of a live server update")
+  func keepsPendingLocalEditAheadOfLiveUpdate() async throws {
+    let harness = try makeHarness(controlledSaves: true)
+    defer { harness.removeUserDefaults() }
+
+    harness.settings.notification.mode = .none
+    await harness.saver.waitForCalls(1)
+
+    harness.settings.updateFromServer(.with {
+      $0.notificationSettings = .with { $0.mode = .all }
+    })
+    #expect(harness.settings.notification.mode == .none)
+
+    let refresh = Task {
+      await harness.settings.refresh(reason: .notificationPresentation)
+    }
+    await harness.saver.succeed()
+    await harness.fetcher.waitForCalls(1)
+    await harness.fetcher.succeed(NotificationSettingsValues(
+      mode: .none,
+      silent: false,
+      disableDmNotifications: false
+    ))
+    await refresh.value
+
+    #expect(harness.settings.notification.mode == .none)
+  }
+
+  @Test("restores and retries an unsynced local edit after relaunch")
+  func restoresPendingEditAfterRelaunch() async throws {
+    let suiteName = "INUserSettingsRefreshTests.\(UUID().uuidString)"
+    let userDefaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { userDefaults.removePersistentDomain(forName: suiteName) }
+
+    let account = UserSettingsTestAccount(userID: 1)
+    let firstFetcher = ControlledNotificationSettingsFetcher()
+    let firstSaver = ControlledNotificationSettingsSaver(isControlled: true)
+    let first = INUserSettings(
+      userDefaults: userDefaults,
+      currentUserID: { account.userID },
+      fetchNotificationSettings: { try await firstFetcher.fetch() },
+      saveNotificationSettings: { try await firstSaver.save($0) }
+    )
+
+    first.notification.mode = .none
+    await firstSaver.waitForCalls(1)
+    await firstSaver.fail()
+    #expect(first.notification.mode == .none)
+
+    let secondFetcher = ControlledNotificationSettingsFetcher()
+    let secondSaver = ControlledNotificationSettingsSaver(isControlled: true)
+    let second = INUserSettings(
+      userDefaults: userDefaults,
+      currentUserID: { account.userID },
+      fetchNotificationSettings: { try await secondFetcher.fetch() },
+      saveNotificationSettings: { try await secondSaver.save($0) }
+    )
+    #expect(second.notification.mode == .none)
+
+    let secondRefresh = Task {
+      await second.refresh(reason: .authenticatedScene)
+    }
+    await secondSaver.waitForCalls(1)
+    let secondFetchCountWhilePending = await secondFetcher.callCount
+    #expect(secondFetchCountWhilePending == 0)
+    await secondSaver.succeed()
+    await secondFetcher.waitForCalls(1)
+    await secondFetcher.succeed(NotificationSettingsValues(
+      mode: .none,
+      silent: false,
+      disableDmNotifications: false
+    ))
+    await secondRefresh.value
+
+    let thirdFetcher = ControlledNotificationSettingsFetcher()
+    let thirdSaver = ControlledNotificationSettingsSaver(isControlled: true)
+    let third = INUserSettings(
+      userDefaults: userDefaults,
+      currentUserID: { account.userID },
+      fetchNotificationSettings: { try await thirdFetcher.fetch() },
+      saveNotificationSettings: { try await thirdSaver.save($0) }
+    )
+    #expect(third.notification.mode == .none)
+
+    let thirdRefresh = Task {
+      await third.refresh(reason: .authenticatedScene)
+    }
+    await thirdFetcher.waitForCalls(1)
+    let thirdSaveCount = await thirdSaver.callCount
+    #expect(thirdSaveCount == 0)
+    await thirdFetcher.succeed(NotificationSettingsValues(
+      mode: .all,
+      silent: false,
+      disableDmNotifications: false
+    ))
+    await thirdRefresh.value
+
+    #expect(third.notification.mode == .all)
+  }
+
+  private func makeHarness(
+    cachedMode: NotificationMode? = nil,
+    controlledSaves: Bool = false
+  ) throws -> UserSettingsRefreshHarness {
+    let suiteName = "INUserSettingsRefreshTests.\(UUID().uuidString)"
+    let userDefaults = try #require(UserDefaults(suiteName: suiteName))
+
+    if let cachedMode {
+      let cachedSettings = NotificationSettingsManager()
+      cachedSettings.mode = cachedMode
+      let data = try JSONEncoder().encode(cachedSettings)
+      userDefaults.set(data, forKey: "notificationSettings")
+    }
+
+    let account = UserSettingsTestAccount(userID: 1)
+    let fetcher = ControlledNotificationSettingsFetcher()
+    let saver = ControlledNotificationSettingsSaver(isControlled: controlledSaves)
+    let settings = INUserSettings(
+      userDefaults: userDefaults,
+      currentUserID: { account.userID },
+      fetchNotificationSettings: { try await fetcher.fetch() },
+      saveNotificationSettings: { try await saver.save($0) }
+    )
+
+    return UserSettingsRefreshHarness(
+      settings: settings,
+      account: account,
+      fetcher: fetcher,
+      saver: saver,
+      userDefaults: userDefaults,
+      suiteName: suiteName
+    )
+  }
+}
+
+@MainActor
+private struct UserSettingsRefreshHarness {
+  let settings: INUserSettings
+  let account: UserSettingsTestAccount
+  let fetcher: ControlledNotificationSettingsFetcher
+  let saver: ControlledNotificationSettingsSaver
+  let userDefaults: UserDefaults
+  let suiteName: String
+
+  func removeUserDefaults() {
+    userDefaults.removePersistentDomain(forName: suiteName)
+  }
+}
+
+@MainActor
+private final class UserSettingsTestAccount {
+  var userID: Int64?
+
+  init(userID: Int64?) {
+    self.userID = userID
+  }
+}
+
+private actor ControlledNotificationSettingsFetcher {
+  private typealias FetchContinuation = CheckedContinuation<NotificationSettingsValues?, any Error>
+  private typealias CallWaiter = (count: Int, continuation: CheckedContinuation<Void, Never>)
+
+  private var continuations: [FetchContinuation] = []
+  private var callWaiters: [CallWaiter] = []
+  private(set) var callCount = 0
+
+  func fetch() async throws -> NotificationSettingsValues? {
+    callCount += 1
+    resumeReadyCallWaiters()
+    return try await withCheckedThrowingContinuation { continuation in
+      continuations.append(continuation)
+    }
+  }
+
+  func waitForCalls(_ count: Int) async {
+    guard callCount < count else { return }
+    await withCheckedContinuation { continuation in
+      callWaiters.append((count, continuation))
+    }
+  }
+
+  func succeed(_ values: NotificationSettingsValues?) {
+    continuations.removeFirst().resume(returning: values)
+  }
+
+  func fail() {
+    continuations.removeFirst().resume(throwing: UserSettingsTestError.fetchFailed)
+  }
+
+  private func resumeReadyCallWaiters() {
+    let ready = callWaiters.filter { $0.count <= callCount }
+    callWaiters.removeAll { $0.count <= callCount }
+    for waiter in ready {
+      waiter.continuation.resume()
+    }
+  }
+}
+
+private actor ControlledNotificationSettingsSaver {
+  private typealias SaveContinuation = CheckedContinuation<Void, any Error>
+  private typealias CallWaiter = (count: Int, continuation: CheckedContinuation<Void, Never>)
+
+  private let isControlled: Bool
+  private var continuations: [SaveContinuation] = []
+  private var callWaiters: [CallWaiter] = []
+  private(set) var callCount = 0
+  private(set) var savedValues: [NotificationSettingsValues] = []
+
+  init(isControlled: Bool) {
+    self.isControlled = isControlled
+  }
+
+  func save(_ values: NotificationSettingsValues) async throws {
+    savedValues.append(values)
+    callCount += 1
+    resumeReadyCallWaiters()
+    guard isControlled else { return }
+
+    try await withCheckedThrowingContinuation { continuation in
+      continuations.append(continuation)
+    }
+  }
+
+  func waitForCalls(_ count: Int) async {
+    guard callCount < count else { return }
+    await withCheckedContinuation { continuation in
+      callWaiters.append((count, continuation))
+    }
+  }
+
+  func succeed() {
+    continuations.removeFirst().resume()
+  }
+
+  func fail() {
+    continuations.removeFirst().resume(throwing: UserSettingsTestError.saveFailed)
+  }
+
+  private func resumeReadyCallWaiters() {
+    let ready = callWaiters.filter { $0.count <= callCount }
+    callWaiters.removeAll { $0.count <= callCount }
+    for waiter in ready {
+      waiter.continuation.resume()
+    }
+  }
+}
+
+private enum UserSettingsTestError: Error {
+  case fetchFailed
+  case saveFailed
+}

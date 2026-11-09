@@ -1,0 +1,393 @@
+import Auth
+import InlineKit
+import SwiftUI
+
+struct IntegrationOptionsView: View {
+  let spaceId: Int64
+  let provider: String
+
+  @Environment(\.dismiss) private var dismiss
+
+  @State private var selectedDatabase: String?
+  @State private var databases: [NotionSimplifiedDatabase] = []
+  @State private var selectedTeamId: String?
+  @State private var teams: [LinearTeam] = []
+  @State private var isLoading = false
+  @State private var errorMessage: String?
+  @State private var lastLoadedAt: Date?
+  @State private var didLoadFromCache = false
+  @State private var hadStaleCachedSelection = false
+  @State private var hadStaleNotionSelection = false
+  @State private var saveTask: Task<Void, Never>?
+
+  private let databasesCacheKey: String
+  private let selectedDatabaseCacheKey: String
+  private let teamsCacheKey: String
+  private let selectedTeamCacheKey: String
+
+  init(spaceId: Int64, provider: String) {
+    self.spaceId = spaceId
+    self.provider = provider
+    databasesCacheKey = "notion_databases_\(spaceId)"
+    selectedDatabaseCacheKey = "notion_selected_database_\(spaceId)"
+    teamsCacheKey = "linear_teams_\(spaceId)"
+    selectedTeamCacheKey = "linear_selected_team_\(spaceId)"
+  }
+
+  var body: some View {
+    Form {
+      if provider == "notion" {
+        Section("Notion Source") {
+          Text("Choose the Notion source where Inline should create \"Will Do\" tasks for this space. Changes save automatically.")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+
+          Picker("Notion Source", selection: notionSelection) {
+            Text("Select a Notion source")
+              .tag(nil as String?)
+              .disabled(true)
+            ForEach(databases, id: \.id) { database in
+              Text("\(database.icon ?? "📄") \(database.title)")
+                .tag(database.id as String?)
+            }
+          }
+          .pickerStyle(.menu)
+
+          Text(notionSelectionSummary)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+            .truncationMode(.tail)
+        }
+      } else if provider == "linear" {
+        Section("Default team") {
+          Text("Required. Choose where Inline should create new issues for this space. Changes save automatically.")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+
+          Picker("Team", selection: linearSelection) {
+            Text("Select a team")
+              .tag(nil as String?)
+              .disabled(true)
+            ForEach(teams, id: \.id) { team in
+              Text("\(team.name) (\(team.key))")
+                .tag(team.id as String?)
+            }
+          }
+          .pickerStyle(.menu)
+
+          Text(linearSelectionSummary)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+
+          if !isLoading, teams.isEmpty {
+            Text("No teams found. Make sure Linear is connected for this space.")
+              .font(.footnote)
+              .foregroundStyle(.secondary)
+          }
+        }
+      }
+
+      if let errorMessage {
+        Section {
+          Text(errorMessage)
+            .foregroundStyle(.red)
+        }
+      }
+
+      Section {
+        statusRow
+      }
+    }
+    .formStyle(.grouped)
+    .scrollContentBackground(.hidden)
+    .navigationTitle(provider == "linear" ? "Linear Options" : "Notion Options")
+    .frame(minWidth: 380, minHeight: 240)
+    .toolbar {
+      ToolbarItem(placement: .confirmationAction) {
+        Button("Done") {
+          dismiss()
+        }
+      }
+    }
+    .task {
+      loadCachedData()
+      await refresh()
+    }
+  }
+
+  private var notionSelection: Binding<String?> {
+    Binding(
+      get: { selectedDatabase },
+      set: { value in
+        selectedDatabase = value
+        guard let value, !value.isEmpty else { return }
+        cacheNotionSelection(value)
+        saveNotionSelection(value)
+      }
+    )
+  }
+
+  private var linearSelection: Binding<String?> {
+    Binding(
+      get: { selectedTeamId },
+      set: { value in
+        selectedTeamId = value
+        guard let value, !value.isEmpty else { return }
+        cacheLinearSelection(value)
+        saveLinearSelection(value)
+      }
+    )
+  }
+
+  private var statusRow: some View {
+    HStack(spacing: 8) {
+      ProgressView()
+        .controlSize(.small)
+        .opacity(isLoading ? 1 : 0)
+
+      Text(statusText)
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+
+      Spacer()
+
+      if errorMessage != nil {
+        Button("Try Again") {
+          Task { await refresh() }
+        }
+        .buttonStyle(.link)
+      }
+    }
+  }
+
+  private var statusText: String {
+    if isLoading {
+      return provider == "linear" ? "Updating teams..." : "Updating Notion sources..."
+    }
+    if let lastLoadedAt {
+      return "Updated \(lastLoadedAt.formatted(date: .abbreviated, time: .shortened))"
+    }
+    if didLoadFromCache {
+      return "Showing cached results"
+    }
+    return provider == "linear" ? "Loading teams..." : "Loading Notion sources..."
+  }
+
+  private var notionSelectionSummary: String {
+    guard provider == "notion" else { return "" }
+    if hadStaleNotionSelection {
+      return "Your previous Notion selection isn't valid for this space anymore. Select a Notion source again."
+    }
+    guard let selectedDatabase, !selectedDatabase.isEmpty else {
+      return "Select a Notion source to enable \"Will Do\" tasks."
+    }
+    guard let source = databases.first(where: { $0.id == selectedDatabase }) else {
+      return "Selected Notion source"
+    }
+    return "Tasks will be created in \(source.title)."
+  }
+
+  private var linearSelectionSummary: String {
+    guard provider == "linear" else { return "" }
+    if hadStaleCachedSelection {
+      return "Your previous selection wasn't saved for this space. Select a team again."
+    }
+    guard let selectedTeamId, !selectedTeamId.isEmpty else {
+      return "Select a team to enable \"Create Linear Issue\"."
+    }
+    guard let team = teams.first(where: { $0.id == selectedTeamId }) else {
+      return "Default team selected"
+    }
+    return "Issues will be created in \(team.name) (\(team.key))."
+  }
+
+  private func cacheNotionSelection(_ value: String) {
+    UserDefaults.standard.set(value, forKey: selectedDatabaseCacheKey)
+  }
+
+  private func saveNotionSelection(_ newValue: String) {
+    enqueueSave {
+      do {
+        try await InlineRPCClient.shared.setNotionDatabase(spaceID: spaceId, databaseID: newValue)
+        await MainActor.run {
+          NotificationCenter.default.post(name: .connectorConfigurationUpdated, object: nil)
+        }
+      } catch {
+        await MainActor.run {
+          if selectedDatabase == newValue {
+            errorMessage = "Failed to save selection: \(error.localizedDescription)"
+            selectedDatabase = nil
+            UserDefaults.standard.removeObject(forKey: selectedDatabaseCacheKey)
+          }
+        }
+      }
+    }
+  }
+
+  private func cacheLinearSelection(_ value: String) {
+    UserDefaults.standard.set(value, forKey: selectedTeamCacheKey)
+  }
+
+  private func saveLinearSelection(_ newValue: String) {
+    enqueueSave {
+      do {
+        try await InlineRPCClient.shared.setLinearTeam(spaceID: spaceId, teamID: newValue)
+        await MainActor.run {
+          NotificationCenter.default.post(name: .connectorConfigurationUpdated, object: nil)
+        }
+      } catch {
+        await MainActor.run {
+          if selectedTeamId == newValue {
+            errorMessage = "Failed to save selection: \(error.localizedDescription)"
+            selectedTeamId = nil
+            UserDefaults.standard.removeObject(forKey: selectedTeamCacheKey)
+          }
+        }
+      }
+    }
+  }
+
+  private func enqueueSave(_ operation: @escaping @MainActor () async -> Void) {
+    let previous = saveTask
+    saveTask = Task { @MainActor in
+      await previous?.value
+      await operation()
+    }
+  }
+
+  private func loadCachedData() {
+    var loadedDatabasesFromCache = false
+    var loadedTeamsFromCache = false
+
+    if let cachedData = UserDefaults.standard.data(forKey: databasesCacheKey),
+       let decoded = try? JSONDecoder().decode([NotionSimplifiedDatabase].self, from: cachedData)
+    {
+      databases = decoded
+      loadedDatabasesFromCache = true
+    }
+    // Lists may be cached, but the saved target always comes from the server.
+    selectedDatabase = nil
+
+    if let cachedTeamsData = UserDefaults.standard.data(forKey: teamsCacheKey),
+       let decodedTeams = try? JSONDecoder().decode([LinearTeam].self, from: cachedTeamsData)
+    {
+      teams = decodedTeams
+      loadedTeamsFromCache = true
+    }
+    selectedTeamId = nil
+
+    switch provider {
+    case "notion":
+      didLoadFromCache = loadedDatabasesFromCache
+    case "linear":
+      didLoadFromCache = loadedTeamsFromCache
+    default:
+      didLoadFromCache = loadedDatabasesFromCache || loadedTeamsFromCache
+    }
+  }
+
+  private func fetchDatabases() async {
+    await MainActor.run { isLoading = true }
+    do {
+      let fetched = try await InlineRPCClient.shared.notionDatabases(spaceID: spaceId)
+      if let encoded = try? JSONEncoder().encode(fetched) {
+        UserDefaults.standard.set(encoded, forKey: databasesCacheKey)
+      }
+      await MainActor.run {
+        databases = fetched
+        lastLoadedAt = Date()
+      }
+    } catch {
+      await MainActor.run {
+        errorMessage = "Unable to load databases: \(error.localizedDescription)"
+      }
+    }
+    await MainActor.run { isLoading = false }
+  }
+
+  private func fetchCurrentNotionSelection() async {
+    do {
+      let integrations = try await InlineRPCClient.shared.integrations(
+        userID: Auth.shared.getCurrentUserId() ?? 0,
+        spaceID: spaceId
+      )
+      await MainActor.run {
+        hadStaleNotionSelection = false
+        if let sourceId = integrations.notionDatabaseId, !sourceId.isEmpty {
+          selectedDatabase = sourceId
+          cacheNotionSelection(sourceId)
+        } else {
+          if UserDefaults.standard.string(forKey: selectedDatabaseCacheKey)?.isEmpty == false {
+            hadStaleNotionSelection = true
+          }
+          selectedDatabase = nil
+          UserDefaults.standard.removeObject(forKey: selectedDatabaseCacheKey)
+        }
+      }
+    } catch {
+      await MainActor.run { selectedDatabase = nil }
+    }
+  }
+
+  private func fetchTeams() async {
+    await MainActor.run { isLoading = true }
+    do {
+      let fetched = try await InlineRPCClient.shared.linearTeams(spaceID: spaceId)
+      if let encoded = try? JSONEncoder().encode(fetched) {
+        UserDefaults.standard.set(encoded, forKey: teamsCacheKey)
+      }
+      await MainActor.run {
+        teams = fetched
+        lastLoadedAt = Date()
+      }
+    } catch {
+      await MainActor.run {
+        errorMessage = "Unable to load teams: \(error.localizedDescription)"
+      }
+    }
+    await MainActor.run { isLoading = false }
+  }
+
+  private func fetchCurrentLinearSelection() async {
+    do {
+      let integrations = try await InlineRPCClient.shared.integrations(
+        userID: Auth.shared.getCurrentUserId() ?? 0,
+        spaceID: spaceId
+      )
+      await MainActor.run {
+        hadStaleCachedSelection = false
+        if let teamId = integrations.linearTeamId, !teamId.isEmpty {
+          selectedTeamId = teamId
+          cacheLinearSelection(teamId)
+        } else {
+          if UserDefaults.standard.string(forKey: selectedTeamCacheKey)?.isEmpty == false {
+            hadStaleCachedSelection = true
+          }
+          selectedTeamId = nil
+          UserDefaults.standard.removeObject(forKey: selectedTeamCacheKey)
+        }
+      }
+    } catch {
+      await MainActor.run { selectedTeamId = nil }
+    }
+  }
+
+  private func refresh() async {
+    await MainActor.run { errorMessage = nil }
+    if provider == "notion" {
+      await fetchDatabases()
+      await fetchCurrentNotionSelection()
+    } else if provider == "linear" {
+      async let teamsTask: Void = fetchTeams()
+      async let selectionTask: Void = fetchCurrentLinearSelection()
+      _ = await (teamsTask, selectionTask)
+    }
+  }
+}
+
+#Preview {
+  IntegrationOptionsView(spaceId: 1, provider: "notion")
+}

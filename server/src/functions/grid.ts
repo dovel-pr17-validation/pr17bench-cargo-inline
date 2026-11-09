@@ -1,0 +1,1553 @@
+import type {
+  CreateGridRoomInput,
+  CreateGridRoomResult,
+  DeleteGridRoomInput,
+  DeleteGridRoomResult,
+  GetGridInput,
+  GetGridResult,
+  GetGridHomeInput,
+  GetGridHomeResult,
+  GridHomeSpace,
+  Grid,
+  GridCurrentCall,
+  GridRoom,
+  JoinGridRoomInput,
+  JoinGridRoomResult,
+  LeaveGridRoomInput,
+  LeaveGridRoomResult,
+  MoveGridCallHereInput,
+  MoveGridCallHereResult,
+  PrepareGridConnectionInput,
+  PrepareGridConnectionResult,
+  SetGridAvatarMicrophoneEnabledInput,
+  SetGridAvatarMicrophoneEnabledResult,
+  SetGridRoomLockedInput,
+  SetGridRoomLockedResult,
+  SetGridRoomTitleInput,
+  SetGridRoomTitleResult,
+} from "@inline-chat/protocol/core"
+import { GridConnectionUnavailableReason, ServerMessage } from "@inline-chat/protocol/core"
+import { internalMessaging } from "@in/server/modules/internalMessaging/service"
+import { connectionDirectory } from "@in/server/modules/internalMessaging/directory"
+import { SessionId, SpaceId, UserId } from "@in/server/core/schema/identifiers"
+import { db } from "@in/server/db"
+import { SpaceSettingsModel } from "@in/server/db/models/spaceSettings"
+import { UsersModel } from "@in/server/db/models/users"
+import {
+  chats,
+  gridPresence,
+  gridRooms,
+  gridTranscriptionRuns,
+  gridTranscriptionSpaceRevisions,
+  members,
+  sessions,
+  spaces,
+  users,
+  type DbGridPresence,
+  type DbGridRoom,
+} from "@in/server/db/schema"
+import { isGridCallTransferEnabled } from "@in/server/env"
+import type { Transaction } from "@in/server/db/types"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import { encodeUser } from "@in/server/realtime/encoders/encodeUser"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { sendMessageToRealtimeSession, sendMessageToRealtimeSpace } from "@in/server/realtime/message"
+import {
+  createGridConnectionCredentials,
+  gridParticipantIdentity,
+  liveKitRequiresGenerationRotation,
+} from "@in/server/modules/grid/livekit"
+import { setGridAvatarMicrophoneState } from "@in/server/modules/grid/avatarState"
+import { notifyGridChanged } from "@in/server/modules/grid/realtime"
+import { enrollGridRoomHistory } from "./gridTranscription"
+import {
+  encodeGridTranscription,
+  stopGridTranscription,
+  transcriptionAvailable,
+  supportedGridTranscriptionSession,
+} from "@in/server/modules/grid/transcription/state"
+import { enqueueGridParticipantRevocation } from "@in/server/modules/grid/providerEffects"
+import {
+  activeGridConnection,
+  lockGridMutations,
+  recordGridParticipantRevocation,
+  reconcileGridRoom,
+  type GridMutationState,
+} from "@in/server/modules/grid/roomLifecycle"
+import { Log } from "@in/server/utils/log"
+import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm"
+
+// Heartbeats are normally 30 seconds apart. Ten missed heartbeats leave room
+// to repair or switch networks, while a crashed, killed or suspended client
+// (an iPhone alone in the background) leaves the room within minutes.
+const PRESENCE_LEASE_MS = 5 * 60_000
+const MAX_ROOM_CAPACITY = 25
+const MAX_NAMED_ROOMS_PER_SPACE = 50
+const MAX_ROOM_TITLE_LENGTH = 80
+const log = new Log("grid")
+
+type GridClaim = {
+  roomId: number
+  callId: string
+  mediaMembershipId: string
+  currentCall: GridCurrentCall
+}
+
+type GridClaimMutationState = GridMutationState & { claim?: GridClaim }
+
+type GridCredentialIssuer = typeof createGridConnectionCredentials
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export async function getGrid(input: GetGridInput, context: FunctionContext): Promise<GetGridResult> {
+  const spaceId = positiveId(input.spaceId, RealtimeRpcError.SpaceIdInvalid)
+  await AccessGuards.ensureSpaceMember(spaceId, context.currentUserId)
+
+  const expectedMembershipId =
+    input.expectedMembershipId === undefined ? undefined : membershipFence(input.expectedMembershipId)
+  // Expired leases are hidden by every read and removed by the expiry sweeper,
+  // so a snapshot never waits on the Grid mutation lock.
+  if (expectedMembershipId !== undefined || !isGridCallTransferEnabled()) {
+    await renewOwnedPresence(spaceId, context, expectedMembershipId)
+  }
+  const [grid, currentCall] = await Promise.all([buildGrid(spaceId, context), buildCurrentCall(context)])
+  return { grid, currentCall }
+}
+
+export async function getGridHome(
+  _input: GetGridHomeInput,
+  context: FunctionContext,
+): Promise<GetGridHomeResult> {
+  const membershipRows = await db
+    .select({ spaceId: members.spaceId })
+    .from(members)
+    .innerJoin(spaces, and(eq(spaces.id, members.spaceId), isNull(spaces.deleted)))
+    .where(eq(members.userId, context.currentUserId))
+
+  const enabledSpaceIds = (await SpaceSettingsModel.getStoredMany(membershipRows.map(({ spaceId }) => spaceId)))
+    .filter(({ gridEnabled }) => gridEnabled)
+    .map(({ spaceId }) => spaceId)
+
+  const presenceRows =
+    enabledSpaceIds.length === 0
+      ? []
+      : await db
+          .select({ spaceId: gridRooms.spaceId, presence: gridPresence })
+          .from(gridPresence)
+          .innerJoin(gridRooms, eq(gridRooms.id, gridPresence.roomId))
+          .where(
+            and(
+              inArray(gridRooms.spaceId, enabledSpaceIds),
+              gt(gridPresence.leaseExpiresAt, new Date()),
+            ),
+          )
+          .orderBy(desc(gridPresence.joinedAt))
+
+  const userIds = [...new Set(presenceRows.map(({ presence }) => presence.userId))]
+  const usersWithPhotos = userIds.length > 0 ? await UsersModel.getUsersWithPhotos(userIds) : []
+  const encodedUsers = new Map(
+    usersWithPhotos.map(({ user, photoFile }) => [user.id, encodeUser({ user, photoFile, min: true })]),
+  )
+  const summaries: GridHomeSpace[] = enabledSpaceIds.map((spaceId) => ({
+    spaceId: BigInt(spaceId),
+    activeAvatarCount: 0,
+    recentAvatars: [],
+    latestActivityAt: 0n,
+  }))
+  const summariesBySpaceId = new Map(enabledSpaceIds.map((spaceId, index) => [spaceId, summaries[index]!]))
+
+  for (const { spaceId, presence } of presenceRows) {
+    const summary = summariesBySpaceId.get(spaceId)
+    const user = encodedUsers.get(presence.userId)
+    if (!summary || !user) continue
+    summary.activeAvatarCount += 1
+    const joinedAt = encodeDateStrict(presence.joinedAt)
+    if (summary.latestActivityAt === 0n) summary.latestActivityAt = joinedAt
+    if (summary.recentAvatars.length < 4) {
+      summary.recentAvatars.push({
+        user,
+        joinedAt,
+        ownedByCurrentSession:
+          presence.userId === context.currentUserId && presence.ownerSessionId === context.currentSessionId,
+        microphoneEnabled: presence.microphoneEnabled,
+        membershipId: presence.mediaMembershipId,
+        microphoneRevision: presence.microphoneRevision,
+      })
+    }
+  }
+
+  summaries.sort((a, b) => {
+    if (a.activeAvatarCount > 0 !== b.activeAvatarCount > 0) {
+      return a.activeAvatarCount > 0 ? -1 : 1
+    }
+    return Number(b.latestActivityAt - a.latestActivityAt)
+  })
+  return {
+    spaces: summaries,
+    currentCall: await buildCurrentCall(context),
+    callTransferEnabled: isGridCallTransferEnabled(),
+  }
+}
+
+export async function createGridRoom(
+  input: CreateGridRoomInput,
+  context: FunctionContext,
+): Promise<CreateGridRoomResult> {
+  const startedAt = Date.now()
+  const spaceId = positiveId(input.spaceId, RealtimeRpcError.SpaceIdInvalid)
+  log.debug("GRID_TRACE phase=create_rpc_start", {
+    spaceId,
+    userId: context.currentUserId,
+    sessionId: context.currentSessionId,
+  })
+  await ensureGridAvailable(spaceId, context.currentUserId)
+
+  const state = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    await ensureCurrentSession(tx, context)
+    await lockUser(tx, context.currentUserId)
+    // The preflight can race a Space leave or deletion before this lock.
+    await ensureGridAvailable(spaceId, context.currentUserId, tx)
+
+    const state: GridClaimMutationState = {
+      affectedSpaceIds: new Set([spaceId]),
+      endedConnections: [],
+    }
+    const existing = await getActivePresenceWithRoom(tx, context.currentUserId, state)
+    assertPresenceFence(existing, context, input.expectedMembershipId, { allowLegacyTakeover: true })
+    if (existing && existing.room.spaceId === spaceId && existing.room.title === null) {
+      const [occupancy] = await tx
+        .select({ value: count() })
+        .from(gridPresence)
+        .where(and(eq(gridPresence.roomId, existing.room.id), gt(gridPresence.leaseExpiresAt, new Date())))
+
+      if (Number(occupancy?.value ?? 0) === 1) {
+        await movePresence(tx, context, existing.room, existing, state, input.microphoneEnabled)
+        state.changedRoomId = existing.room.id
+        return state
+      }
+    }
+
+    const [room] = await tx
+      .insert(gridRooms)
+      .values({ spaceId, createdByUserId: context.currentUserId })
+      .returning()
+    if (!room) throw RealtimeRpcError.InternalError()
+
+    state.changedRoomId = room.id
+    await movePresence(tx, context, room, existing, state, input.microphoneEnabled)
+    return state
+  })
+
+  await notifyGridChanged(state)
+  const [grids, connection] = await Promise.all([
+    buildGrids(state.affectedSpaceIds, context),
+    state.claim ? credentialsForParticipant(state.claim, context) : undefined,
+    state.changedRoomId ? notifyConnectionReady(state.changedRoomId) : undefined,
+  ])
+  log.debug("GRID_TRACE phase=create_rpc_done", {
+    spaceId,
+    roomId: state.changedRoomId,
+    hasCredentials: connection !== undefined,
+    elapsedMs: Date.now() - startedAt,
+  })
+  return {
+    grids,
+    connection,
+    currentCall: state.claim?.currentCall,
+  }
+}
+
+export async function joinGridRoom(
+  input: JoinGridRoomInput,
+  context: FunctionContext,
+): Promise<JoinGridRoomResult> {
+  const startedAt = Date.now()
+  const roomId = positiveId(input.roomId, RealtimeRpcError.BadRequest)
+  log.debug("GRID_TRACE phase=join_rpc_start", {
+    roomId,
+    userId: context.currentUserId,
+    sessionId: context.currentSessionId,
+  })
+
+  const state = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    await ensureCurrentSession(tx, context)
+    await lockUser(tx, context.currentUserId)
+
+    const [room] = await tx.select().from(gridRooms).where(eq(gridRooms.id, roomId)).for("update").limit(1)
+    if (!room) throw RealtimeRpcError.BadRequest()
+    await ensureGridAvailable(room.spaceId, context.currentUserId, tx)
+
+    const state: GridClaimMutationState = {
+      affectedSpaceIds: new Set([room.spaceId]),
+      changedRoomId: room.id,
+      endedConnections: [],
+    }
+    const existing = await getActivePresenceWithRoom(tx, context.currentUserId, state)
+    assertPresenceFence(existing, context, input.expectedMembershipId, { allowLegacyTakeover: true })
+    if (existing?.room.id === room.id) {
+      await movePresence(tx, context, room, existing, state, input.microphoneEnabled)
+      return state
+    }
+
+    const admin = await isSpaceAdmin(tx, room.spaceId, context.currentUserId)
+    if (room.locked && !admin) throw RealtimeRpcError.BadRequest()
+
+    const [occupancy] = await tx
+      .select({ value: count() })
+      .from(gridPresence)
+      .where(and(eq(gridPresence.roomId, room.id), gt(gridPresence.leaseExpiresAt, new Date())))
+    if (Number(occupancy?.value ?? 0) >= MAX_ROOM_CAPACITY) throw RealtimeRpcError.BadRequest()
+
+    await movePresence(tx, context, room, existing, state, input.microphoneEnabled)
+    return state
+  })
+
+  log.debug("GRID_TRACE phase=join_transaction_done", {
+    roomId,
+    elapsedMs: Date.now() - startedAt,
+  })
+  await notifyGridChanged(state)
+  const [grids, connection] = await Promise.all([
+    buildGrids(state.affectedSpaceIds, context),
+    state.claim ? credentialsForParticipant(state.claim, context) : undefined,
+    notifyConnectionReady(roomId),
+  ])
+  log.debug("GRID_TRACE phase=join_rpc_done", {
+    roomId,
+    generation: connection?.connection?.generation,
+    hasCredentials: connection !== undefined,
+    elapsedMs: Date.now() - startedAt,
+  })
+  return {
+    grids,
+    connection,
+    currentCall: state.claim?.currentCall,
+  }
+}
+
+export async function leaveGridRoom(
+  input: LeaveGridRoomInput,
+  context: FunctionContext,
+): Promise<LeaveGridRoomResult> {
+  const expectedRoomId = positiveId(input.expectedRoomId, RealtimeRpcError.BadRequest)
+  const expectedMembershipId = commandMembershipFence(input.expectedMembershipId)
+
+  const state = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    await ensureCurrentSession(tx, context)
+    await lockUser(tx, context.currentUserId)
+    const existing = await getPresenceWithRoom(tx, context.currentUserId)
+    if (
+      !existing ||
+      existing.room.id !== expectedRoomId ||
+      existing.presence.ownerSessionId !== context.currentSessionId ||
+      (expectedMembershipId !== undefined && existing.presence.mediaMembershipId !== expectedMembershipId)
+    ) {
+      return { affectedSpaceIds: new Set<number>(), endedConnections: [] }
+    }
+
+    const activeConnection = activeGridConnection(existing.room)
+    await tx.delete(gridPresence).where(eq(gridPresence.userId, context.currentUserId))
+    const endedConnection = await reconcileGridRoom(tx, existing.room.id)
+    const state: GridMutationState = {
+      affectedSpaceIds: new Set([existing.room.spaceId]),
+      changedRoomId: existing.room.id,
+      endedConnections: endedConnection ? [endedConnection] : [],
+    }
+    if (activeConnection) {
+      await recordGridParticipantRevocation(
+        tx,
+        state,
+        activeConnection,
+        context.currentUserId,
+        existing.presence.mediaMembershipId,
+      )
+    }
+    return state
+  })
+
+  await notifyGridChanged(state)
+  const [grids, currentCall] = await Promise.all([
+    buildGrids(state.affectedSpaceIds, context),
+    buildCurrentCall(context),
+  ])
+  return { grids, currentCall }
+}
+
+/** Atomic control transfer. Media cleanup remains asynchronous and provider-specific. */
+export async function moveGridCallHere(
+  input: MoveGridCallHereInput,
+  context: FunctionContext,
+  issueCredentials: GridCredentialIssuer = createGridConnectionCredentials,
+): Promise<MoveGridCallHereResult> {
+  if (!isGridCallTransferEnabled()) throw gridClientUpgradeRequired()
+  const callId = membershipFence(input.callId)
+  const expectedMembershipId = membershipFence(input.expectedMembershipId)
+  const state = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    await ensureCurrentSession(tx, context)
+    await lockUser(tx, context.currentUserId)
+    const state: GridClaimMutationState = { affectedSpaceIds: new Set(), endedConnections: [] }
+    const existing = await getActivePresenceWithRoom(tx, context.currentUserId, state)
+    if (
+      !existing ||
+      existing.presence.callId !== callId ||
+      existing.presence.mediaMembershipId !== expectedMembershipId
+    ) {
+      return state
+    }
+    await ensureGridAvailable(existing.room.spaceId, context.currentUserId, tx)
+    state.changedRoomId = existing.room.id
+    await movePresence(tx, context, existing.room, existing, state, false, {
+      preserveCallId: callId,
+      replaceMembership: true,
+    })
+    return state
+  })
+  await notifyGridChanged(state)
+  const [grids, connection, currentCall] = await Promise.all([
+    buildGrids(state.affectedSpaceIds, context),
+    state.claim ? credentialsForParticipant(state.claim, context, issueCredentials) : undefined,
+    state.claim?.currentCall ?? buildCurrentCall(context),
+    state.changedRoomId ? notifyConnectionReady(state.changedRoomId) : undefined,
+  ])
+  return { grids, connection, currentCall, moved: state.claim !== undefined }
+}
+
+export async function setGridRoomTitle(
+  input: SetGridRoomTitleInput,
+  context: FunctionContext,
+): Promise<SetGridRoomTitleResult> {
+  const roomId = positiveId(input.roomId, RealtimeRpcError.BadRequest)
+  const normalizedTitle = normalizeTitle(input.title)
+
+  const spaceId = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    const room = await getLockedRoom(tx, roomId)
+    await ensureGridAvailable(room.spaceId, context.currentUserId, tx)
+    await ensureCanRenameRoom(tx, room.spaceId, context.currentUserId)
+
+    if (normalizedTitle && room.title === null) {
+      const [namedRoomCount] = await tx
+        .select({ value: count() })
+        .from(gridRooms)
+        .where(and(eq(gridRooms.spaceId, room.spaceId), isNotNull(gridRooms.title)))
+      if (Number(namedRoomCount?.value ?? 0) >= MAX_NAMED_ROOMS_PER_SPACE) throw RealtimeRpcError.BadRequest()
+    }
+
+    try {
+      await tx.update(gridRooms).set({ title: normalizedTitle, updatedAt: new Date() }).where(eq(gridRooms.id, room.id))
+    } catch (error) {
+      if (isUniqueViolation(error)) throw RealtimeRpcError.BadRequest()
+      throw error
+    }
+    await reconcileGridRoom(tx, room.id)
+    return room.spaceId
+  })
+
+  await notifyGridChanged({ affectedSpaceIds: new Set([spaceId]), changedRoomId: roomId, endedConnections: [] })
+  return { grid: await buildGrid(spaceId, context) }
+}
+
+export async function setGridRoomLocked(
+  input: SetGridRoomLockedInput,
+  context: FunctionContext,
+): Promise<SetGridRoomLockedResult> {
+  const roomId = positiveId(input.roomId, RealtimeRpcError.BadRequest)
+
+  const spaceId = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    const room = await getLockedRoom(tx, roomId)
+    await ensureGridAvailable(room.spaceId, context.currentUserId, tx)
+    const admin = await isSpaceAdmin(tx, room.spaceId, context.currentUserId)
+    const publicSpace = await isPublicSpace(tx, room.spaceId)
+    const [presence] = await tx
+      .select({ userId: gridPresence.userId })
+      .from(gridPresence)
+      .where(
+        and(
+          eq(gridPresence.roomId, room.id),
+          eq(gridPresence.userId, context.currentUserId),
+          eq(gridPresence.ownerSessionId, context.currentSessionId),
+          gt(gridPresence.leaseExpiresAt, new Date()),
+        ),
+      )
+      .limit(1)
+    if (publicSpace ? !admin : !presence) throw RealtimeRpcError.BadRequest()
+
+    const [occupancy] = await tx
+      .select({ value: count() })
+      .from(gridPresence)
+      .where(and(eq(gridPresence.roomId, room.id), gt(gridPresence.leaseExpiresAt, new Date())))
+    if (input.locked && Number(occupancy?.value ?? 0) === 0) throw RealtimeRpcError.BadRequest()
+
+    await tx.update(gridRooms).set({ locked: input.locked, updatedAt: new Date() }).where(eq(gridRooms.id, room.id))
+    return room.spaceId
+  })
+
+  await notifyGridChanged({ affectedSpaceIds: new Set([spaceId]), changedRoomId: roomId, endedConnections: [] })
+  return { grid: await buildGrid(spaceId, context) }
+}
+
+export async function deleteGridRoom(
+  input: DeleteGridRoomInput,
+  context: FunctionContext,
+): Promise<DeleteGridRoomResult> {
+  const roomId = positiveId(input.roomId, RealtimeRpcError.BadRequest)
+
+  const spaceId = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    const room = await getLockedRoom(tx, roomId)
+    await ensureGridAvailable(room.spaceId, context.currentUserId, tx)
+    await ensureCreatorOrAdmin(tx, room, context.currentUserId)
+
+    const [occupancy] = await tx
+      .select({ value: count() })
+      .from(gridPresence)
+      .where(and(eq(gridPresence.roomId, room.id), gt(gridPresence.leaseExpiresAt, new Date())))
+    if (Number(occupancy?.value ?? 0) !== 0) throw RealtimeRpcError.BadRequest()
+
+    // Expired leases can leave an active provider generation behind. Retire it
+    // through the normal durable lifecycle before cascading away its room.
+    const connection = activeGridConnection(room)
+    if (connection) {
+      const participants = await tx.select().from(gridPresence).where(eq(gridPresence.roomId, room.id))
+      for (const participant of participants) {
+        await enqueueGridParticipantRevocation(
+          tx,
+          connection,
+          participant.userId,
+          gridParticipantIdentity(participant.userId, participant.mediaMembershipId),
+        )
+      }
+    }
+    await reconcileGridRoom(tx, room.id)
+    await tx.delete(gridRooms).where(eq(gridRooms.id, room.id))
+    return room.spaceId
+  })
+
+  await notifyGridChanged({ affectedSpaceIds: new Set([spaceId]), changedRoomId: roomId, endedConnections: [] })
+  return { grid: await buildGrid(spaceId, context) }
+}
+
+export async function prepareGridConnection(
+  input: PrepareGridConnectionInput,
+  context: FunctionContext,
+): Promise<PrepareGridConnectionResult> {
+  const startedAt = Date.now()
+  const roomId = positiveId(input.roomId, RealtimeRpcError.BadRequest)
+  const expectedMembershipId = commandMembershipFence(input.expectedMembershipId)
+  log.debug("GRID_TRACE phase=prepare_rpc_start", {
+    roomId,
+    generation: input.generation,
+    userId: context.currentUserId,
+    sessionId: context.currentSessionId,
+  })
+  const preparation = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    await ensureCurrentSession(tx, context)
+
+    const [row] = await tx
+      .select({ room: gridRooms, presence: gridPresence, user: users })
+      .from(gridRooms)
+      .innerJoin(
+        gridPresence,
+        and(eq(gridPresence.roomId, gridRooms.id), eq(gridPresence.userId, context.currentUserId)),
+      )
+      .innerJoin(users, eq(users.id, gridPresence.userId))
+      .where(
+        and(
+          eq(gridRooms.id, roomId),
+          eq(gridRooms.connectionGeneration, input.generation),
+          eq(gridPresence.ownerSessionId, context.currentSessionId),
+          expectedMembershipId === undefined ? undefined : eq(gridPresence.mediaMembershipId, expectedMembershipId),
+          gt(gridPresence.leaseExpiresAt, new Date()),
+        ),
+      )
+      .for("update")
+      .limit(1)
+
+    if (!row || !row.room.connectionStartedAt) return { active: false as const }
+    await ensureGridAvailable(row.room.spaceId, context.currentUserId, tx)
+    const connection = encodeRoom(row.room).connection
+    if (!connection) return { active: false as const }
+    return {
+      active: true as const,
+      connection,
+      userId: row.user.id,
+      displayName: displayName(row.user),
+      participantIdentity: gridParticipantIdentity(row.user.id, row.presence.mediaMembershipId),
+      mediaMembershipId: row.presence.mediaMembershipId,
+      callId: row.presence.callId,
+      spaceId: row.room.spaceId,
+    }
+  })
+
+  if (!preparation.active) {
+    log.debug("GRID_TRACE phase=prepare_rpc_unavailable", {
+      roomId,
+      generation: input.generation,
+      elapsedMs: Date.now() - startedAt,
+    })
+    return { unavailableReason: GridConnectionUnavailableReason.NOT_ACTIVE }
+  }
+  let credentials
+  try {
+    credentials = await createGridConnectionCredentials({
+      connection: preparation.connection,
+      userId: preparation.userId,
+      displayName: preparation.displayName,
+      participantIdentity: preparation.participantIdentity,
+      callId: preparation.callId,
+      mediaMembershipId: preparation.mediaMembershipId,
+    })
+  } catch (error) {
+    Log.shared.warn("Failed to mint prepared Grid connection credentials", {
+      roomId,
+      generation: input.generation,
+      userId: context.currentUserId,
+      error,
+    })
+    credentials = undefined
+  }
+  if (credentials) {
+    const stillActive = await gridCredentialAuthorityIsActive({
+      roomId,
+      generation: input.generation,
+      spaceId: preparation.spaceId,
+      userId: context.currentUserId,
+      sessionId: context.currentSessionId,
+      mediaMembershipId: preparation.mediaMembershipId,
+      callId: preparation.callId,
+    })
+    if (!stillActive) {
+      log.debug("GRID_TRACE phase=prepare_rpc_stale_after_mint", {
+        roomId,
+        generation: input.generation,
+        elapsedMs: Date.now() - startedAt,
+      })
+      return { unavailableReason: GridConnectionUnavailableReason.NOT_ACTIVE }
+    }
+  }
+  log.debug("GRID_TRACE phase=prepare_rpc_done", {
+    roomId,
+    generation: input.generation,
+    hasCredentials: credentials !== undefined,
+    elapsedMs: Date.now() - startedAt,
+  })
+  return credentials
+    ? { connection: credentials, unavailableReason: GridConnectionUnavailableReason.UNSPECIFIED }
+    : { unavailableReason: GridConnectionUnavailableReason.PROVIDER_UNAVAILABLE }
+}
+
+async function gridCredentialAuthorityIsActive(input: {
+  roomId: number
+  generation: number
+  spaceId: number
+  userId: number
+  sessionId: number
+  mediaMembershipId: string
+  callId: string
+}): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    const [active] = await tx
+      .select({ roomId: gridRooms.id })
+      .from(gridRooms)
+      .innerJoin(spaces, and(eq(spaces.id, gridRooms.spaceId), isNull(spaces.deleted)))
+      .innerJoin(
+        gridPresence,
+        and(
+          eq(gridPresence.roomId, gridRooms.id),
+          eq(gridPresence.userId, input.userId),
+          eq(gridPresence.ownerSessionId, input.sessionId),
+          eq(gridPresence.mediaMembershipId, input.mediaMembershipId),
+          eq(gridPresence.callId, input.callId),
+          gt(gridPresence.leaseExpiresAt, new Date()),
+        ),
+      )
+      .innerJoin(
+        members,
+        and(
+          eq(members.spaceId, gridRooms.spaceId),
+          eq(members.userId, gridPresence.userId),
+        ),
+      )
+      .innerJoin(
+        sessions,
+        and(
+          eq(sessions.id, gridPresence.ownerSessionId),
+          eq(sessions.userId, gridPresence.userId),
+          isNull(sessions.revoked),
+        ),
+      )
+      .where(
+        and(
+          eq(gridRooms.id, input.roomId),
+          eq(gridRooms.spaceId, input.spaceId),
+          eq(gridRooms.connectionGeneration, input.generation),
+          isNotNull(gridRooms.connectionStartedAt),
+        ),
+      )
+      .limit(1)
+    if (!active) return false
+    return (await SpaceSettingsModel.getStored(input.spaceId, tx)).gridEnabled
+  })
+}
+
+export async function setGridAvatarMicrophoneEnabled(
+  input: SetGridAvatarMicrophoneEnabledInput,
+  context: FunctionContext,
+): Promise<SetGridAvatarMicrophoneEnabledResult> {
+  const roomId = positiveId(input.expectedRoomId, RealtimeRpcError.BadRequest)
+  const expectedMembershipId = commandMembershipFence(input.expectedMembershipId)
+  const stateUpdate = await db.transaction(async (tx) => {
+    await lockGridMutations(tx)
+    await ensureCurrentSession(tx, context)
+    const [row] = await tx
+      .select({ spaceId: gridRooms.spaceId })
+      .from(gridPresence)
+      .innerJoin(gridRooms, eq(gridRooms.id, gridPresence.roomId))
+      .where(
+        and(
+          eq(gridPresence.userId, context.currentUserId),
+          eq(gridPresence.ownerSessionId, context.currentSessionId),
+          eq(gridPresence.roomId, roomId),
+          expectedMembershipId === undefined ? undefined : eq(gridPresence.mediaMembershipId, expectedMembershipId),
+          gt(gridPresence.leaseExpiresAt, new Date()),
+        ),
+      )
+      .limit(1)
+    if (!row) throw RealtimeRpcError.BadRequest()
+    await ensureGridAvailable(row.spaceId, context.currentUserId, tx)
+    const updated = await setGridAvatarMicrophoneState(tx, {
+      userId: context.currentUserId,
+      ownerSessionId: context.currentSessionId,
+      roomId,
+      enabled: input.enabled,
+      expectedMembershipId,
+    })
+    if (!updated) throw RealtimeRpcError.BadRequest()
+    return { spaceId: row.spaceId, ...updated }
+  })
+  await sendMessageToRealtimeSpace(stateUpdate.spaceId, {
+    oneofKind: "grid",
+    grid: {
+      event: {
+        oneofKind: "avatarStateChanged",
+        avatarStateChanged: {
+          spaceId: BigInt(stateUpdate.spaceId),
+          roomId: BigInt(roomId),
+          userId: BigInt(context.currentUserId),
+          microphoneEnabled: input.enabled,
+          membershipId: stateUpdate.membershipId,
+          microphoneRevision: stateUpdate.revision,
+        },
+      },
+    },
+  })
+  log.debug("GRID_TRACE phase=avatar_microphone_changed", {
+    spaceId: stateUpdate.spaceId,
+    roomId,
+    userId: context.currentUserId,
+    sessionId: context.currentSessionId,
+    enabled: input.enabled,
+  })
+  return { enabled: input.enabled }
+}
+
+async function movePresence(
+  tx: Transaction,
+  context: FunctionContext,
+  targetRoom: DbGridRoom,
+  existing: Awaited<ReturnType<typeof getPresenceWithRoom>>,
+  state: GridClaimMutationState,
+  microphoneEnabled?: boolean,
+  options: { preserveCallId?: string; replaceMembership?: boolean } = {},
+) {
+  if (existing) {
+    state.affectedSpaceIds.add(existing.room.spaceId)
+  }
+
+  const ownershipReplaced =
+    existing !== undefined &&
+    (existing.presence.ownerSessionId !== context.currentSessionId || options.replaceMembership === true)
+  const rotateForAccessRevocation = ownershipReplaced && liveKitRequiresGenerationRotation()
+  if (existing && ownershipReplaced) {
+    await stopGridTranscription(
+      tx,
+      existing.room.id,
+      rotateForAccessRevocation ? "generation_changed" : "authority_lost",
+      true,
+    )
+  }
+  if (existing && (existing.room.id !== targetRoom.id || ownershipReplaced)) {
+    const connection = activeGridConnection(existing.room)
+    if (connection) {
+      await recordGridParticipantRevocation(
+        tx,
+        state,
+        connection,
+        context.currentUserId,
+        existing.presence.mediaMembershipId,
+      )
+    }
+  }
+
+  const presence = await claimPresence(tx, context, targetRoom.id, microphoneEnabled, options)
+  await enrollGridRoomHistory(tx, targetRoom.id, [context.currentUserId])
+  const roster = await tx
+    .select({ userId: gridPresence.userId })
+    .from(gridPresence)
+    .where(and(eq(gridPresence.roomId, targetRoom.id), gt(gridPresence.leaseExpiresAt, new Date())))
+  if (roster.length > 8) await stopGridTranscription(tx, targetRoom.id, "speaker_capacity", true)
+  const [ownerSession] = await tx
+    .select({ clientType: sessions.clientType, clientVersion: sessions.clientVersion })
+    .from(sessions)
+    .where(eq(sessions.id, context.currentSessionId))
+    .limit(1)
+  if (!ownerSession || !supportedGridTranscriptionSession(ownerSession))
+    await stopGridTranscription(tx, targetRoom.id, "unsupported_client", true)
+  state.claim = {
+    roomId: presence.roomId,
+    callId: presence.callId,
+    mediaMembershipId: presence.mediaMembershipId,
+    currentCall: encodeCurrentCall(presence, targetRoom, context, ownerSession?.clientType),
+  }
+
+  if (existing && existing.room.id !== targetRoom.id) {
+    const endedConnection = await reconcileGridRoom(tx, existing.room.id, { rotateForAccessRevocation })
+    if (endedConnection) state.endedConnections.push(endedConnection)
+  }
+  const endedConnection = await reconcileGridRoom(tx, targetRoom.id, {
+    rotateForAccessRevocation: existing?.room.id === targetRoom.id && rotateForAccessRevocation,
+  })
+  if (endedConnection) state.endedConnections.push(endedConnection)
+}
+
+async function claimPresence(
+  tx: Transaction,
+  context: FunctionContext,
+  roomId: number,
+  microphoneEnabled?: boolean,
+  options: { preserveCallId?: string; replaceMembership?: boolean } = {},
+) {
+  const now = new Date()
+  const [presence] = await tx
+    .insert(gridPresence)
+    .values({
+      userId: context.currentUserId,
+      roomId,
+      ownerSessionId: context.currentSessionId,
+      callId: options.preserveCallId,
+      microphoneEnabled: microphoneEnabled ?? false,
+      joinedAt: now,
+      leaseExpiresAt: new Date(now.getTime() + PRESENCE_LEASE_MS),
+    })
+    .onConflictDoUpdate({
+      target: gridPresence.userId,
+      set: {
+        roomId,
+        ownerSessionId: context.currentSessionId,
+        joinedAt:
+          options.preserveCallId !== undefined
+            ? gridPresence.joinedAt
+            : sql`case when ${gridPresence.roomId} = ${roomId} and ${gridPresence.ownerSessionId} = ${context.currentSessionId} then ${gridPresence.joinedAt} else now() end`,
+        callId:
+          options.preserveCallId ??
+          sql`case when ${gridPresence.roomId} = ${roomId} and ${gridPresence.ownerSessionId} = ${context.currentSessionId} then ${gridPresence.callId} else gen_random_uuid() end`,
+        mediaMembershipId: options.replaceMembership
+          ? sql`gen_random_uuid()`
+          : sql`case when ${gridPresence.roomId} = ${roomId} and ${gridPresence.ownerSessionId} = ${context.currentSessionId} then ${gridPresence.mediaMembershipId} else gen_random_uuid() end`,
+        microphoneEnabled:
+          microphoneEnabled === undefined
+            ? sql`case when ${gridPresence.ownerSessionId} = ${context.currentSessionId} then ${gridPresence.microphoneEnabled} else false end`
+            : microphoneEnabled,
+        microphoneRevision: options.replaceMembership
+          ? 0
+          : microphoneEnabled === undefined
+          ? sql`case when ${gridPresence.roomId} = ${roomId} and ${gridPresence.ownerSessionId} = ${context.currentSessionId} then ${gridPresence.microphoneRevision} else 0 end`
+          : sql`case when ${gridPresence.roomId} = ${roomId} and ${gridPresence.ownerSessionId} = ${context.currentSessionId} and ${gridPresence.microphoneEnabled} != ${microphoneEnabled} then ${gridPresence.microphoneRevision} + 1 when ${gridPresence.roomId} = ${roomId} and ${gridPresence.ownerSessionId} = ${context.currentSessionId} then ${gridPresence.microphoneRevision} else 0 end`,
+        leaseExpiresAt: new Date(now.getTime() + PRESENCE_LEASE_MS),
+      },
+    })
+    .returning()
+  if (!presence) throw RealtimeRpcError.InternalError()
+  return presence
+}
+
+/**
+ * Extends only the caller's own unexpired lease in this Space. Lease-only
+ * writes do not bump the Grid revision, and the one row lock orders renewal
+ * against expiry and ownership changes without the Grid mutation lock: a
+ * mutation or sweep that deletes the row first leaves nothing to renew, and a
+ * sweep skips a row whose renewal is still in flight.
+ */
+async function renewOwnedPresence(spaceId: number, context: FunctionContext, expectedMembershipId?: string) {
+  const now = new Date()
+  await db
+    .update(gridPresence)
+    .set({ leaseExpiresAt: new Date(now.getTime() + PRESENCE_LEASE_MS) })
+    .where(
+      and(
+        eq(gridPresence.userId, context.currentUserId),
+        eq(gridPresence.ownerSessionId, context.currentSessionId),
+        expectedMembershipId === undefined ? undefined : eq(gridPresence.mediaMembershipId, expectedMembershipId),
+        gt(gridPresence.leaseExpiresAt, now),
+        inArray(gridPresence.roomId, db.select({ id: gridRooms.id }).from(gridRooms).where(eq(gridRooms.spaceId, spaceId))),
+      ),
+    )
+}
+
+// Grid snapshots read one MVCC snapshot instead of taking the mutation lock.
+// Every writer bumps the Space revision counters in the same transaction as
+// the content (database triggers), so a snapshot's revision always matches
+// its content.
+const snapshotRead = { isolationLevel: "repeatable read", accessMode: "read only" } as const
+
+async function buildGrids(spaceIds: Set<number>, context: FunctionContext): Promise<Grid[]> {
+  return Promise.all([...spaceIds].sort((a, b) => a - b).map((spaceId) => buildGrid(spaceId, context)))
+}
+
+async function buildCurrentCall(context: FunctionContext): Promise<GridCurrentCall | undefined> {
+  return db.transaction(async (tx) => {
+    const [row] = await tx
+      .select({ presence: gridPresence, room: gridRooms, ownerClientType: sessions.clientType })
+      .from(gridPresence)
+      .innerJoin(gridRooms, eq(gridRooms.id, gridPresence.roomId))
+      .innerJoin(spaces, and(eq(spaces.id, gridRooms.spaceId), isNull(spaces.deleted)))
+      .innerJoin(members, and(eq(members.spaceId, gridRooms.spaceId), eq(members.userId, gridPresence.userId)))
+      .innerJoin(
+        sessions,
+        and(
+          eq(sessions.id, gridPresence.ownerSessionId),
+          eq(sessions.userId, gridPresence.userId),
+          isNull(sessions.revoked),
+        ),
+      )
+      .where(and(eq(gridPresence.userId, context.currentUserId), gt(gridPresence.leaseExpiresAt, new Date())))
+      .limit(1)
+    if (!row || !(await SpaceSettingsModel.getStored(row.room.spaceId, tx)).gridEnabled) return undefined
+    return encodeCurrentCall(row.presence, row.room, context, row.ownerClientType)
+  }, snapshotRead)
+}
+
+function encodeCurrentCall(
+  presence: DbGridPresence,
+  room: DbGridRoom,
+  context: FunctionContext,
+  ownerClientType?: string | null,
+): GridCurrentCall {
+  return {
+    callId: presence.callId,
+    spaceId: BigInt(room.spaceId),
+    roomId: BigInt(room.id),
+    membershipId: presence.mediaMembershipId,
+    ownedByCurrentSession: presence.ownerSessionId === context.currentSessionId,
+    ownerClientType: ownerClientType ?? "",
+  }
+}
+
+function membershipFence(value: string, allowEmpty = false): string {
+  if (allowEmpty && value === "") return value
+  if (!uuidPattern.test(value)) throw RealtimeRpcError.BadRequest()
+  return value.toLowerCase()
+}
+
+function gridClientUpgradeRequired(): RealtimeRpcError {
+  return new RealtimeRpcError(
+    RealtimeRpcError.Code.BAD_REQUEST,
+    "Grid call ownership requires an updated client and enabled server.",
+    400,
+  )
+}
+
+function commandMembershipFence(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    if (isGridCallTransferEnabled()) throw gridClientUpgradeRequired()
+    return undefined
+  }
+  return membershipFence(value)
+}
+
+function assertPresenceFence(
+  existing: Awaited<ReturnType<typeof getPresenceWithRoom>>,
+  context: FunctionContext,
+  value: string | undefined,
+  options: { allowLegacyTakeover?: boolean } = {},
+): void {
+  if (value === undefined) {
+    if (isGridCallTransferEnabled()) throw gridClientUpgradeRequired()
+    return
+  }
+  const expected = membershipFence(value, true)
+  if (!existing && expected === "") return
+  if (
+    existing &&
+    expected === existing.presence.mediaMembershipId &&
+    (existing.presence.ownerSessionId === context.currentSessionId ||
+      (options.allowLegacyTakeover === true && !isGridCallTransferEnabled()))
+  )
+    return
+  throw new RealtimeRpcError(
+    RealtimeRpcError.Code.BAD_REQUEST,
+    "The Grid call changed. Refresh before trying again.",
+    400,
+  )
+}
+
+async function buildGrid(spaceId: number, context: FunctionContext): Promise<Grid> {
+  // Snapshot content and its revision come from one MVCC snapshot. A response
+  // can therefore be older than a later response, but it can never label old
+  // content with a newer revision. Leases that expired since the last sweep
+  // are already hidden here by their lease time.
+  const snapshot = await db.transaction(async (tx) => {
+    const settings = await SpaceSettingsModel.getStored(spaceId, tx)
+    const [space] = await tx
+      .select({
+        revision: spaces.gridRevision,
+        // Capture/history writers bump this isolated counter with their run
+        // changes, so it labels exactly the run projections read below.
+        transcriptionRevision:
+          sql<bigint>`coalesce((select "revision" from ${gridTranscriptionSpaceRevisions} where "space_id" = ${spaces.id}), 0)`.mapWith(
+            BigInt,
+          ),
+      })
+      .from(spaces)
+      .where(and(eq(spaces.id, spaceId), isNull(spaces.deleted)))
+      .limit(1)
+    if (!space) throw RealtimeRpcError.SpaceIdInvalid()
+
+    const roomRows = settings.gridEnabled
+      ? await tx
+          .select({ room: gridRooms, presence: gridPresence })
+          .from(gridRooms)
+          .leftJoin(
+            gridPresence,
+            and(eq(gridPresence.roomId, gridRooms.id), gt(gridPresence.leaseExpiresAt, new Date())),
+          )
+          .where(eq(gridRooms.spaceId, spaceId))
+          .orderBy(asc(gridRooms.createdAt), asc(gridRooms.id), asc(gridPresence.joinedAt))
+      : []
+    const available = await transcriptionAvailable(tx, spaceId)
+    const projected = new Map<
+      number,
+      {
+        roomThreadId?: bigint
+        transcription?: ReturnType<typeof encodeGridTranscription>
+        transcriptionAvailable: boolean
+      }
+    >()
+    const boundRoomIds = roomRows.filter((row) => available || row.room.roomThreadId !== null).map((row) => row.room.id)
+    const latestRuns = boundRoomIds.length
+      ? await tx
+          .selectDistinctOn([gridTranscriptionRuns.sourceRoomId])
+          .from(gridTranscriptionRuns)
+          .where(inArray(gridTranscriptionRuns.sourceRoomId, [...new Set(boundRoomIds)]))
+          .orderBy(gridTranscriptionRuns.sourceRoomId, desc(gridTranscriptionRuns.createdAt))
+      : []
+    const runByRoom = new Map(latestRuns.map((run) => [run.sourceRoomId, run]))
+    const projectionChatIds = [
+      ...new Set([
+        ...roomRows.flatMap((row) => (row.room.roomThreadId === null ? [] : [row.room.roomThreadId])),
+        ...latestRuns.map((run) => run.transcriptChatId),
+      ]),
+    ]
+    const projectionChats = projectionChatIds.length
+      ? await tx.select().from(chats).where(inArray(chats.id, projectionChatIds))
+      : []
+    const chatById = new Map(projectionChats.map((chat) => [chat.id, chat]))
+    const ownerSessionIds = available
+      ? [...new Set(roomRows.flatMap((row) => (row.presence ? [row.presence.ownerSessionId] : [])))]
+      : []
+    const ownerSessions = ownerSessionIds.length
+      ? await tx
+          .select({
+            id: sessions.id,
+            clientType: sessions.clientType,
+            clientVersion: sessions.clientVersion,
+            revoked: sessions.revoked,
+          })
+          .from(sessions)
+          .where(inArray(sessions.id, ownerSessionIds))
+      : []
+    const qualifiedOwners = new Set(
+      ownerSessions
+        .filter((session) => session.revoked === null && supportedGridTranscriptionSession(session))
+        .map((session) => session.id),
+    )
+    for (const room of new Map(roomRows.map((row) => [row.room.id, row.room])).values()) {
+      if (!available && room.roomThreadId === null) {
+        projected.set(room.id, { transcriptionAvailable: false })
+        continue
+      }
+      let roomThreadId: bigint | undefined
+      if (room.roomThreadId) {
+        const chat = chatById.get(room.roomThreadId)
+        if (
+          chat &&
+          chat.type === "thread" &&
+          chat.spaceId === room.spaceId &&
+          chat.publicThread === false &&
+          chat.parentChatId === null
+        ) {
+          try {
+            await AccessGuards.ensureChatAccess(chat, context.currentUserId, tx)
+            roomThreadId = BigInt(chat.id)
+          } catch (error) {
+            if (!RealtimeRpcError.is(error)) throw error
+          }
+        }
+      }
+      const run = runByRoom.get(room.id)
+      let canRead = false
+      if (run) {
+        const chat = chatById.get(run.transcriptChatId)
+        if (chat) {
+          try {
+            await AccessGuards.ensureChatAccess(chat, context.currentUserId, tx)
+            canRead = true
+          } catch (error) {
+            if (!RealtimeRpcError.is(error)) throw error
+          }
+        }
+      }
+      const roster = roomRows.filter((row) => row.room.id === room.id && row.presence).map((row) => row.presence!)
+      const roomAvailable =
+        available &&
+        room.connectionStartedAt !== null &&
+        roster.length >= 2 &&
+        roster.length <= 8 &&
+        roster.every((presence) => qualifiedOwners.has(presence.ownerSessionId))
+      projected.set(room.id, {
+        roomThreadId,
+        transcription: run ? encodeGridTranscription(run, canRead) : undefined,
+        transcriptionAvailable: roomAvailable,
+      })
+    }
+    return {
+      settings,
+      revision: BigInt(space.revision) + (space.transcriptionRevision ?? 0n),
+      roomRows,
+      projected,
+      available,
+    }
+  }, snapshotRead)
+
+  if (!snapshot.settings.gridEnabled) {
+    return {
+      spaceId: BigInt(spaceId),
+      enabled: false,
+      rooms: [],
+      revision: BigInt(snapshot.revision),
+      callTransferEnabled: isGridCallTransferEnabled(),
+    }
+  }
+
+  const { roomRows } = snapshot
+
+  const userIds = [...new Set(roomRows.flatMap((row) => (row.presence ? [row.presence.userId] : [])))]
+  const usersWithPhotos = userIds.length > 0 ? await UsersModel.getUsersWithPhotos(userIds) : []
+  const encodedUsers = new Map(
+    usersWithPhotos.map(({ user, photoFile }) => [user.id, encodeUser({ user, photoFile, min: true })]),
+  )
+  const rooms = new Map<number, GridRoom>()
+  let currentRoomId: bigint | undefined
+
+  for (const row of roomRows) {
+    let room = rooms.get(row.room.id)
+    if (!room) {
+      room = encodeRoom(row.room)
+      Object.assign(room, snapshot.projected.get(row.room.id))
+      rooms.set(row.room.id, room)
+    }
+    if (row.presence) {
+      const user = encodedUsers.get(row.presence.userId)
+      if (!user) continue
+      const ownedByCurrentSession =
+        row.presence.userId === context.currentUserId && row.presence.ownerSessionId === context.currentSessionId
+      room.avatars.push({
+        user,
+        joinedAt: encodeDateStrict(row.presence.joinedAt),
+        ownedByCurrentSession,
+        microphoneEnabled: row.presence.microphoneEnabled,
+        membershipId: row.presence.mediaMembershipId,
+        microphoneRevision: row.presence.microphoneRevision,
+      })
+      if (ownedByCurrentSession) currentRoomId = BigInt(row.room.id)
+    }
+  }
+
+  return {
+    spaceId: BigInt(spaceId),
+    enabled: true,
+    rooms: [...rooms.values()],
+    currentRoomId,
+    revision: BigInt(snapshot.revision),
+    callTransferEnabled: isGridCallTransferEnabled(),
+  }
+}
+
+function encodeRoom(room: DbGridRoom): GridRoom {
+  return {
+    id: BigInt(room.id),
+    spaceId: BigInt(room.spaceId),
+    createdByUserId: BigInt(room.createdByUserId),
+    title: room.title ?? undefined,
+    locked: room.locked,
+    createdAt: encodeDateStrict(room.createdAt),
+    updatedAt: encodeDateStrict(room.updatedAt),
+    avatars: [],
+    transcriptionAvailable: false,
+    connection: room.connectionStartedAt
+      ? {
+          roomId: BigInt(room.id),
+          generation: room.connectionGeneration,
+          startedAt: encodeDateStrict(room.connectionStartedAt),
+        }
+      : undefined,
+  }
+}
+
+async function getPresenceWithRoom(tx: Transaction, userId: number) {
+  const [row] = await tx
+    .select({ presence: gridPresence, room: gridRooms })
+    .from(gridPresence)
+    .innerJoin(gridRooms, eq(gridRooms.id, gridPresence.roomId))
+    .where(eq(gridPresence.userId, userId))
+    .limit(1)
+  return row
+}
+
+async function getActivePresenceWithRoom(
+  tx: Transaction,
+  userId: number,
+  state: GridMutationState,
+) {
+  const existing = await getPresenceWithRoom(tx, userId)
+  if (!existing || existing.presence.leaseExpiresAt > new Date()) return existing
+
+  const activeConnection = activeGridConnection(existing.room)
+  await tx.delete(gridPresence).where(eq(gridPresence.userId, userId))
+  state.affectedSpaceIds.add(existing.room.spaceId)
+  const endedConnection = await reconcileGridRoom(tx, existing.room.id)
+  if (endedConnection) state.endedConnections.push(endedConnection)
+  if (activeConnection) {
+    await recordGridParticipantRevocation(
+      tx,
+      state,
+      activeConnection,
+      userId,
+      existing.presence.mediaMembershipId,
+    )
+  }
+  return undefined
+}
+
+async function getLockedRoom(tx: Transaction, roomId: number): Promise<DbGridRoom> {
+  const [room] = await tx.select().from(gridRooms).where(eq(gridRooms.id, roomId)).for("update").limit(1)
+  if (!room) throw RealtimeRpcError.BadRequest()
+  return room
+}
+
+async function ensureGridAvailable(spaceId: number, userId: number, tx?: Transaction) {
+  const [member] = await (tx ?? db)
+    .select({ id: members.id })
+    .from(members)
+    .innerJoin(spaces, and(eq(spaces.id, members.spaceId), isNull(spaces.deleted)))
+    .where(and(eq(members.spaceId, spaceId), eq(members.userId, userId)))
+    .limit(1)
+  if (!member) throw RealtimeRpcError.SpaceIdInvalid()
+  const settings = await SpaceSettingsModel.getStored(spaceId, tx)
+  if (!settings.gridEnabled) throw RealtimeRpcError.BadRequest()
+}
+
+async function ensureCurrentSession(tx: Transaction, context: FunctionContext) {
+  const [session] = await tx
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(
+      and(
+        eq(sessions.id, context.currentSessionId),
+        eq(sessions.userId, context.currentUserId),
+        sql`${sessions.revoked} is null`,
+      ),
+    )
+    .for("update")
+    .limit(1)
+  if (!session) throw RealtimeRpcError.Unauthenticated()
+}
+
+async function lockUser(tx: Transaction, userId: number) {
+  const [user] = await tx.select({ id: users.id }).from(users).where(eq(users.id, userId)).for("update").limit(1)
+  if (!user) throw RealtimeRpcError.UserIdInvalid()
+}
+
+async function isSpaceAdmin(tx: Transaction, spaceId: number, userId: number): Promise<boolean> {
+  const [member] = await tx
+    .select({ role: members.role })
+    .from(members)
+    .where(and(eq(members.spaceId, spaceId), eq(members.userId, userId)))
+    .limit(1)
+  return member?.role === "owner" || member?.role === "admin"
+}
+
+async function isPublicSpace(tx: Transaction, spaceId: number): Promise<boolean> {
+  const [space] = await tx
+    .select({ isPublic: spaces.isPublic })
+    .from(spaces)
+    .where(eq(spaces.id, spaceId))
+    .limit(1)
+  if (!space) throw RealtimeRpcError.SpaceIdInvalid()
+  return space.isPublic
+}
+
+async function ensureCanRenameRoom(tx: Transaction, spaceId: number, userId: number) {
+  if (!(await isPublicSpace(tx, spaceId))) return
+  if (!(await isSpaceAdmin(tx, spaceId, userId))) throw RealtimeRpcError.BadRequest()
+}
+
+async function ensureCreatorOrAdmin(tx: Transaction, room: DbGridRoom, userId: number) {
+  if (room.createdByUserId === userId) return
+  if (!(await isSpaceAdmin(tx, room.spaceId, userId))) throw RealtimeRpcError.BadRequest()
+}
+
+async function credentialsForParticipant(
+  claim: GridClaim,
+  context: FunctionContext,
+  issueCredentials: GridCredentialIssuer = createGridConnectionCredentials,
+) {
+  const roomId = claim.roomId
+  const userId = context.currentUserId
+  const sessionId = context.currentSessionId
+  const startedAt = Date.now()
+  const [row] = await db
+    .select({ room: gridRooms, presence: gridPresence, user: users })
+    .from(gridRooms)
+    .innerJoin(
+      gridPresence,
+      and(
+        eq(gridPresence.roomId, gridRooms.id),
+        eq(gridPresence.userId, userId),
+        eq(gridPresence.ownerSessionId, sessionId),
+        eq(gridPresence.callId, claim.callId),
+        eq(gridPresence.mediaMembershipId, claim.mediaMembershipId),
+        gt(gridPresence.leaseExpiresAt, new Date()),
+      ),
+    )
+    .innerJoin(users, eq(users.id, gridPresence.userId))
+    .where(eq(gridRooms.id, roomId))
+    .limit(1)
+  const connection = row ? encodeRoom(row.room).connection : undefined
+  if (!row || !connection) {
+    log.debug("GRID_TRACE phase=participant_credentials_unavailable", {
+      roomId,
+      userId,
+      sessionId,
+      elapsedMs: Date.now() - startedAt,
+    })
+    return undefined
+  }
+  let credentials
+  try {
+    credentials = await issueCredentials({
+      connection,
+      userId,
+      displayName: displayName(row.user),
+      participantIdentity: gridParticipantIdentity(userId, row.presence.mediaMembershipId),
+      callId: claim.callId,
+      mediaMembershipId: claim.mediaMembershipId,
+    })
+  } catch (error) {
+    Log.shared.warn("Failed to mint committed Grid participant credentials", {
+      roomId,
+      generation: connection.generation,
+      userId,
+      sessionId,
+      error,
+    })
+    return undefined
+  }
+  if (
+    credentials
+    && !(await gridCredentialAuthorityIsActive({
+      roomId,
+      generation: connection.generation,
+      spaceId: row.room.spaceId,
+      userId,
+      sessionId,
+      mediaMembershipId: row.presence.mediaMembershipId,
+      callId: claim.callId,
+    }))
+  ) {
+    log.debug("GRID_TRACE phase=participant_credentials_stale_after_mint", {
+      roomId,
+      generation: connection.generation,
+      userId,
+      sessionId,
+      elapsedMs: Date.now() - startedAt,
+    })
+    return undefined
+  }
+  log.debug("GRID_TRACE phase=participant_credentials_done", {
+    roomId,
+    generation: connection.generation,
+    userId,
+    sessionId,
+    hasCredentials: credentials !== undefined,
+    elapsedMs: Date.now() - startedAt,
+  })
+  return credentials
+}
+
+async function notifyConnectionReady(roomId: number) {
+  try {
+    await notifyConnectionReadyUnchecked(roomId)
+  } catch (error) {
+    // The committed room state remains authoritative. Participants can request
+    // credentials again through PrepareGridConnection after refetch/reconnect.
+    Log.shared.warn("Failed to send Grid connection-ready notification", { roomId, error })
+  }
+}
+
+async function notifyConnectionReadyUnchecked(roomId: number) {
+  const startedAt = Date.now()
+  const rows = await db
+    .select({ room: gridRooms, presence: gridPresence, user: users })
+    .from(gridRooms)
+    .innerJoin(
+      gridPresence,
+      and(eq(gridPresence.roomId, gridRooms.id), gt(gridPresence.leaseExpiresAt, new Date())),
+    )
+    .innerJoin(users, eq(users.id, gridPresence.userId))
+    .where(eq(gridRooms.id, roomId))
+  const connection = rows[0] ? encodeRoom(rows[0].room).connection : undefined
+  if (!connection) {
+    log.debug("GRID_TRACE phase=ready_push_skipped", {
+      roomId,
+      participantCount: rows.length,
+      elapsedMs: Date.now() - startedAt,
+    })
+    return
+  }
+
+  await Promise.all(
+    rows.map(async (row) => {
+      const credentials = await createGridConnectionCredentials({
+        connection,
+        userId: row.user.id,
+        displayName: displayName(row.user),
+        participantIdentity: gridParticipantIdentity(row.user.id, row.presence.mediaMembershipId),
+        callId: row.presence.callId,
+        mediaMembershipId: row.presence.mediaMembershipId,
+      })
+      if (!credentials) return
+      const stillActive = await gridCredentialAuthorityIsActive({
+        roomId,
+        generation: connection.generation,
+        spaceId: row.room.spaceId,
+        userId: row.user.id,
+        sessionId: row.presence.ownerSessionId,
+        mediaMembershipId: row.presence.mediaMembershipId,
+        callId: row.presence.callId,
+      })
+      if (!stillActive) {
+        log.debug("GRID_TRACE phase=ready_push_stale_after_mint", {
+          roomId,
+          generation: connection.generation,
+          userId: row.user.id,
+          sessionId: row.presence.ownerSessionId,
+        })
+        return
+      }
+      const payload: ServerMessage["payload"] = {
+        oneofKind: "grid",
+        grid: {
+          event: {
+            oneofKind: "connectionReady",
+            connectionReady: { credentials },
+          },
+        },
+      }
+      await sendMessageToRealtimeSession(row.user.id, row.presence.ownerSessionId, payload)
+      try {
+        const view = await connectionDirectory.list(row.user.id)
+        if (view.status !== "available") return
+        const owningBoots = new Set(view.connections
+          .filter((registration) => registration.sessionId === row.presence.ownerSessionId && registration.bootId !== internalMessaging.bootId)
+          .map((registration) => registration.bootId))
+        const event = { kind: "SessionRealtime" as const, payload: {
+            kind: "gridCredentials",
+            roomId,
+            spaceId: SpaceId.make(row.room.spaceId),
+            generation: connection.generation,
+            mediaMembershipId: row.presence.mediaMembershipId,
+            callId: row.presence.callId,
+            encodedPayload: Buffer.from(ServerMessage.toBinary({ payload })).toString("base64"),
+          } as const }
+        await Promise.all([...owningBoots].map((bootId) => internalMessaging.publish({
+          target: { kind: "session", bootId, userId: UserId.make(row.user.id), sessionId: SessionId.make(row.presence.ownerSessionId) },
+          event,
+        })))
+      } catch (error) {
+        log.warn("Failed to encode Grid session hint", { roomId, userId: row.user.id, error })
+      }
+    }),
+  )
+  log.debug("GRID_TRACE phase=ready_push_done", {
+    roomId,
+    generation: connection.generation,
+    participantCount: rows.length,
+    elapsedMs: Date.now() - startedAt,
+  })
+}
+
+export function subscribeGridCredentialHints(): () => void {
+  return internalMessaging.on("SessionRealtime", async ({ target, event }) => {
+    if (event.payload.kind !== "gridCredentials") return
+    const { roomId, spaceId, generation, mediaMembershipId, callId, encodedPayload } = event.payload
+    if (
+      !(await gridCredentialAuthorityIsActive({
+        roomId,
+        spaceId,
+        generation,
+        mediaMembershipId,
+        callId,
+        userId: target.userId,
+        sessionId: target.sessionId,
+      }))
+    )
+      return
+    let payload: ServerMessage["payload"]
+    try {
+      payload = ServerMessage.fromBinary(Buffer.from(encodedPayload, "base64")).payload
+      if (payload.oneofKind !== "grid" || payload.grid.event.oneofKind !== "connectionReady") return
+    } catch { return }
+    await sendMessageToRealtimeSession(target.userId, target.sessionId, payload)
+  })
+}
+
+function displayName(user: { firstName: string | null; lastName: string | null; username: string | null }): string {
+  return [user.firstName, user.lastName].filter(Boolean).join(" ") || user.username || "Inline member"
+}
+
+function normalizeTitle(value: string): string | null {
+  const title = value.trim().replace(/\s+/g, " ")
+  if (title.length === 0) return null
+  if (title.length > MAX_ROOM_TITLE_LENGTH) throw RealtimeRpcError.BadRequest()
+  return title
+}
+
+function positiveId(value: bigint, error: () => RealtimeRpcError): number {
+  const id = Number(value)
+  if (!Number.isSafeInteger(id) || id <= 0) throw error()
+  return id
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "23505"
+}

@@ -1,0 +1,410 @@
+import { ModelError } from "@in/server/db/models/_errors"
+import type { TPeerInfo } from "@in/server/api-types"
+import type { DbFile, DbMessage } from "@in/server/db/schema"
+import { decryptMessage } from "@in/server/modules/encryption/encryptMessage"
+import {
+  MessageActions,
+  MessageEntities,
+  MessageSendMode,
+  type BlockContent,
+  type InputPeer,
+  type Message,
+  type MessageAttachment,
+  type MessageAttachments,
+  type MessageFwdHeader,
+  type MessageMedia,
+  type MessageReplies,
+  type MessageService,
+  type MessageSubthread,
+  type Peer,
+  type Photo,
+} from "@inline-chat/protocol/core"
+import { encodePeer, encodePeerFromInputPeer } from "@in/server/realtime/encoders/encodePeer"
+import { encodePhoto, encodePhotoLegacy } from "@in/server/realtime/encoders/encodePhoto"
+import type { DbFullDocument, DbFullPhoto, DbFullVideo, DbFullVoice } from "@in/server/db/models/files"
+import { encodeVideo } from "@in/server/realtime/encoders/encodeVideo"
+import { encodeDocument } from "@in/server/realtime/encoders/encodeDocument"
+import { encodeVoice } from "@in/server/realtime/encoders/encodeVoice"
+import type { DbFullMessage } from "@in/server/db/models/messages"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { encodeReaction } from "@in/server/realtime/encoders/encodeReaction"
+import { decryptBinary } from "@in/server/modules/encryption/encryption"
+import { detectHasLink } from "@in/server/modules/message/linkDetection"
+import { isUserMentioned } from "@in/server/modules/message/helpers"
+import { encodeMessageAttachment } from "@in/server/realtime/encoders/encodeMessageAttachment"
+import type { SystemMessage } from "@in/server/modules/systemMessages"
+import { projectReadyBlockPhotos } from "@in/server/modules/message/blockContent"
+
+type EncodableMessage = DbMessage & {
+  systemMessage?: SystemMessage | null
+  blockContent?: BlockContent | null
+  agentSession?: Message["agentSession"]
+}
+
+function encodeServiceMessage(systemMessage: SystemMessage | null | undefined): MessageService | undefined {
+  const event = systemMessage?.event
+
+  switch (event?.oneofKind) {
+    case "threadBacklink":
+      return {
+        event: {
+          oneofKind: "threadBacklink",
+          threadBacklink: {
+            sourceChatId: event.threadBacklink.sourceChatId,
+            sourceTitle: event.threadBacklink.sourceTitle,
+          },
+        },
+      }
+
+    case "pinnedMessage":
+      return {
+        event: {
+          oneofKind: "pinnedMessage",
+          pinnedMessage: {
+            messageId: event.pinnedMessage.pinnedMessageId,
+          },
+        },
+      }
+
+    case "gridTranscript":
+      return {
+        event: {
+          oneofKind: "gridTranscript",
+          gridTranscript: event.gridTranscript,
+        },
+      }
+
+    case undefined:
+      return undefined
+  }
+}
+
+export const encodeMessage = ({
+  message,
+  file,
+  photo,
+  video,
+  document,
+  voice,
+  encodingForUserId,
+  encodingForPeer,
+  sendMode,
+  replies,
+  subthread,
+  mentionedUserIds,
+}: {
+  message: EncodableMessage
+  encodingForUserId: number
+  encodingForPeer: { legacyPeer: TPeerInfo } | { peer: Peer } | { inputPeer: InputPeer }
+  file?: DbFile | undefined
+  photo?: DbFullPhoto | undefined
+  video?: DbFullVideo | undefined
+  document?: DbFullDocument | undefined
+  voice?: DbFullVoice | undefined
+  sendMode?: MessageSendMode
+  replies?: MessageReplies
+  subthread?: MessageSubthread
+  mentionedUserIds?: ReadonlySet<number>
+}): Message => {
+  // Decrypt
+  let text = message.text ? message.text : undefined
+  if (message.textEncrypted && message.textIv && message.textTag) {
+    const decryptedText = decryptMessage({
+      encrypted: message.textEncrypted,
+      iv: message.textIv,
+      authTag: message.textTag,
+    })
+    text = decryptedText
+  }
+
+  let entities: MessageEntities | undefined = undefined
+  if (message.entitiesEncrypted && message.entitiesIv && message.entitiesTag) {
+    const decryptedEntities = decryptBinary({
+      encrypted: message.entitiesEncrypted,
+      iv: message.entitiesIv,
+      authTag: message.entitiesTag,
+    })
+    entities = MessageEntities.fromBinary(decryptedEntities)
+  }
+
+  const hasLink = message.hasLink ?? (detectHasLink({ entities }) ? true : undefined)
+
+  let actions: MessageActions | undefined = undefined
+  if (message.actionsEncrypted && message.actionsIv && message.actionsTag) {
+    const decryptedActions = decryptBinary({
+      encrypted: message.actionsEncrypted,
+      iv: message.actionsIv,
+      authTag: message.actionsTag,
+    })
+    actions = MessageActions.fromBinary(decryptedActions)
+  }
+
+  let peerId: Peer
+
+  if ("legacyPeer" in encodingForPeer) {
+    peerId = encodePeer(encodingForPeer.legacyPeer)
+  } else if ("peer" in encodingForPeer) {
+    peerId = encodingForPeer.peer
+  } else {
+    peerId = encodePeerFromInputPeer({
+      inputPeer: encodingForPeer.inputPeer,
+      currentUserId: encodingForUserId,
+    })
+  }
+
+  let media: MessageMedia | undefined = undefined
+
+  if (message.mediaType === "nudge") {
+    media = {
+      media: {
+        oneofKind: "nudge",
+        nudge: {},
+      },
+    }
+  } else if (file) {
+    media = {
+      media: {
+        oneofKind: "photo",
+        photo: {
+          photo: encodePhotoLegacy({ file }),
+        },
+      },
+    }
+  } else if (photo) {
+    media = {
+      media: {
+        oneofKind: "photo",
+        photo: { photo: encodePhoto({ photo }) },
+      },
+    }
+  } else if (video) {
+    media = {
+      media: {
+        oneofKind: "video",
+        video: { video: encodeVideo({ video }) },
+      },
+    }
+  } else if (document) {
+    media = {
+      media: {
+        oneofKind: "document",
+        document: { document: encodeDocument({ document }) },
+      },
+    }
+  } else if (voice) {
+    const encodedVoice = encodeVoice({ voice })
+    media = encodedVoice
+      ? {
+          media: {
+            oneofKind: "voice",
+            voice: { voice: encodedVoice },
+          },
+        }
+      : undefined
+  }
+
+  let fwdFrom: MessageFwdHeader | undefined = undefined
+  let fwdFromPeer: Peer | undefined = undefined
+
+  if (message.fwdFromPeerChatId) {
+    fwdFromPeer = {
+      type: { oneofKind: "chat", chat: { chatId: BigInt(message.fwdFromPeerChatId) } },
+    }
+  } else if (message.fwdFromPeerUserId) {
+    fwdFromPeer = {
+      type: { oneofKind: "user", user: { userId: BigInt(message.fwdFromPeerUserId) } },
+    }
+  }
+
+  if (fwdFromPeer && message.fwdFromSenderId && message.fwdFromMessageId) {
+    fwdFrom = {
+      fromPeerId: fwdFromPeer,
+      fromId: BigInt(message.fwdFromSenderId),
+      fromMessageId: BigInt(message.fwdFromMessageId),
+    }
+  }
+
+  let messageProto: Message = {
+    id: BigInt(message.messageId),
+    fromId: BigInt(message.fromId),
+    peerId: peerId,
+    chatId: BigInt(message.chatId),
+    message: text,
+    out: encodingForUserId === message.fromId,
+    date: encodeDateStrict(message.date),
+    editDate: message.editDate ? encodeDateStrict(message.editDate) : undefined,
+    rev: BigInt(message.rev ?? 0),
+    mentioned: message.systemMessage?.event.oneofKind === "gridTranscript"
+      ? false
+      : entities ? isUserMentioned(entities, encodingForUserId, mentionedUserIds) : false,
+    replyToMsgId: message.replyToMsgId ? BigInt(message.replyToMsgId) : undefined,
+    media: media,
+    isSticker: message.isSticker || undefined,
+    hasLink: hasLink,
+    entities: entities,
+    sendMode: message.countsAsUnread === false ? MessageSendMode.MODE_SILENT : sendMode ?? undefined,
+    countsAsUnread: message.countsAsUnread === false ? false : undefined,
+    fwdFrom: fwdFrom,
+    replies,
+    subthread,
+    actions: message.systemMessage?.event.oneofKind === "gridTranscript" ? undefined : actions,
+    serviceMessage: encodeServiceMessage(message.systemMessage),
+    blockContent: message.blockContent ?? undefined,
+    agentSession: message.agentSession,
+  }
+
+  return messageProto
+}
+
+export const encodeFullMessage = ({
+  message,
+  encodingForUserId,
+  encodingForPeer,
+  replies,
+  subthread,
+}: {
+  message: DbFullMessage
+  encodingForUserId: number
+  encodingForPeer: { peer: Peer } | { inputPeer: InputPeer }
+  replies?: MessageReplies
+  subthread?: MessageSubthread
+}): Message => {
+  let peerId: Peer
+
+  if ("peer" in encodingForPeer) {
+    peerId = encodingForPeer.peer
+  } else {
+    peerId = encodePeerFromInputPeer({
+      inputPeer: encodingForPeer.inputPeer,
+      currentUserId: encodingForUserId,
+    })
+  }
+
+  let media: MessageMedia | undefined = undefined
+
+  if (message.mediaType === "nudge") {
+    media = {
+      media: {
+        oneofKind: "nudge",
+        nudge: {},
+      },
+    }
+  } else if (message.photo) {
+    media = {
+      media: {
+        oneofKind: "photo",
+        photo: {
+          photo: encodePhoto({ photo: message.photo }),
+        },
+      },
+    }
+  } else if (message.video) {
+    media = {
+      media: {
+        oneofKind: "video",
+        video: { video: encodeVideo({ video: message.video }) },
+      },
+    }
+  } else if (message.document) {
+    media = {
+      media: {
+        oneofKind: "document",
+        document: { document: encodeDocument({ document: message.document }) },
+      },
+    }
+  } else if (message.voice) {
+    const encodedVoice = encodeVoice({ voice: message.voice })
+    if (!encodedVoice) throw ModelError.VoiceInvalid
+    media = encodedVoice
+      ? {
+          media: {
+            oneofKind: "voice",
+            voice: { voice: encodedVoice },
+          },
+        }
+      : undefined
+  }
+
+  // Process attachments if they exist
+  let attachments: MessageAttachments | undefined = undefined
+  if (message.messageAttachments && message.messageAttachments.length > 0) {
+    const encodedAttachments = message.messageAttachments
+      .map((attachment) => encodeMessageAttachment(attachment))
+      .filter((attachment): attachment is MessageAttachment => attachment !== null)
+
+    attachments = {
+      attachments: encodedAttachments,
+    }
+  }
+
+  const hasLinkFromAttachments = message.messageAttachments?.some((attachment) => attachment.linkEmbed) ?? false
+
+  const hasReactions = message.reactions.length > 0
+
+  let blockContent = message.blockContent
+  if (blockContent && message.blockContentPhotos) {
+    const currentPhotos = new Map<bigint, Photo>()
+    for (const [photoId, photo] of message.blockContentPhotos) {
+      currentPhotos.set(photoId, encodePhoto({ photo }))
+    }
+    blockContent = projectReadyBlockPhotos(blockContent, currentPhotos)
+  }
+
+  let fwdFrom: MessageFwdHeader | undefined = undefined
+  let fwdFromPeer: Peer | undefined = undefined
+
+  if (message.fwdFromPeerChatId) {
+    fwdFromPeer = {
+      type: { oneofKind: "chat", chat: { chatId: BigInt(message.fwdFromPeerChatId) } },
+    }
+  } else if (message.fwdFromPeerUserId) {
+    fwdFromPeer = {
+      type: { oneofKind: "user", user: { userId: BigInt(message.fwdFromPeerUserId) } },
+    }
+  }
+
+  if (fwdFromPeer && message.fwdFromSenderId && message.fwdFromMessageId) {
+    fwdFrom = {
+      fromPeerId: fwdFromPeer,
+      fromId: BigInt(message.fwdFromSenderId),
+      fromMessageId: BigInt(message.fwdFromMessageId),
+    }
+  }
+
+  let messageProto: Message = {
+    id: BigInt(message.messageId),
+    fromId: BigInt(message.fromId),
+    peerId: peerId,
+    chatId: BigInt(message.chatId),
+    message: message.text ?? undefined,
+    out: encodingForUserId === message.fromId,
+    date: encodeDateStrict(message.date),
+    editDate: message.editDate ? encodeDateStrict(message.editDate) : undefined,
+    rev: BigInt(message.rev ?? 0),
+    mentioned: message.systemMessage?.event.oneofKind === "gridTranscript"
+      ? false
+      : message.entities ? isUserMentioned(message.entities, encodingForUserId) : false,
+    replyToMsgId: message.replyToMsgId ? BigInt(message.replyToMsgId) : undefined,
+    media: media,
+    isSticker: message.isSticker ?? false,
+    hasLink: message.hasLink === true || detectHasLink({ entities: message.entities }) || hasLinkFromAttachments,
+    attachments: attachments,
+    reactions: hasReactions
+      ? {
+          reactions: message.reactions.map((reaction) => encodeReaction({ reaction })),
+        }
+      : undefined,
+    entities: message.entities ?? undefined,
+    sendMode: message.countsAsUnread === false ? MessageSendMode.MODE_SILENT : undefined,
+    countsAsUnread: message.countsAsUnread === false ? false : undefined,
+    fwdFrom: fwdFrom,
+    replies,
+    subthread,
+    actions: message.systemMessage?.event.oneofKind === "gridTranscript" ? undefined : message.actions ?? undefined,
+    serviceMessage: encodeServiceMessage(message.systemMessage),
+    blockContent: blockContent ?? undefined,
+    agentSession: message.agentSession,
+  }
+
+  return messageProto
+}

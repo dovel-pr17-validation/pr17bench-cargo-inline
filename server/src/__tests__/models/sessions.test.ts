@@ -1,0 +1,223 @@
+import { describe, expect, spyOn, test } from "bun:test"
+import { eq } from "drizzle-orm"
+import { db, schema } from "@in/server/db"
+import { SessionsModel } from "@in/server/db/models/sessions"
+import { setupTestLifecycle, testUtils } from "../setup"
+import { connectionManager } from "@in/server/ws/connections"
+
+describe("SessionsModel push sessions", () => {
+  setupTestLifecycle()
+
+  test("concurrent same-device login replaces authority atomically", async () => {
+    const user = await testUtils.createUser("session-race@example.com")
+    const close = spyOn(connectionManager, "closeConnectionForSession")
+    try {
+      const results = await Promise.all(Array.from({ length: 2 }, () =>
+        testUtils.createSessionForUser(user.id, { deviceId: "same-device" })))
+      const rows = await db.select().from(schema.sessions).where(eq(schema.sessions.userId, user.id))
+      expect(results).toHaveLength(2)
+      expect(rows).toHaveLength(2)
+      expect(rows.filter((row) => !row.revoked)).toHaveLength(1)
+      const revoked = rows.find((row) => row.revoked)!
+      expect(revoked.deviceId).toBeNull()
+      expect(close).toHaveBeenCalledWith(user.id, revoked.id, { authenticationInvalidated: true }, undefined)
+    } finally {
+      close.mockRestore()
+    }
+  })
+
+  test("failed replacement insert preserves the previous live authority", async () => {
+    const user = await testUtils.createUser("session-rollback@example.com")
+    const previous = await testUtils.createSessionForUser(user.id, { deviceId: "rollback-device" })
+    await expect(SessionsModel.create({
+      userId: user.id, deviceId: "rollback-device", tokenHash: "x".repeat(65), personalData: {}, clientType: "web",
+    })).rejects.toThrow()
+    const rows = await db.select().from(schema.sessions).where(eq(schema.sessions.userId, user.id))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.id).toBe(previous.session.id)
+    expect(rows[0]?.revoked).toBeNull()
+    expect(rows[0]?.deviceId).toBe("rollback-device")
+  })
+
+  test("returns only non-revoked iOS sessions with push tokens", async () => {
+    const user = await testUtils.createUser("push-sessions@test.com")
+    const active = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+    const revoked = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+    const noToken = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+    const macos = await testUtils.createSessionForUser(user.id, { clientType: "macos" })
+
+    await SessionsModel.updatePushNotificationDetails(active.session.id, { applePushToken: "active-ios-token" })
+    await SessionsModel.updatePushNotificationDetails(revoked.session.id, { applePushToken: "revoked-ios-token" })
+    await SessionsModel.updatePushNotificationDetails(macos.session.id, { applePushToken: "macos-token" })
+
+    await db
+      .update(schema.sessions)
+      .set({ revoked: new Date() })
+      .where(eq(schema.sessions.id, revoked.session.id))
+
+    const pushSessions = await SessionsModel.getValidIOSPushSessionsByUserId(user.id)
+
+    expect(pushSessions.map((session) => session.id)).toEqual([active.session.id])
+    expect(pushSessions[0]?.applePushToken).toBe("active-ios-token")
+    expect(pushSessions.some((session) => session.id === noToken.session.id)).toBe(false)
+  })
+
+  test("returns Android Expo sessions through provider-aware push lookup", async () => {
+    const user = await testUtils.createUser("android-push-sessions@test.com")
+    const ios = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+    const android = await testUtils.createSessionForUser(user.id, { clientType: "android" })
+    const macos = await testUtils.createSessionForUser(user.id, { clientType: "macos" })
+
+    await SessionsModel.updatePushNotificationDetails(ios.session.id, { applePushToken: "ios-token" })
+    await SessionsModel.updatePushNotificationDetails(android.session.id, {
+      applePushToken: "ExponentPushToken[android-token]",
+      pushNotificationProvider: "expo_android",
+    })
+    await SessionsModel.updatePushNotificationDetails(macos.session.id, { applePushToken: "macos-token" })
+
+    const pushSessions = await SessionsModel.getValidPushSessionsByUserId(user.id)
+    const iosPushSessions = await SessionsModel.getValidIOSPushSessionsByUserId(user.id)
+
+    expect(pushSessions.map((session) => [session.id, session.pushNotificationProvider])).toEqual([
+      [ios.session.id, "apns"],
+      [android.session.id, "expo_android"],
+    ])
+    expect(pushSessions.find((session) => session.id === android.session.id)?.applePushToken).toBe(
+      "ExponentPushToken[android-token]",
+    )
+    expect(iosPushSessions.map((session) => session.id)).toEqual([ios.session.id])
+  })
+
+  test("infers provider for legacy push rows without provider metadata", async () => {
+    const user = await testUtils.createUser("legacy-push-sessions@test.com")
+    const ios = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+    const android = await testUtils.createSessionForUser(user.id, { clientType: "android" })
+
+    await SessionsModel.updatePushNotificationDetails(ios.session.id, { applePushToken: "ios-token" })
+    await SessionsModel.updatePushNotificationDetails(android.session.id, {
+      applePushToken: "ExponentPushToken[android-token]",
+      pushNotificationProvider: "expo_android",
+    })
+    await db
+      .update(schema.sessions)
+      .set({ pushNotificationProvider: null })
+      .where(eq(schema.sessions.userId, user.id))
+
+    const pushSessions = await SessionsModel.getValidPushSessionsByUserId(user.id)
+
+    expect(pushSessions.map((session) => [session.id, session.pushNotificationProvider])).toEqual([
+      [ios.session.id, "apns"],
+      [android.session.id, "expo_android"],
+    ])
+  })
+
+  test("does not update push details for revoked sessions", async () => {
+    const user = await testUtils.createUser("revoked-push-update@test.com")
+    const session = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+
+    await db
+      .update(schema.sessions)
+      .set({ revoked: new Date() })
+      .where(eq(schema.sessions.id, session.session.id))
+
+    await SessionsModel.updatePushNotificationDetails(session.session.id, { applePushToken: "late-token" })
+
+    const [row] = await db
+      .select({ applePushTokenEncrypted: schema.sessions.applePushTokenEncrypted })
+      .from(schema.sessions)
+      .where(eq(schema.sessions.id, session.session.id))
+      .limit(1)
+
+    expect(row?.applePushTokenEncrypted).toBeNull()
+  })
+
+  test("treats a missing session as a normal conditional active update", async () => {
+    await expect(SessionsModel.setActiveIfPresent(2_000_000_000, false)).resolves.toBe(false)
+  })
+
+  test("each push registration reports filtered sync push support", async () => {
+    const user = await testUtils.createUser("filtered-sync-push@test.com")
+    const session = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+    const read = async () => {
+      const [row] = await db
+        .select({ pushFilteredSyncPushes: schema.sessions.pushFilteredSyncPushes })
+        .from(schema.sessions)
+        .where(eq(schema.sessions.id, session.session.id))
+        .limit(1)
+      return row?.pushFilteredSyncPushes
+    }
+
+    await SessionsModel.updatePushNotificationDetails(session.session.id, {
+      applePushToken: "ios-token",
+      supportsFilteredSyncPushes: true,
+    })
+    expect(await read()).toBe(true)
+    const [pushSession] = await SessionsModel.getValidIOSPushSessionsByUserId(user.id)
+    expect(pushSession?.pushFilteredSyncPushes).toBe(true)
+
+    // A build without the capability (older or downgraded) must not inherit it.
+    await SessionsModel.updatePushNotificationDetails(session.session.id, { applePushToken: "ios-token" })
+    expect(await read()).toBe(false)
+
+    await SessionsModel.updatePushNotificationDetails(session.session.id, {
+      applePushToken: "ios-token",
+      supportsFilteredSyncPushes: true,
+    })
+    await SessionsModel.clearApplePushToken(session.session.id)
+    expect(await read()).toBeNull()
+  })
+
+  test("revoke clears push notification details", async () => {
+    const user = await testUtils.createUser("revoke-clears-push@test.com")
+    const session = await testUtils.createSessionForUser(user.id, { clientType: "ios" })
+    const publicKey = new Uint8Array(Array.from({ length: 32 }, (_, index) => index + 1))
+
+    await SessionsModel.updatePushNotificationDetails(session.session.id, {
+      applePushToken: "ios-token",
+      pushContentEncryptionKey: {
+        publicKey,
+        keyId: "key-v1",
+        algorithm: "X25519_HKDF_SHA256_AES256_GCM",
+      },
+      pushContentVersion: 1,
+      supportsFilteredSyncPushes: true,
+    })
+    await SessionsModel.setActive(session.session.id, true)
+
+    await SessionsModel.revoke(session.session.id)
+
+    const [row] = await db
+      .select({
+        revoked: schema.sessions.revoked,
+        active: schema.sessions.active,
+        applePushToken: schema.sessions.applePushToken,
+        applePushTokenEncrypted: schema.sessions.applePushTokenEncrypted,
+        applePushTokenIv: schema.sessions.applePushTokenIv,
+        applePushTokenTag: schema.sessions.applePushTokenTag,
+        pushNotificationProvider: schema.sessions.pushNotificationProvider,
+        pushContentKeyPublic: schema.sessions.pushContentKeyPublic,
+        pushContentKeyId: schema.sessions.pushContentKeyId,
+        pushContentKeyAlgorithm: schema.sessions.pushContentKeyAlgorithm,
+        pushContentVersion: schema.sessions.pushContentVersion,
+        pushFilteredSyncPushes: schema.sessions.pushFilteredSyncPushes,
+      })
+      .from(schema.sessions)
+      .where(eq(schema.sessions.id, session.session.id))
+      .limit(1)
+
+    expect(row?.revoked).not.toBeNull()
+    expect(row?.active).toBe(false)
+    expect(row?.applePushToken).toBeNull()
+    expect(row?.applePushTokenEncrypted).toBeNull()
+    expect(row?.applePushTokenIv).toBeNull()
+    expect(row?.applePushTokenTag).toBeNull()
+    expect(row?.pushNotificationProvider).toBeNull()
+    expect(row?.pushContentKeyPublic).toBeNull()
+    expect(row?.pushContentKeyId).toBeNull()
+    expect(row?.pushContentKeyAlgorithm).toBeNull()
+    expect(row?.pushContentVersion).toBeNull()
+    expect(row?.pushFilteredSyncPushes).toBeNull()
+
+    await expect(SessionsModel.getValidIOSPushSessionsByUserId(user.id)).resolves.toEqual([])
+  })
+})

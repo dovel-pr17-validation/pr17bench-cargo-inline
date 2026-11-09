@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+RELEASE_CONFIG_ROOT=${RELEASE_CONFIG_ROOT:-"${ROOT_DIR}"}
+
+source "${ROOT_DIR}/scripts/macos/arch-utils.sh"
+
+if [[ -f "${RELEASE_CONFIG_ROOT}/scripts/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${RELEASE_CONFIG_ROOT}/scripts/.env"
+  set +a
+fi
+
+SPARKLE_VERSION=${SPARKLE_VERSION:-2.9.3}
+SCHEME=${SCHEME:-"Inline (macOS)"}
+CHANNEL=${CHANNEL:-stable}
+APPCAST_URL=${APPCAST_URL:-"https://public-assets.inline.chat/mac/${CHANNEL}/appcast.xml"}
+SPARKLE_SCHEDULED_CHECK_INTERVAL=${SPARKLE_SCHEDULED_CHECK_INTERVAL:-3600}
+SPARKLE_DIR=${SPARKLE_DIR:-"${ROOT_DIR}/.action/sparkle/${SPARKLE_VERSION}"}
+DERIVED_DATA=${DERIVED_DATA:-"${ROOT_DIR}/build/InlineMacDirect"}
+OUTPUT_DIR=${OUTPUT_DIR:-"${ROOT_DIR}/build/macos-direct"}
+DMG_PATH=${DMG_PATH:-"${OUTPUT_DIR}/Inline.dmg"}
+ENTITLEMENTS_PATH=${ENTITLEMENTS_PATH:-"${ROOT_DIR}/apple/InlineMac/InlineMacDirect.entitlements"}
+MACOS_RELEASE_ARCH=${MACOS_RELEASE_ARCH:-arm64}
+MACOS_PROVISIONING_PROFILE_BASE64=${MACOS_PROVISIONING_PROFILE_BASE64:-""}
+MACOS_PROVISIONING_PROFILE_PATH=${MACOS_PROVISIONING_PROFILE_PATH:-""}
+OVERWRITE_DMG=${OVERWRITE_DMG:-0}
+SIGN_RETRY_COUNT=${SIGN_RETRY_COUNT:-3}
+SIGN_RETRY_DELAY_SECONDS=${SIGN_RETRY_DELAY_SECONDS:-2}
+DEBUG_BUILD=${DEBUG_BUILD:-0}
+CREATE_DMG_NODE_BIN_DIR=${CREATE_DMG_NODE_BIN_DIR:-""}
+EXPECTED_SOURCE_COMMIT=${EXPECTED_SOURCE_COMMIT:-""}
+EXPECTED_SOURCE_BUILD=${EXPECTED_SOURCE_BUILD:-""}
+EXPECTED_SOURCE_SNAPSHOT=${EXPECTED_SOURCE_SNAPSHOT:-""}
+SOURCE_SNAPSHOT_MANIFEST=${SOURCE_SNAPSHOT_MANIFEST:-""}
+BUILD_NUMBER_OVERRIDE=${BUILD_NUMBER_OVERRIDE:-""}
+INLINE_REVISION_OVERRIDE=${INLINE_REVISION_OVERRIDE:-""}
+EXPERIMENTAL_TIP=${EXPERIMENTAL_TIP:-0}
+REQUIRE_CLEAN_SOURCE=${REQUIRE_CLEAN_SOURCE:-0}
+ARTIFACT_PROVENANCE_PATH=${ARTIFACT_PROVENANCE_PATH:-"${OUTPUT_DIR}/release-provenance.json"}
+
+case "${CHANNEL}" in
+  stable|beta|tip) ;;
+  *)
+    echo "Invalid CHANNEL: ${CHANNEL} (expected stable, beta, or tip)" >&2
+    exit 1
+    ;;
+esac
+
+release_source_status() {
+  bun run "${ROOT_DIR}/scripts/macos/macos-source-snapshot.ts" --root "${ROOT_DIR}" --status
+}
+
+verify_frozen_source() {
+  local expected_commit_build current_snapshot current_source_status source_diff
+  if [[ -n "${EXPECTED_SOURCE_SNAPSHOT}" ]]; then
+    if [[ -z "${SOURCE_SNAPSHOT_MANIFEST}" || ! -f "${SOURCE_SNAPSHOT_MANIFEST}" ]]; then
+      echo "SOURCE_SNAPSHOT_MANIFEST is required for an experimental tip build." >&2
+      exit 1
+    fi
+    current_snapshot=$(bun run "${ROOT_DIR}/scripts/macos/macos-source-snapshot.ts" --root "${ROOT_DIR}" --manifest "${SOURCE_SNAPSHOT_MANIFEST}")
+    if [[ "${current_snapshot}" != "${EXPECTED_SOURCE_SNAPSHOT}" ]]; then
+      echo "macOS source changed during experimental tip release: expected snapshot ${EXPECTED_SOURCE_SNAPSHOT}, found ${current_snapshot}" >&2
+      exit 1
+    fi
+  fi
+  if [[ -n "${EXPECTED_SOURCE_COMMIT}" || -n "${EXPECTED_SOURCE_BUILD}" || "${REQUIRE_CLEAN_SOURCE}" == "1" ]]; then
+    if [[ -n "${EXPECTED_SOURCE_COMMIT}" ]]; then
+      source_diff=$(bun run "${ROOT_DIR}/scripts/macos/macos-source-snapshot.ts" --root "${ROOT_DIR}" --diff-from-commit "${EXPECTED_SOURCE_COMMIT}")
+      if [[ -n "${source_diff}" ]]; then
+        echo "macOS release inputs no longer match source commit ${EXPECTED_SOURCE_COMMIT}; refusing to label or publish the artifact." >&2
+        echo "${source_diff}" >&2
+        exit 1
+      fi
+      expected_commit_build=$(git -C "${ROOT_DIR}" rev-list --count "${EXPECTED_SOURCE_COMMIT}^{commit}")
+      if [[ -n "${EXPECTED_SOURCE_BUILD}" && "${expected_commit_build}" != "${EXPECTED_SOURCE_BUILD}" ]]; then
+        echo "Source build ${EXPECTED_SOURCE_BUILD} does not match source commit ${EXPECTED_SOURCE_COMMIT} (build ${expected_commit_build})." >&2
+        exit 1
+      fi
+    elif [[ -n "${EXPECTED_SOURCE_BUILD}" ]]; then
+      echo "EXPECTED_SOURCE_COMMIT is required when EXPECTED_SOURCE_BUILD is set." >&2
+      exit 1
+    fi
+    if [[ "${REQUIRE_CLEAN_SOURCE}" == "1" ]]; then
+      current_source_status=$(release_source_status)
+      if [[ -n "${current_source_status}" ]]; then
+        echo "macOS release inputs became dirty during a public release; refusing to label or publish the artifact." >&2
+        echo "${current_source_status}" >&2
+        exit 1
+      fi
+    fi
+  fi
+}
+
+SOURCE_WAS_CLEAN=0
+if [[ "${EXPERIMENTAL_TIP}" != "1" && -z "$(release_source_status)" ]]; then
+  SOURCE_WAS_CLEAN=1
+elif [[ "${EXPERIMENTAL_TIP}" != "1" ]]; then
+  SOURCE_WAS_CLEAN=0
+fi
+verify_frozen_source
+
+if [[ -z "${CREATE_DMG_NODE_BIN_DIR}" ]]; then
+  for candidate in /opt/homebrew/opt/node@20/bin /usr/local/opt/node@20/bin; do
+    if [[ -x "${candidate}/node" ]]; then
+      CREATE_DMG_NODE_BIN_DIR="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ -n "${CREATE_DMG_NODE_BIN_DIR}" ]]; then
+  export PATH="${CREATE_DMG_NODE_BIN_DIR}:${PATH}"
+fi
+
+if [[ -z "${SPARKLE_PUBLIC_KEY:-}" && -n "${MACOS_SPARKLE_PUBLIC_KEY:-}" ]]; then
+  SPARKLE_PUBLIC_KEY="${MACOS_SPARKLE_PUBLIC_KEY}"
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+BUILD_DIRECT_LOG_PATH=${BUILD_DIRECT_LOG_PATH:-"${OUTPUT_DIR}/build-direct.log"}
+: > "${BUILD_DIRECT_LOG_PATH}"
+exec > >(tee -a "${BUILD_DIRECT_LOG_PATH}") 2>&1
+echo "build-direct log: ${BUILD_DIRECT_LOG_PATH}"
+if [[ -n "${CREATE_DMG_NODE_BIN_DIR}" ]]; then
+  echo "create-dmg node: $(command -v node) ($(node -v))"
+fi
+
+if [[ -z "${SPARKLE_PUBLIC_KEY:-}" ]]; then
+  echo "SPARKLE_PUBLIC_KEY is required" >&2
+  exit 1
+fi
+
+if [[ -z "${MACOS_CERTIFICATE_NAME:-}" ]]; then
+  echo "MACOS_CERTIFICATE_NAME is required" >&2
+  exit 1
+fi
+
+if ! command -v create-dmg >/dev/null 2>&1; then
+  echo "create-dmg is required (install via npm install --global create-dmg)" >&2
+  exit 1
+fi
+if ! create-dmg --version >/dev/null 2>&1; then
+  echo "create-dmg failed to start. Check Node/create-dmg native module compatibility." >&2
+  create-dmg --version >&2 || true
+  exit 1
+fi
+
+if ! command -v lipo >/dev/null 2>&1; then
+  echo "lipo is required" >&2
+  exit 1
+fi
+if ! command -v xcrun >/dev/null 2>&1; then
+  echo "xcrun is required" >&2
+  exit 1
+fi
+
+if [[ ! -f "${ENTITLEMENTS_PATH}" ]]; then
+  echo "Entitlements file not found: ${ENTITLEMENTS_PATH}" >&2
+  exit 1
+fi
+
+entitlement_exists() {
+  /usr/libexec/PlistBuddy -c "Print :$1" "${ENTITLEMENTS_PATH}" >/dev/null 2>&1
+}
+
+if [[ -z "${MACOS_PROVISIONING_PROFILE_BASE64}" && -z "${MACOS_PROVISIONING_PROFILE_PATH}" ]]; then
+  if entitlement_exists "com.apple.developer.aps-environment" || entitlement_exists "keychain-access-groups"; then
+    echo "MACOS_PROVISIONING_PROFILE_BASE64 or MACOS_PROVISIONING_PROFILE_PATH is required for APS/keychain entitlements." >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "${MACOS_PROVISIONING_PROFILE_PATH}" && ! -f "${MACOS_PROVISIONING_PROFILE_PATH}" ]]; then
+  echo "MACOS_PROVISIONING_PROFILE_PATH not found: ${MACOS_PROVISIONING_PROFILE_PATH}" >&2
+  exit 1
+fi
+
+mkdir -p "${SPARKLE_DIR}"
+
+if [[ ! -f "${SPARKLE_DIR}/Sparkle.xcframework/Info.plist" ]]; then
+  curl -L "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-for-Swift-Package-Manager.zip" \
+    -o "${SPARKLE_DIR}/sparkle.zip"
+  unzip -o "${SPARKLE_DIR}/sparkle.zip" -d "${SPARKLE_DIR}"
+fi
+
+SPARKLE_FRAMEWORK_PATH="${SPARKLE_DIR}/Sparkle.xcframework/macos-arm64_x86_64"
+if [[ ! -d "${SPARKLE_FRAMEWORK_PATH}" ]]; then
+  echo "Sparkle framework path not found: ${SPARKLE_FRAMEWORK_PATH}" >&2
+  exit 1
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+BUILD_LOG_PATH="${OUTPUT_DIR}/xcodebuild.log"
+
+set +e
+swift_conditions='$(inherited) SPARKLE'
+configuration="Release"
+app_name="Inline.app"
+if [[ "${DEBUG_BUILD}" == "1" ]]; then
+  swift_conditions='$(inherited) SPARKLE DEBUG_BUILD'
+  configuration="DevBuild"
+  app_name="Inline-Dev.app"
+fi
+
+xcodebuild_args=(
+  -project "${ROOT_DIR}/apple/Inline.xcodeproj"
+  -scheme "${SCHEME}"
+  -configuration "${configuration}"
+  -derivedDataPath "${DERIVED_DATA}"
+  "SWIFT_ACTIVE_COMPILATION_CONDITIONS=${swift_conditions}"
+  "FRAMEWORK_SEARCH_PATHS=${SPARKLE_FRAMEWORK_PATH}"
+  "OTHER_LDFLAGS=-framework Sparkle"
+  "ARCHS=${MACOS_RELEASE_ARCH}"
+  ONLY_ACTIVE_ARCH=NO
+  ENABLE_CODE_COVERAGE=NO
+  CLANG_COVERAGE_MAPPING=NO
+  DEAD_CODE_STRIPPING=YES
+  "CODE_SIGN_ENTITLEMENTS=InlineMac/InlineMacDirect.entitlements"
+  CODE_SIGNING_ALLOWED=NO
+  CODE_SIGNING_REQUIRED=NO
+  CODE_SIGN_STYLE=Manual
+  PROVISIONING_PROFILE_SPECIFIER=
+)
+if [[ "${DEBUG_BUILD}" == "1" ]]; then
+  xcodebuild_args+=("ASSETCATALOG_COMPILER_APPICON_NAME=InlineAppIconDev")
+fi
+
+xcodebuild \
+  "${xcodebuild_args[@]}" 2>&1 | tee "${BUILD_LOG_PATH}"
+xcodebuild_ec=${PIPESTATUS[0]}
+set -e
+if [[ "${xcodebuild_ec}" -ne 0 ]]; then
+  echo "xcodebuild failed with exit code ${xcodebuild_ec}." >&2
+  echo "Filtered build errors:" >&2
+  if ! grep -E "(: error:|^error:|\\*\\* BUILD FAILED \\*\\*)" "${BUILD_LOG_PATH}" >&2; then
+    echo "No explicit error lines found; showing last 80 log lines." >&2
+    tail -n 80 "${BUILD_LOG_PATH}" >&2 || true
+  fi
+  exit "${xcodebuild_ec}"
+fi
+
+APP_PATH="${DERIVED_DATA}/Build/Products/${configuration}/${app_name}"
+PLIST_PATH="${APP_PATH}/Contents/Info.plist"
+verify_frozen_source
+BUILD_NUMBER=${BUILD_NUMBER_OVERRIDE:-${EXPECTED_SOURCE_BUILD:-$(git -C "${ROOT_DIR}" rev-list --count HEAD)}}
+if [[ -n "${INLINE_REVISION_OVERRIDE}" ]]; then
+  INLINE_COMMIT=${INLINE_REVISION_OVERRIDE}
+elif [[ -n "${EXPECTED_SOURCE_COMMIT}" ]]; then
+  INLINE_COMMIT=$(git -C "${ROOT_DIR}" rev-parse --short "${EXPECTED_SOURCE_COMMIT}")
+else
+  INLINE_COMMIT=$(git -C "${ROOT_DIR}" rev-parse --short HEAD)
+fi
+
+if [[ ! -d "${APP_PATH}" ]]; then
+  echo "Built app not found at ${APP_PATH}" >&2
+  exit 1
+fi
+
+plist_set_string() {
+  local key="$1"
+  local value="$2"
+
+  if /usr/libexec/PlistBuddy -c "Print :${key}" "${PLIST_PATH}" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Set :${key} \"${value}\"" "${PLIST_PATH}"
+  else
+    /usr/libexec/PlistBuddy -c "Add :${key} string \"${value}\"" "${PLIST_PATH}"
+  fi
+}
+
+plist_set_bool() {
+  local key="$1"
+  local value="$2"
+
+  if /usr/libexec/PlistBuddy -c "Print :${key}" "${PLIST_PATH}" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Set :${key} ${value}" "${PLIST_PATH}"
+  else
+    /usr/libexec/PlistBuddy -c "Add :${key} bool ${value}" "${PLIST_PATH}"
+  fi
+}
+
+plist_set_integer() {
+  local key="$1"
+  local value="$2"
+
+  if /usr/libexec/PlistBuddy -c "Print :${key}" "${PLIST_PATH}" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Set :${key} ${value}" "${PLIST_PATH}"
+  else
+    /usr/libexec/PlistBuddy -c "Add :${key} integer ${value}" "${PLIST_PATH}"
+  fi
+}
+
+plist_set_string "CFBundleVersion" "${BUILD_NUMBER}"
+plist_set_string "InlineCommit" "${INLINE_COMMIT}"
+if [[ "${DEBUG_BUILD}" == "1" ]]; then
+  plist_set_string "CFBundleDisplayName" "Inline-Dev"
+  plist_set_string "CFBundleName" "Inline-Dev"
+fi
+plist_set_string "SUPublicEDKey" "${SPARKLE_PUBLIC_KEY}"
+plist_set_string "SUFeedURL" "${APPCAST_URL}"
+plist_set_bool "SUEnableAutomaticChecks" "true"
+plist_set_integer "SUScheduledCheckInterval" "${SPARKLE_SCHEDULED_CHECK_INTERVAL}"
+
+FRAMEWORKS_DIR="${APP_PATH}/Contents/Frameworks"
+mkdir -p "${FRAMEWORKS_DIR}"
+rsync -a "${SPARKLE_FRAMEWORK_PATH}/Sparkle.framework" "${FRAMEWORKS_DIR}/"
+
+SPARKLE_FRAMEWORK="${FRAMEWORKS_DIR}/Sparkle.framework"
+if [[ ! -d "${SPARKLE_FRAMEWORK}" ]]; then
+  echo "Sparkle framework not found at ${SPARKLE_FRAMEWORK}" >&2
+  exit 1
+fi
+macos_thin_bundle_to_arch "${APP_PATH}" "${MACOS_RELEASE_ARCH}"
+
+if [[ "${configuration}" == "Release" ]]; then
+  APP_EXECUTABLE="${APP_PATH}/Contents/MacOS/Inline"
+  macos_require_no_llvm_coverage "${APP_EXECUTABLE}"
+  macos_strip_binary_for_release "${APP_EXECUTABLE}"
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+MACOS_CERTIFICATE_NAME="${MACOS_CERTIFICATE_NAME}" \
+MACOS_PROVISIONING_PROFILE_BASE64="${MACOS_PROVISIONING_PROFILE_BASE64}" \
+MACOS_PROVISIONING_PROFILE_PATH="${MACOS_PROVISIONING_PROFILE_PATH}" \
+SIGN_RETRY_COUNT="${SIGN_RETRY_COUNT}" \
+SIGN_RETRY_DELAY_SECONDS="${SIGN_RETRY_DELAY_SECONDS}" \
+  bash "${ROOT_DIR}/scripts/macos/sign-direct.sh" \
+    --app-path "${APP_PATH}" \
+    --entitlements-path "${ENTITLEMENTS_PATH}" \
+    --output-dir "${OUTPUT_DIR}"
+
+mkdir -p "${OUTPUT_DIR}"
+CREATE_DMG_OUTPUT_DIR="${OUTPUT_DIR}"
+if ls "${OUTPUT_DIR}"/*.dmg >/dev/null 2>&1; then
+  CREATE_DMG_OUTPUT_DIR=$(mktemp -d "${OUTPUT_DIR}/.create-dmg.XXXXXX")
+fi
+
+node "${ROOT_DIR}/scripts/macos/dmg/create-dmg.mjs" \
+  "${APP_PATH}" \
+  "${CREATE_DMG_OUTPUT_DIR}/Inline.dmg" \
+  "${MACOS_CERTIFICATE_NAME}"
+
+if [[ -f "${DMG_PATH}" ]]; then
+  if [[ "${OVERWRITE_DMG}" == "1" ]]; then
+    rm -f "${DMG_PATH}"
+  else
+    backup_path="${DMG_PATH%.dmg}-$(date +%Y%m%d-%H%M%S).dmg"
+    mv -f "${DMG_PATH}" "${backup_path}"
+    echo "Existing DMG moved to ${backup_path}"
+  fi
+fi
+
+if [[ -f "${CREATE_DMG_OUTPUT_DIR}/Inline.dmg" ]]; then
+  mkdir -p "$(dirname "${DMG_PATH}")"
+  mv -f "${CREATE_DMG_OUTPUT_DIR}/Inline.dmg" "${DMG_PATH}"
+else
+  DMG_SOURCE=$(ls -1 "${CREATE_DMG_OUTPUT_DIR}"/*.dmg | head -n 1)
+  mkdir -p "$(dirname "${DMG_PATH}")"
+  mv -f "${DMG_SOURCE}" "${DMG_PATH}"
+fi
+
+echo "Build/sign step complete. App is ready for local checks:"
+echo "  App: ${APP_PATH}"
+echo "  DMG: ${DMG_PATH}"
+
+if [[ -z "${SKIP_NOTARIZE:-}" ]]; then
+  echo "Starting notarization for DMG: ${DMG_PATH}"
+  NOTARY_PROFILE="inline-notarytool"
+  if [[ -n "${APPLE_NOTARIZATION_KEY:-}" ]]; then
+    if [[ -z "${APPLE_NOTARIZATION_KEY_ID:-}" || -z "${APPLE_NOTARIZATION_ISSUER:-}" ]]; then
+      echo "APPLE_NOTARIZATION_KEY_ID and APPLE_NOTARIZATION_ISSUER are required with APPLE_NOTARIZATION_KEY" >&2
+      exit 1
+    fi
+    echo "${APPLE_NOTARIZATION_KEY}" > "${OUTPUT_DIR}/notarization_key.p8"
+    set +e
+    store_output=$(
+      xcrun notarytool store-credentials "${NOTARY_PROFILE}" \
+        --key "${OUTPUT_DIR}/notarization_key.p8" \
+        --key-id "${APPLE_NOTARIZATION_KEY_ID}" \
+        --issuer "${APPLE_NOTARIZATION_ISSUER}" 2>&1
+    )
+    store_ec=$?
+    set -e
+    rm -f "${OUTPUT_DIR}/notarization_key.p8"
+    if [[ "${store_ec}" -ne 0 ]]; then
+      echo "Notarization failed: unable to store notarytool credentials (API key auth)." >&2
+      echo "${store_output}" >&2
+      exit 1
+    fi
+  else
+    if [[ -z "${APPLE_ID:-}" || -z "${APPLE_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
+      echo "Notarization requires either API key vars (APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER) or Apple ID vars (APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID)" >&2
+      exit 1
+    fi
+    set +e
+    store_output=$(
+      xcrun notarytool store-credentials "${NOTARY_PROFILE}" \
+        --apple-id "${APPLE_ID}" \
+        --password "${APPLE_PASSWORD}" \
+        --team-id "${APPLE_TEAM_ID}" 2>&1
+    )
+    store_ec=$?
+    set -e
+    if [[ "${store_ec}" -ne 0 ]]; then
+      echo "Notarization failed: unable to store notarytool credentials (Apple ID auth)." >&2
+      echo "${store_output}" >&2
+      exit 1
+    fi
+  fi
+
+  echo "Submitting DMG to Apple notarization (this may take a few minutes)..."
+  # Stream output while still capturing it for status parsing.
+  submit_output_file=$(mktemp "${OUTPUT_DIR}/notary-submit.XXXXXX")
+  set +e
+  xcrun notarytool submit "${DMG_PATH}" \
+    --keychain-profile "${NOTARY_PROFILE}" \
+    --wait \
+    --output-format json 2>&1 | tee "${submit_output_file}"
+  submit_ec=${PIPESTATUS[0]}
+  set -e
+  submit_output=$(cat "${submit_output_file}")
+  rm -f "${submit_output_file}"
+  if [[ "${submit_ec}" -ne 0 ]]; then
+    echo "Notarization failed: notarytool submit exited with code ${submit_ec}." >&2
+    exit 1
+  fi
+
+  submit_parse=$(python3 -c '
+import json, sys
+
+text = sys.stdin.read()
+start = text.rfind("{")
+end = text.rfind("}")
+payload = text[start:end + 1] if start != -1 and end != -1 and end >= start else ""
+
+status = ""
+_id = ""
+try:
+  data = json.loads(payload) if payload else {}
+  status = str(data.get("status", "") or "")
+  _id = str(data.get("id", "") or "")
+except Exception:
+  pass
+
+print((status + " " + _id).strip())
+' <<<"${submit_output}")
+  submit_status=${submit_parse%% *}
+  submit_id=${submit_parse#* }
+  if [[ "${submit_id}" == "${submit_status}" ]]; then
+    submit_id=""
+  fi
+
+  if [[ "${submit_status}" != "Accepted" ]]; then
+    echo "Notarization failed with status: ${submit_status:-"(unknown)"}" >&2
+    if [[ -n "${submit_id}" ]]; then
+      xcrun notarytool log "${submit_id}" --keychain-profile "${NOTARY_PROFILE}" || true
+    fi
+    exit 1
+  fi
+
+  xcrun stapler staple "${DMG_PATH}"
+  xcrun stapler staple "${APP_PATH}"
+fi
+
+verify_frozen_source
+APP_EXECUTABLE_SHA256=$(shasum -a 256 "${APP_PATH}/Contents/MacOS/Inline" | awk '{print $1}')
+DMG_SHA256=$(shasum -a 256 "${DMG_PATH}" | awk '{print $1}')
+DMG_SIZE=$(stat -f %z "${DMG_PATH}")
+mkdir -p "$(dirname "${ARTIFACT_PROVENANCE_PATH}")"
+if [[ "${EXPERIMENTAL_TIP}" == "1" ]]; then
+  PROVENANCE_SOURCE_COMMIT=""
+  PROVENANCE_SOURCE_BUILD="${BUILD_NUMBER}"
+else
+  PROVENANCE_SOURCE_COMMIT=${EXPECTED_SOURCE_COMMIT:-$(git -C "${ROOT_DIR}" rev-parse HEAD)}
+  PROVENANCE_SOURCE_BUILD=${EXPECTED_SOURCE_BUILD:-${BUILD_NUMBER}}
+fi
+python3 - "${ARTIFACT_PROVENANCE_PATH}" "${EXPERIMENTAL_TIP}" "${PROVENANCE_SOURCE_COMMIT}" "${PROVENANCE_SOURCE_BUILD}" "${EXPECTED_SOURCE_SNAPSHOT}" "${BUILD_NUMBER}" "${INLINE_COMMIT}" "${SOURCE_WAS_CLEAN}" "${APP_EXECUTABLE_SHA256}" "${DMG_SIZE}" "${DMG_SHA256}" <<'PY'
+import json
+import sys
+
+path, experimental_tip, source_commit, source_build, source_snapshot, build_number, revision, source_clean, app_sha256, dmg_size, dmg_sha256 = sys.argv[1:]
+if experimental_tip == "1":
+    payload = {
+        "schemaVersion": 2,
+        "sourceState": "experimental-tip",
+        "sourceSnapshotSha256": source_snapshot,
+        "buildNumber": build_number,
+        "revision": revision,
+        "appExecutableSha256": app_sha256,
+        "dmgSize": int(dmg_size),
+        "dmgSha256": dmg_sha256,
+    }
+else:
+    payload = {
+        "schemaVersion": 1,
+        "sourceCommit": source_commit,
+        "sourceBuild": source_build,
+        "buildNumber": build_number,
+        "sourceClean": source_clean == "1",
+        "appExecutableSha256": app_sha256,
+        "dmgSize": int(dmg_size),
+        "dmgSha256": dmg_sha256,
+    }
+with open(path, "w", encoding="utf-8") as file:
+    json.dump(payload, file, indent=2)
+    file.write("\n")
+PY
+echo "Artifact provenance: ${ARTIFACT_PROVENANCE_PATH}"
+
+echo "Built app: ${APP_PATH}"
+echo "DMG: ${DMG_PATH}"

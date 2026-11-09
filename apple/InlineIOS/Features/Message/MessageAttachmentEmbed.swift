@@ -1,0 +1,368 @@
+import InlineKit
+import Logger
+import UIKit
+
+class MessageAttachmentEmbed: UIView, UIContextMenuInteractionDelegate, UIGestureRecognizerDelegate {
+  private enum Constants {
+    static let cornerRadius: CGFloat = 10
+    static let contentSpacing: CGFloat = 6
+    static let verticalPadding: CGFloat = 10
+    static let horizontalPadding: CGFloat = 10
+    static let avatarSize: CGFloat = 18
+    static let checkboxSize: CGFloat = 16
+    static let lineSpacing: CGFloat = 6
+  }
+
+  private var outgoing: Bool = false
+  private var url: URL?
+  private var title: String?
+  private var issueIdentifier: String?
+  private var externalTask: ExternalTask?
+  private var messageId: Int64?
+  private var chatId: Int64?
+
+  private lazy var avatarView: UserAvatarView = {
+    let view = UserAvatarView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var usernameLabel: UILabel = {
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = .systemFont(ofSize: 14, weight: .medium)
+    label.numberOfLines = 1
+    return label
+  }()
+
+  private lazy var checkboxView: UIView = {
+    let view = UIView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.layer.cornerRadius = 3
+    view.layer.borderWidth = 1.5
+    view.backgroundColor = .clear
+    return view
+  }()
+
+  private lazy var taskTitleLabel: UILabel = {
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = .systemFont(ofSize: 14)
+    label.numberOfLines = 2
+    label.lineBreakMode = .byTruncatingTail
+    return label
+  }()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    setupViews()
+    setupLayer()
+    setupInteractions()
+  }
+
+  required init?(coder: NSCoder) {
+    super.init(coder: coder)
+    setupViews()
+    setupLayer()
+    setupInteractions()
+  }
+
+  func configure(
+    userInfo: UserInfo,
+    outgoing: Bool,
+    url: URL? = nil,
+    issueIdentifier: String? = nil,
+    title: String? = nil,
+    externalTask: ExternalTask? = nil,
+    messageId: Int64? = nil,
+    chatId: Int64? = nil
+  ) {
+    self.outgoing = outgoing
+    self.url = url
+    self.title = title
+    self.issueIdentifier = issueIdentifier
+    self.externalTask = externalTask
+    self.messageId = messageId
+    self.chatId = chatId
+    avatarView.configure(with: userInfo, size: Constants.avatarSize)
+
+    let userName = userInfo.user.firstName ?? "User"
+    if externalTask?.application == "linear" {
+      usernameLabel.text = "\(userName) created a Linear issue"
+    } else {
+      usernameLabel.text = "\(userName) will do"
+    }
+
+    taskTitleLabel.text = title ?? "Task"
+
+    updateColors()
+  }
+
+  private func setupInteractions() {
+    let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+    tapGesture.delegate = self
+    addGestureRecognizer(tapGesture)
+
+    let interaction = UIContextMenuInteraction(delegate: self)
+    addInteraction(interaction)
+
+    // Set delegate for any long press gesture recognizers to ensure they can compete with collection view
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      for gestureRecognizer in gestureRecognizers ?? [] where gestureRecognizer is UILongPressGestureRecognizer {
+        gestureRecognizer.delegate = self
+      }
+    }
+
+    isUserInteractionEnabled = true
+  }
+
+  // MARK: - Context Menu
+
+  func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    configurationForMenuAtLocation location: CGPoint
+  ) -> UIContextMenuConfiguration? {
+    guard let url else { return nil }
+
+    return UIContextMenuConfiguration(
+      identifier: nil,
+      previewProvider: nil
+    ) { [weak self] _ in
+      let openAction = UIAction(
+        title: "Fast Open",
+        image: UIImage(systemName: "safari")
+      ) { _ in
+        guard let url = self?.url else { return }
+        InAppBrowser.shared.open(url, from: self?.findViewController())
+      }
+
+      let copyURLAction = UIAction(
+        title: "Copy URL",
+        image: UIImage(systemName: "doc.on.doc")
+      ) { _ in
+        UIPasteboard.general.string = self?.url?.absoluteString
+      }
+
+      let deleteAction = UIAction(
+        title: "Delete",
+        image: UIImage(systemName: "trash"),
+        attributes: .destructive
+      ) { [weak self] _ in
+        self?.showDeleteConfirmation()
+      }
+
+      return UIMenu(title: "", children: [
+        openAction,
+        copyURLAction,
+        UIMenu(title: "", options: .displayInline, children: [
+          deleteAction,
+        ]),
+      ])
+    }
+  }
+
+  func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    previewForHighlightingMenuWithConfiguration configuration: UIContextMenuConfiguration
+  ) -> UITargetedPreview? {
+    let parameters = UIPreviewParameters()
+    parameters.backgroundColor = .clear
+    return UITargetedPreview(view: self, parameters: parameters)
+  }
+
+  func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    willDisplayMenuFor configuration: UIContextMenuConfiguration,
+    animator: UIContextMenuInteractionAnimating?
+  ) {
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+  }
+
+  // MARK: - Actions
+
+  @objc private func handleTap() {
+    guard let url else { return }
+    InAppBrowser.shared.open(url, from: findViewController())
+  }
+
+  // MARK: - Private Helpers
+
+  private func findViewController() -> UIViewController? {
+    var responder: UIResponder? = self
+    while let nextResponder = responder?.next {
+      if let viewController = nextResponder as? UIViewController {
+        return viewController
+      }
+      responder = nextResponder
+    }
+    return nil
+  }
+
+  // MARK: - UIGestureRecognizerDelegate
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+  ) -> Bool {
+    false
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer
+  ) -> Bool {
+    // Don't require other gesture recognizers to fail
+    false
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+  ) -> Bool {
+    // Don't require this gesture recognizer to fail for others
+    false
+  }
+
+  private func showDeleteConfirmation() {
+    guard let viewController = findViewController() else { return }
+
+    let integrationName = (externalTask?.application == "linear") ? "Linear" : "Notion"
+    let alert = UIAlertController(
+      title: "Delete Task",
+      message: "This will delete the task from both Inline and \(integrationName). This action cannot be undone.",
+      preferredStyle: .alert
+    )
+
+    let deleteAction = UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+      self?.deleteAttachment()
+    }
+
+    let cancelAction = UIAlertAction(title: "Cancel", style: .cancel)
+
+    alert.addAction(deleteAction)
+    alert.addAction(cancelAction)
+
+    viewController.present(alert, animated: true)
+  }
+
+  private func deleteAttachment() {
+    guard let externalTask,
+          let messageId,
+          let chatId
+    else {
+      Log.shared.error("Missing required data for attachment deletion")
+      return
+    }
+
+    Task {
+      do {
+        try await DataManager.shared.deleteAttachment(
+          externalTask: externalTask,
+          messageId: messageId,
+          chatId: chatId
+        )
+      } catch {
+        Log.shared.error("Failed to delete attachment", error: error)
+
+        DispatchQueue.main.async { [weak self] in
+          self?.showErrorAlert(error: error)
+        }
+      }
+    }
+  }
+
+  private func showErrorAlert(error: Error) {
+    guard let viewController = findViewController() else { return }
+
+    let alert = UIAlertController(
+      title: "Delete Failed",
+      message: "Failed to delete the task: \(error.localizedDescription)",
+      preferredStyle: .alert
+    )
+
+    let okAction = UIAlertAction(title: "OK", style: .default)
+    alert.addAction(okAction)
+
+    viewController.present(alert, animated: true)
+  }
+}
+
+// MARK: - Layout
+
+private extension MessageAttachmentEmbed {
+  func setupViews() {
+    addSubview(avatarView)
+    addSubview(usernameLabel)
+    addSubview(checkboxView)
+    addSubview(taskTitleLabel)
+
+    let maxTitleHeight = taskTitleLabel.font.lineHeight * 2
+    NSLayoutConstraint.activate([
+      // First line - Avatar and username
+      avatarView.leadingAnchor.constraint(
+        equalTo: leadingAnchor,
+        constant: Constants.horizontalPadding
+      ),
+      avatarView.topAnchor.constraint(
+        equalTo: topAnchor,
+        constant: Constants.verticalPadding
+      ),
+      avatarView.widthAnchor.constraint(equalToConstant: Constants.avatarSize),
+      avatarView.heightAnchor.constraint(equalToConstant: Constants.avatarSize),
+
+      usernameLabel.leadingAnchor.constraint(
+        equalTo: avatarView.trailingAnchor,
+        constant: Constants.contentSpacing
+      ),
+      usernameLabel.centerYAnchor.constraint(equalTo: avatarView.centerYAnchor),
+      usernameLabel.trailingAnchor.constraint(
+        lessThanOrEqualTo: trailingAnchor,
+        constant: -Constants.horizontalPadding
+      ),
+
+      // Second line - Checkbox and task title
+      checkboxView.leadingAnchor.constraint(
+        equalTo: usernameLabel.leadingAnchor
+      ),
+      checkboxView.topAnchor.constraint(
+        equalTo: usernameLabel.bottomAnchor,
+        constant: Constants.lineSpacing
+      ),
+      checkboxView.widthAnchor.constraint(equalToConstant: Constants.checkboxSize),
+      checkboxView.heightAnchor.constraint(equalToConstant: Constants.checkboxSize),
+
+      taskTitleLabel.leadingAnchor.constraint(
+        equalTo: checkboxView.trailingAnchor,
+        constant: Constants.contentSpacing
+      ),
+      taskTitleLabel.topAnchor.constraint(equalTo: checkboxView.topAnchor),
+      taskTitleLabel.trailingAnchor.constraint(
+        lessThanOrEqualTo: trailingAnchor,
+        constant: -Constants.horizontalPadding
+      ),
+      taskTitleLabel.heightAnchor.constraint(lessThanOrEqualToConstant: maxTitleHeight),
+
+      taskTitleLabel.bottomAnchor.constraint(
+        lessThanOrEqualTo: bottomAnchor,
+        constant: -Constants.verticalPadding
+      ),
+    ])
+  }
+
+  func setupLayer() {
+    layer.cornerRadius = Constants.cornerRadius
+    layer.masksToBounds = true
+  }
+
+  func updateColors() {
+    let textColor: UIColor = outgoing ? .white : .label
+    let bgAlpha: CGFloat = outgoing ? 0.13 : 0.08
+    backgroundColor = outgoing ? .white.withAlphaComponent(bgAlpha) : .systemGray.withAlphaComponent(bgAlpha)
+
+    usernameLabel.textColor = textColor
+    taskTitleLabel.textColor = textColor
+    checkboxView.layer.borderColor = textColor.cgColor
+    avatarView.tintColor = textColor
+  }
+}

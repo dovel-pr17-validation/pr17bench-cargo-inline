@@ -1,0 +1,162 @@
+import Foundation
+import InlineKit
+import InlineProtocol
+import Testing
+@testable import TextProcessing
+
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+
+@Suite("Blockquote composer syntax")
+struct BlockquoteMarkdownTests {
+  private var editConfiguration: ProcessEntities.Configuration {
+    .init(
+      font: PlatformFont.systemFont(ofSize: 16),
+      primaryColor: .black,
+      linkColor: .blue,
+      convertMentionsToLink: false
+    )
+  }
+
+  private func parse(_ source: String) -> (text: String, entities: MessageEntities) {
+    ProcessEntities.fromAttributedString(NSAttributedString(string: source))
+  }
+
+  private func ranges(_ entities: MessageEntities, _ type: MessageEntity.TypeEnum) -> [NSRange] {
+    entities.entities.filter { $0.type == type }.map {
+      NSRange(location: Int($0.offset), length: Int($0.length))
+    }
+  }
+
+  private func edit(_ text: String, _ entities: MessageEntities) -> String {
+    MessageMarkdown.editableText(text: text, entities: entities, configuration: editConfiguration).string
+  }
+
+  @Test("Quote lines become one blockquote without their prefixes")
+  func quoteRun() {
+    let parsed = parse("> ship it\n> on Friday\nYes, let's do it")
+    #expect(parsed.text == "ship it\non Friday\nYes, let's do it")
+    #expect(ranges(parsed.entities, .blockquote) == [NSRange(location: 0, length: 17)])
+  }
+
+  @Test("Separate runs make separate quotes")
+  func separateRuns() {
+    let parsed = parse("> one\nmiddle\n> two")
+    #expect(parsed.text == "one\nmiddle\ntwo")
+    #expect(ranges(parsed.entities, .blockquote) == [
+      NSRange(location: 0, length: 3),
+      NSRange(location: 11, length: 3),
+    ])
+  }
+
+  @Test("A bare > line stays inside the run")
+  func bareLine() {
+    let parsed = parse("> first\n>\n> second")
+    #expect(parsed.text == "first\n\nsecond")
+    #expect(ranges(parsed.entities, .blockquote) == [NSRange(location: 0, length: 13)])
+  }
+
+  @Test("Text that only looks like a quote stays literal")
+  func literals() {
+    for source in [">.<", ">_< ok", "a > b", ">\n>", ">>nested"] {
+      let parsed = parse(source)
+      #expect(parsed.text == source)
+      #expect(ranges(parsed.entities, .blockquote).isEmpty)
+    }
+  }
+
+  @Test("Quote lines inside a code block are code")
+  func codeFence() {
+    let parsed = parse("```\n> not a quote\n```")
+    #expect(parsed.text.contains("> not a quote"))
+    #expect(ranges(parsed.entities, .blockquote).isEmpty)
+  }
+
+  @Test("Inline styles inside a quote land on the stripped text")
+  func stylesInsideQuote() {
+    let parsed = parse("> say **hi** to @nobody\nok")
+    #expect(parsed.text == "say hi to @nobody\nok")
+    #expect(ranges(parsed.entities, .blockquote) == [NSRange(location: 0, length: 17)])
+    #expect(ranges(parsed.entities, .bold) == [NSRange(location: 4, length: 2)])
+  }
+
+  @Test("Editing restores the quote prefixes")
+  func editRoundTrip() {
+    for source in [
+      "> ship it\n> on Friday\nYes, let's do it",
+      "before\n> quoted **bold**\nafter",
+      "> first\n>\n> second\nreply",
+    ] {
+      let parsed = parse(source)
+      #expect(edit(parsed.text, parsed.entities) == source)
+    }
+  }
+
+  @Test("Rich-text editing keeps quotes as prefixes")
+  func richTextEdit() {
+    let parsed = parse("> quoted\nreply")
+    let rich = ProcessEntities.toAttributedString(text: parsed.text, entities: parsed.entities, configuration: editConfiguration)
+    let restored = MessageMarkdown.withQuoteSyntax(rich, entities: parsed.entities, attributes: [:])
+    #expect(restored.string == "> quoted\nreply")
+    #expect(parse(restored.string).entities == parsed.entities)
+  }
+
+  @Test("Quote lines for a reply prefix every line")
+  func quoteLines() {
+    #expect(MessageMarkdown.quoteLines("one\n\ntwo") == "> one\n>\n> two\n")
+    let parsed = parse(MessageMarkdown.quoteLines("one\n\ntwo") + "reply")
+    #expect(parsed.text == "one\n\ntwo\nreply")
+    #expect(ranges(parsed.entities, .blockquote) == [NSRange(location: 0, length: 8)])
+  }
+
+  @Test("Quoting again adds a separate quote after what is typed")
+  func quoteAgain() {
+    func quote(_ selection: String, into text: String) -> String {
+      let insertion = MessageMarkdown.quoteInsertion(MessageMarkdown.quoteLines(selection), into: text)
+      return (text as NSString).replacingCharacters(in: insertion.range, with: insertion.text)
+    }
+
+    let first = quote("one", into: "")
+    #expect(first == "> one\n")
+    let second = quote("two", into: first)
+    #expect(second == "> one\n\n> two\n")
+    let parsed = parse(second + "reply")
+    #expect(parsed.text == "one\n\ntwo\nreply")
+    #expect(ranges(parsed.entities, .blockquote) == [NSRange(location: 0, length: 3), NSRange(location: 5, length: 3)])
+
+    // Text typed after a quote stays where it is; the next quote goes below it.
+    #expect(quote("two", into: "> one\nmy take  \n") == "> one\nmy take\n\n> two\n")
+  }
+
+  @Test("A reply quote goes first and quoting again replaces it")
+  func replyQuoteReplaces() {
+    func quote(_ selection: String, into text: String, replacing previous: String?) -> String {
+      let insertion = MessageMarkdown.replyQuoteInsertion(
+        MessageMarkdown.quoteLines(selection),
+        into: text,
+        replacing: previous
+      )
+      return (text as NSString).replacingCharacters(in: insertion.range, with: insertion.text)
+    }
+
+    // First quote goes above what's typed, so the reply shows it in its header.
+    let first = quote("one", into: "my take", replacing: nil)
+    #expect(first == "> one\nmy take")
+    // Quoting again swaps the quote and keeps the caption.
+    #expect(quote("two", into: first, replacing: MessageMarkdown.quoteLines("one")) == "> two\nmy take")
+    // Edited quote lines aren't the inserted ones any more; the new quote goes above them.
+    #expect(quote("two", into: "> one!\nmy take", replacing: MessageMarkdown.quoteLines("one")) == "> two\n\n> one!\nmy take")
+    let parsed = parse("> two\n\n> one!\nmy take")
+    #expect(ranges(parsed.entities, .blockquote).count == 2)
+  }
+
+  @Test("Dropping the reply removes its untouched quote")
+  func replyQuoteRemoval() {
+    let lines = MessageMarkdown.quoteLines("one")
+    #expect(MessageMarkdown.replyQuoteRemoval(lines, from: lines + "my take") == NSRange(location: 0, length: 6))
+    #expect(MessageMarkdown.replyQuoteRemoval(lines, from: "> one!\nmy take") == nil)
+  }
+}

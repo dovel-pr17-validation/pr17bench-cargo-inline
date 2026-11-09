@@ -1,0 +1,1139 @@
+import { describe, expect, it } from "@effect/vitest"
+import {
+  Context,
+  Effect,
+  ErrorReporter as EffectErrorReporter,
+  Layer,
+} from "effect"
+import Elysia from "elysia"
+import {
+  HttpRouter,
+  HttpServer,
+} from "effect/unstable/http"
+import {
+  OpenApi,
+} from "effect/unstable/httpapi"
+import {
+  ErrorReporter,
+  type ErrorReporterShape,
+} from "../core/errors/errorReporter"
+import {
+  defineExecutableHttpApi,
+  makeHttpApplication,
+} from "../core/http/application"
+import { RequestId } from "../core/helpers/requestId"
+import {
+  defineOpenApiDocument,
+  makeBotApiBase,
+  makePlatformApiBase,
+} from "../core/http/openApi"
+import {
+  assertValidOpenApiDocument,
+} from "../core/http/openApiValidation"
+import {
+  HttpRequestContext,
+} from "../core/http/requestContext"
+import {
+  OAuthHttpFailure,
+  OAuthHttpService,
+  type OAuthHttpServiceShape,
+} from "../modules/oauth/httpService.effect"
+import {
+  makeOAuthHttpService,
+  type OAuthHttpHandlers,
+} from "../modules/oauth/httpServiceAdapter.effect"
+import {
+  IdentityOperations,
+  type IdentityOperationsShape,
+} from "../modules/auth/identityOperations.effect"
+import {
+  AuthApiGroup,
+  makeAuthRouteGroup,
+} from "./auth.effect"
+import {
+  SessionAuthentication,
+  type SessionAuthenticationShape,
+} from "./plugins.effect"
+import {
+  OAuthResponseContractFailure,
+  validateOAuthResponse,
+} from "./oauth.effect"
+import { encodeFullUserInfo } from "../api-types"
+import type { DbUserWithPhoto } from "../db/schema"
+import {
+  providerAppErrorResponse,
+  providerAppHandoffResponse,
+} from "../modules/oauth/httpHandlers"
+
+const unusedIdentity = (name: string) =>
+  Effect.die(
+    new Error(`Unexpected identity operation: ${name}`),
+  )
+
+const identityOperations: IdentityOperationsShape = {
+  sendSmsCode: () => unusedIdentity("sendSmsCode"),
+  verifySmsCode: () => unusedIdentity("verifySmsCode"),
+  sendEmailCode: () => unusedIdentity("sendEmailCode"),
+  verifyEmailCode: () => unusedIdentity("verifyEmailCode"),
+  checkInviteCode: () => unusedIdentity("checkInviteCode"),
+  logout: () => unusedIdentity("logout"),
+}
+
+const sessionAuthentication: SessionAuthenticationShape = {
+  authenticate: () => unusedIdentity("authenticate"),
+}
+
+const makeKernel = ({
+  oauth,
+  reporter = {
+    report: () => Effect.void,
+  },
+  trustedClientIpHeader,
+}: {
+  readonly oauth: OAuthHttpServiceShape
+  readonly reporter?: ErrorReporterShape | undefined
+  readonly trustedClientIpHeader?:
+    | "cf-connecting-ip"
+    | "x-real-ip"
+    | undefined
+}) => {
+  const routeGroup = makeAuthRouteGroup()
+  const platformApi = makePlatformApiBase(
+    "https://api.inline.chat",
+  ).add(AuthApiGroup)
+  const botApi = makeBotApiBase("https://api.inline.chat")
+  const application = makeHttpApplication({
+    platform: defineExecutableHttpApi({
+      ...defineOpenApiDocument({
+        api: platformApi,
+        jsonPath: "/v1/reference/json",
+        swaggerPath: "/v1/reference",
+      }),
+      handlers: routeGroup.handlers,
+    }),
+    bot: defineExecutableHttpApi({
+      ...defineOpenApiDocument({
+        api: botApi,
+        jsonPath: "/bot-api-reference/json",
+        swaggerPath: "/bot-api-reference",
+      }),
+      handlers: Layer.empty,
+    }),
+    middleware: {
+      clientIpHeader: trustedClientIpHeader,
+      isProduction: false,
+    },
+  }).pipe(
+    Layer.provide(HttpServer.layerServices),
+    Layer.provide(EffectErrorReporter.layer([])),
+    Layer.provide(Layer.succeed(ErrorReporter)(reporter)),
+    Layer.provide(Layer.succeed(OAuthHttpService)(oauth)),
+    Layer.provide(
+      Layer.merge(
+        Layer.succeed(IdentityOperations)(
+          identityOperations,
+        ),
+        Layer.succeed(SessionAuthentication)(
+          sessionAuthentication,
+        ),
+      ),
+    ),
+  )
+  const webHandler = HttpRouter.toWebHandler(application, {
+    disableLogger: true,
+  })
+  const context = Context.make(HttpRequestContext, {
+    clientIp: "unresolved-client",
+    method: "GET",
+    path: "/test",
+    requestId: RequestId.make("oauth-test"),
+    startedAtMillis: 0,
+  }).pipe(
+    Context.add(OAuthHttpService, oauth),
+    Context.add(IdentityOperations, identityOperations),
+    Context.add(
+      SessionAuthentication,
+      sessionAuthentication,
+    ),
+    Context.add(ErrorReporter, reporter),
+  )
+
+  return {
+    dispose: webHandler.dispose,
+    handler: (request: Request) =>
+      webHandler.handler(request, context),
+  }
+}
+
+describe("Effect OAuth routes", () => {
+  it("preserves profile form fields and accepts an HTML consent intermediate step", async () => {
+    let received: URLSearchParams | undefined
+    const kernel = makeKernel({
+      oauth: {
+        execute: (operation, { request }) => Effect.tryPromise({
+          try: async () => {
+            expect(operation).toBe("consent")
+            received = new URLSearchParams(await request.text())
+            return new Response("<html>Profile saved; choose what to share</html>", {
+              status: 200,
+              headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+            })
+          },
+          catch: (cause) => new OAuthHttpFailure({ operation, cause }),
+        }),
+      },
+    })
+    try {
+      const response = await kernel.handler(new Request("http://inline.test/oauth/authorize/consent", {
+        method: "POST", body: new URLSearchParams({ csrf: "test-csrf", step: "profile", name: "Test Person", username: "testperson" }),
+      }))
+      expect(response.status).toBe(200)
+      expect(received?.get("name")).toBe("Test Person")
+      expect(received?.get("username")).toBe("testperson")
+      expect(received?.get("step")).toBe("profile")
+      expect(response.headers.get("cache-control")).toBe("no-store")
+    } finally {
+      await kernel.dispose()
+    }
+  })
+
+  it("preserves multiple hosted-login cookies through the Web response boundary", async () => {
+    const kernel = makeKernel({
+      oauth: {
+        execute: () => {
+          const response = new Response("<!doctype html><title>Sign in</title>", {
+            status: 200,
+            headers: {
+              "cache-control": "no-store",
+              "content-type": "text/html; charset=utf-8",
+            },
+          })
+          response.headers.append("set-cookie", "inline_hl=capability; Path=/v1/auth; HttpOnly; Secure; SameSite=Lax")
+          response.headers.append("set-cookie", "inline_hl_csrf=csrf; Path=/v1/auth; Secure; SameSite=Lax")
+          return Effect.succeed(response)
+        },
+      },
+    })
+
+    try {
+      const response = await kernel.handler(
+        new Request("http://inline.test/v1/auth/login?capability=test"),
+      )
+
+      expect(response.status).toBe(200)
+      expect(response.headers.getSetCookie()).toEqual([
+        "inline_hl=capability; Path=/v1/auth; HttpOnly; Secure; SameSite=Lax",
+        "inline_hl_csrf=csrf; Path=/v1/auth; Secure; SameSite=Lax",
+      ])
+    } finally {
+      await kernel.dispose()
+    }
+  })
+
+  it("preserves aliases, Web response metadata, and explicit client IP trust", async () => {
+    let invocation:
+      | {
+        readonly operation: string
+        readonly clientIp: string | undefined
+        readonly payload: unknown
+      }
+      | undefined
+    const kernel = makeKernel({
+      trustedClientIpHeader: "x-real-ip",
+      oauth: {
+        execute: (operation, input) =>
+          Effect.tryPromise({
+            try: async () => {
+              invocation = {
+                operation,
+                clientIp: input.clientIp,
+                payload: await input.request.json(),
+              }
+              return new Response(
+                JSON.stringify({
+                  client_id: "client-1",
+                  client_id_issued_at: 1_700_000_000,
+                  redirect_uris: [
+                    "https://client.example/callback",
+                  ],
+                  token_endpoint_auth_method: "none",
+                  grant_types: [
+                    "authorization_code",
+                    "refresh_token",
+                  ],
+                  response_types: ["code"],
+                }),
+                {
+                  status: 201,
+                  headers: {
+                    "cache-control": "no-store",
+                    "content-type": "application/json",
+                  },
+                },
+              )
+            },
+            catch: (cause) =>
+              new OAuthHttpFailure({
+                operation,
+                cause,
+              }),
+          }),
+      },
+    })
+
+    try {
+      const response = await kernel.handler(
+        new Request("http://inline.test/register", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-real-ip": "203.0.113.9",
+            "x-forwarded-for": "198.51.100.12",
+          },
+          body: JSON.stringify({
+            redirect_uris: [
+              "https://client.example/callback",
+            ],
+          }),
+        }),
+      )
+
+      expect(response.status).toBe(201)
+      expect(response.headers.get("cache-control")).toBe(
+        "no-store",
+      )
+      expect(await response.json()).toMatchObject({
+        client_id: "client-1",
+      })
+      expect(invocation).toEqual({
+        operation: "register",
+        clientIp: "203.0.113.9",
+        payload: {
+          redirect_uris: [
+            "https://client.example/callback",
+          ],
+        },
+      })
+    } finally {
+      await kernel.dispose()
+    }
+  })
+
+  it("reports an unexpected service failure once and returns an opaque OAuth error", async () => {
+    let reports = 0
+    const kernel = makeKernel({
+      reporter: {
+        report: () =>
+          Effect.sync(() => {
+            reports += 1
+          }),
+      },
+      oauth: {
+        execute: (operation) =>
+          Effect.fail(
+            new OAuthHttpFailure({
+              operation,
+              cause: new Error("private database detail"),
+            }),
+          ),
+      },
+    })
+
+    try {
+      const response = await kernel.handler(
+        new Request(
+          "http://inline.test/.well-known/oauth-authorization-server",
+        ),
+      )
+
+      expect(response.status).toBe(500)
+      expect(await response.json()).toEqual({
+        error: "server_error",
+        error_description: "Server error",
+      })
+      expect(reports).toBe(1)
+    } finally {
+      await kernel.dispose()
+    }
+  })
+
+  it("preserves authorization cookies and consent redirects", async () => {
+    const kernel = makeKernel({
+      oauth: {
+        execute: (operation) => {
+          if (operation === "authorize") {
+            return Effect.succeed(
+              new Response("<html>Authorize</html>", {
+                headers: {
+                  "cache-control": "no-store",
+                  "content-type":
+                    "text/html; charset=utf-8",
+                  "set-cookie":
+                    "inline_ar=request; Path=/oauth; HttpOnly",
+                },
+              }),
+            )
+          }
+          if (operation === "consent") {
+            return Effect.succeed(
+              new Response(null, {
+                status: 302,
+                headers: {
+                  location:
+                    "https://client.example/callback?code=code&state=state",
+                  "set-cookie":
+                    "inline_ar=; Max-Age=0; Path=/oauth; HttpOnly",
+                },
+              }),
+            )
+          }
+          return unusedIdentity(operation)
+        },
+      },
+    })
+
+    try {
+      const authorize = await kernel.handler(
+        new Request(
+          "http://inline.test/authorize?response_type=code",
+        ),
+      )
+      expect(authorize.status).toBe(200)
+      expect(authorize.headers.get("cache-control")).toBe(
+        "no-store",
+      )
+      expect(authorize.headers.get("set-cookie")).toContain(
+        "inline_ar=request",
+      )
+
+      const consent = await kernel.handler(
+        new Request(
+          "http://inline.test/oauth/authorize/consent",
+          {
+            method: "POST",
+            headers: {
+              "content-type":
+                "application/x-www-form-urlencoded",
+            },
+            body: "csrf=token&space_id=1&space_id=2",
+          },
+        ),
+      )
+      expect(consent.status).toBe(302)
+      expect(consent.headers.get("location")).toBe(
+        "https://client.example/callback?code=code&state=state",
+      )
+      expect(consent.headers.get("set-cookie")).toContain(
+        "Max-Age=0",
+      )
+      expect(await consent.text()).toBe("")
+    } finally {
+      await kernel.dispose()
+    }
+  })
+
+  it("declares the CLI confirmation and consent-cancel pages it serves", async () => {
+    const { hostedLoginConfirmPage } = await import("../modules/auth/hostedLogin/httpHandlers")
+    const transaction = { client: { deviceName: "Laptop" }, createdAt: new Date() }
+    const confirm = hostedLoginConfirmPage({ transaction, csrf: "c" })
+    const rejected = hostedLoginConfirmPage({ transaction, csrf: "c", error: "That code doesn’t match." })
+    expect(rejected.status).toBe(400)
+    for (const response of [confirm, rejected]) {
+      const validated = await Effect.runPromise(validateOAuthResponse("hostedLoginConfirm", response))
+      expect(validated.status).toBe(response.status)
+    }
+    const cancelled = await Effect.runPromise(validateOAuthResponse("consent", new Response("<!doctype html>", {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "set-cookie": "inline_ar=; Max-Age=0" },
+    })))
+    expect(cancelled.status).toBe(200)
+  })
+
+  it("rejects undeclared OAuth responses before serving them", async () => {
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        validateOAuthResponse(
+          "register",
+          new Response(
+            JSON.stringify({
+              client_id: "client-1",
+              client_id_issued_at: 1_700_000_000,
+              redirect_uris: [
+                "https://client.example/callback",
+              ],
+              token_endpoint_auth_method: "none",
+              grant_types: [
+                "authorization_code",
+                "refresh_token",
+              ],
+              response_types: ["code"],
+              unexpected: true,
+            }),
+            {
+              status: 202,
+              headers: {
+                "content-type": "application/json",
+              },
+            },
+          ),
+        ),
+      ),
+    )
+
+    expect(failure).toBeInstanceOf(
+      OAuthResponseContractFailure,
+    )
+    expect(failure).toMatchObject({
+      operation: "register",
+      status: 202,
+    })
+    const bodyFailure = await Effect.runPromise(
+      Effect.flip(
+        validateOAuthResponse(
+          "register",
+          new Response(
+            JSON.stringify({ accepted: true }),
+            {
+              status: 201,
+              headers: {
+                "cache-control": "no-store",
+                "content-type": "application/json",
+              },
+            },
+          ),
+        ),
+      ),
+    )
+    expect(bodyFailure).toBeInstanceOf(
+      OAuthResponseContractFailure,
+    )
+    const headerFailure = await Effect.runPromise(
+      Effect.flip(
+        validateOAuthResponse(
+          "consent",
+          new Response(null, {
+            status: 302,
+            headers: {
+              "set-cookie": "inline_ar=; Max-Age=0",
+            },
+          }),
+        ),
+      ),
+    )
+    expect(headerFailure).toBeInstanceOf(
+      OAuthResponseContractFailure,
+    )
+
+    let reports = 0
+    const kernel = makeKernel({
+      reporter: {
+        report: () =>
+          Effect.sync(() => {
+            reports += 1
+          }),
+      },
+      oauth: {
+        execute: () =>
+          Effect.succeed(
+            new Response(
+              JSON.stringify({ accepted: true }),
+              {
+                status: 202,
+                headers: {
+                  "content-type": "application/json",
+                },
+              },
+            ),
+          ),
+      },
+    })
+
+    try {
+      const response = await kernel.handler(
+        new Request("http://inline.test/oauth/register", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            redirect_uris: [
+              "https://client.example/callback",
+            ],
+          }),
+        }),
+      )
+
+      expect(response.status).toBe(500)
+      expect(await response.json()).toEqual({
+        error: "server_error",
+        error_description: "Server error",
+      })
+      expect(reports).toBe(1)
+    } finally {
+      await kernel.dispose()
+    }
+  })
+
+  it("accepts a real provider redemption user projection", async () => {
+    const user = encodeFullUserInfo({
+      id: 1000,
+      email: "person@example.com",
+      phoneNumber: null,
+      emailVerified: true,
+      phoneVerified: null,
+      firstName: "Inline",
+      lastName: "User",
+      bio: null,
+      username: "inline-user",
+      deleted: false,
+      online: false,
+      lastOnline: null,
+      date: new Date("2026-08-17T10:49:00Z"),
+      photoFileId: null,
+      pendingSetup: false,
+      timeZone: "UTC",
+      shareTimeZone: true,
+      appearInGlobalSearch: true,
+      nextThreadNumber: 1,
+      bot: false,
+      botCreatorId: null,
+      updateSeq: 0,
+      lastUpdateDate: null,
+      photo: null,
+    } satisfies DbUserWithPhoto)
+    const response = new Response(
+      JSON.stringify({
+        ok: true,
+        result: {
+          userId: user.id,
+          token: "provider-session-token",
+          user,
+        },
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    )
+
+    await expect(
+      Effect.runPromise(
+        validateOAuthResponse("providerRedeem", response),
+      ),
+    ).resolves.toBe(response)
+  })
+
+  it("accepts the secure app handoff page for every provider completion route", async () => {
+    const operations = [
+      "providerCallbackGoogle",
+      "providerCallbackApple",
+      "providerContinueInvite",
+      "providerVerifyEmailCode",
+    ] as const
+
+    for (const operation of operations) {
+      const response = providerAppHandoffResponse(
+        "inline-dev://auth/provider?ticket=opaque-ticket",
+      )
+      await expect(
+        Effect.runPromise(validateOAuthResponse(operation, response)),
+      ).resolves.toBe(response)
+    }
+  })
+
+  it("keeps provider handoff tickets out of caches and referrers", async () => {
+    const response = providerAppHandoffResponse(
+      "inline-dev://auth/provider?ticket=%3Copaque%3E",
+    )
+    const body = await response.text()
+    const policy = response.headers.get("content-security-policy") ?? ""
+    const nonce = policy.match(/script-src 'nonce-([^']+)'/)?.[1]
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get("cache-control")).toBe("no-store")
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer")
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff")
+    expect(policy).toContain("default-src 'none'")
+    expect(nonce).toBeTruthy()
+    expect(body).toContain(`nonce="${nonce}"`)
+    expect(body).toContain("Sign-in successful")
+    expect(body).toContain("Opening Inline")
+    expect(body).toContain("Open Inline")
+    expect(body).toContain('rel="icon"')
+    expect(body).not.toContain('class="card"')
+    expect(body).not.toContain(">Close</button>")
+    expect(body).not.toContain("<span>Inline</span>")
+    expect(body).not.toContain("<opaque>")
+  })
+
+  it("accepts a ticketless provider error handoff", async () => {
+    const response = providerAppErrorResponse({
+      appUrl: "inline-dev://auth/provider?error=cancelled",
+      title: "Sign-in cancelled",
+      description: "No changes were made.",
+    })
+
+    await expect(
+      Effect.runPromise(
+        validateOAuthResponse("providerCallbackGoogle", response),
+      ),
+    ).resolves.toBe(response)
+    expect(await response.text()).not.toContain("ticket=")
+  })
+
+  it("reports a private OAuth defect once while preserving its established response", async () => {
+    let reports = 0
+    const publicResponse = new Response(
+      "<html>Code verification failed.</html>",
+      {
+        status: 401,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+        },
+      },
+    )
+    const kernel = makeKernel({
+      reporter: {
+        report: () =>
+          Effect.sync(() => {
+            reports += 1
+          }),
+      },
+      oauth: {
+        execute: (operation) =>
+          Effect.fail(
+            new OAuthHttpFailure({
+              operation,
+              cause: new Error("private provider failure"),
+              publicResponse,
+            }),
+          ),
+      },
+    })
+
+    try {
+      const response = await kernel.handler(
+        new Request(
+          "http://inline.test/oauth/authorize/verify-email-code",
+          {
+            method: "POST",
+            headers: {
+              "content-type":
+                "application/x-www-form-urlencoded",
+            },
+            body: "csrf=token&code=123456",
+          },
+        ),
+      )
+
+      expect(response.status).toBe(401)
+      expect(await response.text()).toBe(
+        "<html>Code verification failed.</html>",
+      )
+      expect(reports).toBe(1)
+    } finally {
+      await kernel.dispose()
+    }
+  })
+
+  it("matches Elysia OAuth body parsing and malformed-body transport", async () => {
+    const cases = [
+      {
+        name: "missing content type",
+        request: () =>
+          new Request("http://inline.test/revoke", {
+            method: "POST",
+            body: "token=opaque",
+          }),
+      },
+      {
+        name: "malformed JSON",
+        request: () =>
+          new Request("http://inline.test/revoke", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: "{",
+          }),
+      },
+      {
+        name: "text",
+        request: () =>
+          new Request("http://inline.test/revoke", {
+            method: "POST",
+            headers: {
+              "content-type": "text/plain",
+            },
+            body: "token=opaque",
+          }),
+      },
+      {
+        name: "JSON",
+        request: () =>
+          new Request("http://inline.test/revoke", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ token: "opaque" }),
+          }),
+      },
+      {
+        name: "form-urlencoded repeated field",
+        request: () =>
+          new Request("http://inline.test/revoke", {
+            method: "POST",
+            headers: {
+              "content-type":
+                "application/x-www-form-urlencoded",
+            },
+            body: "token=first&token=second",
+          }),
+      },
+      {
+        name: "multipart repeated field",
+        request: () => {
+          const body = new FormData()
+          body.append("token", "first")
+          body.append("token", "second")
+          return new Request(
+            "http://inline.test/revoke",
+            {
+              method: "POST",
+              body,
+            },
+          )
+        },
+      },
+      {
+        name: "empty",
+        request: () =>
+          new Request("http://inline.test/revoke", {
+            method: "POST",
+          }),
+      },
+    ] as const
+
+    for (const testCase of cases) {
+      const legacyBodies: Array<unknown> = []
+      const replacementBodies: Array<unknown> = []
+      const response = () =>
+        new Response(JSON.stringify({}), {
+          headers: {
+            "cache-control": "no-store",
+            "content-type": "application/json",
+          },
+        })
+      const legacy = new Elysia().post(
+        "/revoke",
+        ({ body }) => {
+          legacyBodies.push(body)
+          return response()
+        },
+      )
+      const handlers: OAuthHttpHandlers = {
+        metadata: () => response(),
+        register: async () => response(),
+        authorize: async () => response(),
+        authorizeContinue: async () => response(),
+        sendEmailCode: async () => response(),
+        verifyEmailCode: async () => response(),
+        sendSmsCode: async () => response(),
+        verifySmsCode: async () => response(),
+        consent: async () => response(),
+        token: async () => response(),
+        revoke: async (body) => {
+          replacementBodies.push(body)
+          return response()
+        },
+        introspect: async () => response(),
+        providerStart: async () => response(),
+        providerNativeAppleStart: async () => response(),
+        providerNativeAppleComplete: async () => response(),
+        providerNativeAppleContinueInvite: async () => response(),
+        providerCallbackGoogle: async () => response(),
+        providerCallbackApple: async () => response(),
+        providerContinueInvite: async () => response(),
+        providerSendEmailCode: async () => response(),
+        providerVerifyEmailCode: async () => response(),
+        providerRedeem: async () => response(),
+        hostedLoginGet: async () => response(),
+        hostedLoginSendEmail: async () => response(),
+        hostedLoginVerifyEmail: async () => response(),
+        hostedLoginSendSms: async () => response(),
+        hostedLoginVerifySms: async () => response(),
+        hostedLoginConfirm: async () => response(),
+      }
+      const kernel = makeKernel({
+        oauth: makeOAuthHttpService(handlers),
+      })
+
+      try {
+        const legacyResponse = await legacy.handle(
+          testCase.request(),
+        )
+        const replacementResponse = await kernel.handler(
+          testCase.request(),
+        )
+
+        expect(
+          {
+            status: replacementResponse.status,
+            body: await replacementResponse.text(),
+            invoked: replacementBodies.length,
+          },
+          testCase.name,
+        ).toEqual({
+          status: legacyResponse.status,
+          body: await legacyResponse.text(),
+          invoked: legacyBodies.length,
+        })
+        const replacementContentType =
+          replacementResponse.headers.get("content-type")
+        if (testCase.name === "malformed JSON") {
+          expect(replacementContentType).toBeNull()
+        } else {
+          expect(replacementContentType).toBe(
+            legacyResponse.headers.get("content-type"),
+          )
+        }
+        expect(
+          replacementBodies,
+          testCase.name,
+        ).toEqual(legacyBodies)
+      } finally {
+        await kernel.dispose()
+      }
+    }
+  })
+
+  it("documents every compatibility alias and form token exchange", () => {
+    const api = makePlatformApiBase(
+      "https://api.inline.chat",
+    ).add(AuthApiGroup)
+    const spec = OpenApi.fromApi(api)
+    assertValidOpenApiDocument(
+      spec,
+      "Slice 2 auth OpenAPI",
+    )
+
+    expect(Object.keys(spec.paths).sort()).toEqual([
+      "/.well-known/oauth-authorization-server",
+      "/authorize",
+      "/oauth/authorize",
+      "/oauth/authorize/consent",
+      "/oauth/authorize/continue",
+      "/oauth/authorize/send-email-code",
+      "/oauth/authorize/send-sms-code",
+      "/oauth/authorize/verify-email-code",
+      "/oauth/authorize/verify-sms-code",
+      "/oauth/introspect",
+      "/oauth/mcp-events",
+      "/oauth/register",
+      "/oauth/revoke",
+      "/oauth/token",
+      "/register",
+      "/revoke",
+      "/token",
+      "/v1/auth/login",
+      "/v1/auth/login/confirm",
+      "/v1/auth/login/send-email-code",
+      "/v1/auth/login/send-sms-code",
+      "/v1/auth/login/verify-email-code",
+      "/v1/auth/login/verify-phone-code",
+      "/v1/auth/provider/callback/apple",
+      "/v1/auth/provider/callback/google",
+      "/v1/auth/provider/continue-invite",
+      "/v1/auth/provider/native/apple/complete",
+      "/v1/auth/provider/native/apple/continue-invite",
+      "/v1/auth/provider/native/apple/start",
+      "/v1/auth/provider/redeem",
+      "/v1/auth/provider/send-email-code",
+      "/v1/auth/provider/start",
+      "/v1/auth/provider/verify-email-code",
+      "/v1/checkInviteCode",
+      "/v1/logout",
+      "/v1/sendEmailCode",
+      "/v1/sendSmsCode",
+      "/v1/verifyEmailCode",
+      "/v1/verifySmsCode",
+      "/v1/{token}/logout",
+    ])
+    expect(spec.paths).toHaveProperty("/register")
+    expect(spec.paths).toHaveProperty("/authorize")
+    expect(spec.paths).toHaveProperty("/token")
+    expect(spec.paths).toHaveProperty("/revoke")
+
+    const tokenPost = spec.paths["/oauth/token"]?.post as
+      | {
+        readonly requestBody?: {
+          readonly content?: Record<string, unknown>
+        }
+      }
+      | undefined
+    expect(tokenPost?.requestBody?.content).toHaveProperty(
+      "application/x-www-form-urlencoded",
+    )
+    expect(tokenPost?.requestBody?.content).toHaveProperty(
+      "application/json",
+    )
+    expect(tokenPost?.requestBody?.content).toHaveProperty(
+      "multipart/form-data",
+    )
+
+    const identityPost = spec.paths[
+      "/v1/sendEmailCode"
+    ]?.post as
+      | {
+        readonly requestBody?: {
+          readonly content?: Record<string, unknown>
+        }
+      }
+      | undefined
+    expect(identityPost?.requestBody?.content).toHaveProperty(
+      "application/json",
+    )
+    expect(identityPost?.requestBody?.content).toHaveProperty(
+      "application/x-www-form-urlencoded",
+    )
+    expect(identityPost?.requestBody?.content).toHaveProperty(
+      "multipart/form-data",
+    )
+
+    const revokePost = spec.paths["/oauth/revoke"]?.post as
+      | {
+        readonly requestBody?: {
+          readonly required?: boolean
+        }
+        readonly responses?: Record<
+          string,
+          {
+            readonly headers?: Record<string, unknown>
+          }
+        >
+      }
+      | undefined
+    expect(revokePost?.requestBody?.required).toBe(false)
+    expect(
+      revokePost?.responses?.["200"]?.headers,
+    ).toHaveProperty("Cache-Control")
+    expect(revokePost?.responses).not.toHaveProperty("420")
+
+    const consentPost = spec.paths[
+      "/oauth/authorize/consent"
+    ]?.post as
+      | {
+        readonly responses?: Record<
+          string,
+          {
+            readonly headers?: Record<string, unknown>
+          }
+        >
+      }
+      | undefined
+    expect(
+      consentPost?.responses?.["302"]?.headers,
+    ).toMatchObject({
+      Location: { required: true },
+      "Set-Cookie": { required: true },
+    })
+    const consentSchema = spec.components.schemas[
+      "OAuthConsentForm"
+    ] as
+      | {
+        readonly properties?: {
+          readonly space_id?: {
+            readonly anyOf?: ReadonlyArray<{
+              readonly type?: string
+            }>
+          }
+        }
+      }
+      | undefined
+    expect(
+      consentSchema?.properties?.space_id?.anyOf,
+    ).toContainEqual({ type: "array", items: { type: "string" } })
+
+    const authorizeGet = spec.paths[
+      "/oauth/authorize"
+    ]?.get as
+      | {
+        readonly responses?: Record<
+          string,
+          {
+            readonly headers?: Record<string, unknown>
+          }
+        >
+      }
+      | undefined
+    expect(
+      authorizeGet?.responses?.["200"]?.headers,
+    ).toMatchObject({
+      "Cache-Control": expect.any(Object),
+      "Set-Cookie": { required: true },
+    })
+
+    const introspectPost = spec.paths[
+      "/oauth/introspect"
+    ]?.post as
+      | {
+        readonly parameters?: ReadonlyArray<{
+          readonly name?: string
+          readonly required?: boolean
+        }>
+      }
+      | undefined
+    expect(
+      introspectPost?.parameters?.find(
+        (parameter) =>
+          parameter.name === "x-inline-mcp-secret",
+      ),
+    ).toMatchObject({ required: true })
+
+    const logoutGet = spec.paths["/v1/logout"]?.get as
+      | {
+        readonly parameters?: ReadonlyArray<{
+          readonly name?: string
+          readonly required?: boolean
+        }>
+      }
+      | undefined
+    expect(
+      logoutGet?.parameters?.find(
+        (parameter) =>
+          parameter.name === "authorization",
+      ),
+    ).toMatchObject({ required: true })
+    const logoutPost = spec.paths["/v1/logout"]?.post as
+      | {
+        readonly parameters?: ReadonlyArray<{
+          readonly name?: string
+          readonly required?: boolean
+        }>
+      }
+      | undefined
+    expect(
+      logoutPost?.parameters?.find(
+        (parameter) =>
+          parameter.name === "authorization",
+      ),
+    ).toMatchObject({ required: true })
+
+    const pathLogoutGet = spec.paths[
+      "/v1/{token}/logout"
+    ]?.get as
+      | {
+        readonly parameters?: ReadonlyArray<{
+          readonly name?: string
+        }>
+      }
+      | undefined
+    expect(
+      pathLogoutGet?.parameters?.some(
+        (parameter) =>
+          parameter.name === "authorization",
+      ),
+    ).toBe(false)
+  })
+})

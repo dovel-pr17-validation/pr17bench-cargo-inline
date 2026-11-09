@@ -1,0 +1,730 @@
+import AppKit
+import InlineKit
+import InlineUI
+import SwiftUI
+import Translation
+
+class EmbeddedMessageView: NSView, NSGestureRecognizerDelegate {
+  // MARK: - Constants
+
+  private enum Constants {
+    static let rectangleWidth: CGFloat = 3
+    static let contentSpacing: CGFloat = 6
+    static let verticalPadding: CGFloat = 4
+    static let horizontalPadding: CGFloat = 6
+    static let height: CGFloat = Theme.embeddedMessageHeight
+    static let photoWidth: CGFloat = 32
+    static let photoHeight: CGFloat = 32
+    static let quoteIconSize: CGFloat = 9
+  }
+
+  // MARK: - Properties
+
+  enum Kind {
+    case replyInMessage
+    case replyingInCompose
+    case editingInCompose
+    case forwardingInCompose
+    case pinnedInHeader
+  }
+
+  private var kind: Kind = .replyInMessage
+  private var style: EmbeddedMessageStyle
+
+  private var message: Message?
+  private var relatedMessage: Message?
+  private var senderNameForColor: String?
+  private var pressed = false
+  private var simplePhotoView: SimplePhotoView?
+  private var textLeadingConstraint: NSLayoutConstraint?
+  private var nameTrailingConstraint: NSLayoutConstraint?
+  private var messageTrailingConstraint: NSLayoutConstraint?
+  private var rectangleWidthConstraint: NSLayoutConstraint?
+  private var rectangleTopConstraint: NSLayoutConstraint?
+  private var rectangleBottomConstraint: NSLayoutConstraint?
+  private var heightConstraint: NSLayoutConstraint?
+  private var nameLabelHeightConstraint: NSLayoutConstraint?
+  private var nameLabelTopConstraint: NSLayoutConstraint?
+  private var messageLabelBottomConstraint: NSLayoutConstraint?
+  private var photoConstraints: [NSLayoutConstraint] = []
+
+  /// Header for `.pinnedInHeader`, such as "Pinned Message #2" when a chat has several pins.
+  var pinnedHeaderTitle = "Pinned Message" {
+    didSet {
+      guard kind == .pinnedInHeader, pinnedHeaderTitle != oldValue else { return }
+      nameLabel.stringValue = pinnedHeaderTitle
+    }
+  }
+
+  /// Replaces the default jump-to-message click, for hosts that decide where a click goes.
+  var onTap: (() -> Void)?
+
+  var showsBackground: Bool = true {
+    didSet {
+      applyBackgroundAppearance()
+    }
+  }
+
+  var showsLeadingBar: Bool = true {
+    didSet {
+      applyLeadingBarAppearance()
+    }
+  }
+
+  var textHorizontalPadding: CGFloat = Constants.horizontalPadding {
+    didSet {
+      textLeadingPadding = textHorizontalPadding
+      textTrailingPadding = textHorizontalPadding
+    }
+  }
+
+  var textLeadingPadding: CGFloat = Constants.horizontalPadding {
+    didSet {
+      applyTextPadding()
+    }
+  }
+
+  var textTrailingPadding: CGFloat = Constants.horizontalPadding {
+    didSet {
+      applyTextPadding()
+    }
+  }
+
+  private var cornerRadius: CGFloat {
+    switch kind {
+      case .replyInMessage, .pinnedInHeader:
+        8
+      default:
+        0
+    }
+  }
+
+  private var senderFont: NSFont {
+    let weight: NSFont.Weight = kind == .pinnedInHeader ? .medium : .semibold
+    let size: CGFloat = kind == .pinnedInHeader
+      ? max(10, Theme.messageTextFont.pointSize - 1)
+      : 12
+    return .systemFont(ofSize: size, weight: weight)
+  }
+
+  private var messageFont: NSFont {
+    if kind == .pinnedInHeader {
+      return .systemFont(ofSize: max(10, Theme.messageTextFont.pointSize - 1))
+    }
+    return Theme.messageTextFont
+  }
+
+  private var textColor: NSColor {
+    if style == .colored {
+      .labelColor
+    } else {
+      .white
+    }
+  }
+
+  private var senderColor: NSColor {
+    guard let senderNameForColor else {
+      return NSColor.controlAccentColor
+    }
+    let swiftUIColor = AvatarColorUtility.colorFor(name: senderNameForColor)
+    return NSColor(swiftUIColor)
+  }
+
+  private var shouldUseSenderColor: Bool {
+    style == .colored && kind == .replyInMessage
+  }
+
+  private var isTappable: Bool {
+    guard let message else { return false }
+    return message.status != .sending && message.status != .failed
+  }
+
+  private var rectangleColor: NSColor {
+    if style == .colored {
+      return shouldUseSenderColor ? senderColor : NSColor.controlAccentColor
+    } else {
+      return NSColor.white
+    }
+  }
+
+  private var nameLabelColor: NSColor {
+    if style == .colored {
+      if kind == .pinnedInHeader {
+        return textColor
+      }
+      return shouldUseSenderColor ? senderColor : NSColor.controlAccentColor
+    } else {
+      return NSColor.white
+    }
+  }
+
+  private var backgroundColor: NSColor? {
+    guard kind == .replyInMessage || kind == .pinnedInHeader else { return nil }
+
+    if style == .colored {
+      let baseColor = shouldUseSenderColor ? senderColor : NSColor.controlAccentColor
+      return baseColor.withAlphaComponent(0.08)
+    } else {
+      return NSColor.white.withAlphaComponent(0.09)
+    }
+  }
+
+  // MARK: - Views
+
+  override var wantsUpdateLayer: Bool {
+    true
+  }
+
+  private lazy var rectangleView: NSView = {
+    let view = NSView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.wantsLayer = true
+    view.layer?.masksToBounds = true
+    view.layer?.backgroundColor = rectangleColor.cgColor
+    return view
+  }()
+
+  private lazy var nameLabel: NSTextField = {
+    let label = NSTextField(labelWithString: "")
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = senderFont
+    label.lineBreakMode = .byTruncatingTail
+    label.textColor = textColor
+    return label
+  }()
+
+  /// Set when the message quotes part of the replied message; the header then shows the quote.
+  private var quote: String?
+  private var isQuote: Bool { quote != nil }
+
+  private lazy var quoteIconView: NSImageView = {
+    let view = NSImageView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.image = NSImage(systemSymbolName: "quote.closing", accessibilityDescription: nil)?
+      .withSymbolConfiguration(.init(pointSize: Constants.quoteIconSize, weight: .semibold))
+    view.isHidden = true
+    return view
+  }()
+
+  private lazy var messageLabel: NSTextField = {
+    let label = NSTextField(labelWithString: "")
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = messageFont
+    label.lineBreakMode = .byTruncatingTail
+    label.textColor = textColor
+    label.maximumNumberOfLines = 1
+    label.cell?.usesSingleLineMode = true
+    label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+    return label
+  }()
+
+  enum EmbeddedMessageStyle {
+    case colored
+    case white
+  }
+
+  // MARK: - Initialization
+
+  init(style: EmbeddedMessageStyle) {
+    self.style = style
+    super.init(frame: .zero)
+    setupView()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func setupView() {
+    wantsLayer = true
+    layer?.masksToBounds = true
+    PressScaleAnimator.prepare(self)
+
+    translatesAutoresizingMaskIntoConstraints = false
+
+    addSubview(rectangleView)
+    addSubview(nameLabel)
+    addSubview(messageLabel)
+    addSubview(quoteIconView)
+
+    textLeadingConstraint = nameLabel.leadingAnchor.constraint(
+      equalTo: rectangleView.trailingAnchor, constant: Constants.contentSpacing
+    )
+    rectangleWidthConstraint = rectangleView.widthAnchor.constraint(equalToConstant: Constants.rectangleWidth)
+    rectangleTopConstraint = rectangleView.topAnchor.constraint(equalTo: topAnchor)
+    rectangleBottomConstraint = rectangleView.bottomAnchor.constraint(equalTo: bottomAnchor)
+
+    heightConstraint = heightAnchor.constraint(equalToConstant: Constants.height)
+    nameLabelHeightConstraint = nameLabel.heightAnchor.constraint(equalToConstant: Theme.messageNameLabelHeight)
+    nameLabelTopConstraint = nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: Constants.verticalPadding)
+    messageLabelBottomConstraint = messageLabel.bottomAnchor.constraint(
+      equalTo: bottomAnchor, constant: -Constants.verticalPadding
+    )
+
+    nameTrailingConstraint = nameLabel.trailingAnchor.constraint(
+      equalTo: trailingAnchor, constant: -Constants.horizontalPadding
+    )
+    messageTrailingConstraint = messageLabel.trailingAnchor.constraint(
+      equalTo: trailingAnchor, constant: -Constants.horizontalPadding
+    )
+
+    NSLayoutConstraint.activate([
+      // Height
+      heightConstraint!,
+
+      // Rectangle view
+      rectangleView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      rectangleWidthConstraint!,
+      rectangleTopConstraint!,
+      rectangleBottomConstraint!,
+
+      // Name label
+      textLeadingConstraint!,
+      nameTrailingConstraint!,
+      nameLabelTopConstraint!,
+      nameLabelHeightConstraint!,
+
+      // Message label
+      messageLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+      messageTrailingConstraint!,
+      messageLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor),
+      messageLabelBottomConstraint!,
+
+      // Quote mark
+      quoteIconView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+      quoteIconView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+    ])
+
+    let clickGesture = NSClickGestureRecognizer(
+      target: self,
+      action: #selector(handleTap)
+    )
+    clickGesture.delegate = self
+    addGestureRecognizer(clickGesture)
+
+    let pressGesture = NSPressGestureRecognizer(
+      target: self,
+      action: #selector(handlePress)
+    )
+    pressGesture.minimumPressDuration = 0
+    pressGesture.allowableMovement = .greatestFiniteMagnitude
+    pressGesture.delaysPrimaryMouseButtonEvents = false
+    pressGesture.delegate = self
+    addGestureRecognizer(pressGesture)
+
+    applyBackgroundAppearance()
+    applyLeadingBarAppearance()
+    applyTextPadding()
+  }
+
+  func setCollapsed(_ collapsed: Bool) {
+    let height = collapsed ? 0 : Constants.height
+    let nameHeight = collapsed ? 0 : Theme.messageNameLabelHeight
+    let verticalPadding = collapsed ? 0 : Constants.verticalPadding
+
+    heightConstraint?.constant = height
+    nameLabelHeightConstraint?.constant = nameHeight
+    nameLabelTopConstraint?.constant = verticalPadding
+    messageLabelBottomConstraint?.constant = -verticalPadding
+  }
+
+  func setRelatedMessage(_ message: Message) {
+    relatedMessage = message
+  }
+
+  func setStyle(_ style: EmbeddedMessageStyle) {
+    guard self.style != style else { return }
+    self.style = style
+    applyResolvedStyle()
+  }
+
+  @objc func handleTap(_ gesture: NSClickGestureRecognizer) {
+    if let onTap {
+      onTap()
+      return
+    }
+    guard let message else { return }
+    guard message.status != .sending, message.status != .failed else { return }
+
+    let messageId = message.messageId
+    let chatState = ChatsManager.shared.get(for: message.peerId, chatId: message.chatId)
+    let reason: ScrollToMessageReason = switch kind {
+      case .replyInMessage, .replyingInCompose, .editingInCompose:
+        .reply
+      case .pinnedInHeader:
+        .pinned
+      case .forwardingInCompose:
+        .unknown
+    }
+    // A quote reply highlights the quoted text rather than the whole message.
+    chatState.scrollTo(msgId: messageId, reason: reason, quote: kind == .replyInMessage ? quote : nil)
+  }
+
+  @objc private func handlePress(_ gesture: NSPressGestureRecognizer) {
+    switch gesture.state {
+    case .began, .changed:
+      let inside = bounds.contains(gesture.location(in: self))
+      setPressed(isTappable && inside)
+    case .ended, .cancelled, .failed:
+      setPressed(false)
+    default:
+      break
+    }
+  }
+
+  /// `quote` replaces the replied message's text with the part the reply quotes.
+  func update(with embeddedMessage: EmbeddedMessage, kind: Kind, quote: String? = nil) {
+    setQuote(quote)
+    guard let from = embeddedMessage.from else {
+      self.kind = kind
+      applyLeadingBarVerticalInsets()
+      messageLabel.stringValue = "Unknown sender"
+      return
+    }
+
+    let messageContent: String = if let quote {
+      quote.replacingOccurrences(of: "\n", with: " ")
+    } else if let displayText = embeddedMessage.displayTextForLastMessage, !displayText.isEmpty {
+      displayText
+    } else {
+      getMessageContentText(
+        from: embeddedMessage.message,
+        documentFileName: embeddedMessage.document?.fileName,
+        documentMimeType: embeddedMessage.document?.mimeType
+      )
+    }
+
+    updateView(
+      message: embeddedMessage.message,
+      from: from,
+      kind: kind,
+      photoInfo: embeddedMessage.photoInfo,
+      videoInfo: embeddedMessage.videoInfo,
+      messageContent: messageContent
+    )
+  }
+
+  func update(with fullMessage: FullMessage, kind: Kind) {
+    setQuote(nil)
+    guard let from = fullMessage.from else {
+      self.kind = kind
+      applyLeadingBarVerticalInsets()
+      messageLabel.stringValue = "Unknown sender"
+      return
+    }
+
+    let messageContent: String = if let displayText = fullMessage.displayTextForLastMessage, !displayText.isEmpty {
+      displayText
+    } else {
+      getMessageContentText(
+        from: fullMessage.message,
+        documentFileName: fullMessage.documentInfo?.document.fileName,
+        documentMimeType: fullMessage.documentInfo?.document.mimeType
+      )
+    }
+
+    updateView(
+      message: fullMessage.message,
+      from: from,
+      kind: kind,
+      photoInfo: fullMessage.photoInfo,
+      videoInfo: fullMessage.videoInfo,
+      messageContent: messageContent
+    )
+  }
+
+  private func updateView(
+    message: Message,
+    from: User,
+    kind: Kind,
+    photoInfo: PhotoInfo?,
+    videoInfo: VideoInfo?,
+    messageContent: String
+  ) {
+    self.kind = kind
+    self.message = message
+
+    let senderName = from.fullName
+
+    // Set sender name for color calculation
+    senderNameForColor = AvatarColorUtility.formatNameForHashing(
+      firstName: from.firstName,
+      lastName: from.lastName,
+      email: from.email
+    )
+
+    nameLabel.stringValue = switch kind {
+      case .replyInMessage:
+        "\(senderName)"
+
+      case .replyingInCompose:
+        "Reply to \(senderName)"
+
+      case .editingInCompose:
+        "Edit Message"
+
+      case .forwardingInCompose:
+        "Forward Message"
+
+      case .pinnedInHeader:
+        pinnedHeaderTitle
+    }
+
+    // Update visuals after setting senderNameForColor
+    nameLabel.font = senderFont
+    messageLabel.font = messageFont
+    updateLabelLayout()
+    applyResolvedStyle()
+
+    // Handle photo if available
+    let previewPhoto = photoInfo ?? videoInfo?.thumbnail
+    let overlaySymbol = videoInfo != nil ? "play.circle.fill" : nil
+    updatePhotoView(photoInfo: previewPhoto, overlaySymbol: overlaySymbol)
+
+    if kind == .forwardingInCompose {
+      messageLabel.stringValue = forwardDescription(for: senderName, messageText: messageContent)
+    } else if kind == .pinnedInHeader {
+      messageLabel.stringValue = messageContent
+    } else {
+      messageLabel.stringValue = messageContent
+    }
+  }
+
+  func showNotLoaded(
+    kind: Kind,
+    senderName: String? = nil,
+    outgoing _: Bool = false,
+    isOnlyEmoji _: Bool = false,
+    style _: Style? = nil,
+    messageText: String
+  ) {
+    self.kind = kind
+    self.message = nil
+    senderNameForColor = senderName
+
+    let resolvedSender = senderName ?? "User"
+
+    nameLabel.stringValue = switch kind {
+      case .replyInMessage:
+        resolvedSender
+      case .replyingInCompose:
+        "Reply to \(resolvedSender)"
+      case .editingInCompose:
+        "Edit Message"
+      case .forwardingInCompose:
+        "Forward Message"
+      case .pinnedInHeader:
+        pinnedHeaderTitle
+    }
+
+    if kind == .forwardingInCompose {
+      messageLabel.stringValue = forwardDescription(for: resolvedSender, messageText: messageText)
+    } else {
+      messageLabel.stringValue = messageText
+    }
+
+    updatePhotoView(photoInfo: nil, overlaySymbol: nil)
+
+    nameLabel.font = senderFont
+    messageLabel.font = messageFont
+    updateLabelLayout()
+    applyResolvedStyle()
+  }
+
+  private func updateLabelLayout() {
+    let nameLabelHeight: CGFloat
+    if kind == .pinnedInHeader {
+      nameLabelHeight = ceil(senderFont.ascender - senderFont.descender + senderFont.leading)
+    } else {
+      nameLabelHeight = Theme.messageNameLabelHeight
+    }
+    nameLabelHeightConstraint?.constant = nameLabelHeight
+  }
+
+  private func applyBackgroundAppearance() {
+    layer?.backgroundColor = showsBackground ? backgroundColor?.cgColor : nil
+    layer?.cornerRadius = showsBackground ? cornerRadius : 0
+  }
+
+  private func applyLeadingBarAppearance() {
+    let leadingPadding = showsLeadingBar ? Constants.contentSpacing : textLeadingPadding
+    rectangleView.isHidden = !showsLeadingBar
+    rectangleWidthConstraint?.constant = showsLeadingBar ? Constants.rectangleWidth : 0
+    textLeadingConstraint?.constant = leadingPadding
+  }
+
+  private func applyLeadingBarVerticalInsets() {
+    let verticalInset: CGFloat = switch kind {
+      case .replyingInCompose, .editingInCompose, .forwardingInCompose:
+        Constants.verticalPadding
+      case .replyInMessage, .pinnedInHeader:
+        0
+    }
+    rectangleTopConstraint?.constant = verticalInset
+    rectangleBottomConstraint?.constant = -verticalInset
+  }
+
+  private func applyTextPadding() {
+    // Keep the name and quoted text clear of the quote mark.
+    let trailing = textTrailingPadding + (isQuote ? Constants.quoteIconSize + 4 : 0)
+    nameTrailingConstraint?.constant = -trailing
+    messageTrailingConstraint?.constant = -trailing
+    if !showsLeadingBar {
+      textLeadingConstraint?.constant = textLeadingPadding
+    }
+  }
+
+  private func setQuote(_ quote: String?) {
+    let wasQuote = isQuote
+    self.quote = quote
+    guard isQuote != wasQuote else { return }
+    quoteIconView.isHidden = !isQuote
+    applyTextPadding()
+  }
+
+  private func applyResolvedStyle() {
+    rectangleView.layer?.backgroundColor = rectangleColor.cgColor
+    nameLabel.textColor = nameLabelColor
+    quoteIconView.contentTintColor = nameLabelColor
+    messageLabel.textColor = textColor
+    applyBackgroundAppearance()
+    applyLeadingBarVerticalInsets()
+  }
+
+  private func setPressed(_ pressed: Bool) {
+    guard self.pressed != pressed else { return }
+    self.pressed = pressed
+    alphaValue = pressed ? 0.92 : 1
+    PressScaleAnimator.setPressed(pressed, on: self)
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    if window == nil {
+      setPressed(false)
+    } else {
+      PressScaleAnimator.prepare(self)
+    }
+  }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    applyResolvedStyle()
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: NSGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+  ) -> Bool {
+    true
+  }
+
+  private func forwardDescription(for senderName: String, messageText: String) -> String {
+    "\(senderName): \(messageText)"
+  }
+
+  private func getMessageContentText(
+    from message: Message,
+    documentFileName: String?,
+    documentMimeType: String?
+  ) -> String {
+    if message.isSticker == true {
+      "Sticker"
+    } else if let _ = message.photoId {
+      "Photo"
+    } else if let _ = message.videoId {
+      "🎥 Video"
+    } else if let _ = message.documentId {
+      MessagePreviewText.document(fileName: documentFileName, mimeType: documentMimeType)
+    } else {
+      "Message"
+    }
+  }
+
+  private func updatePhotoView(photoInfo: PhotoInfo?, overlaySymbol: String?) {
+    if let photoInfo {
+      if let existingPhotoView = simplePhotoView {
+        existingPhotoView.update(with: photoInfo, overlaySymbol: overlaySymbol)
+      } else {
+        let photoView = SimplePhotoView(
+          photoInfo: photoInfo,
+          width: Constants.photoWidth,
+          height: Constants.photoHeight,
+          relatedMessage: relatedMessage,
+          overlaySymbol: overlaySymbol
+        )
+        simplePhotoView = photoView
+        addSubview(photoView)
+
+        photoConstraints = [
+          photoView.leadingAnchor.constraint(
+            equalTo: rectangleView.trailingAnchor, constant: Constants.contentSpacing
+          ),
+          photoView.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ]
+        NSLayoutConstraint.activate(photoConstraints)
+
+        // Update text leading constraint to be after photo
+        textLeadingConstraint?.isActive = false
+        textLeadingConstraint = nameLabel.leadingAnchor.constraint(
+          equalTo: photoView.trailingAnchor, constant: Constants.contentSpacing
+        )
+        textLeadingConstraint?.isActive = true
+      }
+    } else {
+      if let photoView = simplePhotoView {
+        photoView.removeFromSuperview()
+        simplePhotoView = nil
+
+        NSLayoutConstraint.deactivate(photoConstraints)
+        photoConstraints = []
+
+        // Restore original text leading constraint
+        textLeadingConstraint?.isActive = false
+        textLeadingConstraint = nameLabel.leadingAnchor.constraint(
+          equalTo: rectangleView.trailingAnchor, constant: Constants.contentSpacing
+        )
+        textLeadingConstraint?.isActive = true
+      }
+    }
+  }
+}
+
+extension EmbeddedMessageView {
+  enum Style {
+    case replyBubble
+    case compose
+  }
+
+  static let height: CGFloat = Theme.embeddedMessageHeight
+
+  convenience init() {
+    self.init(style: .colored)
+  }
+
+  func configure(
+    embeddedMessage: EmbeddedMessage,
+    kind: Kind = .replyInMessage,
+    outgoing _: Bool = false,
+    isOnlyEmoji _: Bool = false,
+    style _: Style? = nil,
+    senderNameOverride _: String? = nil
+  ) {
+    update(with: embeddedMessage, kind: kind)
+  }
+
+  func configure(
+    fullMessage: FullMessage,
+    kind: Kind,
+    outgoing _: Bool = false,
+    isOnlyEmoji _: Bool = false,
+    style _: Style? = nil,
+    senderNameOverride _: String? = nil
+  ) {
+    update(with: fullMessage, kind: kind)
+  }
+}
+
+typealias EmbedMessageView = EmbeddedMessageView

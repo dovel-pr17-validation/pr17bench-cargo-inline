@@ -1,0 +1,268 @@
+import AppKit
+import InlineKit
+
+class ComposeMessageView: NSView {
+  // MARK: - Types
+
+  enum Kind {
+    case replying
+    case editing
+    case forwarding
+  }
+
+  // MARK: - Properties
+
+  private var onClose: () -> Void
+  private var kind: Kind = .replying
+  private var heightConstraint: NSLayoutConstraint!
+  private let defaultHeight: CGFloat = Theme.embeddedMessageHeight
+  private let buttonSize: CGFloat = Theme.composeButtonSize
+
+  // MARK: - Constants
+
+  private let hiddenAlpha: CGFloat = 0.95
+  private let visibleAlpha: CGFloat = 1.0
+
+  // MARK: - Views
+
+  private lazy var iconView: NSView = {
+    let view = NSView()
+    // TODO: add a reply icon or sth
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var messageView: EmbeddedMessageView = {
+    let view = EmbeddedMessageView(style: .colored)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var closeButton: ComposeCloseButton = {
+    let button = ComposeCloseButton(target: self, action: #selector(handleClose))
+    button.translatesAutoresizingMaskIntoConstraints = false
+    return button
+  }()
+
+  // MARK: - Initialization
+
+  init(
+    onClose: @escaping () -> Void
+  ) {
+    self.onClose = onClose
+    super.init(frame: .zero)
+    setupView()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  // MARK: - Setup
+
+  private func setupView() {
+    translatesAutoresizingMaskIntoConstraints = false
+    wantsLayer = true
+    clipsToBounds = true
+
+    addMessageView()
+
+    addSubview(closeButton, positioned: .above, relativeTo: messageView)
+
+    heightConstraint = heightAnchor.constraint(equalToConstant: 0)
+
+    NSLayoutConstraint.activate([
+      closeButton.widthAnchor.constraint(equalToConstant: buttonSize),
+      closeButton.heightAnchor.constraint(equalToConstant: buttonSize),
+      closeButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+      closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+      heightConstraint,
+    ])
+
+    // Initially hidden
+    alphaValue = hiddenAlpha
+    heightConstraint.constant = 0
+  }
+
+  private func addMessageView() {
+    addSubview(messageView)
+    messageView
+      .setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    NSLayoutConstraint.activate([
+      messageView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      messageView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      messageView.widthAnchor.constraint(equalTo: widthAnchor),
+      messageView.topAnchor.constraint(equalTo: topAnchor),
+      messageView.heightAnchor.constraint(equalToConstant: defaultHeight),
+    ])
+  }
+
+  // MARK: - Actions
+
+  @objc private func handleClose() {
+    close(animated: true)
+    onClose()
+  }
+
+  // MARK: - Public Methods
+
+  func update(with fullMessage: FullMessage, kind: Kind) {
+    self.kind = kind
+
+    let embeddedKind: EmbeddedMessageView.Kind
+    switch kind {
+    case .replying:
+      embeddedKind = .replyingInCompose
+    case .editing:
+      embeddedKind = .editingInCompose
+    case .forwarding:
+      embeddedKind = .forwardingInCompose
+    }
+
+    messageView.update(with: fullMessage, kind: embeddedKind)
+  }
+
+  func open(animated: Bool = true) {
+    guard alphaValue == hiddenAlpha else { return }
+
+    if animated {
+      // The parent compose view animates its own height from the same state
+      // transition. Resolve this required child constraint first so AppKit never
+      // has to satisfy two independently animated vertical equations.
+      heightConstraint.constant = defaultHeight
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0.2
+        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+
+        animator().alphaValue = visibleAlpha
+      }
+    } else {
+      heightConstraint.constant = defaultHeight
+      alphaValue = visibleAlpha
+    }
+  }
+
+  func close(animated: Bool = false, completion: (() -> Void)? = nil) {
+    guard alphaValue == visibleAlpha else { return }
+
+    if animated {
+      // Keep geometry owned by the parent transition; animate presentation only.
+      heightConstraint.constant = 0
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0.2
+        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        context.completionHandler = {
+          completion?()
+        }
+
+        animator().alphaValue = hiddenAlpha
+      }
+    } else {
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0
+        context.allowsImplicitAnimation = false
+
+        heightConstraint.constant = 0
+        alphaValue = hiddenAlpha
+        completion?()
+      }
+    }
+  }
+
+  var isOpen: Bool {
+    alphaValue == visibleAlpha
+  }
+}
+
+private final class ComposeCloseButton: NSView {
+  private let button = NSButton(frame: .zero)
+  private var hoverTrackingArea: NSTrackingArea?
+  private var isHovering = false
+
+  init(target: AnyObject, action: Selector) {
+    super.init(frame: .zero)
+    wantsLayer = true
+    layer?.backgroundColor = NSColor.clear.cgColor
+
+    button.bezelStyle = .circular
+    button.isBordered = false
+    button.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")
+    button.imagePosition = .imageOnly
+    button.target = target
+    button.action = action
+    button.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(button)
+
+    NSLayoutConstraint.activate([
+      button.leadingAnchor.constraint(equalTo: leadingAnchor),
+      button.trailingAnchor.constraint(equalTo: trailingAnchor),
+      button.topAnchor.constraint(equalTo: topAnchor),
+      button.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func layout() {
+    super.layout()
+    layer?.cornerRadius = min(bounds.width, bounds.height) / 2
+  }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+
+    if let hoverTrackingArea {
+      removeTrackingArea(hoverTrackingArea)
+    }
+
+    let area = NSTrackingArea(
+      rect: .zero,
+      options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+      owner: self,
+      userInfo: nil
+    )
+    addTrackingArea(area)
+    hoverTrackingArea = area
+    refreshHoverState()
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    refreshHoverState()
+  }
+
+  override func mouseEntered(with event: NSEvent) {
+    super.mouseEntered(with: event)
+    setHovering(button.isEnabled)
+  }
+
+  override func mouseExited(with event: NSEvent) {
+    super.mouseExited(with: event)
+    setHovering(false)
+  }
+
+  private func refreshHoverState() {
+    guard button.isEnabled, !isHiddenOrHasHiddenAncestor, let window else {
+      setHovering(false)
+      return
+    }
+
+    let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    setHovering(visibleRect.contains(point))
+  }
+
+  private func setHovering(_ hovering: Bool) {
+    guard isHovering != hovering else { return }
+    isHovering = hovering
+
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    layer?.backgroundColor = hovering ? NSColor.gray.withAlphaComponent(0.1).cgColor : NSColor.clear.cgColor
+    CATransaction.commit()
+  }
+}

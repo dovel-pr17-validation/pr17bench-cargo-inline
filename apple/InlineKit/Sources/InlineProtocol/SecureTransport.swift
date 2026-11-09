@@ -1,0 +1,917 @@
+import BigInt
+import CommonCrypto
+import Compression
+import Foundation
+import Security
+
+public enum InlineProtocolError: Error, Equatable, Sendable {
+  case invalidEncryptedRecord
+  case invalidInput
+}
+
+extension InlineProtocolError: LocalizedError {
+  public var errorDescription: String? {
+    switch self {
+    case .invalidEncryptedRecord: "Inline Protocol encrypted record authentication failed."
+    case .invalidInput: "Inline Protocol input or handshake data was invalid."
+    }
+  }
+}
+
+public enum InlineProtocolDirection: Sendable {
+  case clientToServer
+  case serverToClient
+
+  fileprivate var kdfOffset: Int {
+    switch self {
+    case .clientToServer: 0
+    case .serverToClient: 8
+    }
+  }
+}
+
+public struct InlineEncryptedRecordFields: Equatable, Sendable {
+  public let serverSalt: Int64
+  public let sessionID: Int64
+  public let messageID: Int64
+  public let sequenceNumber: Int32
+  public let body: [UInt8]
+
+  public init(
+    serverSalt: Int64,
+    sessionID: Int64,
+    messageID: Int64,
+    sequenceNumber: Int32,
+    body: [UInt8]
+  ) {
+    self.serverSalt = serverSalt
+    self.sessionID = sessionID
+    self.messageID = messageID
+    self.sequenceNumber = sequenceNumber
+    self.body = body
+  }
+}
+
+public struct InlineRSAPadIntermediate: Equatable, Sendable {
+  public let dataWithPadding: [UInt8]
+  public let dataWithHash: [UInt8]
+  public let aesEncrypted: [UInt8]
+  public let keyAESEncrypted: [UInt8]
+  public let encryptedData: [UInt8]
+}
+
+public enum InlineApplicationObject: Equatable, Sendable {
+  case invoke(layer: Int32, payload: [UInt8])
+  case result(payload: [UInt8])
+  case update(payload: [UInt8])
+}
+
+/// The MTProto service-level `rpc_error` carried inside an outer `rpc_result`.
+/// This remains distinct from the protobuf `RpcError` application payload.
+public struct InlineTLRPCError: Equatable, Sendable {
+  public let code: Int32
+
+  public init(code: Int32) {
+    self.code = code
+  }
+}
+
+public enum InlineAbridgedFrame: Equatable, Sendable {
+  case packet(payload: [UInt8], quickAckRequested: Bool)
+  case quickAck(id: UInt32)
+}
+
+public struct InlineInvokeAfter: Equatable, Sendable {
+  public let messageIDs: [Int64]
+  public let query: [UInt8]
+
+  public init(messageIDs: [Int64], query: [UInt8]) {
+    self.messageIDs = messageIDs
+    self.query = query
+  }
+}
+
+public enum InlineSecureTransport {
+  public static let maximumPacketBytes = 16 * 1024 * 1024
+  public static let resultConstructor: UInt32 = 0xac3ddc54
+  public static let rpcErrorConstructor: UInt32 = 0x2144ca19
+  public static let updateConstructor: UInt32 = 0xdc412c98
+  public static let invokeConstructor: UInt32 = 0xeb7d4aa6
+  public static let invokeAfterMessageConstructor: UInt32 = 0xcb9f372d
+  public static let invokeAfterMessagesConstructor: UInt32 = 0x3dc4b4f0
+  private static let vectorConstructor: UInt32 = 0x1cb5c415
+  private static let maximumInvokeAfterDependencies = 8_192
+  private static let dhPrimeCache = DHPrimeValidationCache(capacity: 64)
+  public static let realtimeLayer: Int32 = 3
+  /// Same request schema as layer 3; the sender decodes `gzip_packed` results.
+  public static let realtimeLayerGzip: Int32 = 4
+  public static let gzipPackedConstructor: UInt32 = 0x3072cfa1
+  public static let messageContainerConstructor: UInt32 = 0x73f1f8dc
+  public static let maximumGzipOutputBytes = 16 * 1024 * 1024
+  public static let telegramDHPrime: [UInt8] = hexBytes(
+    "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f" +
+      "48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c372" +
+      "0fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642" +
+      "477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a" +
+      "4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754f" +
+      "d17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e" +
+      "418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d" +
+      "8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b"
+  )
+
+  public static func rsaPadAttempt(
+    serializedInner: [UInt8],
+    randomPadding: [UInt8],
+    temporaryKey: [UInt8],
+    modulus: [UInt8],
+    exponent: [UInt8]
+  ) throws -> InlineRSAPadIntermediate {
+    guard serializedInner.count <= 144,
+          serializedInner.count + randomPadding.count == 192,
+          temporaryKey.count == 32,
+          modulus.count == 256,
+          !exponent.isEmpty
+    else { throw InlineProtocolError.invalidInput }
+    let dataWithPadding = serializedInner + randomPadding
+    let dataWithHash = Array(dataWithPadding.reversed()) + sha256(temporaryKey + dataWithPadding)
+    let aesEncrypted = try aesIGEEncrypt(Array(dataWithHash), key: temporaryKey, iv: [UInt8](repeating: 0, count: 32))
+    let keyAESEncrypted = xor(temporaryKey, sha256(aesEncrypted)) + aesEncrypted
+    guard lexicographicallyLess(keyAESEncrypted, modulus) else { throw InlineProtocolError.invalidInput }
+    let encryptedData = try modularExponentiation(
+      base: keyAESEncrypted,
+      exponent: exponent,
+      modulus: modulus
+    )
+    return InlineRSAPadIntermediate(
+      dataWithPadding: dataWithPadding,
+      dataWithHash: Array(dataWithHash),
+      aesEncrypted: aesEncrypted,
+      keyAESEncrypted: keyAESEncrypted,
+      encryptedData: encryptedData
+    )
+  }
+
+  public static func deriveTemporaryAES(
+    newNonce: [UInt8],
+    serverNonce: [UInt8]
+  ) throws -> (key: [UInt8], iv: [UInt8]) {
+    guard newNonce.count == 32, serverNonce.count == 16 else { throw InlineProtocolError.invalidInput }
+    let nonceServer = sha1(newNonce + serverNonce)
+    let serverNonceHash = sha1(serverNonce + newNonce)
+    return (
+      nonceServer + Array(serverNonceHash[0..<12]),
+      Array(serverNonceHash[12..<20]) + sha1(newNonce + newNonce) + Array(newNonce[0..<4])
+    )
+  }
+
+  public static func encryptDHInner(
+    serialized: [UInt8],
+    padding: [UInt8],
+    newNonce: [UInt8],
+    serverNonce: [UInt8]
+  ) throws -> [UInt8] {
+    guard padding.count <= 15, (20 + serialized.count + padding.count).isMultiple(of: 16)
+    else { throw InlineProtocolError.invalidInput }
+    let temporary = try deriveTemporaryAES(newNonce: newNonce, serverNonce: serverNonce)
+    return try aesIGEEncrypt(sha1(serialized) + serialized + padding, key: temporary.key, iv: temporary.iv)
+  }
+
+  public static func decryptDHInner(
+    encrypted: [UInt8],
+    serializedLength: Int,
+    newNonce: [UInt8],
+    serverNonce: [UInt8]
+  ) throws -> [UInt8] {
+    guard !encrypted.isEmpty, encrypted.count.isMultiple(of: 16), serializedLength >= 4
+    else { throw InlineProtocolError.invalidInput }
+    let temporary = try deriveTemporaryAES(newNonce: newNonce, serverNonce: serverNonce)
+    let plaintext = try aesIGEDecrypt(encrypted, key: temporary.key, iv: temporary.iv)
+    let paddingLength = plaintext.count - 20 - serializedLength
+    guard (0...15).contains(paddingLength) else { throw InlineProtocolError.invalidInput }
+    let serialized = Array(plaintext[20..<(20 + serializedLength)])
+    guard constantTimeEqual(Array(plaintext[0..<20]), sha1(serialized)) else { throw InlineProtocolError.invalidInput }
+    return serialized
+  }
+
+  public static func validateDHParameters(primeBytes: [UInt8], generator: Int32) throws {
+    guard primeBytes.count == 256,
+          primeBytes[0] & 0x80 != 0,
+          (2...7).contains(generator)
+    else { throw InlineProtocolError.invalidInput }
+
+    let prime = BigUInt(Data(primeBytes))
+    let remainder: (Int) -> Int = { Int(prime % BigUInt($0)) }
+    let generatorMatchesPrime: Bool = switch generator {
+    case 2: remainder(8) == 7
+    case 3: remainder(3) == 2
+    case 4: true
+    case 5: remainder(5) == 1 || remainder(5) == 4
+    case 6: remainder(24) == 19 || remainder(24) == 23
+    case 7: [3, 5, 6].contains(remainder(7))
+    default: false
+    }
+    guard generatorMatchesPrime else { throw InlineProtocolError.invalidInput }
+
+    if primeBytes != telegramDHPrime {
+      let cacheKey = Data(primeBytes)
+      let isSafePrime = dhPrimeCache.value(for: cacheKey) ?? {
+        let result = prime.isPrime(rounds: 64) && ((prime - 1) / 2).isPrime(rounds: 64)
+        dhPrimeCache.insert(result, for: cacheKey)
+        return result
+      }()
+      guard isSafePrime else { throw InlineProtocolError.invalidInput }
+    }
+  }
+
+  public static func validateBuiltinDHParameters(prime: [UInt8], generator: Int32) throws {
+    guard prime == telegramDHPrime else { throw InlineProtocolError.invalidInput }
+    try validateDHParameters(primeBytes: prime, generator: generator)
+  }
+
+  public static func validateDHPublicValue(_ value: [UInt8], prime: [UInt8]) throws {
+    guard !value.isEmpty, value.count <= 256, prime.count == 256 else { throw InlineProtocolError.invalidInput }
+    let padded = [UInt8](repeating: 0, count: 256 - value.count) + value
+    var margin = [UInt8](repeating: 0, count: 256)
+    margin[7] = 1
+    let upper = subtractBigEndian(prime, margin)
+    guard !lexicographicallyLess(padded, margin), !lexicographicallyLess(upper, padded)
+    else { throw InlineProtocolError.invalidInput }
+  }
+
+  static func modularExponentiation(base: [UInt8], exponent: [UInt8], modulus: [UInt8]) throws -> [UInt8] {
+    guard modulus.count == 256,
+          !base.isEmpty,
+          base.count <= modulus.count,
+          !exponent.isEmpty
+    else { throw InlineProtocolError.invalidInput }
+    let paddedBase = [UInt8](repeating: 0, count: modulus.count - base.count) + base
+    guard lexicographicallyLess(paddedBase, modulus) else { throw InlineProtocolError.invalidInput }
+
+    // Raw RSA is the Security framework's native big-endian modular exponentiation primitive.
+    // This path, like the previous BigUInt path, does not claim constant-time handling of the exponent.
+    let publicKey = try rsaPublicKey(modulus: modulus, exponent: exponent)
+    var error: Unmanaged<CFError>?
+    guard let result = SecKeyCreateEncryptedData(
+      publicKey,
+      .rsaEncryptionRaw,
+      Data(paddedBase) as CFData,
+      &error
+    ) as Data? else {
+      if let error { throw error.takeRetainedValue() }
+      throw InlineProtocolError.invalidInput
+    }
+    let bytes = [UInt8](result)
+    guard bytes.count == modulus.count else { throw InlineProtocolError.invalidInput }
+    return bytes
+  }
+
+  public static func encodeInlineInvoke(
+    payload: [UInt8],
+    layer: Int32 = realtimeLayer
+  ) throws -> [UInt8] {
+    try littleEndian(invokeConstructor) + littleEndian(layer) + encodeTLBytes(payload)
+  }
+
+  public static func encodeInlineResult(payload: [UInt8]) throws -> [UInt8] {
+    try littleEndian(resultConstructor) + encodeTLBytes(payload)
+  }
+
+  public static func encodeInlineUpdate(payload: [UInt8]) throws -> [UInt8] {
+    try littleEndian(updateConstructor) + encodeTLBytes(payload)
+  }
+
+  public static func decodeInlineApplicationObject(_ bytes: [UInt8]) throws -> InlineApplicationObject {
+    guard bytes.count >= 8 else { throw InlineProtocolError.invalidInput }
+    let constructor = try readUInt32(bytes, at: 0)
+    if constructor == invokeConstructor {
+      let layer = try readInt32(bytes, at: 4)
+      let decoded = try decodeTLBytes(Array(bytes[8...]))
+      guard decoded.consumed == bytes.count - 8 else { throw InlineProtocolError.invalidInput }
+      return .invoke(layer: layer, payload: decoded.value)
+    }
+    let decoded = try decodeTLBytes(Array(bytes[4...]))
+    guard decoded.consumed == bytes.count - 4 else { throw InlineProtocolError.invalidInput }
+    switch constructor {
+    case resultConstructor: return .result(payload: decoded.value)
+    case updateConstructor: return .update(payload: decoded.value)
+    default: throw InlineProtocolError.invalidInput
+    }
+  }
+
+  /// Decodes the code of an MTProto service-level `rpc_error` result.
+  /// A non-rpc-error result returns nil; a malformed rpc-error is rejected.
+  public static func decodeTLRPCError(_ bytes: [UInt8]) throws -> InlineTLRPCError? {
+    guard bytes.count >= 4 else { return nil }
+    guard try readUInt32(bytes, at: 0) == rpcErrorConstructor else { return nil }
+    guard bytes.count >= 8 else { throw InlineProtocolError.invalidInput }
+    let message = try decodeTLBytes(Array(bytes.dropFirst(8)))
+    guard message.consumed == bytes.count - 8 else { throw InlineProtocolError.invalidInput }
+    return InlineTLRPCError(code: try readInt32(bytes, at: 4))
+  }
+
+  public static func encodeInvokeAfterMessage(messageID: Int64, query: [UInt8]) throws -> [UInt8] {
+    try validateTLQuery(query)
+    return littleEndian(invokeAfterMessageConstructor) + littleEndian(messageID) + query
+  }
+
+  public static func encodeInvokeAfterMessages(messageIDs: [Int64], query: [UInt8]) throws -> [UInt8] {
+    guard messageIDs.count <= maximumInvokeAfterDependencies else { throw InlineProtocolError.invalidInput }
+    try validateTLQuery(query)
+    return littleEndian(invokeAfterMessagesConstructor)
+      + littleEndian(vectorConstructor)
+      + littleEndian(Int32(messageIDs.count))
+      + messageIDs.flatMap(littleEndian)
+      + query
+  }
+
+  public static func decodeInvokeAfter(_ bytes: [UInt8]) throws -> InlineInvokeAfter {
+    guard bytes.count >= 12,
+          bytes.count <= maximumPacketBytes,
+          bytes.count.isMultiple(of: 4)
+    else { throw InlineProtocolError.invalidInput }
+    let constructor = try readUInt32(bytes, at: 0)
+    let messageIDs: [Int64]
+    let queryOffset: Int
+    switch constructor {
+    case invokeAfterMessageConstructor:
+      messageIDs = [try readInt64(bytes, at: 4)]
+      queryOffset = 12
+    case invokeAfterMessagesConstructor:
+      guard try readUInt32(bytes, at: 4) == vectorConstructor else {
+        throw InlineProtocolError.invalidInput
+      }
+      let count = Int(try readInt32(bytes, at: 8))
+      guard (0...maximumInvokeAfterDependencies).contains(count),
+            count <= (bytes.count - 12) / 8
+      else { throw InlineProtocolError.invalidInput }
+      messageIDs = try (0..<count).map { try readInt64(bytes, at: 12 + $0 * 8) }
+      queryOffset = 12 + count * 8
+    default:
+      throw InlineProtocolError.invalidInput
+    }
+    let query = Array(bytes[queryOffset...])
+    try validateTLQuery(query)
+    return InlineInvokeAfter(messageIDs: messageIDs, query: query)
+  }
+
+  private static func validateTLQuery(_ query: [UInt8]) throws {
+    guard query.count >= 4,
+          query.count <= maximumPacketBytes,
+          query.count.isMultiple(of: 4)
+    else { throw InlineProtocolError.invalidInput }
+  }
+
+  public static func authKeyID(_ authKey: [UInt8]) throws -> [UInt8] {
+    guard authKey.count == 256 else { throw InlineProtocolError.invalidInput }
+    return sha1(authKey)[12..<20].map(\.self)
+  }
+
+  public static func computeV2MessageKey(
+    authKey: [UInt8],
+    plaintext: [UInt8],
+    direction: InlineProtocolDirection
+  ) throws -> [UInt8] {
+    guard authKey.count == 256 else { throw InlineProtocolError.invalidInput }
+    let x = direction.kdfOffset
+    return sha256(Array(authKey[(88 + x)..<(120 + x)]) + plaintext)[8..<24].map(\.self)
+  }
+
+  public static func computeV2QuickAckID(
+    authKey: [UInt8],
+    plaintext: [UInt8],
+    direction: InlineProtocolDirection
+  ) throws -> UInt32 {
+    guard authKey.count == 256 else { throw InlineProtocolError.invalidInput }
+    let x = direction.kdfOffset
+    let digest = sha256(Array(authKey[(88 + x)..<(120 + x)]) + plaintext)
+    return (UInt32(digest[0])
+      | UInt32(digest[1]) << 8
+      | UInt32(digest[2]) << 16
+      | UInt32(digest[3]) << 24) & 0x7fff_ffff
+  }
+
+  public static func deriveV2AES(
+    authKey: [UInt8],
+    messageKey: [UInt8],
+    direction: InlineProtocolDirection
+  ) throws -> (key: [UInt8], iv: [UInt8]) {
+    guard authKey.count == 256, messageKey.count == 16 else { throw InlineProtocolError.invalidInput }
+    let x = direction.kdfOffset
+    let a = sha256(messageKey + authKey[x..<(36 + x)])
+    let b = sha256(Array(authKey[(40 + x)..<(76 + x)]) + messageKey)
+    return (
+      Array(a[0..<8]) + Array(b[8..<24]) + Array(a[24..<32]),
+      Array(b[0..<8]) + Array(a[8..<24]) + Array(b[24..<32])
+    )
+  }
+
+  public static func aesIGEEncrypt(
+    _ plaintext: [UInt8],
+    key: [UInt8],
+    iv: [UInt8]
+  ) throws -> [UInt8] {
+    try aesIGE(plaintext, key: key, iv: iv, operation: CCOperation(kCCEncrypt))
+  }
+
+  public static func aesIGEDecrypt(
+    _ ciphertext: [UInt8],
+    key: [UInt8],
+    iv: [UInt8]
+  ) throws -> [UInt8] {
+    try aesIGE(ciphertext, key: key, iv: iv, operation: CCOperation(kCCDecrypt))
+  }
+
+  public static func encryptRecord(
+    authKey: [UInt8],
+    direction: InlineProtocolDirection,
+    fields: InlineEncryptedRecordFields,
+    padding: [UInt8]
+  ) throws -> [UInt8] {
+    guard fields.body.count <= maximumPacketBytes,
+          fields.body.count.isMultiple(of: 4),
+          (12...1024).contains(padding.count)
+    else { throw InlineProtocolError.invalidInput }
+    let plaintext = littleEndian(fields.serverSalt)
+      + littleEndian(fields.sessionID)
+      + littleEndian(fields.messageID)
+      + littleEndian(fields.sequenceNumber)
+      + littleEndian(Int32(fields.body.count))
+      + fields.body
+      + padding
+    guard plaintext.count.isMultiple(of: 16),
+          24 + plaintext.count <= maximumPacketBytes
+    else { throw InlineProtocolError.invalidInput }
+    let messageKey = try computeV2MessageKey(authKey: authKey, plaintext: plaintext, direction: direction)
+    let aes = try deriveV2AES(authKey: authKey, messageKey: messageKey, direction: direction)
+    return try authKeyID(authKey) + messageKey + aesIGEEncrypt(plaintext, key: aes.key, iv: aes.iv)
+  }
+
+  public static func decryptRecord(
+    _ record: [UInt8],
+    authKey: [UInt8],
+    direction: InlineProtocolDirection,
+    expectedSessionID: Int64,
+    validServerSalts: Set<Int64>,
+    nowSeconds: Int64
+  ) throws -> InlineEncryptedRecordFields {
+    do {
+      guard record.count >= 72,
+            record.count <= maximumPacketBytes,
+            (record.count - 24).isMultiple(of: 16)
+      else { throw InlineProtocolError.invalidEncryptedRecord }
+      let messageKey = Array(record[8..<24])
+      let aes = try deriveV2AES(authKey: authKey, messageKey: messageKey, direction: direction)
+      let plaintext = try aesIGEDecrypt(Array(record[24...]), key: aes.key, iv: aes.iv)
+      let expectedMessageKey = try computeV2MessageKey(authKey: authKey, plaintext: plaintext, direction: direction)
+      let validKeyID = constantTimeEqual(Array(record[0..<8]), try authKeyID(authKey))
+      let validMessageKey = constantTimeEqual(messageKey, expectedMessageKey)
+      guard validKeyID, validMessageKey else { throw InlineProtocolError.invalidEncryptedRecord }
+
+      let bodyLength = Int(try readInt32(plaintext, at: 28))
+      guard bodyLength >= 0,
+            bodyLength <= maximumPacketBytes,
+            bodyLength.isMultiple(of: 4),
+            plaintext.count >= 32 + bodyLength
+      else { throw InlineProtocolError.invalidEncryptedRecord }
+      let paddingLength = plaintext.count - 32 - bodyLength
+      guard (12...1024).contains(paddingLength) else { throw InlineProtocolError.invalidEncryptedRecord }
+      let serverSalt = try readInt64(plaintext, at: 0)
+      let sessionID = try readInt64(plaintext, at: 8)
+      let messageID = try readInt64(plaintext, at: 16)
+      let sequenceNumber = try readInt32(plaintext, at: 24)
+      let validDirection: Bool
+      switch direction {
+      case .clientToServer:
+        validDirection = messageID & 3 == 0 && UInt32(truncatingIfNeeded: messageID) != 0
+      case .serverToClient:
+        validDirection = messageID & 1 == 1
+      }
+      let messageSeconds = messageID >> 32
+      guard sessionID == expectedSessionID,
+            validServerSalts.contains(serverSalt),
+            messageID != 0,
+            validDirection,
+            (nowSeconds - 300...nowSeconds + 30).contains(messageSeconds),
+            sequenceNumber >= 0
+      else { throw InlineProtocolError.invalidEncryptedRecord }
+      return InlineEncryptedRecordFields(
+        serverSalt: serverSalt,
+        sessionID: sessionID,
+        messageID: messageID,
+        sequenceNumber: sequenceNumber,
+        body: Array(plaintext[32..<(32 + bodyLength)])
+      )
+    } catch {
+      throw InlineProtocolError.invalidEncryptedRecord
+    }
+  }
+
+  public static func encodeAbridgedPacket(
+    _ payload: [UInt8],
+    requestQuickAck: Bool = false
+  ) throws -> [UInt8] {
+    guard !payload.isEmpty,
+          payload.count <= maximumPacketBytes,
+          payload.count.isMultiple(of: 4)
+    else { throw InlineProtocolError.invalidInput }
+    let words = payload.count / 4
+    let quickAckBit: UInt8 = requestQuickAck ? 0x80 : 0
+    if words < 127 { return [UInt8(words) | quickAckBit] + payload }
+    guard words <= 0x00ff_ffff else { throw InlineProtocolError.invalidInput }
+    return [0x7f | quickAckBit, UInt8(words & 0xff), UInt8((words >> 8) & 0xff), UInt8((words >> 16) & 0xff)] + payload
+  }
+
+  public static func encodeAbridgedQuickAck(_ id: UInt32) throws -> [UInt8] {
+    guard id <= 0x7fff_ffff else { throw InlineProtocolError.invalidInput }
+    let value = id | 0x8000_0000
+    return [
+      UInt8((value >> 24) & 0xff),
+      UInt8((value >> 16) & 0xff),
+      UInt8((value >> 8) & 0xff),
+      UInt8(value & 0xff),
+    ]
+  }
+
+  public static func decodeAbridgedFrame(_ frame: [UInt8]) throws -> InlineAbridgedFrame {
+    if frame.count == 4, frame[0] & 0x80 != 0 {
+      let value = UInt32(frame[0]) << 24
+        | UInt32(frame[1]) << 16
+        | UInt32(frame[2]) << 8
+        | UInt32(frame[3])
+      return .quickAck(id: value & 0x7fff_ffff)
+    }
+    guard frame.count >= 2 else { throw InlineProtocolError.invalidInput }
+    let marker = frame[0]
+    let quickAckRequested = marker & 0x80 != 0
+    let lengthMarker = marker & 0x7f
+    let headerLength: Int
+    let words: Int
+    if lengthMarker == 0x7f {
+      guard frame.count >= 4 else { throw InlineProtocolError.invalidInput }
+      headerLength = 4
+      words = Int(frame[1]) | Int(frame[2]) << 8 | Int(frame[3]) << 16
+    } else {
+      headerLength = 1
+      words = Int(lengthMarker)
+    }
+    let (length, overflow) = words.multipliedReportingOverflow(by: 4)
+    guard !overflow,
+          words > 0,
+          length <= maximumPacketBytes,
+          frame.count == headerLength + length
+    else { throw InlineProtocolError.invalidInput }
+    return .packet(payload: Array(frame[headerLength...]), quickAckRequested: quickAckRequested)
+  }
+
+  /// One AES-256 key schedule per record: an ECB cryptor fed one block at a time, chaining in
+  /// place through preallocated scratch. Per-block `CCCrypt` re-expanded the key each block.
+  private static func aesIGE(
+    _ input: [UInt8],
+    key: [UInt8],
+    iv: [UInt8],
+    operation: CCOperation
+  ) throws -> [UInt8] {
+    guard key.count == kCCKeySizeAES256, iv.count == 32, input.count.isMultiple(of: kCCBlockSizeAES128)
+    else { throw InlineProtocolError.invalidInput }
+    var cryptorReference: CCCryptorRef?
+    let created = key.withUnsafeBytes { keyBytes in
+      CCCryptorCreateWithMode(
+        operation, CCMode(kCCModeECB), CCAlgorithm(kCCAlgorithmAES), CCPadding(ccNoPadding),
+        nil, keyBytes.baseAddress, key.count, nil, 0, 0, CCModeOptions(0), &cryptorReference
+      )
+    }
+    guard created == kCCSuccess, let cryptor = cryptorReference else { throw InlineProtocolError.invalidInput }
+    defer { CCCryptorRelease(cryptor) }
+
+    let encrypting = operation == CCOperation(kCCEncrypt)
+    var output = [UInt8](repeating: 0, count: input.count)
+    var scratchIn = [UInt8](repeating: 0, count: 16)
+    var scratchOut = [UInt8](repeating: 0, count: 16)
+    var failed = false
+    iv.withUnsafeBufferPointer { ivBuffer in
+      input.withUnsafeBufferPointer { inputBuffer in
+        output.withUnsafeMutableBufferPointer { outputBuffer in
+          scratchIn.withUnsafeMutableBufferPointer { blockIn in
+            scratchOut.withUnsafeMutableBufferPointer { blockOut in
+              guard let ivBase = ivBuffer.baseAddress, let inputBase = inputBuffer.baseAddress,
+                    let outputBase = outputBuffer.baseAddress, let inBase = blockIn.baseAddress,
+                    let outBase = blockOut.baseAddress
+              else {
+                failed = !input.isEmpty
+                return
+              }
+              var previousCipher = ivBase
+              var previousPlain = ivBase + 16
+              var offset = 0
+              while offset < input.count {
+                let block = inputBase + offset
+                let result = outputBase + offset
+                let mask = encrypting ? previousCipher : previousPlain
+                let post = encrypting ? previousPlain : previousCipher
+                for index in 0 ..< 16 { inBase[index] = block[index] ^ mask[index] }
+                var moved = 0
+                let status = CCCryptorUpdate(cryptor, inBase, 16, outBase, 16, &moved)
+                guard status == kCCSuccess, moved == 16 else {
+                  failed = true
+                  return
+                }
+                for index in 0 ..< 16 { result[index] = outBase[index] ^ post[index] }
+                if encrypting {
+                  previousCipher = UnsafePointer(result)
+                  previousPlain = block
+                } else {
+                  previousCipher = block
+                  previousPlain = UnsafePointer(result)
+                }
+                offset += 16
+              }
+            }
+          }
+        }
+      }
+    }
+    guard !failed else { throw InlineProtocolError.invalidInput }
+    return output
+  }
+
+  /// Decodes `gzip_packed#3072cfa1 packed_data:bytes` into the object it carries.
+  public static func decodeGzipPacked(
+    _ body: [UInt8],
+    maximumOutputBytes: Int = maximumGzipOutputBytes
+  ) throws -> [UInt8] {
+    guard body.count >= 8, try readUInt32(body, at: 0) == gzipPackedConstructor else {
+      throw InlineProtocolError.invalidInput
+    }
+    let packed = try decodeTLBytes(Array(body[4...]))
+    guard packed.consumed == body.count - 4 else { throw InlineProtocolError.invalidInput }
+    return try gunzip(packed.value, maximumOutputBytes: maximumOutputBytes)
+  }
+
+  /// Returns `body` unchanged unless it is `gzip_packed`.
+  public static func unpackGzip(_ body: [UInt8]) throws -> [UInt8] {
+    guard body.count >= 4, try readUInt32(body, at: 0) == gzipPackedConstructor else { return body }
+    return try decodeGzipPacked(body)
+  }
+
+  /// A single-member RFC 1952 stream. The declared size bounds the output buffer and must match
+  /// it exactly, and the trailer CRC-32 must match the inflated bytes.
+  static func gunzip(_ data: [UInt8], maximumOutputBytes: Int) throws -> [UInt8] {
+    guard data.count >= 18, data[0] == 0x1f, data[1] == 0x8b, data[2] == 8 else {
+      throw InlineProtocolError.invalidInput
+    }
+    let flags = data[3]
+    guard flags & 0xe0 == 0 else { throw InlineProtocolError.invalidInput }
+    var offset = 10
+    if flags & 0x04 != 0 {
+      guard offset + 2 <= data.count else { throw InlineProtocolError.invalidInput }
+      offset += 2 + (Int(data[offset]) | Int(data[offset + 1]) << 8)
+    }
+    for flag in [UInt8(0x08), UInt8(0x10)] where flags & flag != 0 {
+      while offset < data.count, data[offset] != 0 { offset += 1 }
+      offset += 1
+    }
+    if flags & 0x02 != 0 { offset += 2 }
+    guard offset <= data.count - 8 else { throw InlineProtocolError.invalidInput }
+    let trailer = data.count - 8
+    let expectedCRC = UInt32(data[trailer]) | UInt32(data[trailer + 1]) << 8 |
+      UInt32(data[trailer + 2]) << 16 | UInt32(data[trailer + 3]) << 24
+    let expectedSize = Int(UInt32(data[trailer + 4]) | UInt32(data[trailer + 5]) << 8 |
+      UInt32(data[trailer + 6]) << 16 | UInt32(data[trailer + 7]) << 24)
+    guard expectedSize > 0, expectedSize <= maximumOutputBytes else { throw InlineProtocolError.invalidInput }
+    // One spare byte distinguishes "exactly the declared size" from "truncated at capacity".
+    var output = [UInt8](repeating: 0, count: expectedSize + 1)
+    let deflate = Array(data[offset ..< trailer])
+    let produced = output.withUnsafeMutableBufferPointer { destination in
+      deflate.withUnsafeBufferPointer { source in
+        compression_decode_buffer(
+          destination.baseAddress!, destination.count,
+          source.baseAddress!, source.count,
+          nil, COMPRESSION_ZLIB
+        )
+      }
+    }
+    guard produced == expectedSize else { throw InlineProtocolError.invalidInput }
+    output.removeLast()
+    guard crc32(output) == expectedCRC else { throw InlineProtocolError.invalidInput }
+    return output
+  }
+
+  private static let crcTable: [UInt32] = (0 ..< 256).map { value in
+    var crc = UInt32(value)
+    for _ in 0 ..< 8 { crc = crc & 1 == 1 ? 0xedb8_8320 ^ (crc >> 1) : crc >> 1 }
+    return crc
+  }
+
+  static func crc32(_ bytes: [UInt8]) -> UInt32 {
+    var crc: UInt32 = 0xffff_ffff
+    for byte in bytes { crc = crcTable[Int((crc ^ UInt32(byte)) & 0xff)] ^ (crc >> 8) }
+    return crc ^ 0xffff_ffff
+  }
+
+  /// `msg_container#73f1f8dc`: children in order, each with its own message ID and seqno.
+  public static func encodeMessageContainer(
+    _ messages: [(messageID: Int64, sequenceNumber: Int32, body: [UInt8])]
+  ) throws -> [UInt8] {
+    guard !messages.isEmpty, messages.count <= 1_024 else { throw InlineProtocolError.invalidInput }
+    var encoded = littleEndian(messageContainerConstructor) + littleEndian(Int32(messages.count))
+    for message in messages {
+      guard message.body.count.isMultiple(of: 4), message.body.count >= 4,
+            try readUInt32(message.body, at: 0) != messageContainerConstructor
+      else { throw InlineProtocolError.invalidInput }
+      encoded += littleEndian(message.messageID) + littleEndian(message.sequenceNumber) +
+        littleEndian(Int32(message.body.count)) + message.body
+    }
+    return encoded
+  }
+
+  private static func sha1(_ input: [UInt8]) -> [UInt8] {
+    var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+    input.withUnsafeBytes { bytes in
+      _ = CC_SHA1(bytes.baseAddress, CC_LONG(input.count), &digest)
+    }
+    return digest
+  }
+
+  private static func sha256<S: Sequence>(_ input: S) -> [UInt8] where S.Element == UInt8 {
+    let bytes = Array(input)
+    var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+    bytes.withUnsafeBytes { raw in
+      _ = CC_SHA256(raw.baseAddress, CC_LONG(bytes.count), &digest)
+    }
+    return digest
+  }
+
+  private static func rsaPublicKey(modulus: [UInt8], exponent: [UInt8]) throws -> SecKey {
+    let body = asn1Integer(modulus) + asn1Integer(exponent)
+    let der = [UInt8(0x30)] + asn1Length(body.count) + body
+    let attributes: [CFString: Any] = [
+      kSecAttrKeyType: kSecAttrKeyTypeRSA,
+      kSecAttrKeyClass: kSecAttrKeyClassPublic,
+      kSecAttrKeySizeInBits: 2048,
+    ]
+    var error: Unmanaged<CFError>?
+    guard let key = SecKeyCreateWithData(Data(der) as CFData, attributes as CFDictionary, &error) else {
+      if let error { throw error.takeRetainedValue() }
+      throw InlineProtocolError.invalidInput
+    }
+    return key
+  }
+
+  private static func asn1Integer(_ bytes: [UInt8]) -> [UInt8] {
+    let trimmed = Array(bytes.drop(while: { $0 == 0 }))
+    let unsigned = (trimmed.first ?? 0) & 0x80 == 0 ? trimmed : [0] + trimmed
+    return [0x02] + asn1Length(unsigned.count) + unsigned
+  }
+
+  private static func hexBytes(_ value: String) -> [UInt8] {
+    stride(from: 0, to: value.count, by: 2).map { offset in
+      let start = value.index(value.startIndex, offsetBy: offset)
+      let end = value.index(start, offsetBy: 2)
+      return UInt8(value[start..<end], radix: 16)!
+    }
+  }
+
+  private static func asn1Length(_ length: Int) -> [UInt8] {
+    if length < 128 { return [UInt8(length)] }
+    var value = length
+    var bytes: [UInt8] = []
+    while value > 0 { bytes.insert(UInt8(value & 0xff), at: 0); value >>= 8 }
+    return [0x80 | UInt8(bytes.count)] + bytes
+  }
+
+  private static func lexicographicallyLess(_ left: [UInt8], _ right: [UInt8]) -> Bool {
+    for pair in zip(left, right) where pair.0 != pair.1 { return pair.0 < pair.1 }
+    return left.count < right.count
+  }
+
+  private static func subtractBigEndian(_ left: [UInt8], _ right: [UInt8]) -> [UInt8] {
+    var output = left
+    var borrow = 0
+    for index in stride(from: left.count - 1, through: 0, by: -1) {
+      let difference = Int(left[index]) - Int(right[index]) - borrow
+      output[index] = UInt8(truncatingIfNeeded: difference)
+      borrow = difference < 0 ? 1 : 0
+    }
+    return output
+  }
+
+  static func constantTimeEqual(_ left: [UInt8], _ right: [UInt8]) -> Bool {
+    var difference = left.count ^ right.count
+    for index in 0..<max(left.count, right.count) {
+      difference |= Int((index < left.count ? left[index] : 0) ^ (index < right.count ? right[index] : 0))
+    }
+    return difference == 0
+  }
+
+  private static func xor(_ left: [UInt8], _ right: [UInt8]) -> [UInt8] {
+    zip(left, right).map(^)
+  }
+
+  private static func littleEndian<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
+    withUnsafeBytes(of: value.littleEndian, Array.init)
+  }
+
+  private static func encodeTLBytes(_ value: [UInt8]) throws -> [UInt8] {
+    guard value.count <= maximumPacketBytes, value.count <= 0x00ff_ffff else {
+      throw InlineProtocolError.invalidInput
+    }
+    var output: [UInt8]
+    if value.count < 254 {
+      output = [UInt8(value.count)] + value
+    } else {
+      output = [254, UInt8(value.count & 0xff), UInt8((value.count >> 8) & 0xff), UInt8((value.count >> 16) & 0xff)] + value
+    }
+    output += repeatElement(0, count: (4 - output.count % 4) % 4)
+    return output
+  }
+
+  private static func decodeTLBytes(_ bytes: [UInt8]) throws -> (value: [UInt8], consumed: Int) {
+    guard let first = bytes.first else { throw InlineProtocolError.invalidInput }
+    let headerLength: Int
+    let length: Int
+    if first < 254 {
+      headerLength = 1
+      length = Int(first)
+    } else if first == 254, bytes.count >= 4 {
+      headerLength = 4
+      length = Int(bytes[1]) | Int(bytes[2]) << 8 | Int(bytes[3]) << 16
+    } else {
+      throw InlineProtocolError.invalidInput
+    }
+    let encodedLength = headerLength + length
+    let totalLength = encodedLength + (4 - encodedLength % 4) % 4
+    guard length <= maximumPacketBytes,
+          bytes.count >= totalLength,
+          bytes[encodedLength..<totalLength].allSatisfy({ $0 == 0 })
+    else { throw InlineProtocolError.invalidInput }
+    return (Array(bytes[headerLength..<(headerLength + length)]), totalLength)
+  }
+
+  private static func readInt32(_ bytes: [UInt8], at offset: Int) throws -> Int32 {
+    guard offset >= 0, offset + 4 <= bytes.count else { throw InlineProtocolError.invalidInput }
+    let raw = bytes[offset..<(offset + 4)].enumerated().reduce(UInt32(0)) { result, pair in
+      result | UInt32(pair.element) << UInt32(pair.offset * 8)
+    }
+    return Int32(bitPattern: raw)
+  }
+
+  private static func readUInt32(_ bytes: [UInt8], at offset: Int) throws -> UInt32 {
+    guard offset >= 0, offset + 4 <= bytes.count else { throw InlineProtocolError.invalidInput }
+    return bytes[offset..<(offset + 4)].enumerated().reduce(UInt32(0)) { result, pair in
+      result | UInt32(pair.element) << UInt32(pair.offset * 8)
+    }
+  }
+
+  private static func readInt64(_ bytes: [UInt8], at offset: Int) throws -> Int64 {
+    guard offset >= 0, offset + 8 <= bytes.count else { throw InlineProtocolError.invalidInput }
+    let raw = bytes[offset..<(offset + 8)].enumerated().reduce(UInt64(0)) { result, pair in
+      result | UInt64(pair.element) << UInt64(pair.offset * 8)
+    }
+    return Int64(bitPattern: raw)
+  }
+}
+
+private final class DHPrimeValidationCache: @unchecked Sendable {
+  private let capacity: Int
+  private let lock = NSLock()
+  private var order: [Data] = []
+  private var values: [Data: Bool] = [:]
+
+  init(capacity: Int) {
+    self.capacity = capacity
+  }
+
+  func value(for key: Data) -> Bool? {
+    lock.withLock { values[key] }
+  }
+
+  func insert(_ value: Bool, for key: Data) {
+    lock.withLock {
+      guard values[key] == nil else { return }
+      if order.count == capacity, let oldest = order.first {
+        order.removeFirst()
+        values.removeValue(forKey: oldest)
+      }
+      order.append(key)
+      values[key] = value
+    }
+  }
+}
+
+public struct InlineReceiveMessageWindow: Sendable {
+  private let capacity: Int
+  private var accepted: Set<Int64> = []
+
+  public init(capacity: Int = 1000) {
+    precondition(capacity > 0)
+    self.capacity = capacity
+  }
+
+  public mutating func claim(_ messageID: Int64) -> Bool {
+    guard !accepted.contains(messageID) else { return false }
+    if accepted.count >= capacity, let minimum = accepted.min(), messageID < minimum { return false }
+    accepted.insert(messageID)
+    while accepted.count > capacity, let minimum = accepted.min() { accepted.remove(minimum) }
+    return true
+  }
+}

@@ -1,0 +1,301 @@
+import type { InputPeer, Update } from "@inline-chat/protocol/core"
+import { ChatModel } from "@in/server/db/models/chats"
+import { MessageModel } from "@in/server/db/models/messages"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import type { UpdateGroup } from "../modules/updates"
+import { getUpdateGroupFromInputPeer } from "../modules/updates"
+import { RealtimeUpdates } from "../realtime/message"
+import type { UpdateSeqAndDate } from "@in/server/db/models/updates"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import { Notifications } from "@in/server/modules/notifications/notifications"
+import {
+  emitMessageSubthreadUpdateIfNeeded,
+  getSubthreadParentMessageRef,
+  isLinkedSubthread,
+  isReplyThread,
+  queueSubthreadParentUpdate,
+} from "@in/server/modules/subthreads"
+import { pushChatMetadataUpdates } from "@in/server/modules/chatMetadataUpdatePush"
+import { deleteBacklinkMessages, getBacklinkMessagesForSourceMessages } from "@in/server/modules/threadGraph"
+import { db } from "@in/server/db"
+import type { Transaction } from "@in/server/db/types"
+import { registerPostCommitHook } from "@in/server/db/commitHooks"
+import { chats, members, messages, translations, type DbChat } from "@in/server/db/schema"
+import { and, eq, inArray } from "drizzle-orm"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { BotUpdateProjector } from "@in/server/modules/botUpdates/projector"
+import { hasImportedAgentMessages } from "@in/server/modules/agentSessions/service"
+import { decryptSystemMessagePayload } from "@in/server/modules/systemMessages/payload"
+
+type Input = {
+  messageIds: bigint[]
+  peer: InputPeer
+}
+
+type Output = {
+  updates: Update[]
+}
+
+export const deleteMessage = async (input: Input, context: FunctionContext): Promise<Output> => {
+  return deleteMessageWithOptions(input, context)
+}
+
+/** The caller owns the parent chat before the child, and publishes only after commit. */
+export async function deleteSubthreadParentPlacement(
+  childChatId: number,
+  context: FunctionContext,
+  tx: Transaction,
+): Promise<void> {
+  const parentMessage = await getSubthreadParentMessageRef(childChatId, tx)
+  if (!parentMessage) return
+
+  const inputPeer: InputPeer = {
+    type: { oneofKind: "chat", chat: { chatId: BigInt(parentMessage.parentChatId) } },
+  }
+  const messageIds = [BigInt(parentMessage.parentMessageId)]
+  const [parentChat] = await tx.select().from(chats).where(eq(chats.id, parentMessage.parentChatId)).limit(1)
+  if (!parentChat) throw RealtimeRpcError.ChatIdInvalid()
+  if (await hasImportedAgentMessages(parentChat.id, [parentMessage.parentMessageId], tx)) {
+    throw RealtimeRpcError.AgentSessionMessageImmutable()
+  }
+  await tx.delete(translations).where(and(eq(translations.chatId, parentMessage.parentChatId), eq(translations.messageId, parentMessage.parentMessageId)))
+  const { update, metadataChatUpdates } = await MessageModel.deleteMessages(messageIds, parentMessage.parentChatId, tx)
+  registerPostCommitHook(tx, Symbol("deleted-subthread-placement"), {
+    run: async () => {
+      await pushUpdates({ inputPeer, messageIds, currentUserId: context.currentUserId, update })
+      await pushChatMetadataUpdates({ currentUserId: context.currentUserId, chatUpdates: metadataChatUpdates })
+      if (isReplyThread(parentChat)) {
+        await emitMessageSubthreadUpdateIfNeeded({ chatId: parentChat.id, currentUserId: context.currentUserId })
+      } else if (isLinkedSubthread(parentChat)) {
+        queueSubthreadParentUpdate({ chatId: parentChat.id, currentUserId: context.currentUserId, reason: "message deletion" })
+      }
+    },
+  })
+}
+
+async function deleteMessageWithOptions(
+  input: Input,
+  context: FunctionContext,
+  options: { trustedPlacementCleanup?: boolean } = {},
+): Promise<Output> {
+  const chat = await ChatModel.getChatFromInputPeerUnchecked(input.peer, context)
+  if (!options.trustedPlacementCleanup) {
+    await AccessGuards.ensureChatAccess(chat, context.currentUserId)
+  }
+
+  const numericMessageIds = input.messageIds
+    .map(Number)
+    .filter((id) => Number.isSafeInteger(id) && id > 0)
+  if (await hasImportedAgentMessages(chat.id, numericMessageIds)) {
+    throw RealtimeRpcError.AgentSessionMessageImmutable()
+  }
+
+  if (!options.trustedPlacementCleanup) {
+    await ensureDeleteAllowed({
+      chat,
+      messageIds: input.messageIds,
+      currentUserId: context.currentUserId,
+    })
+  }
+
+  const backlinkMessages = options.trustedPlacementCleanup
+    ? []
+    : await getBacklinkMessagesForSourceMessages({
+        chatId: chat.id,
+        messageIds: input.messageIds,
+      })
+
+  const selectedRows = numericMessageIds.length === 0 ? [] : await db.select({
+    messageId: messages.messageId,
+    countsAsUnread: messages.countsAsUnread,
+    systemMessageEncrypted: messages.systemMessageEncrypted,
+    systemMessageIv: messages.systemMessageIv,
+    systemMessageTag: messages.systemMessageTag,
+  }).from(messages).where(and(eq(messages.chatId, chat.id), inArray(messages.messageId, numericMessageIds)))
+  const quietGeneratedIds = new Set(selectedRows
+    .filter((row) => row.countsAsUnread === false && row.systemMessageEncrypted !== null && row.systemMessageIv !== null && row.systemMessageTag !== null && decryptSystemMessagePayload({ encrypted: row.systemMessageEncrypted, iv: row.systemMessageIv, authTag: row.systemMessageTag }).event?.oneofKind === "gridTranscript")
+    .map((row) => row.messageId))
+  const ordinaryMessageIds = input.messageIds.filter((id) => !quietGeneratedIds.has(Number(id)))
+  const onlyQuietGenerated = selectedRows.length > 0 && ordinaryMessageIds.length === 0
+
+  let { update, metadataChatUpdates } = await MessageModel.deleteMessages(input.messageIds, chat.id)
+  if (!options.trustedPlacementCleanup && ordinaryMessageIds.length > 0) {
+    BotUpdateProjector.messageRoutesDeleted({ chatId: chat.id, messageIds: ordinaryMessageIds })
+  }
+  const backlinkSelfUpdates = await deleteBacklinkMessages(backlinkMessages, {
+    currentUserId: context.currentUserId,
+  })
+
+  const { selfUpdates, updateGroup } = await pushUpdates({
+    inputPeer: input.peer,
+    messageIds: input.messageIds,
+    currentUserId: context.currentUserId,
+    update,
+  })
+
+  const { selfUpdates: metadataSelfUpdates } = await pushChatMetadataUpdates({
+    currentUserId: context.currentUserId,
+    chatUpdates: metadataChatUpdates,
+  })
+
+  if (isReplyThread(chat) && !onlyQuietGenerated) {
+    await emitMessageSubthreadUpdateIfNeeded({
+      chatId: chat.id,
+      currentUserId: context.currentUserId,
+    })
+  } else if (isLinkedSubthread(chat) && !onlyQuietGenerated) {
+    queueSubthreadParentUpdate({
+      chatId: chat.id,
+      currentUserId: context.currentUserId,
+      reason: "message deletion",
+    })
+  }
+
+  if (!options.trustedPlacementCleanup && ordinaryMessageIds.length > 0) {
+    await Promise.all(
+      updateGroup.userIds.map(async (userId) => {
+        await Notifications.sendToUser({
+          userId,
+          payload: {
+            kind: "message_deleted",
+            threadId: `chat_${chat.id}`,
+            messageIds: ordinaryMessageIds.map((id) => id.toString()),
+          },
+        })
+      }),
+    )
+  }
+
+  return { updates: [...selfUpdates, ...metadataSelfUpdates, ...backlinkSelfUpdates] }
+}
+
+async function ensureDeleteAllowed(input: {
+  chat: DbChat
+  messageIds: bigint[]
+  currentUserId: number
+}): Promise<void> {
+  if (input.chat.spaceId === null) {
+    return
+  }
+
+  const messageIds = input.messageIds
+    .map((id) => Number(id))
+    .filter((id) => Number.isSafeInteger(id) && id > 0)
+
+  if (messageIds.length === 0) {
+    return
+  }
+
+  const rows = await db
+    .select({
+      messageId: messages.messageId,
+      fromId: messages.fromId,
+    })
+    .from(messages)
+    .where(and(eq(messages.chatId, input.chat.id), inArray(messages.messageId, messageIds)))
+
+  if (rows.every((message) => message.fromId === input.currentUserId)) {
+    return
+  }
+
+  const [member] = await db
+    .select({ role: members.role })
+    .from(members)
+    .where(and(eq(members.spaceId, input.chat.spaceId), eq(members.userId, input.currentUserId)))
+    .limit(1)
+
+  if (member?.role === "admin" || member?.role === "owner") {
+    return
+  }
+
+  throw RealtimeRpcError.SpaceAdminRequired()
+}
+
+// ------------------------------------------------------------
+// Updates
+// ------------------------------------------------------------
+
+/** Push updates for delete messages */
+const pushUpdates = async ({
+  inputPeer,
+  messageIds,
+  currentUserId,
+  update,
+}: {
+  inputPeer: InputPeer
+  messageIds: bigint[]
+  currentUserId: number
+  update: UpdateSeqAndDate
+}): Promise<{ selfUpdates: Update[]; updateGroup: UpdateGroup }> => {
+  const updateGroup = await getUpdateGroupFromInputPeer(inputPeer, { currentUserId })
+
+  let selfUpdates: Update[] = []
+
+  if (updateGroup.type === "dmUsers") {
+    updateGroup.userIds.forEach((userId) => {
+      const encodingForInputPeer: InputPeer =
+        userId === currentUserId ? inputPeer : { type: { oneofKind: "user", user: { userId: BigInt(currentUserId) } } }
+
+      let newMessageUpdate: Update = {
+        update: {
+          oneofKind: "deleteMessages",
+          deleteMessages: {
+            messageIds: messageIds.map((id) => BigInt(id)),
+            peerId: Encoders.peerFromInputPeer({ inputPeer: encodingForInputPeer, currentUserId }),
+          },
+        },
+        seq: update.seq,
+        date: encodeDateStrict(update.date),
+      }
+
+      if (userId === currentUserId) {
+        // current user gets the message id update and new message update
+        RealtimeUpdates.pushToUser(userId, [
+          // order matters here
+          newMessageUpdate,
+        ])
+        selfUpdates = [
+          // order matters here
+          newMessageUpdate,
+        ]
+      } else {
+        // other users get the message only
+        RealtimeUpdates.pushToUser(userId, [newMessageUpdate])
+      }
+    })
+  } else if (updateGroup.type === "threadUsers") {
+    updateGroup.userIds.forEach((userId) => {
+      // New updates
+      let newMessageUpdate: Update = {
+        update: {
+          oneofKind: "deleteMessages",
+          deleteMessages: {
+            messageIds: messageIds.map((id) => BigInt(id)),
+            peerId: Encoders.peerFromInputPeer({ inputPeer, currentUserId }),
+          },
+        },
+        seq: update.seq,
+        date: encodeDateStrict(update.date),
+      }
+
+      if (userId === currentUserId) {
+        // current user gets the message id update and new message update
+        RealtimeUpdates.pushToUser(userId, [
+          // order matters here
+          newMessageUpdate,
+        ])
+        selfUpdates = [
+          // order matters here
+          newMessageUpdate,
+        ]
+      } else {
+        // other users get the message only
+        RealtimeUpdates.pushToUser(userId, [newMessageUpdate])
+      }
+    })
+  }
+
+  return { selfUpdates, updateGroup }
+}

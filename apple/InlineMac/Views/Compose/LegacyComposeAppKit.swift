@@ -1,0 +1,3369 @@
+import AppKit
+import Combine
+import GRDB
+import InlineKit
+import InlineMacUI
+import InlineProtocol
+import Logger
+import SwiftUI
+import TextProcessing
+
+class LegacyComposeAppKit: NSView {
+  private static let attachmentMarker = "\u{FFFC}"
+
+  // MARK: - Internals
+
+  private var log = Log.scoped("Compose", enableTracing: false)
+
+  // MARK: - Props
+
+  private var peerId: InlineKit.Peer
+  private var chat: InlineKit.Chat?
+  private var peerUser: InlineKit.User?
+  private var chatId: Int64? { chat?.id }
+  private var dependencies: AppDependencies
+  private let mentionedParticipants: MentionedParticipantsAutoAddManager
+
+  // We load draft from the dialog passed from chat view model
+  private var dialog: InlineKit.Dialog?
+
+  // MARK: - State
+
+  weak var messageList: (any ChatMessageListController)?
+  weak var parentChatView: ChatViewAppKit?
+
+  var viewModel: MessagesProgressiveViewModel? {
+    messageList?.viewModel
+  }
+
+  private var isEmpty: Bool {
+    textEditor.isAttributedTextEmpty
+  }
+
+  private var isEmptyTrimmed: Bool {
+    textEditor.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  private var canSend: Bool {
+    !drafts2.hasPendingAttachments(peer: peerId) &&
+      (!isEmptyTrimmed || attachmentItems.count > 0 || state.forwardContext != nil)
+  }
+
+  private var canStartVoiceRecording: Bool {
+    isVoiceRecordingAvailable(isVoiceActive: voiceViewModel.isActive)
+  }
+
+  private var currentVoiceActive: Bool {
+    voiceViewModel.isActive
+  }
+
+  private var placeholderText: String {
+    if chat?.isReplyThread == true {
+      return "Reply"
+    }
+
+    guard let peerUser,
+          peerId.asUserId() == peerUser.id,
+          !peerUser.isCurrentUser(),
+          let firstName = peerUser.firstName?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !firstName.isEmpty
+    else {
+      return "Message"
+    }
+
+    return "Message \(firstName)"
+  }
+
+  private func isVoiceRecordingAvailable(isVoiceActive: Bool) -> Bool {
+    !isVoiceActive &&
+      !drafts2.hasPendingAttachments(peer: peerId) &&
+      (ComposeVoiceInputMode.selected == .transcribe || (isEmptyTrimmed && attachmentItems.isEmpty)) &&
+      state.editingMsgId == nil &&
+      state.forwardContext == nil
+  }
+
+  private var voiceButtonTrailingConstraint: NSLayoutConstraint?
+  private lazy var voiceViewModel = ComposeVoiceRecordingViewModel(peerId: peerId)
+  private var voiceEscapeKeyUnsubscribe: (() -> Void)?
+  private var voiceReturnKeyUnsubscribe: (() -> Void)?
+  private var voiceSpaceKeyUnsubscribe: (() -> Void)?
+
+  // [uniqueId: FileMediaItem]
+  private var attachmentItems: [String: FileMediaItem] = [:] {
+    didSet {
+      updateSendButtonIfNeeded()
+    }
+  }
+
+  // Mention completion
+  private var mentionCompletionMenu: MentionCompletionMenu?
+  private var mentionDetector = MentionDetector()
+  private var chatParticipantsViewModel: InlineKit.ChatParticipantsWithMembersViewModel?
+  private var currentMentionRange: MentionRange?
+  private var mentionKeyMonitorEscUnsubscribe: (() -> Void)?
+  private var mentionMenuConstraints: [NSLayoutConstraint] = []
+  private var didRequestMentionParticipants = false
+  private var mentionParticipantsTask: Task<Void, Never>?
+  private var mentionAgentsTask: Task<Void, Never>?
+  private var mentionCandidates = MentionCompletionCandidates.empty
+  private var mentionAgents: [MentionableBotAgent] = []
+
+  // Slash command completion
+  private var commandCompletionMenu: CommandCompletionMenu?
+  private let slashCommandDetector = SlashCommandDetector()
+  private var peerBotCommandsViewModel: PeerBotCommandsViewModel?
+  private var currentSlashCommandRange: SlashCommandRange?
+  private var currentSlashQuery: String?
+  private var commandKeyMonitorEscUnsubscribe: (() -> Void)?
+  private var commandMenuConstraints: [NSLayoutConstraint] = []
+  private var inlineCommandTask: Task<Void, Never>?
+
+  // Shared autocomplete
+  private let threadLinkDetector = ThreadLinkDetector()
+  private let emojiAutocompleteDetector = EmojiAutocompleteDetector()
+  private lazy var autocompleteViewModel = ComposeAutocompleteViewModel(
+    db: dependencies.database,
+    peer: peerId,
+    spaceId: chat?.spaceId,
+    limit: 24,
+    recentThreadChatIds: { [weak self] limit in
+      self?.recentThreadChatIds(limit: limit) ?? []
+    },
+    emojiItems: { query, limit in
+      ComposeEmojiAutocompleteProvider.items(matching: query, limit: limit)
+    },
+    externalResourceItems: { [weak self] query, limit in
+      guard let peer = self?.peerId else { return [] }
+      return try await ExternalResourceSearchClient.search(
+        peer: peer,
+        query: query,
+        limit: limit
+      )
+    }
+  )
+  private var autocompleteMenu: ComposeAutocompleteMenu?
+  private var autocompleteMenuConstraints: [NSLayoutConstraint] = []
+  private var autocompleteKeyMonitorEscUnsubscribe: (() -> Void)?
+
+  private func recentThreadChatIds(limit: Int) -> [Int64] {
+    var ids: [Int64] = []
+    var seen = Set<Int64>()
+
+    func append(_ peer: InlineKit.Peer?) {
+      guard ids.count < limit,
+            let chatId = peer?.asThreadId(),
+            seen.insert(chatId).inserted
+      else {
+        return
+      }
+      ids.append(chatId)
+    }
+
+    if let nav3 = dependencies.nav3, nav3.historyIndex >= 0 {
+      let count = min(nav3.historyIndex + 1, nav3.history.count)
+      for state in nav3.history.prefix(count).reversed() {
+        append(state.route.selectedPeer)
+      }
+    }
+
+    if let nav2 = dependencies.nav2 {
+      for entry in nav2.history.reversed() {
+        append(entry.route.selectedPeer)
+      }
+    }
+
+    for entry in dependencies.nav.history.reversed() {
+      append(entry.route.selectedPeer)
+    }
+
+    return ids
+  }
+
+  // Draft
+  private let drafts2 = Drafts2.shared
+  private var initializedDraft = false
+  private var didRequestFinalDraftPersistence = false
+  private var isCancellingTranscriptionForRemoval = false
+  private var draftEntitySaveTask: Task<Void, Never>?
+  private var draftAttachmentObserverCancel: (@Sendable () -> Void)?
+
+  // Internal
+  private var heightConstraint: NSLayoutConstraint!
+  private var textHeightConstraint: NSLayoutConstraint!
+  private var minHeight = Theme.composeMinHeight + Theme.composeOuterSpacing
+  private var radius: CGFloat = round(Theme.composeMinHeight / 2)
+  private var horizontalOuterSpacing = Theme.composeOuterSpacing
+  private var buttonsBottomSpacing = (Theme.composeMinHeight - Theme.composeButtonSize) / 2
+
+  // ---
+  private var textViewContentHeight: CGFloat = 0.0
+  private var textViewHeight: CGFloat = 0.0
+  private var lastMeasuredTextLayoutWidth: CGFloat = 0.0
+
+  // Features
+  private var feature_animateHeightChanges = false // for now until fixing how to update list view smoothly
+  private var isHandlingStickerInsertion = false
+  private lazy var paragraphDirectionController = ComposeParagraphDirectionController(textView: textEditor.textView)
+  private let stickerDetector = ComposeStickerDetector()
+  private let rightButtonSpacing: CGFloat = 6
+  private var silentModeButtonWidthConstraint: NSLayoutConstraint?
+  private var silentModeToEmojiConstraint: NSLayoutConstraint?
+  private var silentModeButtonBottomSpacing: CGFloat {
+    buttonsBottomSpacing + (Theme.composeButtonSize - ComposeSilentModeButton.controlSize) / 2
+  }
+
+  // MARK: Views
+
+  private lazy var textEditor: ComposeTextEditor = {
+    let textEditor = ComposeTextEditor(initiallySingleLine: false)
+    textEditor.placeholderText = placeholderText
+    textEditor.translatesAutoresizingMaskIntoConstraints = false
+    return textEditor
+  }()
+
+  private lazy var sendButton: ComposeSendButton = {
+    let view = ComposeSendButton(
+      frame: .zero,
+      onSend: { [weak self] in
+        self?.send()
+      },
+      onToggleSendSilently: { [weak self] in
+        self?.state.toggleSendSilently()
+      }
+    )
+    return view
+  }()
+
+  private lazy var silentModeButton: ComposeSilentModeButton = {
+    let view = ComposeSilentModeButton()
+    view.onClick = { [weak self] in
+      self?.state.setSendSilently(false)
+    }
+    view.isHidden = true
+    return view
+  }()
+
+  private lazy var voiceButton: ComposeVoiceButton = {
+    let view = ComposeVoiceButton()
+    view.onClick = { [weak self] in
+      self?.startVoiceRecording()
+    }
+    view.onModeChanged = { [weak self] in self?.updateVoiceAvailability() }
+    view.isHidden = true
+    return view
+  }()
+
+  private lazy var voiceInputView: NSHostingView<ComposeVoiceInputView> = {
+    let view = NSHostingView(rootView: ComposeVoiceInputView(
+      viewModel: voiceViewModel,
+      onPause: { [weak self] in
+        self?.pauseVoiceRecording()
+      },
+      onPlay: { [weak self] in
+        self?.toggleVoicePlayback()
+      },
+      onCancel: { [weak self] in
+        self?.cancelVoiceRecording()
+      },
+      onSend: { [weak self] in
+        self?.sendVoiceRecording()
+      }
+    ))
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.isHidden = true
+    view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    return view
+  }()
+
+  private lazy var emojiButton: ComposeEmojiButton = {
+    let view = ComposeEmojiButton()
+    view.delegate = self
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private lazy var menuButton: ComposeMenuButton = {
+    let view = ComposeMenuButton()
+    view.delegate = self
+    view.isNewThreadEnabledProvider = { [weak self] in
+      guard let self else { return false }
+      return commandLaunchState().isEnabled && chatId != nil && inlineCommandTask == nil
+    }
+    view.onNewThread = { [weak self] in
+      guard let self, commandLaunchState().isEnabled, chatId != nil else { return }
+      performInlineCommand(.createSubthread, fromMenu: true)
+    }
+    view.isCommandsEnabledProvider = { [weak self] in
+      self?.commandLaunchState().isEnabled == true
+    }
+    view.onToggleSendSilently = { [weak self] in
+      self?.state.toggleSendSilently()
+    }
+    view.isSendSilentlyEnabledProvider = { [weak self] in
+      self?.state.sendSilently ?? false
+    }
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  // Reply/Edit
+  private lazy var messageView: ComposeMessageView = {
+    let view = ComposeMessageView(
+      onClose: { [weak self] in
+        self?.state.clearReplyingToMsgId()
+        self?.state.clearEditingMsgId()
+        self?.state.clearForwarding()
+      }
+    )
+
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  // Add attachments view
+  private lazy var attachments: ComposeAttachments = {
+    let view = ComposeAttachments(frame: .zero, compose: self)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  lazy var border = {
+    let border = NSBox()
+    border.boxType = .separator
+    border.translatesAutoresizingMaskIntoConstraints = false
+    return border
+  }()
+
+  // TODO: Only use this in pre-Tahoe
+  lazy var background = {
+    // Add vibrancy effect
+    let material = NSVisualEffectView(frame: bounds)
+    material.material = .headerView
+    material.blendingMode = .withinWindow
+    material.state = .followsWindowActiveState
+    material.translatesAutoresizingMaskIntoConstraints = false
+    return material
+  }()
+
+  var hasTopSeperator: Bool = false
+
+  // -------
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+
+    guard window != nil else { return }
+    hydrateInitialDraftIfNeeded()
+
+    // Refresh state skipped while a previous host was being removed.
+    updateVoiceAvailability(phase: voiceViewModel.phase)
+    updateVoiceKeyHandlers(phase: voiceViewModel.phase)
+    updateHeight(animate: false, voicePhase: voiceViewModel.phase)
+
+    DispatchQueue.main.async { [weak self] in
+      self?.focus()
+    }
+
+    if mentionCompletionMenu != nil {
+      addMentionMenuToSuperview()
+    }
+
+    if commandCompletionMenu != nil {
+      addCommandMenuToSuperview()
+    }
+  }
+
+  override func viewWillMove(toSuperview newSuperview: NSView?) {
+    if newSuperview == nil {
+      cancelTranscriptionForRemoval()
+      requestImmediateDraftPersistenceIfNeeded()
+    } else {
+      didRequestFinalDraftPersistence = false
+    }
+    super.viewWillMove(toSuperview: newSuperview)
+  }
+
+  private func cancelTranscriptionForRemoval() {
+    guard voiceViewModel.inputMode == .transcribe, voiceViewModel.isActive else { return }
+    // cancel() publishes phase synchronously. AppKit may already be finalizing
+    // the host's sibling views, so the phase sink must not relayout this tree.
+    isCancellingTranscriptionForRemoval = true
+    defer { isCancellingTranscriptionForRemoval = false }
+    voiceViewModel.cancel()
+  }
+
+  // MARK: Initialization
+
+  init(
+    peerId: InlineKit.Peer,
+    messageList: any ChatMessageListController,
+    chat: InlineKit.Chat?,
+    peerUser: InlineKit.User?,
+    dependencies: AppDependencies,
+    toolbarState: ChatToolbarState? = nil,
+    parentChatView: ChatViewAppKit? = nil,
+    dialog: InlineKit.Dialog?
+  ) {
+    self.peerId = peerId
+    self.messageList = messageList
+    self.chat = chat
+    self.peerUser = peerUser
+    self.dependencies = dependencies
+    self.mentionedParticipants = MentionedParticipantsAutoAddManager(
+      dependencies: dependencies,
+      toolbarState: toolbarState
+    )
+    self.parentChatView = parentChatView
+    self.dialog = dialog
+
+    super.init(frame: .zero)
+    textEditor.textView.smartLinkPeer = peerId
+    textEditor.textView.smartLinkEscapeAvailabilityDidChange = { [weak self] available in
+      self?.setSmartLinkEscapeHandlerEnabled(available)
+    }
+    draftAttachmentObserverCancel = drafts2.observeAttachmentResults(peer: peerId) { [weak self] result in
+      self?.handleDraftAttachmentResult(result)
+    }
+    setupView()
+    setupObservers()
+    setupKeyDownHandler()
+    restorePendingDraftAttachmentPlaceholders()
+  }
+
+  func setPeerUser(_ user: InlineKit.User?) {
+    guard peerUser != user else { return }
+    peerUser = user
+    textEditor.placeholderText = placeholderText
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  // MARK: Setup
+
+  func setupView() {
+    translatesAutoresizingMaskIntoConstraints = false
+    wantsLayer = true
+
+    // More distinct background
+    // layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.5).cgColor
+
+    // bg
+    addSubview(background)
+    addSubview(border)
+
+    // from top
+    addSubview(messageView)
+
+    addSubview(attachments)
+
+    // to bottom
+    addSubview(sendButton)
+    addSubview(silentModeButton)
+    addSubview(voiceButton)
+    addSubview(voiceInputView)
+    addSubview(emojiButton)
+    addSubview(menuButton)
+    addSubview(textEditor)
+
+    setupReplyingView()
+    setUpConstraints()
+    updateSilentModeUI(animated: false, forceLayout: false)
+    updateVoiceAvailability()
+    setupTextEditor()
+  }
+
+  func prepareForMessageSelection() -> Bool {
+    guard !currentVoiceActive else {
+      ToastCenter.shared.showError("Finish your voice message before selecting messages.")
+      return false
+    }
+    hideMentionCompletion()
+    hideCommandCompletion()
+    hideAutocomplete()
+    return true
+  }
+
+  /// This method is called from ChatViewAppKit's viewDidLayout.
+  /// Draft hydration happens on window attachment so layout stays measurement-only.
+  func didLayout() {
+    updateHeightForTextLayoutWidthChange()
+  }
+
+  private func hydrateInitialDraftIfNeeded() {
+    guard !initializedDraft else { return }
+    let loaded = loadDraft()
+    if !loaded {
+      updateHeight(animate: false)
+      textEditor.showPlaceholder(true)
+    }
+    initializedDraft = true
+  }
+
+  private func setUpConstraints() {
+    heightConstraint = heightAnchor.constraint(equalToConstant: minHeight)
+    textHeightConstraint = textEditor.heightAnchor.constraint(equalToConstant: minHeight)
+
+    let textViewHorizontalPadding = textEditor.horizontalPadding
+    let attachmentsHorizontalInset = horizontalOuterSpacing + Theme.composeButtonSize + textViewHorizontalPadding
+    attachments.setHorizontalContentInset(attachmentsHorizontalInset)
+
+    silentModeButtonWidthConstraint = silentModeButton.widthAnchor.constraint(equalToConstant: 0)
+    silentModeToEmojiConstraint = silentModeButton.trailingAnchor.constraint(
+      equalTo: emojiButton.leadingAnchor,
+      constant: 0
+    )
+
+    let voiceButtonTrailingConstraint = voiceButton.trailingAnchor.constraint(
+      equalTo: trailingAnchor, constant: -horizontalOuterSpacing
+    )
+    self.voiceButtonTrailingConstraint = voiceButtonTrailingConstraint
+    var constraints: [NSLayoutConstraint] = [
+      heightConstraint,
+
+      // bg
+      background.leadingAnchor.constraint(equalTo: leadingAnchor),
+      background.trailingAnchor.constraint(equalTo: trailingAnchor),
+      background.topAnchor.constraint(equalTo: topAnchor),
+      background.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      // send
+      sendButton.trailingAnchor.constraint(
+        equalTo: trailingAnchor, constant: -horizontalOuterSpacing
+      ),
+      sendButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -buttonsBottomSpacing),
+
+      // send silently indicator
+      silentModeButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -silentModeButtonBottomSpacing),
+      silentModeButtonWidthConstraint!,
+      silentModeButton.heightAnchor.constraint(equalToConstant: ComposeSilentModeButton.controlSize),
+      silentModeToEmojiConstraint!,
+
+      // emoji
+      emojiButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -rightButtonSpacing),
+      emojiButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -buttonsBottomSpacing),
+
+      // menu
+      menuButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: horizontalOuterSpacing),
+      menuButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -buttonsBottomSpacing),
+
+      // reply (height handled internally)
+      messageView.leadingAnchor.constraint(equalTo: textEditor.leadingAnchor, constant: textViewHorizontalPadding),
+      messageView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -horizontalOuterSpacing),
+
+      // attachments
+      attachments.leadingAnchor.constraint(equalTo: leadingAnchor),
+      attachments.trailingAnchor.constraint(equalTo: trailingAnchor),
+      attachments.topAnchor.constraint(equalTo: messageView.bottomAnchor),
+
+      // text editor
+      textEditor.leadingAnchor.constraint(equalTo: menuButton.trailingAnchor),
+      textEditor.trailingAnchor.constraint(equalTo: silentModeButton.leadingAnchor),
+      textHeightConstraint,
+      textEditor.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      // Update text editor top constraint
+      // textEditor.topAnchor.constraint(equalTo: topAnchor),
+      textEditor.topAnchor.constraint(equalTo: attachments.bottomAnchor),
+
+      // top seperator border
+      border.leadingAnchor.constraint(equalTo: leadingAnchor),
+      border.trailingAnchor.constraint(equalTo: trailingAnchor),
+      border.topAnchor.constraint(equalTo: topAnchor),
+      border.heightAnchor.constraint(equalToConstant: 1),
+    ]
+
+    constraints.append(contentsOf: [
+      voiceButtonTrailingConstraint,
+      voiceButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -buttonsBottomSpacing),
+      voiceInputView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: horizontalOuterSpacing),
+      voiceInputView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -horizontalOuterSpacing),
+      voiceInputView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      voiceInputView.heightAnchor.constraint(equalToConstant: Theme.composeMinHeight),
+    ])
+
+    NSLayoutConstraint.activate(constraints)
+
+    if hasTopSeperator {
+      border.isHidden = false
+    } else {
+      border.isHidden = true
+    }
+  }
+
+  private var cancellables: Set<AnyCancellable> = []
+  private var state: ChatState {
+    ChatsManager.get(for: peerId, chatId: chatId ?? 0)
+  }
+
+  func setupObservers() {
+    state.replyingToMsgIdPublisher
+      .sink { [weak self] replyingToMsgId in
+        guard let self else { return }
+        removeStaleReplyQuote(replyingTo: replyingToMsgId)
+        updateMessageView(to: replyingToMsgId, kind: .replying, animate: true)
+        updateVoiceAvailability()
+        focus()
+      }.store(in: &cancellables)
+
+    state.quotePublisher
+      .sink { [weak self] markdown in
+        self?.insertQuote(markdown)
+      }.store(in: &cancellables)
+
+    state.editingMsgIdPublisher
+      .sink { [weak self] editingMsgId in
+        guard let self else { return }
+        if editingMsgId != nil, voiceViewModel.inputMode == .transcribe { voiceViewModel.cancel() }
+        updateMessageView(to: editingMsgId, kind: .editing, animate: true)
+        updateVoiceAvailability()
+        focus()
+      }.store(in: &cancellables)
+
+    state.forwardContextPublisher
+      .sink { [weak self] forwardContext in
+        guard let self else { return }
+        if forwardContext != nil, voiceViewModel.inputMode == .transcribe { voiceViewModel.cancel() }
+        let messageId = forwardContext?.messageIds.first
+        let sourceChatId = forwardContext?.sourceChatId
+        updateMessageView(
+          to: messageId,
+          sourceChatId: sourceChatId,
+          kind: .forwarding,
+          animate: true
+        )
+        updateSendButtonIfNeeded()
+        focus()
+      }.store(in: &cancellables)
+
+    state.sendSilentlyPublisher
+      .sink { [weak self] isEnabled in
+        self?.updateSilentModeUI()
+        ToastCenter.shared.showInfo(
+          isEnabled ? "Send silently enabled" : "Send silently disabled"
+        )
+      }.store(in: &cancellables)
+
+    voiceViewModel.$phase
+      .sink { [weak self] phase in
+        guard let self else { return }
+        // Keyboard handlers must be removed even when presentation is suppressed.
+        updateVoiceKeyHandlers(phase: phase)
+        guard !isCancellingTranscriptionForRemoval else { return }
+        updateVoiceAvailability(phase: phase)
+        updateHeight(animate: true, voicePhase: phase)
+      }
+      .store(in: &cancellables)
+
+    Publishers.CombineLatest4(
+      autocompleteViewModel.$items,
+      autocompleteViewModel.$selectedIndex,
+      autocompleteViewModel.$match,
+      autocompleteViewModel.$loadState
+    )
+    .sink { [weak self] items, selectedIndex, match, loadState in
+      Task { @MainActor [weak self] in
+        guard let self,
+              items == autocompleteViewModel.items,
+              selectedIndex == autocompleteViewModel.selectedIndex,
+              match == autocompleteViewModel.match,
+              loadState == autocompleteViewModel.loadState
+        else {
+          return
+        }
+
+        renderAutocompleteMenu(
+          items: items,
+          selectedIndex: selectedIndex,
+          match: match,
+          loadState: loadState
+        )
+      }
+    }
+    .store(in: &cancellables)
+  }
+
+  private func updateSilentModeUI(
+    animated: Bool = true,
+    forceLayout: Bool = true,
+    isVoiceActive: Bool? = nil
+  ) {
+    let isEnabled = state.sendSilently
+    let voiceActive = isVoiceActive ?? currentVoiceActive
+    let shouldShow = isEnabled && !voiceActive && canSend
+    sendButton.updateSendSilently(isEnabled)
+    silentModeButton.isHidden = !shouldShow
+    silentModeButtonWidthConstraint?.constant = shouldShow ? ComposeSilentModeButton.controlSize : 0
+    silentModeToEmojiConstraint?.constant = shouldShow ? -rightButtonSpacing : 0
+
+    guard animated else {
+      if forceLayout {
+        layoutSubtreeIfNeeded()
+      }
+      return
+    }
+
+    NSAnimationContext.runAnimationGroup { context in
+      context.duration = 0.16
+      context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+      self.layoutSubtreeIfNeeded()
+    }
+  }
+
+  private func updateVoiceAvailability(phase: ComposeVoiceRecordingPhase? = nil) {
+    let isVoiceActive = phase.map { $0 != .idle } ?? voiceViewModel.isActive
+    let shouldShowVoiceButton = isVoiceRecordingAvailable(isVoiceActive: isVoiceActive)
+
+    if isVoiceActive {
+      emojiButton.resignEmojiFocus()
+    }
+
+    voiceInputView.isHidden = !isVoiceActive
+    textEditor.isHidden = isVoiceActive
+    menuButton.isHidden = isVoiceActive
+    let showsDictationWithSend = shouldShowVoiceButton && ComposeVoiceInputMode.selected == .transcribe && canSend
+    emojiButton.isHidden = isVoiceActive || showsDictationWithSend
+    voiceButtonTrailingConstraint?.constant = -horizontalOuterSpacing - (
+      showsDictationWithSend ? ComposeControlMode.legacy.sendButtonSize + rightButtonSpacing : 0
+    )
+    attachments.isHidden = isVoiceActive
+    attachments.setExternallyCollapsed(isVoiceActive)
+    voiceButton.isHidden = isVoiceActive || !shouldShowVoiceButton
+    sendButton.isHidden = isVoiceActive || (shouldShowVoiceButton && !showsDictationWithSend)
+
+    updateSilentModeUI(animated: false, forceLayout: false, isVoiceActive: isVoiceActive)
+  }
+
+  private func startVoiceRecording() {
+    guard canStartVoiceRecording else { return }
+    focusWindowIfNeeded()
+    voiceViewModel.requestStart(mode: ComposeVoiceInputMode.selected)
+  }
+
+  private func pauseVoiceRecording() {
+    if voiceViewModel.inputMode == .transcribe {
+      transcribeVoiceRecording(sendText: false)
+      return
+    }
+    let drafts2 = drafts2
+    let peerId = peerId
+    voiceViewModel.pauseRecording { [weak self] recording in
+      let mediaItem = try makeComposeVoiceMediaItem(from: recording)
+      let attachment = drafts2.appendAttachment(peer: peerId, media: mediaItem)
+      self?.attachmentItems[attachment.id] = mediaItem
+      return mediaItem
+    }
+  }
+
+  private func toggleVoicePlayback() {
+    voiceViewModel.togglePlayback()
+  }
+
+  private func cancelVoiceRecording() {
+    let draftVoiceAttachmentId = voiceViewModel.draftVoiceAttachmentId
+    voiceViewModel.cancel()
+    if let draftVoiceAttachmentId {
+      attachmentItems.removeValue(forKey: draftVoiceAttachmentId)
+      drafts2.removeAttachment(peer: peerId, id: draftVoiceAttachmentId)
+      drafts2.flushBlocking()
+    }
+  }
+
+  private func updateVoiceKeyHandlers(phase: ComposeVoiceRecordingPhase) {
+    guard phase != .idle else {
+      removeVoiceKeyHandlers()
+      return
+    }
+
+    guard voiceEscapeKeyUnsubscribe == nil,
+          voiceReturnKeyUnsubscribe == nil,
+          voiceSpaceKeyUnsubscribe == nil
+    else { return }
+
+    voiceEscapeKeyUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .escape,
+      key: "compose_voice_escape_\(peerId)",
+      handler: { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.cancelVoiceRecording()
+        }
+      }
+    )
+
+    voiceSpaceKeyUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .spaceKey,
+      key: "compose_voice_space_\(peerId)",
+      handler: { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.handleVoiceSpaceKey()
+        }
+      }
+    )
+
+    if voiceViewModel.inputMode == .transcribe {
+      voiceReturnKeyUnsubscribe = dependencies.keyMonitor?.addHandler(
+        for: .returnKey,
+        key: "compose_voice_return_\(peerId)",
+        handler: { [weak self] _ in
+          Task { @MainActor [weak self] in
+            self?.sendVoiceRecording()
+          }
+        }
+      )
+    }
+  }
+
+  private func removeVoiceKeyHandlers() {
+    voiceEscapeKeyUnsubscribe?()
+    voiceEscapeKeyUnsubscribe = nil
+    voiceReturnKeyUnsubscribe?()
+    voiceReturnKeyUnsubscribe = nil
+    voiceSpaceKeyUnsubscribe?()
+    voiceSpaceKeyUnsubscribe = nil
+  }
+
+  private func handleVoiceSpaceKey() {
+    switch voiceViewModel.phase {
+      case .recording:
+        pauseVoiceRecording()
+      case .review:
+        voiceViewModel.togglePlayback()
+      case .idle, .starting, .finishing, .transcribing, .transcriptionFailed:
+        break
+    }
+  }
+
+  private func sendVoiceRecording() {
+    if voiceViewModel.inputMode == .transcribe {
+      transcribeVoiceRecording(sendText: true)
+      return
+    }
+    guard !drafts2.hasPendingAttachments(peer: peerId) else { return }
+    Task { @MainActor [weak self] in
+      guard let self,
+            await voiceViewModel.finalizeRecordingForSend()
+      else { return }
+      sendFinalizedVoiceRecording()
+    }
+  }
+
+  private func transcribeVoiceRecording(sendText: Bool) {
+    guard !drafts2.hasPendingAttachments(peer: peerId) else { return }
+    voiceViewModel.transcribe(sendText: sendText) { [weak self] transcript, shouldSend in
+      guard let self, self.window != nil, self.superview != nil else { return }
+      let draft = NSMutableAttributedString(attributedString: self.textEditor.attributedString)
+      let separator = draft.string.isEmpty || draft.string.last?.isWhitespace == true ? "" : "\n"
+      draft.append(self.textEditor.createAttributedString(separator + transcript))
+      self.setAttributedString(draft)
+      self.saveDraft()
+      self.focus()
+      if shouldSend { self.send(interpretInlineCommands: false) }
+    }
+  }
+
+  private func sendFinalizedVoiceRecording() {
+    do {
+      guard let mediaItem = try voiceViewModel.takeVoiceMediaItem() else { return }
+
+      keepCurrentChatInSidebar()
+      Transactions.shared.mutate(
+        transaction: .sendMessage(
+          TransactionSendMessage(
+            text: nil,
+            peerId: peerId,
+            chatId: chatId ?? 0,
+            mediaItems: [mediaItem],
+            replyToMsgId: state.replyingToMsgId,
+            isSticker: nil,
+            entities: nil,
+            sendMode: state.sendSilently ? .modeSilent : nil
+          )
+        )
+      )
+
+      clear()
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        self.state.scrollToBottom()
+      }
+    } catch {
+      log.error("Failed to send voice recording", error: error)
+      ToastCenter.shared.showError("Failed to send voice message")
+    }
+  }
+
+  private func setupTextEditor() {
+    // Set the delegate if needed
+    textEditor.delegate = self
+
+    // Configure text input settings
+    textEditor.textView.isAutomaticSpellingCorrectionEnabled = AppSettings.shared.automaticSpellCorrection
+    textEditor.textView.isContinuousSpellCheckingEnabled = AppSettings.shared.checkSpellingWhileTyping
+
+    // Listen to AppSettings changes
+    AppSettings.shared.$automaticSpellCorrection
+      .sink { [weak self] enabled in
+        self?.textEditor.textView.isAutomaticSpellingCorrectionEnabled = enabled
+      }.store(in: &cancellables)
+
+    AppSettings.shared.$checkSpellingWhileTyping
+      .sink { [weak self] enabled in
+        self?.textEditor.textView.isContinuousSpellCheckingEnabled = enabled
+      }.store(in: &cancellables)
+  }
+
+  // MARK: - Mention Completion
+
+  private func ensureMentionCompletion() {
+    guard mentionCompletionMenu == nil, let chatId else { return }
+
+    // Initialize chat participants view model
+    chatParticipantsViewModel = InlineKit.ChatParticipantsWithMembersViewModel(
+      db: dependencies.database,
+      chatId: chatId,
+      purpose: .mentionCandidates
+    )
+
+    // Create mention completion menu
+    mentionCompletionMenu = MentionCompletionMenu(surfaceStyle: .material)
+    mentionCompletionMenu?.delegate = self
+    mentionCompletionMenu?.translatesAutoresizingMaskIntoConstraints = false
+
+    // Subscribe to participants updates
+    chatParticipantsViewModel?.$mentionCandidates
+      .sink { [weak self] candidates in
+        guard let self else { return }
+        log.trace("Mention candidates updated: \(candidates.users.count + candidates.groups.count) candidates")
+        mentionCandidates = candidates
+        applyMentionCandidates()
+
+        if let currentMentionRange,
+           mentionCompletionMenu?.hasItems == true,
+           mentionCompletionMenu?.isVisible == false
+        {
+          showMentionCompletion(for: currentMentionRange.query)
+        }
+      }
+      .store(in: &cancellables)
+
+    NotificationCenter.default.publisher(for: .botAgentsChanged)
+      .sink { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.loadMentionAgents(forceRefresh: true)
+        }
+      }
+      .store(in: &cancellables)
+
+    loadMentionAgents()
+  }
+
+  private func loadMentionAgents(forceRefresh: Bool = false) {
+    mentionAgentsTask?.cancel()
+    mentionAgentsTask = Task { @MainActor [weak self, peerId = peerId] in
+      guard let self else { return }
+      do {
+        mentionAgents = try await BotAgentDirectory.shared.agents(for: peerId, forceRefresh: forceRefresh)
+      } catch is CancellationError {
+        return
+      } catch {
+        mentionAgents = []
+      }
+      applyMentionCandidates()
+    }
+  }
+
+  private func applyMentionCandidates() {
+    var candidates = mentionCandidates
+    candidates.agents = mentionAgents
+    mentionCompletionMenu?.updateCandidates(candidates)
+  }
+
+  private func refetchMentionParticipantsIfNeeded() {
+    guard !didRequestMentionParticipants, let chatParticipantsViewModel else { return }
+    didRequestMentionParticipants = true
+
+    mentionParticipantsTask?.cancel()
+    mentionParticipantsTask = Task { @MainActor [weak self, weak chatParticipantsViewModel] in
+      await Task.yield()
+      guard !Task.isCancelled else { return }
+      self?.log.trace("Fetching chat participants from server")
+      await chatParticipantsViewModel?.refetchParticipants()
+    }
+  }
+
+  private func addMentionMenuToSuperview() {
+    guard let menu = mentionCompletionMenu,
+          menu.superview == nil,
+          let parentView = parentChatView?.view
+    else {
+      log.trace("addMentionMenuToSuperview: menu already has superview, is nil, or no parent chat view")
+      return
+    }
+
+    log.trace("addMentionMenuToSuperview: adding menu to ChatViewAppKit's view")
+
+    // Add menu to the parent chat view
+    parentView.addSubview(menu)
+
+    // Remove any existing constraints
+    NSLayoutConstraint.deactivate(mentionMenuConstraints)
+    mentionMenuConstraints.removeAll()
+
+    // Create new constraints to position above compose with full width
+    mentionMenuConstraints = [
+      menu.leadingAnchor.constraint(equalTo: leadingAnchor),
+      menu.trailingAnchor.constraint(equalTo: trailingAnchor),
+      menu.bottomAnchor.constraint(equalTo: topAnchor, constant: -12),
+    ]
+
+    NSLayoutConstraint.activate(mentionMenuConstraints)
+    log.trace("addMentionMenuToSuperview: menu positioned above compose view")
+  }
+
+  private func ensureSlashCommandCompletion() {
+    guard peerBotCommandsViewModel == nil else { return }
+    peerBotCommandsViewModel = PeerBotCommandsViewModel(peer: peerId)
+    commandCompletionMenu = CommandCompletionMenu(surfaceStyle: .material)
+    commandCompletionMenu?.delegate = self
+    commandCompletionMenu?.translatesAutoresizingMaskIntoConstraints = false
+  }
+
+  private func addCommandMenuToSuperview() {
+    guard let menu = commandCompletionMenu,
+          menu.superview == nil,
+          let parentView = parentChatView?.view
+    else {
+      return
+    }
+
+    parentView.addSubview(menu)
+    NSLayoutConstraint.deactivate(commandMenuConstraints)
+    commandMenuConstraints.removeAll()
+
+    commandMenuConstraints = [
+      menu.leadingAnchor.constraint(equalTo: leadingAnchor),
+      menu.trailingAnchor.constraint(equalTo: trailingAnchor),
+      menu.bottomAnchor.constraint(equalTo: topAnchor, constant: -12),
+    ]
+
+    NSLayoutConstraint.activate(commandMenuConstraints)
+  }
+
+  private func ensureAutocompleteMenu() {
+    guard autocompleteMenu == nil else { return }
+    autocompleteMenu = ComposeAutocompleteMenu(surfaceStyle: .material)
+    autocompleteMenu?.delegate = self
+    autocompleteMenu?.translatesAutoresizingMaskIntoConstraints = false
+  }
+
+  private func addAutocompleteMenuToSuperview() {
+    guard let menu = autocompleteMenu,
+          menu.superview == nil,
+          let parentView = parentChatView?.view
+    else {
+      return
+    }
+
+    parentView.addSubview(menu)
+    NSLayoutConstraint.deactivate(autocompleteMenuConstraints)
+    autocompleteMenuConstraints.removeAll()
+    autocompleteMenuConstraints = [
+      menu.leadingAnchor.constraint(equalTo: leadingAnchor),
+      menu.trailingAnchor.constraint(equalTo: trailingAnchor),
+      menu.bottomAnchor.constraint(equalTo: topAnchor, constant: -12),
+    ]
+
+    NSLayoutConstraint.activate(autocompleteMenuConstraints)
+  }
+
+  private func renderAutocompleteMenu(
+    items: [ComposeAutocompleteItem],
+    selectedIndex: Int,
+    match: ComposeAutocompleteMatch?,
+    loadState: ComposeAutocompleteLoadState
+  ) {
+    let hasCurrentItems = if let match {
+      !items.isEmpty && items.allSatisfy { $0.kind == match.kind }
+    } else {
+      false
+    }
+    let action = composeAutocompletePresentationAction(
+      currentSession: autocompleteMenu?.presentationSession,
+      nextMatch: match,
+      hasItems: hasCurrentItems,
+      loadState: loadState,
+      isVisible: autocompleteMenu?.isVisible == true
+    )
+
+    switch action {
+    case .hide:
+      autocompleteMenu?.hide()
+      autocompleteKeyMonitorEscUnsubscribe?()
+      autocompleteKeyMonitorEscUnsubscribe = nil
+      return
+    case .retainVisibleContent:
+      _ = autocompleteMenu?.retainVisibleContentWhileLoading()
+      return
+    case .present:
+      break
+    }
+
+    guard let match else { return }
+    ensureAutocompleteMenu()
+    addAutocompleteMenuToSuperview()
+    autocompleteMenu?.update(
+      items: items,
+      selectedIndex: selectedIndex,
+      match: match
+    )
+    autocompleteMenu?.show()
+
+    autocompleteKeyMonitorEscUnsubscribe?()
+    autocompleteKeyMonitorEscUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .escape,
+      key: "compose_autocomplete_\(peerId)",
+      handler: { [weak self] _ in
+        self?.hideAutocomplete(suppressCurrentMatch: true)
+      }
+    )
+  }
+
+  private func showMentionCompletion(for query: String) {
+    log.trace("showMentionCompletion: query='\(query)'")
+    ensureMentionCompletion()
+    guard let mentionCompletionMenu else { return }
+
+    // Ensure menu is added to view hierarchy
+    addMentionMenuToSuperview()
+    hideCommandCompletion()
+    hideAutocomplete()
+
+    mentionCompletionMenu.filterParticipants(with: query)
+    mentionCompletionMenu.show()
+    refetchMentionParticipantsIfNeeded()
+
+    // Add escape handler for mention menu
+    mentionKeyMonitorEscUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .escape,
+      key: "compose_mention_\(peerId)",
+      handler: { [weak self] _ in
+        self?.hideMentionCompletion()
+      }
+    )
+  }
+
+  private func hideMentionCompletion() {
+    currentMentionRange = nil
+    mentionCompletionMenu?.hide()
+
+    // Remove escape handler
+    mentionKeyMonitorEscUnsubscribe?()
+    mentionKeyMonitorEscUnsubscribe = nil
+  }
+
+  private func showCommandCompletion(for query: String) {
+    currentSlashQuery = query
+    ensureSlashCommandCompletion()
+    addCommandMenuToSuperview()
+    hideMentionCompletion()
+    hideAutocomplete()
+
+    guard let peerBotCommandsViewModel, let commandCompletionMenu else { return }
+    let suggestions = peerBotCommandsViewModel.commandSuggestions(matching: query)
+    commandCompletionMenu.updateSuggestions(suggestions)
+
+    if suggestions.isEmpty {
+      commandCompletionMenu.hide()
+    } else {
+      commandCompletionMenu.show()
+      commandKeyMonitorEscUnsubscribe?()
+      commandKeyMonitorEscUnsubscribe = dependencies.keyMonitor?.addHandler(
+        for: .escape,
+        key: "compose_command_\(peerId)",
+        handler: { [weak self] _ in
+          self?.hideCommandCompletion()
+        }
+      )
+    }
+
+    if peerBotCommandsViewModel.shouldAttemptLoad {
+      Task { @MainActor [weak self] in
+        await peerBotCommandsViewModel.ensureLoaded()
+        guard self?.currentSlashQuery == query else { return }
+        self?.showCommandCompletion(for: query)
+      }
+    }
+  }
+
+  private func hideCommandCompletion() {
+    currentSlashCommandRange = nil
+    currentSlashQuery = nil
+    commandCompletionMenu?.hide()
+    commandKeyMonitorEscUnsubscribe?()
+    commandKeyMonitorEscUnsubscribe = nil
+  }
+
+  private func hideAutocomplete(suppressCurrentMatch: Bool = false) {
+    autocompleteViewModel.hide(suppressCurrentMatch: suppressCurrentMatch)
+    autocompleteMenu?.hide()
+    autocompleteKeyMonitorEscUnsubscribe?()
+    autocompleteKeyMonitorEscUnsubscribe = nil
+  }
+
+  private var hasVisibleCompletionMenu: Bool {
+    mentionCompletionMenu?.isVisible == true ||
+      commandCompletionMenu?.isVisible == true ||
+      autocompleteMenu?.isVisible == true
+  }
+
+  private func detectMentionAtCursor() {
+    let cursorPosition = textEditor.textView.selectedRange().location
+    let attributedText = textEditor.attributedString
+    log.trace("detectMentionAtCursor cursor=\(cursorPosition)")
+
+    if let mentionRange = mentionDetector.detectMentionAt(cursorPosition: cursorPosition, in: attributedText) {
+      let isNewMentionSession = currentMentionRange?.range.location != mentionRange.range.location
+      currentMentionRange = mentionRange
+      if isNewMentionSession {
+        loadMentionAgents()
+      }
+      showMentionCompletion(for: mentionRange.query)
+    } else {
+      hideMentionCompletion()
+    }
+  }
+
+  @discardableResult
+  private func detectSlashCommandAtCursor() -> Bool {
+    let cursorPosition = textEditor.textView.selectedRange().location
+    let attributedText = textEditor.attributedString
+
+    if let slashRange = slashCommandDetector.detectSlashCommandAt(cursorPosition: cursorPosition, in: attributedText) {
+      currentSlashCommandRange = slashRange
+      showCommandCompletion(for: slashRange.query)
+      return true
+    }
+
+    hideCommandCompletion()
+    return false
+  }
+
+  private enum ComposeCompletionTrigger {
+    case textChange
+    case selectionChange
+  }
+
+  @discardableResult
+  private func detectEmojiAutocompleteAtCursor(trigger: ComposeCompletionTrigger) -> Bool {
+    if trigger == .selectionChange, autocompleteMenu?.isVisible != true {
+      return false
+    }
+
+    let cursorPosition = textEditor.textView.selectedRange().location
+    let attributedText = textEditor.attributedString
+
+    if let emojiRange = emojiAutocompleteDetector.detectEmojiAutocompleteAt(cursorPosition: cursorPosition, in: attributedText) {
+      hideMentionCompletion()
+      hideCommandCompletion()
+      autocompleteViewModel.update(
+        match: ComposeAutocompleteMatch(
+          kind: .emoji,
+          range: emojiRange.range,
+          query: emojiRange.query
+        )
+      )
+      return true
+    }
+
+    if autocompleteViewModel.match?.kind == .emoji {
+      hideAutocomplete()
+    }
+
+    return false
+  }
+
+  @discardableResult
+  private func detectThreadAutocompleteAtCursor() -> Bool {
+    let cursorPosition = textEditor.textView.selectedRange().location
+    let attributedText = textEditor.attributedString
+
+    if let threadRange = threadLinkDetector.detectThreadLinkAt(cursorPosition: cursorPosition, in: attributedText) {
+      hideMentionCompletion()
+      hideCommandCompletion()
+      autocompleteViewModel.configure(spaceId: chat?.spaceId)
+      autocompleteViewModel.update(
+        match: ComposeAutocompleteMatch(
+          kind: .thread,
+          range: threadRange.range,
+          query: threadRange.query
+        )
+      )
+      return true
+    }
+
+    if let referenceRange = threadLinkDetector.detectThreadNumberReferenceAt(
+      cursorPosition: cursorPosition,
+      in: attributedText
+    ) {
+      hideMentionCompletion()
+      hideCommandCompletion()
+      autocompleteViewModel.configure(spaceId: chat?.spaceId)
+      autocompleteViewModel.update(
+        match: ComposeAutocompleteMatch(
+          kind: .threadNumber,
+          range: referenceRange.range,
+          query: referenceRange.query
+        )
+      )
+      return true
+    }
+
+    hideAutocomplete()
+    return false
+  }
+
+  private func detectComposeCompletionsAtCursor(trigger: ComposeCompletionTrigger) {
+    let selectedRange = textEditor.textView.selectedRange()
+    guard selectedRange.location != NSNotFound,
+          selectedRange.length == 0,
+          !textEditor.textView.hasMarkedText()
+    else {
+      hideMentionCompletion()
+      hideCommandCompletion()
+      hideAutocomplete()
+      return
+    }
+
+    if trigger == .selectionChange, !hasVisibleCompletionMenu {
+      hideMentionCompletion()
+      hideCommandCompletion()
+      hideAutocomplete()
+      return
+    }
+
+    if detectSlashCommandAtCursor() {
+      hideAutocomplete()
+      return
+    }
+    if detectEmojiAutocompleteAtCursor(trigger: trigger) {
+      return
+    }
+    if detectThreadAutocompleteAtCursor() {
+      return
+    }
+    detectMentionAtCursor()
+  }
+
+  // MARK: - Public Interface
+
+  var text: String {
+    get { textEditor.string }
+    set { textEditor.string = newValue }
+  }
+
+  func focusEditor() {
+    guard messageList?.isMessageSelectionActive != true else { return }
+    guard !voiceViewModel.isActive else { return }
+    textEditor.focus()
+  }
+
+  // MARK: - Height
+
+  private func getTextViewHeight(isVoiceActive: Bool? = nil) -> CGFloat {
+    if isVoiceActive ?? currentVoiceActive {
+      textViewHeight = Theme.composeMinHeight
+      return textViewHeight
+    }
+
+    // Keep the original single-line height even with unusually tall typing metrics.
+    let verticalPadding = textViewContentHeight <= textEditor.getTypingLineHeight()
+      ? Theme.composeVerticalPadding
+      : textEditor.verticalPadding
+    textViewHeight = min(300.0, max(
+      textEditor.minHeight,
+      textViewContentHeight + verticalPadding * 2
+    ))
+
+    return textViewHeight
+  }
+
+  private func updateHeightForTextLayoutWidthChange() {
+    guard !currentVoiceActive else { return }
+
+    var textLayoutWidth = textEditor.textView.bounds.width
+    if textLayoutWidth <= 1 {
+      textEditor.layoutSubtreeIfNeeded()
+      textLayoutWidth = textEditor.textView.bounds.width
+    }
+    guard textLayoutWidth > 1 else { return }
+    guard abs(lastMeasuredTextLayoutWidth - textLayoutWidth) >= 0.5 else { return }
+
+    lastMeasuredTextLayoutWidth = textLayoutWidth
+    if textEditor.isAttributedTextEmpty {
+      return
+    }
+
+    updateHeightIfNeeded(for: textEditor.textView, animate: false)
+  }
+
+  // Get compose wrapper height
+  private func getHeight(isVoiceActive: Bool? = nil) -> CGFloat {
+    let voiceActive = isVoiceActive ?? currentVoiceActive
+    var height = getTextViewHeight(isVoiceActive: voiceActive)
+
+    // Reply view
+    if state.replyingToMsgId != nil || state.editingMsgId != nil || state.forwardContext != nil {
+      height += Theme.embeddedMessageHeight
+    }
+
+    if !voiceActive {
+      height += attachments.getHeight()
+    }
+
+    return height
+  }
+
+  func updateHeight(animate: Bool = false, voicePhase: ComposeVoiceRecordingPhase? = nil) {
+    let isVoiceActive = voicePhase.map { $0 != .idle }
+    let textEditorHeight = getTextViewHeight(isVoiceActive: isVoiceActive)
+    let wrapperHeight = getHeight(isVoiceActive: isVoiceActive)
+
+    log.trace("updating height wrapper=\(wrapperHeight), textEditor=\(textEditorHeight)")
+
+    if feature_animateHeightChanges || animate {
+      // First update the height of scroll view immediately so it doesn't clip from top while animating
+      CATransaction.begin()
+      CATransaction.disableActions()
+      textEditor.setHeight(textEditorHeight)
+      CATransaction.commit()
+
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0.2
+        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        context.allowsImplicitAnimation = true
+        // Disable screen updates during animation setup
+        // NSAnimationContext.beginGrouping()
+        heightConstraint.animator().constant = wrapperHeight
+        textHeightConstraint.animator().constant = textEditorHeight
+        textEditor.updateTextViewInsets(contentHeight: textViewContentHeight) // use height without paddings
+        attachments.updateHeight(animated: true)
+        messageList?.updateInsetForCompose(wrapperHeight)
+        // NSAnimationContext.endGrouping()
+      }
+    } else {
+      textEditor.setHeight(textEditorHeight)
+      textEditor.updateTextViewInsets(contentHeight: textViewContentHeight)
+      heightConstraint.constant = wrapperHeight
+      textHeightConstraint.constant = textEditorHeight
+      attachments.updateHeight(animated: false)
+      messageList?.updateInsetForCompose(wrapperHeight)
+    }
+
+    // Update mention menu position if it's visible
+    if mentionCompletionMenu?.isVisible == true {
+      updateMentionMenuPosition()
+    }
+  }
+
+  private func updateMentionMenuPosition() {
+    guard let menu = mentionCompletionMenu, menu.superview != nil else { return }
+
+    // Remove existing constraints
+    NSLayoutConstraint.deactivate(mentionMenuConstraints)
+    mentionMenuConstraints.removeAll()
+
+    // Create new constraints with updated position
+    mentionMenuConstraints = [
+      menu.leadingAnchor.constraint(equalTo: leadingAnchor),
+      menu.trailingAnchor.constraint(equalTo: trailingAnchor),
+      menu.bottomAnchor.constraint(equalTo: topAnchor, constant: -12),
+    ]
+
+    NSLayoutConstraint.activate(mentionMenuConstraints)
+  }
+
+  private var ignoreNextHeightChange = false
+
+  // MARK: - Reply View
+
+  private func setupReplyingView() {
+    if let replyingToMsgId = state.replyingToMsgId {
+      updateMessageView(to: replyingToMsgId, kind: .replying, animate: false, shouldUpdateHeight: false)
+    }
+
+    if let editingMessageId = state.editingMsgId {
+      updateMessageView(to: editingMessageId, kind: .editing, animate: false, shouldUpdateHeight: false)
+    }
+
+    if let forwardContext = state.forwardContext,
+       let previewMessageId = forwardContext.messageIds.first
+    {
+      updateMessageView(
+        to: previewMessageId,
+        sourceChatId: forwardContext.sourceChatId,
+        kind: .forwarding,
+        animate: false,
+        shouldUpdateHeight: false
+      )
+    }
+
+    updateSendButtonIfNeeded()
+  }
+
+  private var keyMonitorEscUnsubscribe: (() -> Void)?
+  private func addReplyEscHandler() {
+    keyMonitorEscUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .escape,
+      key: "compose_reply_\(peerId)",
+      handler: { [weak self] _ in
+        guard let self else { return }
+        state.clearReplyingToMsgId()
+        state.clearEditingMsgId()
+        state.clearForwarding()
+        removeReplyEscHandler()
+      }
+    )
+  }
+
+  private func removeReplyEscHandler() {
+    keyMonitorEscUnsubscribe?()
+    keyMonitorEscUnsubscribe = nil
+  }
+
+  private func updateMessageView(
+    to msgId: Int64?,
+    sourceChatId: Int64? = nil,
+    kind: ComposeMessageView.Kind,
+    animate: Bool = false,
+    shouldUpdateHeight: Bool = true
+  ) {
+    if let msgId {
+      // Update and show the reply view
+      let resolvedChatId = sourceChatId ?? chatId ?? 0
+      if let message = try? FullMessage.get(messageId: msgId, chatId: resolvedChatId) {
+        messageView.update(with: message, kind: kind)
+        messageView.open(animated: animate)
+        addReplyEscHandler()
+
+        if kind == .editing {
+          let attributedString = ExperimentalFeatureFlags.richMessageCopyEditingEnabled ? MessageMarkdown.editableText(
+            text: message.message.text ?? "",
+            entities: message.message.entities,
+            configuration: .init(
+              font: ComposeTextEditor.font,
+              primaryColor: ComposeTextEditor.textColor,
+              linkColor: ComposeTextEditor.linkColor,
+              convertMentionsToLink: false
+            )
+          ) : MessageMarkdown.withQuoteSyntax(
+            toAttributedString(
+              text: message.message.text ?? "",
+              entities: message.message.entities
+            ),
+            entities: message.message.entities,
+            attributes: [.font: ComposeTextEditor.font, .foregroundColor: ComposeTextEditor.textColor]
+          )
+
+          // TODO: Extract these to a function
+          // set manually without updating height
+          textEditor.replaceAttributedString(attributedString)
+          textEditor.showPlaceholder(text.isEmpty)
+          updateSendButtonIfNeeded()
+          // calculate text height to prepare for height change
+          updateContentHeight(for: textEditor.textView)
+        }
+      }
+    } else {
+      // Hide and remove the reply view
+      messageView.close(animated: true)
+      removeReplyEscHandler()
+
+      if kind == .editing {
+        // clear string
+        setText("", animate: animate, shouldUpdateHeight: false)
+      }
+    }
+
+    if shouldUpdateHeight {
+      // Update height to accommodate the reply view
+      updateHeight(animate: animate)
+    }
+  }
+
+  // MARK: - Actions
+
+  private func shouldSendAsFile(_ image: NSImage) -> Bool {
+    // Too narrow
+    let ratio = max(image.size.width / image.size.height, image.size.height / image.size.width)
+    if ratio > 20 {
+      return true
+    }
+
+    // Too small
+    if image.size.width < 50, image.size.height < 50 {
+      return true
+    }
+
+    return false
+  }
+
+  func addImage(_ image: NSImage, _ url: URL? = nil) {
+    // Format
+    let preferredImageFormat: ImageFormat? = if let url {
+      url.pathExtension.lowercased() == "png" ? ImageFormat.png : ImageFormat.jpeg
+    } else { nil }
+
+    // Check aspect ratio
+    if shouldSendAsFile(image) {
+      if let url {
+        addFile(url)
+        return
+      }
+
+      let tempDir = FileHelpers.getTrueTemporaryDirectory()
+      let result = try? image.save(
+        to: tempDir,
+        withName: "image\(preferredImageFormat?.toExt() ?? ".jpg")",
+        format: preferredImageFormat ?? .jpeg
+      )
+      if let (_, url) = result {
+        addFile(url)
+      } else {
+        ToastCenter.shared.showError("Couldn’t add attachment as media or a file.")
+      }
+      return
+    }
+
+    // Add a placeholder view immediately; Drafts2 owns file-cache persistence.
+    let pendingId = drafts2.addImage(
+      peer: peerId,
+      image: image,
+      preferredFormat: preferredImageFormat,
+      fallbackURL: url
+    )
+    attachments.addImageView(image, id: pendingId)
+    updateHeight(animate: true)
+  }
+
+  func removeImage(_ id: String) {
+    // Update UI
+    attachments.removeImageView(id: id)
+    updateHeight(animate: true)
+
+    // Update state
+    attachmentItems.removeValue(forKey: id)
+    drafts2.removeAttachment(peer: peerId, id: id)
+  }
+
+  private func isVideoFile(_ url: URL) -> Bool {
+    guard (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true else { return false }
+    let ext = url.pathExtension.lowercased()
+    return ["mp4", "mov", "m4v", "avi", "mkv", "webm"].contains(ext)
+  }
+
+  private func isAnimatedImageFile(_ url: URL) -> Bool {
+    guard (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true else { return false }
+    return url.pathExtension.lowercased() == "gif"
+  }
+
+  private func loadThumbnail(from photoInfo: PhotoInfo?) -> NSImage? {
+    guard let localPath = photoInfo?.bestPhotoSize()?.localPath else { return nil }
+    let url = FileHelpers.getLocalCacheDirectory(for: .photos).appendingPathComponent(localPath)
+    return NSImage(contentsOf: url)
+  }
+
+  @MainActor
+  func addVideo(_ url: URL, thumbnail: NSImage? = nil) async {
+    // Show a placeholder immediately; Drafts2 owns file-cache persistence.
+    let pendingId = drafts2.addVideo(peer: peerId, url: url, thumbnail: thumbnail)
+    attachments.addVideoView(thumbnail: thumbnail, videoURL: url, id: pendingId)
+    updateHeight(animate: true)
+  }
+
+  @MainActor
+  func addAnimatedImage(_ url: URL) async {
+    let thumbnail = NSImage(contentsOf: url)
+    let pendingId = drafts2.addAnimatedImage(peer: peerId, url: url)
+    attachments.addVideoView(thumbnail: thumbnail, videoURL: nil, id: pendingId)
+    updateHeight(animate: true)
+  }
+
+  func removeVideo(_ id: String) {
+    attachments.removeVideoView(id: id)
+    attachmentItems.removeValue(forKey: id)
+    drafts2.removeAttachment(peer: peerId, id: id)
+    updateHeight(animate: true)
+  }
+
+  @discardableResult
+  func addFile(_ url: URL) -> Bool {
+    let pendingId = drafts2.addFile(peer: peerId, url: url)
+    attachments.addPendingDocument(url: url, id: pendingId)
+    updateHeight(animate: true)
+    return true
+  }
+
+  func removeFile(_ id: String) {
+    // TODO: Delete from file cache as well
+
+    // Update UI
+    attachments.removeDocumentView(id: id)
+    updateHeight(animate: true)
+
+    // Update state
+    attachmentItems.removeValue(forKey: id)
+    drafts2.removeAttachment(peer: peerId, id: id)
+  }
+
+  func clearAttachments(updateHeights: Bool = false) {
+    attachmentItems.removeAll()
+    attachments.clearViews()
+    if updateHeights {
+      updateHeight()
+    }
+  }
+
+  // Clear, reset height
+  func clear() {
+    voiceViewModel.cancel()
+
+    // State
+    attachmentItems.removeAll()
+    state.clearReplyingToMsgId()
+    state.clearEditingMsgId()
+    state.clearForwarding()
+    clearDraft(flush: true)
+
+    // Views
+    attachments.clearViews()
+    textViewContentHeight =
+      textEditor
+        .getTypingLineHeight() // manually for now, FIXME: make it automatic in texteditor.clear
+    textEditor.clear()
+    clearAttachments(updateHeights: false)
+    updateSendButtonIfNeeded()
+
+    // must be last call
+    updateHeight()
+  }
+
+  // Send the message
+  func send(sendMode: MessageSendMode? = nil, interpretInlineCommands: Bool = true) {
+    guard messageList?.isMessageSelectionActive != true else { return }
+    textEditor.textView.resetPastedLinks()
+    if voiceViewModel.phase == .review {
+      sendVoiceRecording()
+      return
+    }
+    if voiceViewModel.isActive {
+      return
+    }
+
+    // DispatchQueue.main.async(qos: .userInteractive) {
+    ignoreNextHeightChange = true
+    let attributedString = trimmedAttributedString(textEditor.attributedString)
+    let replyToMsgId = state.replyingToMsgId
+    let attachmentItemsSnapshot = drafts2.load(peer: peerId)?.attachments.map(\.media) ?? Array(attachmentItems.values)
+    let destinationPeerId = peerId
+    let destinationChatId = chatId ?? 0
+    // keep a copy of editingMessageId before we clear it
+    let editingMessageId = state.editingMsgId
+    let forwardContext = state.forwardContext
+
+    // Extract mention entities from attributed text
+    // TODO: replace with `fromAttributedString`
+    let (rawText, entities) = ProcessEntities.fromAttributedString(
+      attributedString,
+      threadLinkSpaceId: chat?.spaceId
+    )
+
+    let hasText = !rawText.isEmpty
+    let hasAttachments = !attachmentItemsSnapshot.isEmpty
+
+    let hasBotCommandEntity = entities.entities.contains { entity in
+      if case .botCommand = entity.entity { return true }
+      return false
+    }
+    if interpretInlineCommands,
+       editingMessageId == nil,
+       forwardContext == nil,
+       !hasAttachments,
+       !hasBotCommandEntity,
+       let action = InlineCommandRegistry.action(forStandaloneText: rawText) {
+      ignoreNextHeightChange = false
+      performInlineCommand(action)
+      return
+    }
+
+    // make it nil if empty
+    let text = if rawText.isEmpty, hasAttachments {
+      nil as String?
+    } else {
+      rawText
+    }
+    let effectiveSendMode = sendMode ?? (state.sendSilently ? .modeSilent : nil)
+
+    func enqueueAttachments(replyToMessageId: Int64?) {
+      for (index, attachment) in attachmentItemsSnapshot.enumerated() {
+        let isFirst = index == 0
+        Transactions.shared.mutate(
+          transaction:
+          .sendMessage(
+            TransactionSendMessage(
+              text: isFirst ? text : nil,
+              peerId: destinationPeerId,
+              chatId: destinationChatId, // FIXME: chatId fallback
+              mediaItems: [attachment],
+              replyToMsgId: isFirst ? replyToMessageId : nil,
+              isSticker: nil,
+              entities: isFirst ? entities : nil,
+              sendMode: effectiveSendMode
+            )
+          )
+        )
+      }
+    }
+
+    if !canSend { return }
+
+    // Edit message
+    if let editingMessageId {
+      mentionedParticipants.handle(entities: entities, peer: destinationPeerId, chat: chat) {
+        Task.detached(priority: .userInitiated) { // @MainActor in
+          try await Api.realtime.send(.editMessage(
+            messageId: editingMessageId,
+            text: text ?? "",
+            chatId: destinationChatId,
+            peerId: destinationPeerId,
+            entities: entities
+          ))
+        }
+      }
+    }
+
+    // Forward message
+    else if let forwardContext {
+      guard !forwardContext.messageIds.isEmpty else {
+        log.error("Forward failed: empty message ids")
+        return
+      }
+
+      keepCurrentChatInSidebar()
+
+      if hasAttachments {
+        enqueueAttachments(replyToMessageId: nil)
+      }
+
+      Task.detached(priority: .userInitiated) { [weak self] in
+        guard let self else { return }
+
+        if hasText, !hasAttachments {
+          _ = await Api.realtime.sendQueued(
+            .sendMessage(
+              text: text,
+              peerId: self.peerId,
+              chatId: self.chatId ?? 0, // FIXME: chatId fallback
+              replyToMsgId: nil,
+              isSticker: nil,
+              entities: entities,
+              sendMode: effectiveSendMode
+            )
+          )
+        }
+
+        do {
+          let result = try await Api.realtime.send(.forwardMessages(
+            fromPeerId: forwardContext.fromPeerId,
+            toPeerId: self.peerId,
+            messageIds: forwardContext.messageIds
+          ))
+
+          if case let .forwardMessages(response) = result, response.updates.isEmpty {
+            _ = await Api.realtime.sendQueued(.getChatHistory(peer: self.peerId))
+          }
+        } catch {
+          self.log.error("Forward failed", error: error)
+        }
+      }
+      state.clearForwarding()
+    }
+
+    // Send message
+    else if attachmentItemsSnapshot.isEmpty {
+      keepCurrentChatInSidebar()
+
+      mentionedParticipants.handle(entities: entities, peer: destinationPeerId, chat: chat) {
+        Task.detached(priority: .userInitiated) { // @MainActor in
+          try await Api.realtime.send(
+            .sendMessage(
+              text: text,
+              peerId: destinationPeerId,
+              chatId: destinationChatId, // FIXME: chatId fallback
+              replyToMsgId: replyToMsgId,
+              isSticker: nil,
+              entities: entities,
+              sendMode: effectiveSendMode
+            )
+          )
+        }
+      }
+      // let _ = Transactions.shared.mutate(
+      //   transaction:
+      //   .sendMessage(
+      //     TransactionSendMessage(
+      //       text: text,
+      //       peerId: self.peerId,
+      //       chatId: self.chatId ?? 0, // FIXME: chatId fallback
+      //       mediaItems: [],
+      //       replyToMsgId: replyToMsgId,
+      //       isSticker: nil,
+      //       entities: entities
+      //     )
+      //   )
+      // )
+    }
+
+    // With image/file/video
+    else {
+      keepCurrentChatInSidebar()
+      mentionedParticipants.handle(entities: entities, peer: destinationPeerId, chat: chat) {
+        enqueueAttachments(replyToMessageId: replyToMsgId)
+      }
+    }
+
+    // Clear immediately
+    clear()
+
+    // Cancel typing
+    Task {
+      await ComposeActions.shared.stoppedTyping(for: self.peerId)
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+      // Scroll to new message
+      self.state.scrollToBottom()
+    }
+
+    ignoreNextHeightChange = false
+    // }
+  }
+
+  private func performInlineCommand(_ action: InlineCommandAction, fromMenu: Bool = false) {
+    guard inlineCommandTask == nil else { return }
+    let invocationPeerId = peerId
+    let invocationText = textEditor.plainText
+    let invocationAttributedText = NSAttributedString(attributedString: textEditor.attributedString)
+    let normalizedInvocation = invocationText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let replyingToMsgId = state.replyingToMsgId
+    guard fromMenu || (normalizedInvocation.hasPrefix("/") &&
+          !normalizedInvocation.dropFirst().contains(where: { $0.isWhitespace })),
+          state.editingMsgId == nil,
+          state.forwardContext == nil,
+          attachmentItems.isEmpty,
+          !drafts2.hasPendingAttachments(peer: invocationPeerId),
+          !voiceViewModel.isActive
+    else { return }
+
+    hideCommandCompletion()
+    inlineCommandTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { inlineCommandTask = nil }
+      do {
+        let execution: InlineCommandExecution
+        switch action {
+        case .renameThread:
+          guard invocationPeerId.asThreadId() != nil else {
+            ToastCenter.shared.showError("Only threads can be renamed.")
+            return
+          }
+          focusWindowIfNeeded()
+          guard MainWindowOpenCoordinator.shared.isViewingChat(invocationPeerId),
+                MainWindowOpenCoordinator.shared.renameThread()
+          else {
+            ToastCenter.shared.showError("Couldn’t open title editing for this thread.")
+            return
+          }
+          execution = .completed
+        case .collapseHistory:
+          guard let messageList,
+                let maxID = messageList.highestPositiveMessageId
+          else { return }
+          try await messageList.collapseHistory(maxID: maxID)
+          execution = .completed
+        case .createSubthread:
+          guard let parentChatId = chatId else { return }
+          let result = try await LocalThreadCommandService.createAndOpen(parentChatId: parentChatId) {
+            [realtimeV2 = dependencies.realtimeV2] transaction in
+            try await realtimeV2.send(transaction)
+          }
+          execution = .openThread(result)
+        }
+
+        guard window != nil, peerId == invocationPeerId else { return }
+        let invocationIsUnchanged = textEditor.plainText == invocationText &&
+          textEditor.attributedString.isEqual(to: invocationAttributedText) &&
+          state.replyingToMsgId == replyingToMsgId &&
+          state.editingMsgId == nil &&
+          state.forwardContext == nil &&
+          attachmentItems.isEmpty &&
+          !drafts2.hasPendingAttachments(peer: invocationPeerId) &&
+          !voiceViewModel.isActive
+        if !fromMenu, invocationIsUnchanged {
+          clearInlineCommandText()
+        }
+
+        if case let .openThread(result) = execution {
+          dependencies.openChatRoute(peer: result.peer)
+          if !result.didOpenInSidebar {
+            ToastCenter.shared.showError("Thread created, but couldn’t open it in the sidebar.")
+          }
+        }
+      } catch {
+        guard window != nil, peerId == invocationPeerId else { return }
+        log.error("Inline command failed", error: error)
+        ToastCenter.shared.showError(error.localizedDescription)
+      }
+    }
+  }
+
+  private func clearInlineCommandText() {
+    textViewContentHeight = textEditor.getTypingLineHeight()
+    textEditor.clear()
+    clearDraft()
+    updateSendButtonIfNeeded()
+    updateHeight()
+  }
+
+  private enum InlineCommandExecution {
+    case completed
+    case openThread(LocalThreadCommandResult)
+  }
+
+  private func commandLaunchState() -> ComposeCommandLaunchState {
+    ComposeCommandLaunchState(
+      text: textEditor.plainText,
+      isEditing: state.editingMsgId != nil,
+      isForwarding: state.forwardContext != nil,
+      hasAttachments: !attachmentItems.isEmpty,
+      hasPendingAttachments: drafts2.hasPendingAttachments(peer: peerId),
+      isVoiceActive: voiceViewModel.isActive
+    )
+  }
+
+  private func showCommandsFromMenu() {
+    switch commandLaunchState() {
+      case .blocked:
+        return
+      case .empty:
+        insertSlashAndShowCommands()
+      case .text:
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Clear message to show commands?"
+        alert.informativeText = "Commands only work when the message is empty."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Clear and Show Commands")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+          guard response == .alertFirstButtonReturn else { return }
+          self?.clearInlineCommandText()
+          self?.insertSlashAndShowCommands()
+        }
+    }
+  }
+
+  private func insertSlashAndShowCommands() {
+    guard commandLaunchState() == .empty else { return }
+    if !textEditor.plainText.isEmpty {
+      clearInlineCommandText()
+    }
+    focusWindowIfNeeded()
+    focus()
+    textEditor.insertText("/")
+    _ = detectSlashCommandAtCursor()
+  }
+
+  private func trimmedAttributedString(_ attributedString: NSAttributedString) -> NSAttributedString {
+    let whitespaceSet = CharacterSet.whitespacesAndNewlines
+    let fullString = attributedString.string as NSString
+    let startRange = fullString.rangeOfCharacter(from: whitespaceSet.inverted)
+    if startRange.location == NSNotFound {
+      return NSAttributedString()
+    }
+    let endRange = fullString.rangeOfCharacter(from: whitespaceSet.inverted, options: .backwards)
+    let trimmedRange = NSRange(
+      location: startRange.location,
+      length: NSMaxRange(endRange) - startRange.location
+    )
+    return attributedString.attributedSubstring(from: trimmedRange)
+  }
+
+  private func keepCurrentChatInSidebar() {
+    SidebarState.shared.keepInSidebar(peerId)
+  }
+
+  func sendSticker(_ image: NSImage) {
+    let replyToMsgId = state.replyingToMsgId
+    let sendMode: MessageSendMode? = state.sendSilently ? .modeSilent : nil
+
+    keepCurrentChatInSidebar()
+
+    Task.detached(priority: .userInitiated) { [weak self] in
+      guard let self else { return }
+      do {
+        let photoInfo = try FileCache.savePhoto(image: image, optimize: true)
+        let mediaItem = FileMediaItem.photo(photoInfo)
+
+        Transactions.shared.mutate(
+          transaction: .sendMessage(
+            TransactionSendMessage(
+              text: nil,
+              peerId: self.peerId,
+              chatId: self.chatId ?? 0,
+              mediaItems: [mediaItem],
+              replyToMsgId: replyToMsgId,
+              isSticker: true,
+              entities: nil,
+              sendMode: sendMode
+            )
+          )
+        )
+      } catch {
+        self.log.error("Failed to send sticker", error: error)
+      }
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+      self.state.scrollToBottom()
+    }
+  }
+
+  func focus() {
+    guard messageList?.isMessageSelectionActive != true else { return }
+    guard !voiceViewModel.isActive else { return }
+    textEditor.focus()
+  }
+
+  private func focusWindowIfNeeded() {
+    guard let window else { return }
+    if !NSApplication.shared.isActive {
+      NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+    if !window.isKeyWindow {
+      window.makeKeyAndOrderFront(nil)
+    }
+  }
+
+  /// The quote lines Quote put at the top and the message they quote, so quoting again or
+  /// dropping the reply can take them back out.
+  private var insertedReplyQuote: (markdown: String, messageId: Int64)?
+
+  /// Puts quote lines first, replacing the last quote, through the normal input path, and
+  /// leaves the cursor at the end so the reply is typed below the quote. One quote per reply,
+  /// like Telegram, so the reply shows it in its header.
+  private func insertQuote(_ markdown: String) {
+    let textView = textEditor.textView
+    let insertion = MessageMarkdown.replyQuoteInsertion(
+      markdown,
+      into: textView.string,
+      replacing: insertedReplyQuote?.markdown
+    )
+    textView.updateTypingAttributesIfNeeded()
+    textView.insertText(insertion.text, replacementRange: insertion.range)
+    insertedReplyQuote = state.replyingToMsgId.map { (markdown, $0) }
+    textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
+    focus()
+  }
+
+  /// A reply that moved to another message, or was dropped, takes its inserted quote with it
+  /// while the lines are still untouched at the top.
+  private func removeStaleReplyQuote(replyingTo replyingToMsgId: Int64?) {
+    guard let inserted = insertedReplyQuote, replyingToMsgId != inserted.messageId else { return }
+    insertedReplyQuote = nil
+    let textView = textEditor.textView
+    guard let range = MessageMarkdown.replyQuoteRemoval(inserted.markdown, from: textView.string) else { return }
+    let selection = textView.selectedRange()
+    textView.insertText("", replacementRange: range)
+    textView.setSelectedRange(NSRange(location: max(0, selection.location - range.length), length: 0))
+  }
+
+  // TODO: Abstract setAttributedString out of this
+  func setText(_ text: String, animate: Bool = false, shouldUpdateHeight: Bool = true) {
+    let attributedString = textEditor.createAttributedString(text)
+    textEditor.replaceAttributedString(attributedString)
+    updateContentHeight(for: textEditor.textView)
+    if shouldUpdateHeight {
+      updateHeight(animate: animate)
+    }
+    // reevaluate placeholder
+    textEditor.showPlaceholder(text.isEmpty)
+    updateSendButtonIfNeeded()
+  }
+
+  func acceptExternalDraft(_ text: String, for peer: InlineKit.Peer) -> Bool {
+    guard peerId == peer else { return false }
+    if !text.isEmpty {
+      guard commandLaunchState() == .empty else { return false }
+      setText(text)
+      _ = saveDraft()
+    }
+    focusEditor()
+    return true
+  }
+
+  func isComposer(for peer: InlineKit.Peer) -> Bool { peerId == peer }
+
+  private var keyMonitorUnsubscribe: (() -> Void)?
+  private var keyMonitorPasteUnsubscribe: (() -> Void)?
+  private var smartLinkEscapeKeyUnsubscribe: (() -> Void)?
+
+  private func setSmartLinkEscapeHandlerEnabled(_ enabled: Bool) {
+    smartLinkEscapeKeyUnsubscribe?()
+    smartLinkEscapeKeyUnsubscribe = nil
+    guard enabled else { return }
+
+    smartLinkEscapeKeyUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .escape,
+      key: "compose_smart_link_\(peerId)",
+      handler: { [weak self] _ in
+        self?.textEditor.textView.revertLatestSmartLink()
+      }
+    )
+  }
+
+  private func setupKeyDownHandler() {
+    keyMonitorUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .textInputCatchAll,
+      key: "compose\(peerId)",
+      handler: { [weak self] event in
+        guard let self else { return }
+        guard !voiceViewModel.isActive else { return }
+
+        guard messageList?.isMessageSelectionActive != true else { return }
+
+        // Only allow valid printable characters, not control/navigation keys
+        guard let characters = event.characters,
+              characters != " ", // Ignore space as it prevents our image preview from working
+              !characters.isEmpty,
+              characters.allSatisfy({ char in
+                // Check if character is printable (not a control character)
+                if let scalar = char.unicodeScalars.first {
+                  return scalar.properties.isAlphabetic ||
+                    scalar.properties.isMath ||
+                    char == "@" ||
+                    char == "/"
+                }
+                return false
+              })
+        else { return }
+
+        // Put cursor in the text field
+        focus()
+
+        // Insert text
+        textEditor.textView.insertText(
+          characters,
+          replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+      }
+    )
+
+    // Add paste handler
+    keyMonitorPasteUnsubscribe = dependencies.keyMonitor?.addHandler(
+      for: .paste,
+      key: "compose_paste_\(peerId)",
+      handler: { [weak self] _ in
+        self?.handleGlobalPaste()
+      }
+    )
+  }
+
+  private func handleGlobalPaste() {
+    guard messageList?.isMessageSelectionActive != true else { return }
+    guard !voiceViewModel.isActive else { return }
+
+    let pasteboard = NSPasteboard.general
+
+    // If this is non-text content, route through attachments.
+    if handleAttachments(from: pasteboard) { return }
+
+    // Otherwise, perform a native plain-text paste (ComposeNSTextView disables rich paste for reliability).
+    focus()
+    textEditor.textView.paste(nil)
+  }
+
+  deinit {
+    inlineCommandTask?.cancel()
+    requestImmediateDraftPersistenceIfNeeded()
+    draftAttachmentObserverCancel?()
+    draftAttachmentObserverCancel = nil
+    draftEntitySaveTask?.cancel()
+    draftEntitySaveTask = nil
+    cancellables.removeAll()
+
+    // Clean up
+    keyMonitorUnsubscribe?()
+    keyMonitorUnsubscribe = nil
+    keyMonitorPasteUnsubscribe?()
+    keyMonitorPasteUnsubscribe = nil
+    smartLinkEscapeKeyUnsubscribe?()
+    smartLinkEscapeKeyUnsubscribe = nil
+    removeVoiceKeyHandlers()
+
+    // Clean up mention resources
+    mentionKeyMonitorEscUnsubscribe?()
+    mentionKeyMonitorEscUnsubscribe = nil
+    NSLayoutConstraint.deactivate(mentionMenuConstraints)
+    mentionMenuConstraints.removeAll()
+    mentionCompletionMenu?.removeFromSuperview()
+    mentionParticipantsTask?.cancel()
+    mentionParticipantsTask = nil
+    mentionAgentsTask?.cancel()
+    mentionAgentsTask = nil
+
+    log.trace("deinit")
+  }
+}
+
+// MARK: External Interface for file drop
+
+extension LegacyComposeAppKit {
+  @discardableResult
+  func handleAttachments(from pasteboard: NSPasteboard) -> Bool {
+    guard !voiceViewModel.isActive else { return false }
+    guard textEditor.textView.handleAttachments(from: pasteboard, includeText: false) else {
+      return false
+    }
+
+    focus()
+    return true
+  }
+
+  func handleFileDrop(_ urls: [URL]) {
+    guard !voiceViewModel.isActive else { return }
+
+    for url in urls {
+      if isAnimatedImageFile(url) {
+        handleAnimatedImageDropOrPaste(url)
+      } else if isVideoFile(url) {
+        handleVideoDropOrPaste(url)
+      } else {
+        addFile(url)
+      }
+    }
+  }
+
+  func handleTextDropOrPaste(_ text: String) {
+    guard !voiceViewModel.isActive else { return }
+
+    textEditor.insertText(text)
+    focusWindowIfNeeded()
+    focus()
+  }
+
+  func handleImageDropOrPaste(_ image: NSImage, _ url: URL? = nil) {
+    guard !voiceViewModel.isActive else { return }
+
+    addImage(image, url)
+    focusWindowIfNeeded()
+    focus()
+  }
+
+  func handleVideoDropOrPaste(_ url: URL, thumbnail: NSImage? = nil) {
+    guard !voiceViewModel.isActive else { return }
+    Task { [weak self] in await self?.addVideo(url, thumbnail: thumbnail) }
+  }
+
+  func handleAnimatedImageDropOrPaste(_ url: URL) {
+    guard !voiceViewModel.isActive else { return }
+    Task { [weak self] in await self?.addAnimatedImage(url) }
+  }
+}
+
+// MARK: Delegate
+
+private enum ComposeAutocompleteArrowDirection {
+  case previous
+  case next
+}
+
+extension LegacyComposeAppKit: NSTextViewDelegate, ComposeTextViewDelegate {
+  // Implement delegate methods as needed
+  func textViewDidPressCommandReturn(_ textView: NSTextView) -> Bool {
+    // Always send with command enter
+    send()
+    return true // handled
+  }
+
+  func textViewDidPressArrowUp(_ textView: NSTextView, event: NSEvent) -> Bool {
+    guard shouldHandlePlainComposeArrow(textView, event: event) else { return false }
+
+    if autocompleteMenu?.isVisible == true {
+      return handleAutocompleteArrow(.previous)
+    }
+
+    if commandCompletionMenu?.isVisible == true {
+      commandCompletionMenu?.selectPrevious()
+      return true
+    }
+
+    // If mention menu is visible, let it handle the arrow key
+    if mentionCompletionMenu?.isVisible == true {
+      mentionCompletionMenu?.selectPrevious()
+      return true
+    }
+
+    // only if empty
+    guard textView.string.count == 0 else { return false }
+
+    // fetch last message of ours in this chat that isn't sending or failed
+    let lastMsgId = try? dependencies.database.reader.read { db in
+      let lastMsg = try InlineKit.Message
+        .filter { $0.chatId == chatId }
+        .filter { $0.out == true }
+        .filter { $0.status == MessageSendingStatus.sent }
+        .order { $0.date.desc }
+        .limit(1)
+        .fetchOne(db)
+      // Transcribed speech is never editable.
+      return lastMsg?.isGridTranscript == true ? nil : lastMsg?.messageId
+    }
+    guard let lastMsgId else { return false }
+
+    // Trigger edit mode for last message
+    state.setEditingMsgId(lastMsgId)
+    return true // handled
+  }
+
+  func textViewDidPressReturn(_ textView: NSTextView) -> Bool {
+    if handleAutocompleteCommitKey() { return true }
+
+    if let commandCompletionMenu,
+       commandCompletionMenu.isVisible,
+       commandCompletionMenu.selectCurrentItem(sendAfterInsertion: true) {
+      return true
+    }
+
+    // If mention menu is visible, select current item with Enter
+    if let mentionCompletionMenu, mentionCompletionMenu.isVisible {
+      if mentionCompletionMenu.selectCurrentItem() {
+        return true
+      }
+    }
+
+    if !AppSettings.shared.sendsWithCmdEnter {
+      // Send
+      send()
+      return true
+    }
+
+    return false // not handled
+  }
+
+  func textView(_ textView: NSTextView, didReceiveImage image: NSImage, url: URL? = nil) {
+    handleImageDropOrPaste(image, url)
+  }
+
+  func textView(_ textView: NSTextView, didReceiveFile url: URL) {
+    handleFileDrop([url])
+  }
+
+  func textView(_ textView: NSTextView, didReceiveVideo url: URL) {
+    handleVideoDropOrPaste(url)
+  }
+
+  func textView(_ textView: NSTextView, didReceiveAnimatedImage url: URL) {
+    handleAnimatedImageDropOrPaste(url)
+  }
+
+  func textView(_ textView: NSTextView, didFailToPasteAttachment failure: PasteboardAttachmentFailure) {
+    ToastCenter.shared.showError(failure.userFacingMessage)
+  }
+
+  /// Note(@mo): User reported Chinese users still see the placeholder when they start typing in Chinese characters.
+  /// So apparently there is a feature in macOS for these languages called Chinese IME (Input Method Editor) which lays
+  /// out text temporarily without committing it. This method can detect this and hide the placeholder. And show it back
+  /// when that text is removed.
+  func textView(
+    _ textView: NSTextView,
+    shouldChangeTextIn affectedCharRange: NSRange,
+    replacementString: String?
+  ) -> Bool {
+    // Hide placeholder during IME composition and handle undo to empty text
+    let currentText = textView.string
+    let replacementText = replacementString ?? ""
+
+    // Calculate resulting text safely
+    let nsString = currentText as NSString
+    guard affectedCharRange.location <= nsString.length,
+          NSMaxRange(affectedCharRange) <= nsString.length
+    else {
+      return true
+    }
+
+    let resultingText = nsString.replacingCharacters(in: affectedCharRange, with: replacementText)
+    textEditor.showPlaceholder(resultingText.isEmpty)
+
+    let threadLinkRanges = ComposeThreadLinkEditing.affectedThreadLinkRanges(
+      in: textView.attributedString(),
+      changeRange: affectedCharRange
+    )
+    if !threadLinkRanges.isEmpty, let textStorage = textView.textStorage {
+      textStorage.beginEditing()
+      ComposeThreadLinkEditing.stripThreadLinks(
+        in: textStorage,
+        ranges: threadLinkRanges,
+        textColor: NSColor.labelColor
+      )
+      textStorage.endEditing()
+      textView.resetTypingAttributesToDefault()
+    }
+
+    return true
+  }
+
+  func textDidChange(_ notification: Notification) {
+    guard let textView = notification.object as? NSTextView else { return }
+
+    paragraphDirectionController.textDidChange()
+
+    // Prevent mention style leakage to new text
+    textView.updateTypingAttributesIfNeeded()
+
+    if !ignoreNextHeightChange {
+      updateHeightIfNeeded(for: textView)
+    } else {
+      log.trace("ignore next height change")
+    }
+
+    detectComposeCompletionsAtCursor(trigger: .textChange)
+
+    handleStickerDetectionIfNeeded(for: textView)
+
+    if textEditor.isAttributedTextEmpty {
+      // Handle empty text
+      textEditor.showPlaceholder(true)
+
+      // Cancel typing
+      Task {
+        await ComposeActions.shared.stoppedTyping(for: self.peerId)
+      }
+    } else {
+      // Handle non-empty text
+      textEditor.showPlaceholder(false)
+
+      // Start typing
+      Task {
+        await ComposeActions.shared.startedTyping(for: self.peerId)
+      }
+    }
+
+    updateSendButtonIfNeeded()
+    saveDraftWithDebounce()
+  }
+
+  private func handleStickerDetectionIfNeeded(for textView: NSTextView) {
+    guard #available(macOS 15.0, *) else { return }
+    guard isHandlingStickerInsertion == false else { return }
+
+    let stickers = stickerDetector.detectStickers(in: textView.attributedString())
+    guard stickers.isEmpty == false else { return }
+    guard let textStorage = textView.textStorage else { return }
+
+    isHandlingStickerInsertion = true
+    let fullString = textStorage.string as NSString
+    let sorted = stickers.sorted { $0.range.location > $1.range.location }
+    for sticker in sorted {
+      sendSticker(sticker.image)
+      let range = sticker.range
+      guard range.location != NSNotFound, NSMaxRange(range) <= textStorage.length else { continue }
+      let composedRange = fullString.rangeOfComposedCharacterSequences(for: range)
+      let safeRange = NSMaxRange(composedRange) <= textStorage.length ? composedRange : range
+      textStorage.replaceCharacters(in: safeRange, with: "")
+    }
+    textView.resetTypingAttributesToDefault()
+    isHandlingStickerInsertion = false
+
+  }
+
+  /// Reflect state changes in send button
+  func updateSendButtonIfNeeded() {
+    sendButton.updateCanSend(canSend)
+    updateVoiceAvailability()
+  }
+
+  func calculateContentHeight(for textView: NSTextView) -> CGFloat {
+    contentHeight(for: textView)
+  }
+
+  func updateContentHeight(for textView: NSTextView) {
+    textViewContentHeight = calculateContentHeight(for: textView)
+  }
+
+  func updateHeightIfNeeded(for textView: NSTextView, animate: Bool = false) {
+    let contentHeight = contentHeight(for: textView)
+
+    if abs(textViewContentHeight - contentHeight) < 0.5 {
+      // Normal typing within the same measured visual row does not change
+      // compose height.
+      log.trace("minimal change to height ignore")
+      return
+    }
+
+    log.trace("update height to \(contentHeight)")
+
+    textViewContentHeight = contentHeight
+
+    updateHeight(animate: animate)
+  }
+
+  private func contentHeight(for textView: NSTextView) -> CGFloat {
+    ComposeTextEditor.measuredContentHeight(for: textView)
+  }
+
+  func textViewDidChangeSelection(_ notification: Notification) {
+    guard let textView = notification.object as? NSTextView else { return }
+
+    paragraphDirectionController.selectionDidChange()
+
+    // Reset typing attributes when cursor moves to prevent mention style leakage
+    textView.updateTypingAttributesIfNeeded()
+    detectComposeCompletionsAtCursor(trigger: .selectionChange)
+  }
+
+  func textViewDidPressArrowDown(_ textView: NSTextView, event: NSEvent) -> Bool {
+    guard shouldHandlePlainComposeArrow(textView, event: event) else { return false }
+
+    if autocompleteMenu?.isVisible == true {
+      return handleAutocompleteArrow(.next)
+    }
+
+    if commandCompletionMenu?.isVisible == true {
+      commandCompletionMenu?.selectNext()
+      return true
+    }
+
+    // If mention menu is visible, let it handle the arrow key
+    if mentionCompletionMenu?.isVisible == true {
+      mentionCompletionMenu?.selectNext()
+      return true
+    }
+
+    return false // not handled
+  }
+
+  func textViewDidPressArrowLeft(_ textView: NSTextView, event: NSEvent) -> Bool {
+    guard shouldHandlePlainComposeArrow(textView, event: event) else { return false }
+
+    guard let autocompleteMenu,
+          autocompleteMenu.isVisible,
+          autocompleteMenu.isShowingEmojiPalette
+    else {
+      return false
+    }
+
+    return handleAutocompleteArrow(.previous)
+  }
+
+  func textViewDidPressArrowRight(_ textView: NSTextView, event: NSEvent) -> Bool {
+    guard shouldHandlePlainComposeArrow(textView, event: event) else { return false }
+
+    guard let autocompleteMenu,
+          autocompleteMenu.isVisible,
+          autocompleteMenu.isShowingEmojiPalette
+    else {
+      return false
+    }
+
+    return handleAutocompleteArrow(.next)
+  }
+
+  func textViewDidPressCompletionNavigation(_ textView: NSTextView, isForward: Bool) -> Bool {
+    guard !textView.hasMarkedText() else { return false }
+
+    if autocompleteMenu?.isVisible == true {
+      _ = handleAutocompleteArrow(isForward ? .next : .previous)
+      return true
+    }
+
+    if commandCompletionMenu?.isVisible == true {
+      if isForward {
+        commandCompletionMenu?.selectNext()
+      } else {
+        commandCompletionMenu?.selectPrevious()
+      }
+      return true
+    }
+
+    if mentionCompletionMenu?.isVisible == true {
+      if isForward {
+        mentionCompletionMenu?.selectNext()
+      } else {
+        mentionCompletionMenu?.selectPrevious()
+      }
+      return true
+    }
+
+    return false
+  }
+
+  private func shouldHandlePlainComposeArrow(_ textView: NSTextView, event: NSEvent) -> Bool {
+    guard !textView.hasMarkedText() else {
+      dismissCompletionMenusForTextNavigation()
+      return false
+    }
+
+    let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+    guard modifiers.isEmpty else {
+      dismissCompletionMenusForTextNavigation()
+      return false
+    }
+
+    return true
+  }
+
+  private func dismissCompletionMenusForTextNavigation() {
+    hideMentionCompletion()
+    hideCommandCompletion()
+    hideAutocomplete()
+  }
+
+  private func handleAutocompleteArrow(_ direction: ComposeAutocompleteArrowDirection) -> Bool {
+    guard let autocompleteMenu,
+          autocompleteMenu.isVisible
+    else {
+      return false
+    }
+    guard autocompleteMenu.canSelectItems else { return true }
+
+    if autocompleteMenu.isShowingEmojiPalette, isAtEmojiPaletteEdge(direction) {
+      hideAutocomplete()
+      return false
+    }
+
+    switch direction {
+    case .previous:
+      autocompleteViewModel.selectPrevious()
+    case .next:
+      autocompleteViewModel.selectNext()
+    }
+
+    return true
+  }
+
+  private func isAtEmojiPaletteEdge(_ direction: ComposeAutocompleteArrowDirection) -> Bool {
+    let count = autocompleteViewModel.items.count
+    guard count > 0 else { return true }
+
+    switch direction {
+    case .previous:
+      return autocompleteViewModel.selectedIndex <= 0
+    case .next:
+      return autocompleteViewModel.selectedIndex >= count - 1
+    }
+  }
+
+  func textViewDidPressTab(_ textView: NSTextView) -> Bool {
+    if handleAutocompleteCommitKey() { return true }
+
+    if commandCompletionMenu?.isVisible == true {
+      commandCompletionMenu?.selectCurrentItem(sendAfterInsertion: false)
+      return true
+    }
+
+    // If mention menu is visible, select current item
+    if mentionCompletionMenu?.isVisible == true {
+      mentionCompletionMenu?.selectCurrentItem()
+      return true
+    }
+
+    return false // not handled
+  }
+
+  func textViewDidPressEscape(_ textView: NSTextView) -> Bool {
+    if autocompleteCommitKeyAction != .ignore {
+      hideAutocomplete(suppressCurrentMatch: true)
+      return true
+    }
+
+    if commandCompletionMenu?.isVisible == true {
+      hideCommandCompletion()
+      return true
+    }
+
+    // If mention menu is visible, hide it
+    if mentionCompletionMenu?.isVisible == true {
+      hideMentionCompletion()
+      return true
+    }
+
+    return false // not handled
+  }
+
+  private var autocompleteCommitKeyAction: ComposeAutocompleteCommitKeyAction {
+    composeAutocompleteCommitKeyAction(
+      match: autocompleteViewModel.match,
+      loadState: autocompleteViewModel.loadState,
+      isVisible: autocompleteMenu?.isVisible == true,
+      canSelectItems: autocompleteMenu?.canSelectItems == true
+    )
+  }
+
+  private func handleAutocompleteCommitKey() -> Bool {
+    switch autocompleteCommitKeyAction {
+    case .ignore:
+      return false
+    case .consume:
+      return true
+    case .select:
+      _ = autocompleteMenu?.selectCurrentItem()
+      return true
+    }
+  }
+
+  func textViewDidChangeFormatting(_ textView: NSTextView) {
+    saveDraft()
+  }
+
+  func textView(_ textView: NSTextView, didDetectMentionWith query: String, at location: Int) {
+    // This method is called from text change detection
+    // Implementation will be in textDidChange
+  }
+
+  func textViewDidCancelMention(_ textView: NSTextView) {
+    hideMentionCompletion()
+    hideCommandCompletion()
+    hideAutocomplete()
+  }
+
+  func textViewDidGainFocus(_ textView: NSTextView) {
+    paragraphDirectionController.didGainFocus()
+  }
+
+  func textViewDidLoseFocus(_ textView: NSTextView) {
+    DispatchQueue.main.async { [weak self, weak textView] in
+      guard let self, let textView else { return }
+
+      if window?.firstResponder === textView {
+        return
+      }
+
+      if autocompleteMenuContainsFirstResponder() {
+        focus()
+        return
+      }
+
+      // Hide mention menu when text view loses focus
+      hideMentionCompletion()
+      hideCommandCompletion()
+      hideAutocomplete()
+    }
+  }
+
+  private func autocompleteMenuContainsFirstResponder() -> Bool {
+    guard let menu = autocompleteMenu,
+          menu.isVisible,
+          let responderView = window?.firstResponder as? NSView
+    else {
+      return false
+    }
+
+    return responderView === menu || responderView.isDescendant(of: menu)
+  }
+}
+
+// MARK: ComposeEmojiButtonDelegate
+
+extension LegacyComposeAppKit: ComposeEmojiButtonDelegate {
+  func composeEmojiButton(_ button: ComposeEmojiButton, didReceiveText text: String) {
+    focus()
+    textEditor.insertText(text)
+  }
+
+  func composeEmojiButton(_ button: ComposeEmojiButton, didReceiveSticker image: NSImage) {
+    sendSticker(image)
+    focus()
+  }
+}
+
+// MARK: ComposeMenuButtonDelegate
+
+extension LegacyComposeAppKit: ComposeMenuButtonDelegate {
+  func composeMenuButtonDidRequestCommands(_ button: ComposeMenuButton) {
+    showCommandsFromMenu()
+  }
+
+  func composeMenuButton(_ button: ComposeMenuButton, didSelectImage image: NSImage, url: URL) {
+    handleImageDropOrPaste(image, url)
+  }
+
+  func composeMenuButton(_ button: ComposeMenuButton, didSelectVideo url: URL) {
+    handleVideoDropOrPaste(url)
+  }
+
+  func composeMenuButton(_ button: ComposeMenuButton, didSelectFiles urls: [URL]) {
+    handleFileDrop(urls)
+  }
+
+  func composeMenuButton(didCaptureImage image: NSImage) {
+    handleImageDropOrPaste(image)
+  }
+}
+
+// MARK: MentionCompletionMenuDelegate
+
+extension LegacyComposeAppKit: MentionCompletionMenuDelegate {
+  func mentionMenu(_ menu: MentionCompletionMenu, didSelectItem item: MentionCompletionItem, withText text: String) {
+    guard let mentionRange = currentMentionRange else { return }
+    log.trace("mentionMenu didSelectItem: \(text)")
+
+    let currentAttributedText = textEditor.attributedString
+    let result = switch item {
+    case let .user(user):
+      mentionDetector.replaceMention(
+        in: currentAttributedText,
+        range: mentionRange.range,
+        with: text,
+        userId: user.userInfo.user.id,
+        mentionAttributes: composeMentionAttributes,
+        trailingAttributes: composeBaseTextAttributes
+      )
+    case let .group(group):
+      mentionDetector.replaceGroupMention(
+        in: currentAttributedText,
+        range: mentionRange.range,
+        with: text,
+        groupId: group.id,
+        mentionAttributes: composeMentionAttributes,
+        trailingAttributes: composeBaseTextAttributes
+      )
+    case let .agent(agent):
+      mentionDetector.replaceMention(
+        in: currentAttributedText,
+        range: mentionRange.range,
+        with: text,
+        userId: agent.botUserId,
+        agentId: agent.id,
+        mentionAttributes: composeMentionAttributes,
+        trailingAttributes: composeBaseTextAttributes
+      )
+    }
+
+    // Update attributed text and cursor position
+    ignoreNextHeightChange = true
+    textEditor.setAttributedString(result.newAttributedText)
+    textEditor.textView.setSelectedRange(NSRange(location: result.newCursorPosition, length: 0))
+    textEditor.textView.resetTypingAttributesToDefault()
+    ignoreNextHeightChange = false
+
+    // Hide the menu
+    hideMentionCompletion()
+
+    // Update height if needed
+    updateHeightIfNeeded(for: textEditor.textView)
+    saveDraft()
+  }
+
+  func mentionMenuDidRequestClose(_ menu: MentionCompletionMenu) {
+    hideMentionCompletion()
+  }
+}
+
+extension LegacyComposeAppKit: CommandCompletionMenuDelegate {
+  func commandMenu(
+    _ menu: CommandCompletionMenu,
+    didSelectSuggestion suggestion: ComposeCommandSuggestion,
+    sendAfterInsertion: Bool
+  ) {
+    guard let currentSlashCommandRange else { return }
+
+    if case let .inline(command) = suggestion {
+      hideCommandCompletion()
+      if sendAfterInsertion {
+        performInlineCommand(command.action)
+      } else {
+        // App commands are not inserted on Tab: leaving executable system text in compose could
+        // later send it to a bot or the chat instead of running the local action.
+        updateHeightIfNeeded(for: textEditor.textView)
+      }
+      return
+    }
+
+    guard case let .bot(botSuggestion) = suggestion else { return }
+
+    let currentAttributedText = textEditor.attributedString
+    let commandText = botSuggestion.insertionText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let result = slashCommandDetector.replaceSlashCommand(
+      in: currentAttributedText,
+      range: currentSlashCommandRange.range,
+      with: commandText,
+      targetBotUserId: botSuggestion.botId
+    )
+
+    ignoreNextHeightChange = true
+    textEditor.setAttributedString(result.newAttributedText)
+    textEditor.textView.setSelectedRange(NSRange(location: result.newCursorPosition, length: 0))
+    ignoreNextHeightChange = false
+
+    hideCommandCompletion()
+
+    if sendAfterInsertion {
+      send()
+    } else {
+      updateHeightIfNeeded(for: textEditor.textView)
+      updateSendButtonIfNeeded()
+      saveDraft()
+    }
+  }
+
+  func commandMenuDidRequestClose(_ menu: CommandCompletionMenu) {
+    hideCommandCompletion()
+  }
+}
+
+extension LegacyComposeAppKit: ComposeAutocompleteMenuDelegate {
+  func autocompleteMenu(_ menu: ComposeAutocompleteMenu, didSelect item: ComposeAutocompleteItem) {
+    guard let match = autocompleteViewModel.match else { return }
+
+    switch item.payload {
+      case let .thread(chatId, _, title):
+        let result = if match.kind == .threadNumber,
+                        let reference = item.threadReference {
+          threadLinkDetector.replaceThreadNumberReference(
+            in: textEditor.attributedString,
+            range: match.range,
+            with: reference,
+            linkAttributes: composeThreadLinkAttributes,
+            trailingAttributes: composeBaseTextAttributes
+          )
+        } else {
+          threadLinkDetector.replaceThreadLink(
+            in: textEditor.attributedString,
+            range: match.range,
+            with: title,
+            chatId: chatId,
+            linkAttributes: composeThreadLinkAttributes,
+            trailingAttributes: composeBaseTextAttributes
+          )
+        }
+
+        ignoreNextHeightChange = true
+        textEditor.setAttributedString(result.newAttributedText)
+        textEditor.textView.setSelectedRange(NSRange(location: result.newCursorPosition, length: 0))
+        textEditor.textView.resetTypingAttributesToDefault()
+        ignoreNextHeightChange = false
+
+        hideAutocomplete()
+        updateHeightIfNeeded(for: textEditor.textView)
+        saveDraft()
+
+      case let .externalResource(resource):
+        let result = ExternalResourceLinkEditing.replaceReference(
+          in: textEditor.attributedString,
+          range: match.range,
+          with: resource,
+          linkAttributes: composeThreadLinkAttributes,
+          trailingAttributes: composeBaseTextAttributes
+        )
+
+        ignoreNextHeightChange = true
+        textEditor.setAttributedString(result.newAttributedText)
+        textEditor.textView.setSelectedRange(NSRange(location: result.newCursorPosition, length: 0))
+        textEditor.textView.resetTypingAttributesToDefault()
+        ignoreNextHeightChange = false
+
+        hideAutocomplete()
+        updateHeightIfNeeded(for: textEditor.textView)
+        updateSendButtonIfNeeded()
+        saveDraft()
+
+      case let .emoji(value, _):
+        let preferredValue = AppSettings.shared.preferredEmojiSkinTone.applying(to: value)
+        let result = emojiAutocompleteDetector.replaceEmojiAutocomplete(
+          in: textEditor.attributedString,
+          range: match.range,
+          with: preferredValue
+        )
+
+        ignoreNextHeightChange = true
+        textEditor.setAttributedString(result.attributedText)
+        textEditor.textView.setSelectedRange(NSRange(location: result.cursorPosition, length: 0))
+        ignoreNextHeightChange = false
+
+        hideAutocomplete()
+        updateHeightIfNeeded(for: textEditor.textView)
+
+      case .mention, .command, .inlineCommand:
+        assertionFailure("iOS-only autocomplete payload reached the legacy macOS composer")
+    }
+  }
+
+  private var composeThreadLinkAttributes: [NSAttributedString.Key: Any] {
+    var attributes = composeBaseTextAttributes
+    attributes[.foregroundColor] = ComposeTextEditor.linkColor
+    return attributes
+  }
+
+  private var composeMentionAttributes: [NSAttributedString.Key: Any] {
+    var attributes = composeBaseTextAttributes
+    attributes[.foregroundColor] = ComposeTextEditor.linkColor
+    return attributes
+  }
+
+  private var composeBaseTextAttributes: [NSAttributedString.Key: Any] {
+    textEditor.textView.defaultTypingAttributes
+  }
+
+  func autocompleteMenuDidRequestClose(_ menu: ComposeAutocompleteMenu) {
+    hideAutocomplete(suppressCurrentMatch: true)
+  }
+}
+
+// MARK: - Rich text loading
+
+extension LegacyComposeAppKit {
+  func toAttributedString(text: String, entities: MessageEntities?) -> NSAttributedString {
+    let attributedString = ProcessEntities.toAttributedString(
+      text: text,
+      entities: entities,
+      configuration: .init(
+        font: ComposeTextEditor.font,
+        primaryColor: ComposeTextEditor.textColor,
+        linkColor: ComposeTextEditor.linkColor,
+        convertMentionsToLink: false
+      )
+    )
+
+    return attributedString
+  }
+
+  func setMessage(text: String, entities: MessageEntities?) {
+    // Convert to attributed string
+    let attributedString = ProcessEntities.toAttributedString(
+      text: text,
+      entities: entities,
+      configuration: .init(
+        font: ComposeTextEditor.font,
+        primaryColor: ComposeTextEditor.textColor,
+        linkColor: ComposeTextEditor.linkColor,
+        convertMentionsToLink: false
+      )
+    )
+
+    setAttributedString(attributedString)
+  }
+
+  func setAttributedString(_ attributedString: NSAttributedString) {
+    // Set as compose text
+    textEditor.replaceAttributedString(attributedString)
+    paragraphDirectionController.refreshAllParagraphDirections()
+    textEditor.showPlaceholder(text.isEmpty)
+
+    // Measure new height
+    updateContentHeight(for: textEditor.textView)
+
+    // Update compose height
+    updateHeight(animate: false)
+
+    updateSendButtonIfNeeded()
+  }
+}
+
+// MARK: - Draft
+
+extension LegacyComposeAppKit {
+  /// Loads draft and if nothing found returns false
+  func loadDraft() -> Bool {
+    guard let draft = drafts2.load(peer: peerId, legacyDraftMessage: dialog?.draftMessage),
+          !draft.isEmpty
+    else {
+      return false
+    }
+
+    // Convert to attributed string. Most drafts are plain text, so avoid entity
+    // parsing work when protobuf entities are not present.
+    let attributedString: NSAttributedString
+    if let entities = draft.entities {
+      attributedString = toAttributedString(
+        text: draft.text,
+        entities: entities
+      )
+    } else {
+      attributedString = textEditor.createAttributedString(draft.text)
+    }
+
+    // `didLayout()` is called after layout in normal flow. Only force layout
+    // when width isn't resolved yet.
+    if textEditor.bounds.width <= 1 {
+      layoutSubtreeIfNeeded()
+    }
+
+    // Set as compose text
+    setAttributedString(attributedString)
+    renderDraftAttachments(draft.attachments)
+
+    return true
+  }
+
+  @discardableResult
+  private func saveDraft() -> Int64 {
+    let revision = updateDraftTextFromEditor()
+    saveDraftEntities(forRevision: revision)
+    return revision
+  }
+
+  private func clearDraft() {
+    clearDraft(flush: false)
+  }
+
+  private func clearDraft(flush: Bool) {
+    draftEntitySaveTask?.cancel()
+    draftEntitySaveTask = nil
+    drafts2.clear(peer: peerId)
+    if flush {
+      drafts2.flushBlocking()
+    }
+  }
+
+  private func requestImmediateDraftPersistenceIfNeeded() {
+    guard didRequestFinalDraftPersistence == false else { return }
+    didRequestFinalDraftPersistence = true
+
+    draftEntitySaveTask?.cancel()
+    draftEntitySaveTask = nil
+
+    saveDraft()
+    drafts2.flushBlocking()
+  }
+
+  /// Triggers save with a 3s delay which cancels previous Task thus creating a basic debounced
+  /// entity extraction to be used on textDidChange.
+  private func saveDraftWithDebounce() {
+    let revision = updateDraftTextFromEditor()
+    scheduleDraftEntitySave(forRevision: revision)
+  }
+
+  @discardableResult
+  private func updateDraftTextFromEditor() -> Int64 {
+    let text = textEditor.textView.string.replacingOccurrences(of: Self.attachmentMarker, with: "")
+    return drafts2.updateText(peer: peerId, text: text)
+  }
+
+  private func scheduleDraftEntitySave(forRevision revision: Int64) {
+    draftEntitySaveTask?.cancel()
+    draftEntitySaveTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      try? await Task.sleep(nanoseconds: 3_000_000_000)
+      guard !Task.isCancelled else { return }
+      saveDraftEntities(forRevision: revision)
+    }
+  }
+
+  private func saveDraftEntities(forRevision revision: Int64) {
+    let (rawText, entities) = ProcessEntities.fromAttributedString(
+      textEditor.attributedString,
+      parseMarkdown: false,
+      threadLinkSpaceId: chat?.spaceId
+    )
+    let text = rawText.replacingOccurrences(of: Self.attachmentMarker, with: "")
+    let normalizedEntities: MessageEntities? = rawText == text ? Drafts2.normalizedEntities(entities) : nil
+    drafts2.updateEntities(peer: peerId, entities: normalizedEntities, forRevision: revision)
+  }
+
+  private func renderDraftAttachments(_ draftAttachments: [Drafts2Attachment]) {
+    guard !draftAttachments.isEmpty else { return }
+
+    attachmentItems.removeAll()
+    attachments.clearViews()
+    for attachment in draftAttachments {
+      renderDraftAttachment(attachment)
+    }
+
+    updateHeight(animate: false)
+    updateSendButtonIfNeeded()
+  }
+
+  private func handleDraftAttachmentResult(_ result: Drafts2AttachmentResult) {
+    switch result {
+      case let .pending(pendingId):
+        if !attachments.containsAttachment(id: pendingId) {
+          attachments.addPendingAttachment(id: pendingId)
+          updateHeight(animate: true)
+        }
+        updateSendButtonIfNeeded()
+      case let .success(pendingId, attachment):
+        removeDraftAttachmentPlaceholder(id: pendingId)
+        guard drafts2.load(peer: peerId)?.attachments.contains(where: { $0.id == attachment.id }) == true else {
+          updateSendButtonIfNeeded()
+          return
+        }
+        renderDraftAttachment(attachment)
+        updateHeight(animate: true)
+        updateSendButtonIfNeeded()
+      case let .failure(pendingId, message):
+        removeDraftAttachmentPlaceholder(id: pendingId)
+        log.error("Failed to save draft attachment: \(message)")
+        ToastCenter.shared.showError("Couldn’t add attachment as media or a file.")
+        updateHeight(animate: true)
+        updateSendButtonIfNeeded()
+      case let .cancelled(pendingId):
+        removeDraftAttachmentPlaceholder(id: pendingId)
+        updateHeight(animate: true)
+        updateSendButtonIfNeeded()
+    }
+  }
+
+  private func renderDraftAttachment(_ attachment: Drafts2Attachment) {
+    switch attachment.media {
+      case let .photo(photoInfo):
+        guard let image = loadThumbnail(from: photoInfo) else {
+          log.warning("Unable to render draft photo attachment without local thumbnail")
+          return
+        }
+        attachmentItems[attachment.id] = attachment.media
+        attachments.addImageView(image, id: attachment.id)
+      case let .video(videoInfo):
+        attachmentItems[attachment.id] = attachment.media
+        attachments.addVideoView(videoInfo, id: attachment.id)
+      case let .document(documentInfo):
+        attachmentItems[attachment.id] = attachment.media
+        attachments.addDocumentView(documentInfo, id: attachment.id)
+      case let .voice(voice):
+        guard voiceViewModel.loadDraftVoice(voice) else {
+          log.warning("Unable to restore draft voice attachment")
+          return
+        }
+        attachmentItems[attachment.id] = attachment.media
+        updateVoiceAvailability(phase: .review)
+    }
+  }
+
+  private func removeDraftAttachmentPlaceholder(id: String) {
+    attachments.removeImageView(id: id)
+    attachments.removeVideoView(id: id)
+    attachments.removeDocumentView(id: id)
+  }
+
+  private func restorePendingDraftAttachmentPlaceholders() {
+    for pendingId in drafts2.pendingAttachmentIDs(peer: peerId) {
+      handleDraftAttachmentResult(.pending(pendingId: pendingId))
+    }
+  }
+}
+
+extension LegacyComposeAppKit: ComposeImplementation, ComposeAttachmentOwner {
+  var view: NSView {
+    self
+  }
+
+  func hostWillMove(toSuperview newSuperview: NSView?) {
+    if newSuperview == nil {
+      cancelTranscriptionForRemoval()
+      requestImmediateDraftPersistenceIfNeeded()
+    } else {
+      didRequestFinalDraftPersistence = false
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@inline-chat/email-preview",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.tsx",
+    "start": "bun src/index.tsx",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint --ignore-path ../../../.oxlintignore src",
+    "test": "echo \"No tests yet for @inline-chat/email-preview\""
+  },
+  "dependencies": {
+    "@inline-chat/email-templates": "workspace:*",
+    "@react-email/components": "^1.0.6",
+    "@react-email/render": "^2.0.4",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "oxlint": "catalog:",
+    "typescript": "catalog:"
+  },
+  "license": "AGPL-3.0-only"
+}

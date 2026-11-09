@@ -1,0 +1,108 @@
+import { MessageEntities } from "@inline-chat/protocol/core"
+import type { InputTranslation } from "@in/server/db/models/translations"
+import { Log } from "@in/server/utils/log"
+import { translateTexts } from "./textTranslation"
+import { convertEntityOffsets } from "./entityConversion"
+import type { TranslationCallInput } from "./types"
+import { isProd, HARDCODED_TRANSLATION_CONTEXT } from "@in/server/env"
+
+const log = new Log("modules/translation")
+
+type TranslationDependencies = {
+  translateTexts: typeof translateTexts
+  convertEntityOffsets: typeof convertEntityOffsets
+}
+
+export function createTranslationModule(deps: TranslationDependencies) {
+  return {
+    translateMessages(input: TranslationCallInput) {
+      return translateMessages(input, deps)
+    },
+  }
+}
+
+export const TranslationModule = createTranslationModule({
+  translateTexts,
+  convertEntityOffsets,
+})
+
+if (!HARDCODED_TRANSLATION_CONTEXT && isProd) {
+  log.warn("HARDCODED_TRANSLATION_CONTEXT is not available")
+}
+
+async function translateMessages(
+  input: TranslationCallInput,
+  deps: TranslationDependencies,
+): Promise<InputTranslation[]> {
+  log.info(`Translating ${input.messages.length} messages to ${input.language} using 2-step process`)
+
+  // Step 1: Translate text content only
+  const textTranslations = await deps.translateTexts(input)
+
+  // Step 2: Convert entity offsets for messages that have entities
+  // Collect messages that need entity conversion
+  const messagesWithEntities = textTranslations
+    .map((translation) => {
+      const originalMessage = input.messages.find((m) => m.messageId === translation.messageId)
+      if (!originalMessage) {
+        throw new Error(`Original message not found for messageId: ${translation.messageId}`)
+      }
+      return { translation, originalMessage }
+    })
+    .filter(({ originalMessage }) => originalMessage.entities && originalMessage.text)
+
+  // Convert entity offsets using batch processing (works for single messages too)
+  let entityResults: Array<{ messageId: number; entities: MessageEntities | null }> = []
+
+  if (messagesWithEntities.length > 0) {
+    log.info(
+      `Converting entity offsets for ${messagesWithEntities.length} message${
+        messagesWithEntities.length === 1 ? "" : "s"
+      }`,
+    )
+    try {
+      entityResults = await deps.convertEntityOffsets({
+        messages: messagesWithEntities.map(({ translation, originalMessage }) => ({
+          messageId: translation.messageId,
+          originalText: originalMessage.text!,
+          translatedText: translation.translation,
+          originalEntities: originalMessage.entities!,
+        })),
+        actorId: input.actorId,
+      })
+    } catch (error) {
+      log.traceContent("Entity conversion failure", error)
+      log.error("Entity conversion failed")
+      // Continue without entities rather than failing the entire translation
+      entityResults = messagesWithEntities.map(({ translation }) => ({
+        messageId: translation.messageId,
+        entities: null,
+      }))
+    }
+  }
+
+  // Create final results with entities merged in
+  const entityMap = new Map(entityResults.map((r) => [r.messageId, r.entities]))
+
+  const translationsWithEntities = textTranslations.map((translation) => {
+    const sourceMessage = input.messages.find((m) => m.messageId === translation.messageId)
+    if (!sourceMessage) {
+      throw new Error(`Original message not found for messageId: ${translation.messageId}`)
+    }
+    const entities = entityMap.get(translation.messageId) || null
+    const date = new Date()
+    const msgRev = sourceMessage.rev ?? 0
+    return {
+      translation: translation.translation,
+      messageId: translation.messageId,
+      chatId: input.chat.id,
+      language: input.language,
+      entities,
+      date,
+      msgRev,
+    }
+  })
+
+  log.info(`Translation completed: ${translationsWithEntities.length} messages processed`)
+  return translationsWithEntities
+}

@@ -1,0 +1,243 @@
+import Foundation
+import GRDB
+import InlineProtocol
+import Logger
+import RealtimeV2
+
+public enum DialogOrderDestination: Sendable, Codable, Equatable {
+  case root
+  case folder(Int64)
+}
+
+public struct UpdateDialogOrderTransaction: Transaction2 {
+  public var method: InlineProtocol.Method = .updateDialogOrder
+  public var context: Context
+  public var type: TransactionKindType = .mutation()
+
+  public struct Context: Sendable, Codable {
+    let peerId: Peer
+    let order: String?
+    let pinnedOrder: String?
+    let pinned: Bool?
+    let destination: DialogOrderDestination?
+    let intentId: String?
+    /// Optional so transactions queued by older app versions still decode.
+    let requiresChatCreated: Bool?
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case context
+  }
+
+  private var log = Log.scoped("Transactions/UpdateDialogOrder")
+
+  public init(
+    peerId: Peer,
+    order: String? = nil,
+    pinnedOrder: String? = nil,
+    pinned: Bool? = nil,
+    destination: DialogOrderDestination? = nil,
+    requiresChatCreated: Bool = false
+  ) {
+    context = Context(
+      peerId: peerId,
+      order: order,
+      pinnedOrder: pinnedOrder,
+      pinned: pinned,
+      destination: destination,
+      intentId: UUID().uuidString,
+      requiresChatCreated: requiresChatCreated
+    )
+  }
+
+  public func input(from context: Context) -> InlineProtocol.RpcCall.OneOf_Input? {
+    .updateDialogOrder(.with {
+      $0.peerID = context.peerId.toInputPeer()
+      if let order = context.order {
+        $0.order = order
+      }
+      if let pinnedOrder = context.pinnedOrder {
+        $0.pinnedOrder = pinnedOrder
+      }
+      if let pinned = context.pinned {
+        $0.pinned = pinned
+      }
+      if let destination = context.destination {
+        $0.destination = .with {
+          switch destination {
+          case .root: $0.root = true
+          case let .folder(folderId): $0.folderID = folderId
+          }
+        }
+      }
+    })
+  }
+
+  public func optimistic() async {
+    do {
+      let snapshot = try await AppDatabase.shared.dbWriter.write { db -> DialogMutationSnapshot? in
+        guard var dialog = try Dialog.get(peerId: context.peerId).fetchOne(db) else { return nil }
+        let baseline = dialog
+        try applyLocalOrder(&dialog, db: db)
+        try dialog.save(db, onConflict: .replace)
+        return DialogMutationSnapshot(
+          baseline: baseline,
+          optimistic: try Dialog.fetchOne(db, id: dialog.id) ?? dialog,
+          createdRow: false
+        )
+      }
+      guard let snapshot else { return }
+      await DialogMutationRollbackTracker.shared.record(
+        intentID: context.intentId,
+        peer: context.peerId,
+        kind: .order,
+        snapshot: snapshot,
+        fields: Self.rollbackFields
+      )
+    } catch {
+      log.error("Failed to optimistically update dialog order", error: error)
+    }
+  }
+
+  public func apply(_ result: RpcResult.OneOf_Result?) async throws(TransactionExecutionError) {
+    guard case let .updateDialogOrder(response) = result else {
+      throw TransactionExecutionError.invalid
+    }
+
+    guard response.hasChat, response.hasDialog else {
+      throw TransactionExecutionError.invalid
+    }
+
+    do {
+      try await AppDatabase.shared.dbWriter.write { db in
+        if response.hasUser {
+          _ = try User.save(db, user: response.user)
+        }
+
+        var chat = Chat(from: response.chat)
+        try chat.saveWithValidLastMsg(db)
+        _ = try response.dialog.saveFull(db)
+      }
+      await DialogMutationRollbackTracker.shared.complete(
+        intentID: context.intentId,
+        peer: context.peerId,
+        kind: .order
+      )
+    } catch {
+      log.error("Failed to apply dialog order result", error: error)
+      throw TransactionExecutionError.invalid
+    }
+  }
+
+  // Neither outcome rolls back, so the intent must stop owning its fields.
+  public func commitOutcomeUnknown() async {
+    await DialogMutationRollbackTracker.shared.complete(intentID: context.intentId, peer: context.peerId, kind: .order)
+  }
+
+  public func cancelled() async {
+    await DialogMutationRollbackTracker.shared.complete(intentID: context.intentId, peer: context.peerId, kind: .order)
+  }
+
+  public func failed(error: TransactionError2) async {
+    log.error("UpdateDialogOrder transaction failed", error: error)
+    guard let rollback = await DialogMutationRollbackTracker.shared.takeForRollback(
+      intentID: context.intentId,
+      peer: context.peerId,
+      kind: .order
+    ) else { return }
+
+    do {
+      try await AppDatabase.shared.dbWriter.write { db in
+        try rollback.apply(db)
+      }
+    } catch {
+      log.error("Failed to roll back dialog order state", error: error)
+    }
+  }
+
+  private static let rollbackFields: [DialogRollbackField] = [
+    .pinned, .open, .order, .pinnedOrder, .archived, .chatListHidden, .folderId,
+  ]
+
+  public var blockers: [TransactionBlocker] {
+    guard context.requiresChatCreated == true,
+          case let .thread(chatId) = context.peerId
+    else {
+      return []
+    }
+
+    return [.chatCreated(chatId: chatId)]
+  }
+
+  func applyLocalOrder(_ dialog: inout Dialog, db: Database) throws {
+    if let order = context.order {
+      dialog.order = order
+    }
+
+    if let pinnedOrder = context.pinnedOrder {
+      dialog.pinnedOrder = pinnedOrder
+    }
+
+    var movedIntoFolder = false
+    if let destination = context.destination {
+      switch destination {
+      case .root:
+        dialog.folderId = nil
+      case let .folder(folderId):
+        // Mirror the server: folder membership never creates a child pin; it can only preserve one.
+        let folderIsPinned = try DialogFolder.fetchOne(db, key: folderId)?.isPinned == true
+        let preservesExistingPin = dialog.pinned == true && folderIsPinned
+        dialog.folderId = folderId
+        dialog.pinned = preservesExistingPin
+        movedIntoFolder = true
+      }
+      dialog.open = true
+      dialog.archived = false
+      dialog.chatListHidden = nil
+    }
+
+    guard movedIntoFolder == false else { return }
+    guard let pinned = context.pinned else { return }
+
+    dialog.pinned = pinned
+    if pinned {
+      dialog.folderId = nil
+      if dialog.order == nil {
+        dialog.order = try Dialog.nextSidebarOrder(db)
+      }
+      if dialog.pinnedOrder == nil {
+        dialog.pinnedOrder = try Dialog.nextPinnedOrder(db)
+      }
+      dialog.open = true
+      dialog.archived = false
+      dialog.chatListHidden = nil
+      return
+    }
+
+    if context.order != nil {
+      dialog.open = true
+      dialog.archived = false
+      dialog.chatListHidden = nil
+    }
+  }
+}
+
+public extension Transaction2 where Self == UpdateDialogOrderTransaction {
+  static func updateDialogOrder(
+    peerId: Peer,
+    order: String? = nil,
+    pinnedOrder: String? = nil,
+    pinned: Bool? = nil,
+    destination: DialogOrderDestination? = nil,
+    requiresChatCreated: Bool = false
+  ) -> UpdateDialogOrderTransaction {
+    UpdateDialogOrderTransaction(
+      peerId: peerId,
+      order: order,
+      pinnedOrder: pinnedOrder,
+      pinned: pinned,
+      destination: destination,
+      requiresChatCreated: requiresChatCreated
+    )
+  }
+}

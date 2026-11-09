@@ -1,0 +1,3 @@
+import InlineKit
+
+typealias ReplyThreadTitleFallback = InlineKit.ReplyThreadTitleFallback

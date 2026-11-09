@@ -1,0 +1,96 @@
+import Foundation
+
+public enum InlineCommandAction: Hashable, Sendable {
+  case collapseHistory
+  case createSubthread
+  case renameThread
+}
+
+public struct InlineCommandDefinition: Identifiable, Hashable, Sendable {
+  public let command: String
+  public let description: String
+  public let action: InlineCommandAction
+
+  public var id: String { command }
+
+  public init(command: String, description: String, action: InlineCommandAction) {
+    self.command = command
+    self.description = description
+    self.action = action
+  }
+}
+
+/// The single semantic boundary for app-owned slash commands. UI surfaces ask this registry what
+/// to present and what local action to run; they never turn an app command into outgoing chat text.
+public enum InlineCommandRegistry {
+  public static let commands: [InlineCommandDefinition] = [
+    InlineCommandDefinition(
+      command: "rename",
+      description: "Rename this thread.",
+      action: .renameThread
+    ),
+    InlineCommandDefinition(
+      command: "clear",
+      description: "Collapse history for you — nothing is deleted.",
+      action: .collapseHistory
+    ),
+    InlineCommandDefinition(
+      command: "thread",
+      description: "Create and open a subthread.",
+      action: .createSubthread
+    ),
+  ]
+
+  /// App commands that can run in `peer`. Only threads can be renamed, so DMs don't offer `/rename`.
+  public static func commands(for peer: Peer?) -> [InlineCommandDefinition] {
+    guard let peer, peer.asThreadId() == nil else { return commands }
+    return commands.filter { $0.action != .renameThread }
+  }
+
+  public static func action(forStandaloneText text: String) -> InlineCommandAction? {
+    let text = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard text.first == "/", !text.dropFirst().contains(where: { $0.isWhitespace }) else { return nil }
+    return commands.first { "/\($0.command)" == text }?.action
+  }
+}
+
+/// One shared availability rule for opening the slash-command picker from Compose.
+/// Reply context is intentionally absent: commands can target a replied-to message.
+public enum ComposeCommandLaunchState: Equatable, Sendable {
+  case empty
+  case text
+  case blocked
+
+  public init(
+    text: String,
+    isEditing: Bool,
+    isForwarding: Bool,
+    hasAttachments: Bool,
+    hasPendingAttachments: Bool,
+    isVoiceActive: Bool
+  ) {
+    if isEditing || isForwarding || hasAttachments || hasPendingAttachments || isVoiceActive {
+      self = .blocked
+    } else if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      self = .empty
+    } else {
+      self = .text
+    }
+  }
+
+  public var isEnabled: Bool {
+    self != .blocked
+  }
+}
+
+public enum ComposeCommandSuggestion: Identifiable, Hashable, Sendable {
+  case bot(PeerBotCommandSuggestion)
+  case inline(InlineCommandDefinition)
+
+  public var id: String {
+    switch self {
+    case let .bot(command): "bot-\(command.id)"
+    case let .inline(command): "inline-\(command.id)"
+    }
+  }
+}

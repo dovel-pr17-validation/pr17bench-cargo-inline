@@ -1,0 +1,513 @@
+import { canonicalMediaForFile } from "@in/server/modules/message/canonicalMediaForFile"
+import { db } from "@in/server/db"
+import { eq, and } from "drizzle-orm"
+import { chats, users, type DbFile, type DbMessage, type DbUser } from "@in/server/db/schema"
+import { InlineError } from "@in/server/types/errors"
+import { Log } from "@in/server/utils/log"
+import { type Static, Type } from "@sinclair/typebox"
+import {
+  encodeMessageInfo,
+  TInputPeerInfo,
+  TUpdate,
+  TMessageInfo,
+  TPeerInfo,
+  type TUpdateInfo,
+  Optional,
+} from "@in/server/api-types"
+import { getUpdateGroup } from "@in/server/modules/updates"
+import * as APN from "apn"
+import type { HandlerContext } from "../controllers/helpers"
+import { getApnProvider } from "../libs/apn"
+import { summarizeApnFailure } from "../libs/apnFailures"
+import { SessionsModel } from "@in/server/db/models/sessions"
+import { encryptMessage, encryptMessageEntities } from "@in/server/modules/encryption/encryptMessage"
+import { TInputId } from "@in/server/types/methods"
+import { isProd } from "@in/server/env"
+import { getFileByUniqueId } from "@in/server/db/models/files"
+import { debugDelay } from "@in/server/utils/helpers/time"
+import { RealtimeUpdates } from "@in/server/realtime/message"
+import { MessageEntities, Update } from "@inline-chat/protocol/core"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { processOutgoingText } from "@in/server/modules/message/processOutgoingText"
+import { detectHasLink } from "@in/server/modules/message/linkDetection"
+import {
+  maxNotificationNameBytes,
+  notificationBodyText,
+  notificationText,
+} from "@in/server/modules/notifications/messagePreview"
+import { getAuthorizedChat } from "@in/server/modules/authorization/legacyAccessGuards"
+import { MessageModel } from "@in/server/db/models/messages"
+import type { UpdateSeqAndDate } from "@in/server/db/models/updates"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { prepareBlockContent, type PreparedBlockContent } from "@in/server/modules/message/blockContentStorage"
+
+export const Input = Type.Object({
+  peerId: Optional(TInputPeerInfo),
+  peerUserId: Optional(TInputId),
+  peerThreadId: Optional(TInputId),
+
+  text: Optional(Type.String()),
+  replyToMessageId: Optional(TInputId),
+
+  randomId: Optional(
+    Type.String({
+      examples: ["17654533432775"],
+      title: "Random id",
+      description: "Random 64bit integer assgined by client to prevent duplicate messages",
+    }),
+  ),
+
+  fileUniqueId: Optional(
+    Type.String({
+      examples: ["INP123456789012345678901"],
+      title: "File unique id",
+      description: "File unique id you received from uploadFile method as a result of uploading media",
+    }),
+  ),
+
+  isSticker: Optional(Type.Boolean()),
+  parseMarkdown: Optional(
+    Type.Boolean({
+      description:
+        "Parse Inline's supported Markdown surface. Defaults to true; false preserves the supplied syntax literally.",
+    }),
+  ),
+})
+
+type Input = Static<typeof Input>
+
+export const Response = Type.Object({
+  message: TMessageInfo,
+  updates: Type.Array(TUpdate),
+})
+
+type Response = Static<typeof Response>
+
+export const handler = async (input: Input, context: HandlerContext): Promise<Response> => {
+  const messageDate = new Date()
+
+  const peerId = input.peerUserId
+    ? { userId: Number(input.peerUserId) }
+    : input.peerThreadId
+    ? { threadId: Number(input.peerThreadId) }
+    : input.peerId
+
+  const randomId = input.randomId ? BigInt(input.randomId) : undefined
+  const replyToMsgId = input.replyToMessageId ? Number(input.replyToMessageId) : undefined
+  if (!peerId) {
+    throw new InlineError(InlineError.ApiError.PEER_INVALID)
+  }
+
+  // Delay for simulating network latency
+  await debugDelay(100)
+
+  // Get or validate chat ID from peer info
+  const chatId = await getChatIdFromPeer(peerId, context)
+  await getAuthorizedChat(chatId, context.currentUserId)
+  await ensurePrivatePeerCanReceiveMessages(chatId, context.currentUserId)
+
+  const outgoingText = input.text
+    ? await processOutgoingText({
+        text: input.text,
+        entities: undefined,
+        parseMarkdown: input.parseMarkdown ?? true,
+      })
+    : undefined
+
+  const text = outgoingText?.text
+  const entities = outgoingText?.entities
+
+  let preparedBlockContent: PreparedBlockContent | undefined
+  if (text && outgoingText?.blockContent) {
+    try {
+      preparedBlockContent = prepareBlockContent({
+        text,
+        entities,
+        parsed: {
+          blockContent: outgoingText.blockContent,
+          imageSources: outgoingText.blockImageSources ?? [],
+        },
+      })
+    } catch (error) {
+      Log.shared.error("rich content preparation failed; sending the plain projection", {
+        chatId,
+        currentUserId: context.currentUserId,
+        errorType: error instanceof Error ? error.name : "UnknownError",
+      })
+    }
+  }
+
+  // Encrypt
+  const encryptedText = text ? encryptMessage(text) : undefined
+  const binaryEntities = entities ? MessageEntities.toBinary(entities) : undefined
+  const encryptedEntities =
+    binaryEntities && binaryEntities.length > 0 ? encryptMessageEntities(binaryEntities) : undefined
+  const hasLink = detectHasLink({ entities })
+
+  // File
+  let file: DbFile | undefined
+  if (input.fileUniqueId) {
+    file = await getFileByUniqueId(input.fileUniqueId)
+    if (!file) {
+      throw new InlineError(InlineError.ApiError.FILE_NOT_FOUND)
+    }
+    if (file.userId !== context.currentUserId) {
+      throw new InlineError(InlineError.ApiError.FILE_NOT_FOUND)
+    }
+  }
+
+  if (!input.text && !file) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const { message: newMessage, update: durableUpdate } = await db.transaction(async (tx) => {
+    // Preserve chat -> file lock order with other message writers.
+    const [lockedChat] = await tx.select().from(chats).where(eq(chats.id, chatId)).for("update").limit(1)
+    if (!lockedChat) throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    const media = file ? await canonicalMediaForFile(tx, file.id) : {}
+    return MessageModel.insertMessage(
+      {
+        ...media,
+        chatId,
+        fromId: context.currentUserId,
+        text: null,
+        textEncrypted: encryptedText?.encrypted ?? null,
+        textIv: encryptedText?.iv ?? null,
+        textTag: encryptedText?.authTag ?? null,
+        entitiesEncrypted: encryptedEntities?.encrypted ?? null,
+        entitiesIv: encryptedEntities?.iv ?? null,
+        entitiesTag: encryptedEntities?.authTag ?? null,
+        replyToMsgId: replyToMsgId ?? null,
+        randomId: randomId ?? null,
+        fileId: file?.id ?? null,
+        date: messageDate,
+        isSticker: input.isSticker ?? false,
+        hasLink,
+      },
+      preparedBlockContent,
+      tx,
+    )
+  })
+
+  if (!newMessage) {
+    Log.shared.error("Failed to send message")
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+
+  const encodedMessage = encodeMessageInfo(newMessage, {
+    currentUserId: context.currentUserId,
+    peerId: peerId,
+    files: file ? [file] : null,
+  })
+
+  await sendMessageUpdate({
+    message: { message: newMessage, file },
+    durableUpdate,
+    peerId: input.peerId ?? peerId,
+    currentUserId: context.currentUserId,
+  })
+
+  const currentUser = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, context.currentUserId))
+    .then(([user]) => user)
+
+  if (!currentUser) {
+    // Should not happen
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+
+  if (
+    input.peerUserId &&
+    // Don't send push notifications to self
+    input.peerUserId !== context.currentUserId
+  ) {
+    const title =
+      notificationText(currentUser.firstName ?? currentUser.username, maxNotificationNameBytes) || "New Message"
+    sendPushNotificationToUser({
+      userId: Number(input.peerUserId),
+      title,
+      chatId,
+      message: notificationBodyText(text) || (file ? "🖼️ Photo" : "New message"),
+      currentUserId: context.currentUserId,
+      currentUser,
+    })
+  }
+
+  const updateMessageId: TUpdateInfo = {
+    updateMessageId: {
+      randomId: newMessage.randomId?.toString() ?? "",
+      messageId: newMessage.messageId,
+    },
+  }
+
+  return { message: encodedMessage, updates: [updateMessageId] }
+}
+
+async function ensurePrivatePeerCanReceiveMessages(chatId: number, currentUserId: number): Promise<void> {
+  const [chat] = await db.select().from(chats).where(eq(chats.id, chatId)).limit(1)
+  if (!chat || chat.type !== "private" || chat.minUserId == null || chat.maxUserId == null) {
+    return
+  }
+
+  const peerUserId = chat.minUserId === currentUserId ? chat.maxUserId : chat.minUserId
+  if (peerUserId === currentUserId) {
+    return
+  }
+
+  const [peerUser] = await db.select({ deleted: users.deleted }).from(users).where(eq(users.id, peerUserId)).limit(1)
+  if (!peerUser || peerUser.deleted === true) {
+    throw new InlineError(InlineError.ApiError.PEER_INVALID)
+  }
+}
+
+export const getChatIdFromPeer = async (
+  peer: Static<typeof TInputPeerInfo>,
+  context: { currentUserId: number },
+): Promise<number> => {
+  // Handle thread chat
+  if ("threadId" in peer) {
+    const threadId = peer.threadId
+    if (!threadId || isNaN(threadId)) {
+      throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    }
+    return threadId
+  }
+
+  // Handle user chat
+  if ("userId" in peer) {
+    const userId = peer.userId
+    if (!userId || isNaN(userId)) {
+      throw new InlineError(InlineError.ApiError.PEER_INVALID)
+    }
+
+    // For self-chat, both minUserId and maxUserId will be currentUserId
+    const minUserId = Math.min(context.currentUserId, userId)
+    const maxUserId = Math.max(context.currentUserId, userId)
+
+    // Find chat where minUserId and maxUserId match
+    const existingChat = await db
+      .select()
+      .from(chats)
+      .where(and(eq(chats.type, "private"), eq(chats.minUserId, minUserId), eq(chats.maxUserId, maxUserId)))
+      .then((result) => result[0])
+
+    if (existingChat) {
+      return existingChat.id
+    }
+
+    // create new chat???
+    throw new InlineError(InlineError.ApiError.PEER_INVALID)
+  }
+
+  throw new InlineError(InlineError.ApiError.PEER_INVALID)
+}
+
+// HERE YOU ARE DENA
+const sendMessageUpdate = async ({
+  durableUpdate,
+  peerId,
+  message,
+  currentUserId,
+}: {
+  durableUpdate: UpdateSeqAndDate
+  peerId: TPeerInfo
+  message: { message: DbMessage; file: DbFile | undefined }
+  currentUserId: number
+}) => {
+  const updateGroup = await getUpdateGroup(peerId, { currentUserId })
+  const [fullMessage] = await MessageModel.getMessagesByIds(message.message.chatId, [BigInt(message.message.messageId)])
+  if (!fullMessage) throw new InlineError(InlineError.ApiError.INTERNAL)
+
+  if (updateGroup.type === "dmUsers") {
+    updateGroup.userIds.forEach((userId) => {
+      let encodingForPeer: TPeerInfo = userId === currentUserId ? peerId : { userId: currentUserId }
+
+      // New updates
+      let messageIdUpdate: Update = {
+        update: {
+          oneofKind: "updateMessageId",
+          updateMessageId: {
+            messageId: BigInt(message.message.messageId),
+            randomId: message.message.randomId ?? 0n,
+          },
+        },
+      }
+
+      let newMessageUpdate: Update = {
+        seq: durableUpdate.seq,
+        date: encodeDateStrict(durableUpdate.date),
+        update: {
+          oneofKind: "newMessage",
+          newMessage: {
+            message: Encoders.fullMessage({
+              message: fullMessage,
+              encodingForUserId: userId,
+              encodingForPeer: { peer: Encoders.peer(encodingForPeer) },
+            }),
+          },
+        },
+      }
+
+      if (userId === currentUserId) {
+        // current user gets the message id update and new message update
+        RealtimeUpdates.pushToUser(userId, [
+          // order matters here
+          messageIdUpdate,
+          newMessageUpdate,
+        ])
+      } else {
+        // other users get the message only
+        RealtimeUpdates.pushToUser(userId, [newMessageUpdate])
+      }
+    })
+  } else if (updateGroup.type === "threadUsers") {
+    updateGroup.userIds.forEach((userId) => {
+      // New updates
+      let messageIdUpdate: Update = {
+        update: {
+          oneofKind: "updateMessageId",
+          updateMessageId: {
+            messageId: BigInt(message.message.messageId),
+            randomId: message.message.randomId ?? 0n,
+          },
+        },
+      }
+
+      let newMessageUpdate: Update = {
+        seq: durableUpdate.seq,
+        date: encodeDateStrict(durableUpdate.date),
+        update: {
+          oneofKind: "newMessage",
+          newMessage: {
+            message: Encoders.fullMessage({
+              message: fullMessage,
+              encodingForUserId: userId,
+              encodingForPeer: { peer: Encoders.peer(peerId) },
+            }),
+          },
+        },
+      }
+
+      if (userId === currentUserId) {
+        // current user gets the message id update and new message update
+        RealtimeUpdates.pushToUser(userId, [
+          // order matters here
+          messageIdUpdate,
+          newMessageUpdate,
+        ])
+      } else {
+        // other users get the message only
+        RealtimeUpdates.pushToUser(userId, [newMessageUpdate])
+      }
+    })
+  }
+}
+
+const sendPushNotificationToUser = async ({
+  userId,
+  title,
+  message,
+  currentUserId,
+  chatId,
+  currentUser,
+}: {
+  userId: number
+  title: string
+  message: string
+  chatId: number
+  currentUserId: number
+  currentUser: DbUser
+}) => {
+  try {
+    // Get all sessions for the user
+    const userSessions = await SessionsModel.getValidSessionsByUserId(userId)
+
+    if (!userSessions.length) {
+      return
+    }
+
+    const projectedTitle = notificationText(title, maxNotificationNameBytes) || "New Message"
+    const projectedBody = notificationBodyText(message) || "New message"
+    const projectedFirstName = notificationText(currentUser.firstName, maxNotificationNameBytes) || undefined
+    const projectedLastName = notificationText(currentUser.lastName, maxNotificationNameBytes) || undefined
+
+    for (const session of userSessions) {
+      if (!session.applePushToken) continue
+
+      let topic =
+        session.clientType === "macos"
+          ? isProd
+            ? "chat.inline.InlineMac"
+            : "chat.inline.InlineMac.debug"
+          : isProd
+          ? "chat.inline.InlineIOS"
+          : "chat.inline.InlineIOS.debug"
+
+      // Configure notification
+      const notification = new APN.Notification()
+      notification.payload = {
+        userId: currentUserId,
+        // The iOS notification extension shows content only to the signed-in recipient.
+        recipientUserId: String(userId),
+
+        from: {
+          firstName: projectedFirstName,
+          lastName: projectedLastName,
+        },
+      }
+      notification.contentAvailable = true
+      notification.mutableContent = true
+      notification.topic = topic
+      notification.threadId = `chat_${chatId}`
+      notification.sound = "default"
+      notification.alert = {
+        title: projectedTitle,
+        body: projectedBody,
+      }
+
+      const payloadBytes = Buffer.byteLength(JSON.stringify(notification), "utf8")
+      if (payloadBytes > 4_096) {
+        Log.shared.warn("Legacy notification payload exceeded APNs byte budget", { payloadBytes, userId })
+        continue
+      }
+
+      let apnProvider = getApnProvider()
+      if (!apnProvider) {
+        Log.shared.error("APN provider not found", { userId })
+        continue
+      }
+
+      const sendPush = async () => {
+        if (!session.applePushToken) return
+        try {
+          const result = await apnProvider.send(notification, session.applePushToken)
+          if (result.failed.length > 0) {
+            const summaries = result.failed.map((failure) => summarizeApnFailure(failure))
+            Log.shared.debug("Failed to send push notification", {
+              errors: summaries,
+              userId,
+            })
+          } else {
+            Log.shared.debug("Push notification sent successfully", {
+              userId,
+            })
+          }
+        } catch (error) {
+          Log.shared.debug("Error sending push notification", {
+            error,
+            userId,
+          })
+        }
+      }
+
+      sendPush()
+    }
+  } catch (error) {
+    Log.shared.debug("Error sending push notification", {
+      error,
+      userId,
+    })
+  }
+}

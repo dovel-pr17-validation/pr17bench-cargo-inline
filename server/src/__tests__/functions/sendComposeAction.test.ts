@@ -1,0 +1,408 @@
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
+import { UpdateComposeAction_ComposeAction } from "@inline-chat/protocol/core"
+import { sendComposeAction } from "@in/server/functions/messages.sendComposeAction"
+import { sendTransientUpdateFor } from "@in/server/modules/updates/sendUpdate"
+import { setupTestLifecycle, testUtils } from "../setup"
+import { RealtimeUpdates } from "@in/server/realtime/message"
+import { internalMessaging } from "@in/server/modules/internalMessaging/service"
+import { outboundPublications } from "@in/server/modules/internalMessaging/outbound"
+import { handler as legacySendComposeAction } from "@in/server/methods/sendComposeAction"
+
+// Mock RealtimeUpdates.pushToUser to track what updates are sent
+const mockPushToUser = mock(async () => {})
+let restorePushToUser: (() => void) | undefined
+let emailCounter = 0
+const nextEmail = (label: string) => `${label}-${++emailCounter}@example.com`
+
+describe("sendComposeAction", () => {
+  setupTestLifecycle()
+
+  beforeEach(() => {
+    mockPushToUser.mockClear()
+    const push = spyOn(RealtimeUpdates, "pushToUser").mockImplementation(mockPushToUser)
+    restorePushToUser = () => push.mockRestore()
+  })
+
+  afterEach(() => {
+    restorePushToUser?.()
+    restorePushToUser = undefined
+  })
+
+  test("should send typing action to DM participant with correct peer encoding", async () => {
+    const user1 = await testUtils.createUser(nextEmail("user1"))
+    const user2 = await testUtils.createUser(nextEmail("user2"))
+
+    if (!user1 || !user2) throw new Error("Failed to create users")
+
+    await testUtils.createPrivateChat(user1, user2)
+
+    const inputPeer = {
+      type: { oneofKind: "user" as const, user: { userId: BigInt(user2.id) } },
+    }
+
+    await sendComposeAction(
+      {
+        peer: inputPeer,
+        action: UpdateComposeAction_ComposeAction.TYPING,
+      },
+      {
+        currentUserId: user1.id,
+        currentSessionId: 123,
+      },
+    )
+
+    // Should send update to user2 only (not sender user1)
+    expect(mockPushToUser).toHaveBeenCalledTimes(1)
+    expect(mockPushToUser).toHaveBeenCalledWith(user2.id, [
+      {
+        update: {
+          oneofKind: "updateComposeAction",
+          updateComposeAction: {
+            userId: BigInt(user1.id),
+            // For DM, user2 should see user1 as the peer (not user2)
+            peerId: { type: { oneofKind: "user", user: { userId: BigInt(user1.id) } } },
+            action: UpdateComposeAction_ComposeAction.TYPING,
+          },
+        },
+      },
+    ])
+  })
+
+  test("should send stop action (NONE) to DM participant", async () => {
+    const user1 = await testUtils.createUser(nextEmail("user1"))
+    const user2 = await testUtils.createUser(nextEmail("user2"))
+
+    if (!user1 || !user2) throw new Error("Failed to create users")
+
+    await testUtils.createPrivateChat(user1, user2)
+
+    const inputPeer = {
+      type: { oneofKind: "user" as const, user: { userId: BigInt(user2.id) } },
+    }
+
+    await sendComposeAction(
+      {
+        peer: inputPeer,
+        action: UpdateComposeAction_ComposeAction.NONE,
+      },
+      {
+        currentUserId: user1.id,
+        currentSessionId: 123,
+      },
+    )
+
+    expect(mockPushToUser).toHaveBeenCalledTimes(1)
+    expect(mockPushToUser).toHaveBeenCalledWith(user2.id, [
+      {
+        update: {
+          oneofKind: "updateComposeAction",
+          updateComposeAction: {
+            userId: BigInt(user1.id),
+            peerId: { type: { oneofKind: "user", user: { userId: BigInt(user1.id) } } },
+            action: UpdateComposeAction_ComposeAction.NONE,
+          },
+        },
+      },
+    ])
+  })
+
+  test("should send upload action to thread participants with correct peer encoding", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Test Space", [
+      nextEmail("user1"),
+      nextEmail("user2"),
+      nextEmail("user3"),
+    ])
+    const [user1, user2, user3] = users
+
+    if (!user1 || !user2 || !user3) throw new Error("Failed to create users")
+
+    const chat = await testUtils.createChat(space.id, "Test Thread", "thread")
+
+    if (!chat) throw new Error("Failed to create chat")
+
+    const inputPeer = {
+      type: { oneofKind: "chat" as const, chat: { chatId: BigInt(chat.id) } },
+    }
+
+    await sendComposeAction(
+      {
+        peer: inputPeer,
+        action: UpdateComposeAction_ComposeAction.UPLOADING_PHOTO,
+      },
+      {
+        currentUserId: user1.id,
+        currentSessionId: 123,
+      },
+    )
+
+    // Should send to user2 and user3 (all space members except sender user1)
+    expect(mockPushToUser).toHaveBeenCalledTimes(2)
+
+    // Both recipients should see the same chat peer
+    const expectedUpdate = {
+      update: {
+        oneofKind: "updateComposeAction",
+        updateComposeAction: {
+          userId: BigInt(user1.id),
+          peerId: { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } },
+          action: UpdateComposeAction_ComposeAction.UPLOADING_PHOTO,
+        },
+      },
+    }
+
+    expect(mockPushToUser).toHaveBeenCalledWith(user2.id, [expectedUpdate])
+    expect(mockPushToUser).toHaveBeenCalledWith(user3.id, [expectedUpdate])
+  })
+
+  test("should send legacy transient typing action to thread participants", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Legacy Compose Space", [
+      nextEmail("legacy-user1"),
+      nextEmail("legacy-user2"),
+      nextEmail("legacy-user3"),
+    ])
+    const [user1, user2, user3] = users
+
+    if (!user1 || !user2 || !user3) throw new Error("Failed to create users")
+
+    const chat = await testUtils.createChat(space.id, "Legacy Thread", "thread")
+
+    if (!chat) throw new Error("Failed to create chat")
+
+    await sendTransientUpdateFor({
+      reason: {
+        composeAction: {
+          update: {
+            userId: user1.id,
+            peerId: { threadId: chat.id },
+            action: "typing",
+          },
+          target: { threadId: chat.id },
+          otherPeerId: { threadId: chat.id },
+        },
+      },
+    })
+
+    const expectedUpdate = {
+      update: {
+        oneofKind: "updateComposeAction",
+        updateComposeAction: {
+          userId: BigInt(user1.id),
+          peerId: { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } },
+          action: UpdateComposeAction_ComposeAction.TYPING,
+        },
+      },
+    }
+
+    expect(mockPushToUser).toHaveBeenCalledTimes(2)
+    expect(mockPushToUser).toHaveBeenCalledWith(user2.id, [expectedUpdate])
+    expect(mockPushToUser).toHaveBeenCalledWith(user3.id, [expectedUpdate])
+    const calls = mockPushToUser.mock.calls
+    expect(calls.every((call: any) => call[0] !== user1.id)).toBe(true)
+  })
+
+  test("should send recording voice action to DM participant", async () => {
+    const user1 = await testUtils.createUser(nextEmail("voice-user1"))
+    const user2 = await testUtils.createUser(nextEmail("voice-user2"))
+
+    if (!user1 || !user2) throw new Error("Failed to create users")
+
+    await testUtils.createPrivateChat(user1, user2)
+
+    const inputPeer = {
+      type: { oneofKind: "user" as const, user: { userId: BigInt(user2.id) } },
+    }
+
+    await sendComposeAction(
+      {
+        peer: inputPeer,
+        action: UpdateComposeAction_ComposeAction.RECORDING_VOICE,
+      },
+      {
+        currentUserId: user1.id,
+        currentSessionId: 123,
+      },
+    )
+
+    expect(mockPushToUser).toHaveBeenCalledWith(user2.id, [
+      {
+        update: {
+          oneofKind: "updateComposeAction",
+          updateComposeAction: {
+            userId: BigInt(user1.id),
+            peerId: { type: { oneofKind: "user", user: { userId: BigInt(user1.id) } } },
+            action: UpdateComposeAction_ComposeAction.RECORDING_VOICE,
+          },
+        },
+      },
+    ])
+  })
+
+  test("should not send update to sender", async () => {
+    const user1 = await testUtils.createUser(nextEmail("user1"))
+    const user2 = await testUtils.createUser(nextEmail("user2"))
+
+    if (!user1 || !user2) throw new Error("Failed to create users")
+
+    await testUtils.createPrivateChat(user1, user2)
+
+    const inputPeer = {
+      type: { oneofKind: "user" as const, user: { userId: BigInt(user2.id) } },
+    }
+
+    await sendComposeAction(
+      {
+        peer: inputPeer,
+        action: UpdateComposeAction_ComposeAction.TYPING,
+      },
+      {
+        currentUserId: user1.id,
+        currentSessionId: 123,
+      },
+    )
+
+    // Verify sender (user1) does not receive an update
+    const calls = mockPushToUser.mock.calls
+    expect(calls.every((call: any) => call[0] !== user1.id)).toBe(true)
+  })
+
+  test("should default to NONE action when no action provided", async () => {
+    const user1 = await testUtils.createUser(nextEmail("user1"))
+    const user2 = await testUtils.createUser(nextEmail("user2"))
+
+    if (!user1 || !user2) throw new Error("Failed to create users")
+
+    await testUtils.createPrivateChat(user1, user2)
+
+    const inputPeer = {
+      type: { oneofKind: "user" as const, user: { userId: BigInt(user2.id) } },
+    }
+
+    await sendComposeAction(
+      {
+        peer: inputPeer,
+        // No action provided
+      },
+      {
+        currentUserId: user1.id,
+        currentSessionId: 123,
+      },
+    )
+
+    expect(mockPushToUser).toHaveBeenCalledWith(user2.id, [
+      {
+        update: {
+          oneofKind: "updateComposeAction",
+          updateComposeAction: {
+            userId: BigInt(user1.id),
+            peerId: { type: { oneofKind: "user", user: { userId: BigInt(user1.id) } } },
+            action: UpdateComposeAction_ComposeAction.NONE,
+          },
+        },
+      },
+    ])
+  })
+
+  test("finishes local compose delivery without waiting for bounded broker publications", async () => {
+    const memberEmails = Array.from({ length: 34 }, () => nextEmail("compose-recipient"))
+    const { space, users } = await testUtils.createSpaceWithMembers("Bounded Compose Space", memberEmails)
+    const sender = users[0]
+    if (!sender) throw new Error("Failed to create sender")
+    const chat = await testUtils.createChat(space.id, "Bounded Compose Thread", "thread")
+    if (!chat) throw new Error("Failed to create chat")
+
+    const releasePublications = Promise.withResolvers<void>()
+    const saturated = Promise.withResolvers<void>()
+    let activePublications = 0
+    let maximumActivePublications = 0
+    await outboundPublications.drain()
+    outboundPublications.start()
+    const publications = spyOn(internalMessaging, "publish").mockImplementation(async () => {
+      activePublications += 1
+      maximumActivePublications = Math.max(maximumActivePublications, activePublications)
+      if (activePublications === 28) saturated.resolve()
+      await releasePublications.promise
+      activePublications -= 1
+      return { status: "published", subscribers: 1 }
+    })
+
+    try {
+      await sendComposeAction(
+        {
+          peer: { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } },
+          action: UpdateComposeAction_ComposeAction.TYPING,
+        },
+        { currentUserId: sender.id, currentSessionId: 123 },
+      )
+
+      await saturated.promise
+      expect(publications).toHaveBeenCalledTimes(28)
+      expect(maximumActivePublications).toBe(28)
+
+      releasePublications.resolve()
+      await outboundPublications.drain()
+
+      expect(publications).toHaveBeenCalledTimes(33)
+      expect(maximumActivePublications).toBe(28)
+    } finally {
+      releasePublications.resolve()
+      await outboundPublications.drain()
+      publications.mockRestore()
+    }
+  })
+
+  test("rejects outsiders naming another pair's DM by chat ID without notifying anyone", async () => {
+    const userA = await testUtils.createUser(nextEmail("dm-a"))
+    const userB = await testUtils.createUser(nextEmail("dm-b"))
+    const outsider = await testUtils.createUser(nextEmail("dm-outsider"))
+    const chat = await testUtils.createPrivateChat(userA, userB)
+    if (!chat) throw new Error("Failed to create DM")
+
+    await expect(sendComposeAction(
+      {
+        peer: { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } },
+        action: UpdateComposeAction_ComposeAction.TYPING,
+      },
+      { currentUserId: outsider.id, currentSessionId: 123 },
+    )).rejects.toThrow()
+    expect(mockPushToUser).not.toHaveBeenCalled()
+  })
+
+  test("rejects non-members of a private space thread without notifying participants", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Private Compose Space", [
+      nextEmail("private-member"),
+    ])
+    const [member] = users
+    const outsider = await testUtils.createUser(nextEmail("private-outsider"))
+    const chat = await testUtils.createChat(space.id, "Private Thread", "thread", false)
+    if (!member || !chat) throw new Error("Failed to create fixtures")
+    await testUtils.addParticipant(chat.id, member.id)
+
+    await expect(sendComposeAction(
+      {
+        peer: { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } },
+        action: UpdateComposeAction_ComposeAction.TYPING,
+      },
+      { currentUserId: outsider.id, currentSessionId: 123 },
+    )).rejects.toThrow()
+    await expect(legacySendComposeAction(
+      { peerThreadId: chat.id, action: "typing" },
+      { currentUserId: outsider.id },
+    )).rejects.toMatchObject({ type: "PEER_INVALID", code: 400 })
+    expect(mockPushToUser).not.toHaveBeenCalled()
+  })
+
+  test("legacy HTTP compose action still reaches an authorized thread", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Legacy Authorized Space", [
+      nextEmail("legacy-authorized-1"),
+      nextEmail("legacy-authorized-2"),
+    ])
+    const [sender, recipient] = users
+    const chat = await testUtils.createChat(space.id, "Legacy Authorized Thread", "thread")
+    if (!sender || !recipient || !chat) throw new Error("Failed to create fixtures")
+
+    await legacySendComposeAction({ peerThreadId: chat.id, action: "typing" }, { currentUserId: sender.id })
+
+    expect(mockPushToUser).toHaveBeenCalledTimes(1)
+    expect(mockPushToUser).toHaveBeenCalledWith(recipient.id, expect.anything())
+  })
+})

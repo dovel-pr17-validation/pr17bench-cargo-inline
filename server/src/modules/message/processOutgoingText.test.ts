@@ -1,0 +1,684 @@
+import { beforeEach, describe, expect, test } from "bun:test"
+import { MessageEntity_Type } from "@inline-chat/protocol/core"
+import { db } from "@in/server/db"
+import { users } from "@in/server/db/schema"
+import { BotAgentsModel } from "@in/server/db/models/botAgents"
+import { processOutgoingText } from "@in/server/modules/message/processOutgoingText"
+import { setupTestLifecycle, testUtils } from "@in/server/__tests__/setup"
+import { eq } from "drizzle-orm"
+
+const runId = Date.now()
+let userIndex = 0
+const nextEmail = (label: string) => `${label}-${runId}-${userIndex++}@example.com`
+
+describe("processOutgoingText", () => {
+  setupTestLifecycle()
+
+  beforeEach(() => {
+    userIndex = 0
+  })
+
+  test("preserves markdown syntax when parsing is omitted", async () => {
+    const text = "hello **world** [docs](https://example.com)"
+    const result = await processOutgoingText({
+      text,
+      entities: undefined,
+    })
+
+    expect(result.text).toBe(text)
+    expect(result.entities).toBeUndefined()
+  })
+
+  test("preserves markdown syntax when parsing is explicitly disabled", async () => {
+    const text = "hello **world** [docs](https://example.com)"
+    const result = await processOutgoingText({
+      text,
+      entities: undefined,
+      parseMarkdown: false,
+    })
+
+    expect(result.text).toBe(text)
+    expect(result.entities).toBeUndefined()
+  })
+
+  test("preserves explicit entities when the markdown flag is omitted", async () => {
+    const entities = {
+      entities: [
+        {
+          type: MessageEntity_Type.BOLD,
+          offset: 6n,
+          length: 9n,
+          entity: { oneofKind: undefined },
+        },
+      ],
+    }
+    const result = await processOutgoingText({
+      text: "hello **world**",
+      entities,
+    })
+
+    expect(result.text).toBe("hello **world**")
+    expect(result.entities).toEqual(entities)
+  })
+
+  test("converts markdown inline user id links to mention entities", async () => {
+    const user = await testUtils.createUser(nextEmail("inline-link-id"))
+
+    const result = await processOutgoingText({
+      text: `cc [@Mo](inline://user?id=${user.id}) please`,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc @Mo please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const mention = result.entities!.entities[0]!
+    expect(mention.type).toBe(MessageEntity_Type.MENTION)
+    expect(mention.offset).toBe(3n)
+    expect(mention.length).toBe(3n)
+    expect(mention.entity.oneofKind).toBe("mention")
+    if (mention.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(mention.entity.mention.userId).toBe(BigInt(user.id))
+  })
+
+  test("preserves a valid bot and Agent pair in an inline mention", async () => {
+    const bot = await testUtils.createUser(nextEmail("inline-agent-bot"))
+    const agent = await BotAgentsModel.create({
+      botUserId: bot.id,
+      name: "Data Analyst",
+    })
+
+    const result = await processOutgoingText({
+      text: `ask [@Data Analyst](inline://user?id=${bot.id}&agent_id=${agent.id})`,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    const mention = result.entities?.entities[0]
+    expect(mention?.entity.oneofKind).toBe("mention")
+    if (mention?.entity.oneofKind !== "mention") throw new Error("Expected Agent mention")
+    expect(mention.entity.mention).toEqual({
+      userId: BigInt(bot.id),
+      agentId: agent.id,
+    })
+  })
+
+  test("resolves canonical in user links with the same user and Agent validation", async () => {
+    const user = await testUtils.createUser(nextEmail("in-link-user"))
+    const bot = await testUtils.createUser(nextEmail("in-link-bot"))
+    const agent = await BotAgentsModel.create({ botUserId: bot.id, name: "Analyst" })
+
+    for (const scheme of ["in", "inline"]) {
+      for (const target of [`${scheme}://user/${user.id}`, `${scheme}://user?id=${user.id}`]) {
+        const result = await processOutgoingText({
+          text: `😀 cc [@Dena](${target})`,
+          entities: undefined,
+          parseMarkdown: true,
+        })
+        expect(result.text).toBe("😀 cc @Dena")
+        expect(result.entities?.entities).toEqual([
+          {
+            type: MessageEntity_Type.MENTION,
+            offset: 6n,
+            length: 5n,
+            entity: { oneofKind: "mention", mention: { userId: BigInt(user.id) } },
+          },
+        ])
+      }
+      for (const [targetId, expected] of [
+        [bot.id, { userId: BigInt(bot.id), agentId: agent.id }],
+        [user.id, { userId: BigInt(user.id) }],
+      ] as const) {
+        const result = await processOutgoingText({
+          text: `ask [@Analyst](${scheme}://user/${targetId}?agent_id=${agent.id})`,
+          entities: undefined,
+          parseMarkdown: true,
+        })
+        expect(result.entities?.entities[0]?.entity).toEqual({ oneofKind: "mention", mention: expected })
+      }
+    }
+  })
+
+  test("bridge mention and chat labels retain literal references and line breaks", async () => {
+    const user = await testUtils.createUser(nextEmail("bridge-link-label"))
+    const highlighted = await processOutgoingText({
+      text: String.raw`[@a \=\=B\=\=](in://user/${user.id})`,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+    expect(highlighted.text).toBe("@a ==B==")
+    expect(highlighted.entities?.entities).toHaveLength(1)
+    expect(highlighted.entities?.entities[0]?.type).toBe(MessageEntity_Type.MENTION)
+    const result = await processOutgoingText({
+      text: String.raw`ask [@A \&amp; B](in://user/${user.id}) about [First&#10;&#10;Second](in://chat/456)`,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+    expect(result.text).toBe("ask @A &amp; B about First\n\nSecond")
+    expect(result.entities?.entities).toEqual([
+      {
+        type: MessageEntity_Type.MENTION,
+        offset: 4n,
+        length: 10n,
+        entity: { oneofKind: "mention", mention: { userId: BigInt(user.id) } },
+      },
+      {
+        type: MessageEntity_Type.THREAD,
+        offset: 21n,
+        length: 13n,
+        entity: { oneofKind: "thread", thread: { chatId: 456n } },
+      },
+    ])
+    const url = await processOutgoingText({
+      text: String.raw`[doc](https://example.com/a\(b\)?x=\&amp;\&y=1)`,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+    expect(url.entities?.entities[0]?.entity).toEqual({
+      oneofKind: "textUrl",
+      textUrl: { url: "https://example.com/a(b)?x=&amp;&y=1" },
+    })
+  })
+
+  test("falls back to the bot mention when the Agent belongs to another bot", async () => {
+    const bot = await testUtils.createUser(nextEmail("inline-agent-target"))
+    const otherBot = await testUtils.createUser(nextEmail("inline-agent-owner"))
+    const agent = await BotAgentsModel.create({
+      botUserId: otherBot.id,
+      name: "Data Analyst",
+    })
+
+    const result = await processOutgoingText({
+      text: `ask [@Data Analyst](inline://user?id=${bot.id}&agent_id=${agent.id})`,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    const mention = result.entities?.entities[0]
+    expect(mention?.entity.oneofKind).toBe("mention")
+    if (mention?.entity.oneofKind !== "mention") throw new Error("Expected bot mention")
+    expect(mention.entity.mention).toEqual({ userId: BigInt(bot.id) })
+  })
+
+  test("validates an explicit Bot API Agent mention through the same pair contract", async () => {
+    const bot = await testUtils.createUser(nextEmail("explicit-agent-target"))
+    const otherBot = await testUtils.createUser(nextEmail("explicit-agent-owner"))
+    const agent = await BotAgentsModel.create({ botUserId: otherBot.id, name: "Analyst" })
+
+    const result = await processOutgoingText({
+      text: "@Analyst",
+      entities: {
+        entities: [{
+          type: MessageEntity_Type.MENTION,
+          offset: 0n,
+          length: 8n,
+          entity: {
+            oneofKind: "mention",
+            mention: { userId: BigInt(bot.id), agentId: agent.id },
+          },
+        }],
+      },
+    })
+
+    const mention = result.entities?.entities[0]
+    expect(mention?.entity.oneofKind).toBe("mention")
+    if (mention?.entity.oneofKind !== "mention") throw new Error("Expected bot mention")
+    expect(mention.entity.mention).toEqual({ userId: BigInt(bot.id) })
+  })
+
+  test("converts markdown inline username links to mention entities", async () => {
+    const user = await testUtils.createUser(nextEmail("inline-link-username"))
+    await db.update(users).set({ username: "linkedmo" }).where(eq(users.id, user.id)).execute()
+
+    const result = await processOutgoingText({
+      text: "cc [@Mo](inline://user?username=LinkedMo) please",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc @Mo please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const mention = result.entities!.entities[0]!
+    expect(mention.type).toBe(MessageEntity_Type.MENTION)
+    expect(mention.entity.oneofKind).toBe("mention")
+    if (mention.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(mention.entity.mention.userId).toBe(BigInt(user.id))
+  })
+
+  test("converts markdown inline chat links to thread entities", async () => {
+    const result = await processOutgoingText({
+      text: "cc [Planning](inline://chat?id=42) please",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc Planning please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const thread = result.entities!.entities[0]!
+    expect(thread.type).toBe(MessageEntity_Type.THREAD)
+    expect(thread.offset).toBe(3n)
+    expect(thread.length).toBe(8n)
+    expect(thread.entity.oneofKind).toBe("thread")
+    if (thread.entity.oneofKind !== "thread") {
+      throw new Error("Expected thread entity")
+    }
+    expect(thread.entity.thread.chatId).toBe(42n)
+  })
+
+  test("converts markdown inline thread id links to thread entities", async () => {
+    const result = await processOutgoingText({
+      text: "cc [Planning](inline://thread?id=42) please",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc Planning please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const thread = result.entities!.entities[0]!
+    expect(thread.type).toBe(MessageEntity_Type.THREAD)
+    expect(thread.entity.oneofKind).toBe("thread")
+    if (thread.entity.oneofKind !== "thread") {
+      throw new Error("Expected thread entity")
+    }
+    expect(thread.entity.thread.chatId).toBe(42n)
+  })
+
+  test("converts copied thread links consistently across schemes and entity forms", async () => {
+    for (const url of ["in://chat/42", "in://thread?id=42", "inline://chat/42"]) {
+      const markdown = await processOutgoingText({ text: `😀 [Planning](${url})`, entities: undefined, parseMarkdown: true })
+      const bare = await processOutgoingText({
+        text: `😀 ${url}`,
+        entities: { entities: [{ type: MessageEntity_Type.URL, offset: 3n, length: BigInt(url.length), entity: { oneofKind: undefined } }] },
+      })
+      for (const result of [markdown, bare]) {
+        expect(result.entities?.entities).toHaveLength(1)
+        const thread = result.entities!.entities[0]!
+        expect(thread.type).toBe(MessageEntity_Type.THREAD)
+        expect(thread.offset).toBe(3n)
+        expect(thread.entity).toEqual({ oneofKind: "thread", thread: { chatId: 42n } })
+      }
+    }
+  })
+
+  test("preserves message destinations instead of reducing them to thread links", async () => {
+    for (const url of ["in://chat/42/message/9", "inline://thread/42/message/9", "inline://chat?id=42&message_id=9", "in://chat/42?messageId=9"]) {
+      const result = await processOutgoingText({ text: `[Message](${url})`, entities: undefined, parseMarkdown: true })
+      expect(result.entities?.entities[0]?.type).toBe(MessageEntity_Type.TEXT_URL)
+      expect(result.entities?.entities[0]?.entity).toEqual({ oneofKind: "textUrl", textUrl: { url } })
+    }
+  })
+
+  test("a bare thread route does not create a thread named after its URL", async () => {
+    const text = "in://thread?space_id=7"
+    const entities = { entities: [{ type: MessageEntity_Type.URL, offset: 0n, length: BigInt(text.length), entity: { oneofKind: undefined } }] }
+    const result = await processOutgoingText({ text, entities })
+    expect(result.entities).toEqual(entities)
+  })
+
+  test("converts markdown inline thread title links to thread title entities", async () => {
+    const result = await processOutgoingText({
+      text: "cc [Planning](inline://thread?space_id=7) please",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc Planning please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const thread = result.entities!.entities[0]!
+    expect(thread.type).toBe(MessageEntity_Type.THREAD_TITLE)
+    expect(thread.offset).toBe(3n)
+    expect(thread.length).toBe(8n)
+    expect(thread.entity.oneofKind).toBe("threadTitle")
+    if (thread.entity.oneofKind !== "threadTitle") {
+      throw new Error("Expected thread title entity")
+    }
+    expect(thread.entity.threadTitle.spaceId).toBe(7n)
+    expect(thread.entity.threadTitle.title).toBe("Planning")
+  })
+
+  test("uses inline thread title query when label differs", async () => {
+    const result = await processOutgoingText({
+      text: "cc [the thread](inline://thread?space_id=7&title=Planning) please",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc the thread please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const thread = result.entities!.entities[0]!
+    expect(thread.type).toBe(MessageEntity_Type.THREAD_TITLE)
+    expect(thread.entity.oneofKind).toBe("threadTitle")
+    if (thread.entity.oneofKind !== "threadTitle") {
+      throw new Error("Expected thread title entity")
+    }
+    expect(thread.entity.threadTitle.spaceId).toBe(7n)
+    expect(thread.entity.threadTitle.title).toBe("Planning")
+  })
+
+  test("converts markdown home thread title links to thread title entities", async () => {
+    const result = await processOutgoingText({
+      text: "cc [Personal Plan](inline://thread) please",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc Personal Plan please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const thread = result.entities!.entities[0]!
+    expect(thread.type).toBe(MessageEntity_Type.THREAD_TITLE)
+    expect(thread.entity.oneofKind).toBe("threadTitle")
+    if (thread.entity.oneofKind !== "threadTitle") {
+      throw new Error("Expected thread title entity")
+    }
+    expect(thread.entity.threadTitle.spaceId).toBe(0n)
+    expect(thread.entity.threadTitle.title).toBe("Personal Plan")
+  })
+
+  test("keeps invalid inline thread links as text urls", async () => {
+    const result = await processOutgoingText({
+      text: "cc [Planning](inline://thread?space_id=nope) please",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc Planning please")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const link = result.entities!.entities[0]!
+    expect(link.type).toBe(MessageEntity_Type.TEXT_URL)
+    expect(link.entity).toEqual({
+      oneofKind: "textUrl",
+      textUrl: { url: "inline://thread?space_id=nope" },
+    })
+  })
+
+  test("converts explicit inline user text_url entities to mention entities", async () => {
+    const user = await testUtils.createUser(nextEmail("inline-link-entity"))
+
+    const result = await processOutgoingText({
+      text: "cc @Mo",
+      entities: {
+        entities: [
+          {
+            type: MessageEntity_Type.TEXT_URL,
+            offset: 3n,
+            length: 3n,
+            entity: {
+              oneofKind: "textUrl",
+              textUrl: { url: `inline://user/${user.id}` },
+            },
+          },
+        ],
+      },
+    })
+
+    expect(result.text).toBe("cc @Mo")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const mention = result.entities!.entities[0]!
+    expect(mention.type).toBe(MessageEntity_Type.MENTION)
+    expect(mention.offset).toBe(3n)
+    expect(mention.length).toBe(3n)
+    expect(mention.entity.oneofKind).toBe("mention")
+    if (mention.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(mention.entity.mention.userId).toBe(BigInt(user.id))
+  })
+
+  test("trims whitespace from client-provided mention ranges", async () => {
+    const result = await processOutgoingText({
+      text: "cc @Dena  @Test2  mentions",
+      entities: {
+        entities: [
+          {
+            type: MessageEntity_Type.MENTION,
+            offset: 3n,
+            length: 6n,
+            entity: {
+              oneofKind: "mention",
+              mention: { userId: 10300n },
+            },
+          },
+          {
+            type: MessageEntity_Type.MENTION,
+            offset: 10n,
+            length: 7n,
+            entity: {
+              oneofKind: "mention",
+              mention: { userId: 10600n },
+            },
+          },
+        ],
+      },
+    })
+
+    expect(result.text).toBe("cc @Dena  @Test2  mentions")
+    expect(result.entities?.entities).toHaveLength(2)
+    expect(result.entities?.entities[0]).toMatchObject({
+      type: MessageEntity_Type.MENTION,
+      offset: 3n,
+      length: 5n,
+    })
+    expect(result.entities?.entities[1]).toMatchObject({
+      type: MessageEntity_Type.MENTION,
+      offset: 10n,
+      length: 6n,
+    })
+  })
+
+  test("prefers inline user id links over username fallbacks", async () => {
+    const idUser = await testUtils.createUser(nextEmail("inline-link-id-priority"))
+    const usernameUser = await testUtils.createUser(nextEmail("inline-link-username-fallback"))
+    await db.update(users).set({ username: "linkedmo" }).where(eq(users.id, usernameUser.id)).execute()
+
+    const result = await processOutgoingText({
+      text: `cc [@Mo](inline://user/${idUser.id}?username=linkedmo)`,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.entities?.entities).toHaveLength(1)
+    const mention = result.entities!.entities[0]!
+    expect(mention.entity.oneofKind).toBe("mention")
+    if (mention.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(mention.entity.mention.userId).toBe(BigInt(idUser.id))
+  })
+
+  test("keeps unresolved inline user links as text urls", async () => {
+    const result = await processOutgoingText({
+      text: "cc [@Missing](inline://user?id=99999999)",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc @Missing")
+    expect(result.entities?.entities).toHaveLength(1)
+
+    const entity = result.entities!.entities[0]!
+    expect(entity.type).toBe(MessageEntity_Type.TEXT_URL)
+    expect(entity.entity).toEqual({
+      oneofKind: "textUrl",
+      textUrl: { url: "inline://user?id=99999999" },
+    })
+  })
+
+  test("does not duplicate bare username mentions covered by inline mention links", async () => {
+    const user = await testUtils.createUser(nextEmail("inline-link-no-duplicate"))
+    await db.update(users).set({ username: "nodupe" }).where(eq(users.id, user.id)).execute()
+
+    const result = await processOutgoingText({
+      text: "cc [@nodupe](inline://user?username=nodupe)",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("cc @nodupe")
+    expect(result.entities?.entities).toHaveLength(1)
+    expect(result.entities?.entities[0]?.type).toBe(MessageEntity_Type.MENTION)
+  })
+
+  test("parses bot commands from outgoing text", async () => {
+    const result = await processOutgoingText({
+      text: "/start please",
+      entities: undefined,
+    })
+
+    expect(result.entities?.entities).toHaveLength(1)
+    const command = result.entities!.entities[0]!
+    expect(command.type).toBe(MessageEntity_Type.BOT_COMMAND)
+    expect(command.offset).toBe(0n)
+    expect(command.length).toBe(6n)
+    expect(command.entity.oneofKind).toBeUndefined()
+  })
+
+  test("parses bot commands after whitespace with bot username suffix", async () => {
+    const result = await processOutgoingText({
+      text: "run /deploy@buildbot now",
+      entities: undefined,
+    })
+
+    expect(result.entities?.entities).toHaveLength(1)
+    const command = result.entities!.entities[0]!
+    expect(command.type).toBe(MessageEntity_Type.BOT_COMMAND)
+    expect(command.offset).toBe(4n)
+    expect(command.length).toBe(BigInt("/deploy@buildbot".length))
+  })
+
+  test("does not parse bot commands mid-word", async () => {
+    const result = await processOutgoingText({
+      text: "abc/start",
+      entities: undefined,
+    })
+
+    expect(result.entities).toBeUndefined()
+  })
+
+  test("does not parse the first segment of a URL path as a bot command", async () => {
+    const result = await processOutgoingText({
+      text: "Open /web/something",
+      entities: undefined,
+    })
+
+    expect(result.entities).toBeUndefined()
+  })
+
+  test("keeps bot command offsets in utf16 coordinates", async () => {
+    const result = await processOutgoingText({
+      text: "😀 /start",
+      entities: undefined,
+    })
+
+    expect(result.entities?.entities).toHaveLength(1)
+    const command = result.entities!.entities[0]!
+    expect(command.type).toBe(MessageEntity_Type.BOT_COMMAND)
+    expect(command.offset).toBe(3n)
+    expect(command.length).toBe(6n)
+  })
+
+  test("does not parse bot commands covered by markdown code entities", async () => {
+    const result = await processOutgoingText({
+      text: "Use `/start` today",
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("Use /start today")
+    expect(result.entities?.entities).toHaveLength(1)
+    expect(result.entities?.entities[0]?.type).toBe(MessageEntity_Type.CODE)
+  })
+
+  test("projects completed and trailing open fences through one shared parse", async () => {
+    const input = [
+      "```ts",
+      "const first = true",
+      "```",
+      "```swift",
+      "let second = `value`",
+    ].join("\n")
+    const result = await processOutgoingText({
+      text: input,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe("const first = true\nlet second = `value`")
+    expect(result.entities?.entities.map((entity) => entity.type)).toEqual([
+      MessageEntity_Type.PRE,
+      MessageEntity_Type.PRE,
+    ])
+    expect(result.blockContent?.blocks.map((block) => block.kind.oneofKind)).toEqual(["code", "code"])
+
+    const second = result.blockContent?.blocks[1]
+    expect(second?.kind.oneofKind).toBe("code")
+    if (second?.kind.oneofKind !== "code") return
+    const start = Number(second.kind.code.text?.offset ?? 0n)
+    const end = start + Number(second.kind.code.text?.length ?? 0n)
+    expect(result.text.slice(start, end)).toBe("let second = `value`")
+  })
+
+  test("projects Hermes terminal dedup counters without corrupting later code blocks", async () => {
+    const input = [
+      "💻 terminal",
+      "```",
+      "/opt/data/tools/bin/coolify --context...",
+      "```",
+      "```",
+      "/opt/data/tools/bin/axiom-readonly --...",
+      "``` (×3)",
+      "```",
+      "curl --fail --silent --show-error -m...",
+      "```",
+    ].join("\n")
+    const result = await processOutgoingText({
+      text: input,
+      entities: undefined,
+      parseMarkdown: true,
+    })
+
+    expect(result.text).toBe([
+      "💻 terminal",
+      "/opt/data/tools/bin/coolify --context...",
+      "/opt/data/tools/bin/axiom-readonly --...",
+      "(×3)",
+      "curl --fail --silent --show-error -m...",
+    ].join("\n"))
+    expect(result.entities?.entities.map((entity) => entity.type)).toEqual([
+      MessageEntity_Type.PRE,
+      MessageEntity_Type.PRE,
+      MessageEntity_Type.PRE,
+    ])
+    expect(result.blockContent?.blocks.map((block) => block.kind.oneofKind)).toEqual([
+      "paragraph",
+      "code",
+      "code",
+      "paragraph",
+      "code",
+    ])
+
+    const codeText = result.blockContent?.blocks.flatMap((block) => {
+      if (block.kind.oneofKind !== "code" || !block.kind.code.text) return []
+      const start = Number(block.kind.code.text.offset)
+      const end = start + Number(block.kind.code.text.length)
+      return [result.text.slice(start, end)]
+    })
+    expect(codeText).toEqual([
+      "/opt/data/tools/bin/coolify --context...",
+      "/opt/data/tools/bin/axiom-readonly --...",
+      "curl --fail --silent --show-error -m...",
+    ])
+  })
+})

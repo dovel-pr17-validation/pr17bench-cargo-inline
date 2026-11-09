@@ -1,0 +1,244 @@
+import Combine
+import GRDB
+import InlineKit
+import Logger
+import QuickLook
+import SwiftUI
+import UIKit
+
+extension DocumentRow {
+  func fileIconButtonTapped() {
+    switch documentState {
+      case .needsDownload:
+        downloadFile()
+
+      case .downloading:
+        cancelDownload()
+
+      case .locallyAvailable:
+        openFile()
+    }
+  }
+
+  func viewTapped() {
+    guard !isBeingRemoved else { return }
+
+    switch documentState {
+      case .locallyAvailable:
+        openFile()
+
+      case .downloading:
+        cancelDownload()
+
+      case .needsDownload:
+        downloadFile()
+    }
+  }
+
+  // MARK: - File Operations
+
+  func downloadFile() {
+    let documentInfo = documentInfo
+    let document = document
+
+    // Prevent duplicate downloads
+    if case .downloading = documentState {
+      return
+    }
+
+    // Update UI state and start observing progress
+    documentState = .downloading(bytesReceived: 0, totalBytes: Int64(document.size ?? 0))
+    startMonitoringProgress()
+
+    let msg = documentMessage.message
+
+    Log.shared.debug(
+      "UI downloadFile tapped: docId=\(documentInfo.id) msgId=\(msg.id) fileName=\(document.fileName ?? "nil") size=\(document.size ?? -1) mime=\(document.mimeType ?? "nil") cdnUrl=\(document.cdnUrl ?? "nil")"
+    )
+
+    let startedNativeDownload = ExperimentalFeatureFlags.nativeFileDownloadsEnabled
+    FileDownloader.shared.downloadDocument(document: documentInfo, for: msg) { result in
+      DispatchQueue.main.async {
+        Log.shared.debug("UI downloadFile completion: docId=\(documentInfo.id) result=\(result)")
+        switch result {
+          case .success:
+            documentState = .locallyAvailable
+          case let .failure(error):
+            Log.shared.error("Document download failed:", error: error)
+            documentState = .needsDownload
+            if !FileDownloader.isCancellation(error), startedNativeDownload {
+              ToastManager.shared.showToast(
+                "File download failed",
+                description: "Please try again.",
+                type: .error,
+                systemImage: "exclamationmark.triangle.fill"
+              )
+            }
+        }
+      }
+    }
+  }
+
+  func cancelDownload() {
+    if case .downloading = documentState {
+      FileDownloader.shared.cancelDocumentDownload(documentId: documentInfo.id)
+      guard !FileDownloader.shared.isDocumentDownloadActive(documentId: documentInfo.id) else { return }
+
+      documentState = .needsDownload
+      progressSubscription?.cancel()
+      progressSubscription = nil
+    }
+  }
+
+  func openFile() {
+    Log.shared.debug("📄 openFile() called for state: \(documentState)")
+
+    guard documentState == .locallyAvailable else {
+      Log.shared.error("📄 Cannot open document: Not locally available")
+      return
+    }
+
+    guard let fileURL = documentURL else {
+      Log.shared.error("📄 Cannot open document: No valid file URL")
+      documentState = .needsDownload
+      return
+    }
+
+    // Validate file is readable
+    guard FileManager.default.isReadableFile(atPath: fileURL.path) else {
+      Log.shared.error("📄 File is not readable at path: \(fileURL.path)")
+      showDocumentError("File is not accessible")
+      documentState = .needsDownload
+      return
+    }
+
+    Log.shared.debug("📄 Opening file: \(fileURL.lastPathComponent)")
+
+    if QLPreviewController.canPreview(fileURL as QLPreviewItem) {
+      Log.shared.debug("📄 Using QuickLook for preview")
+      showingQuickLook = true
+    } else {
+      Log.shared.debug("📄 QuickLook can't preview - showing share options")
+      showShareMenu(for: fileURL)
+    }
+  }
+
+  private func showShareMenu(for url: URL) {
+    guard let presenter = activeTopViewController()
+    else {
+      Log.shared.error("📄 Cannot find active view controller for share menu")
+      return
+    }
+
+    // Create and store the interaction controller to keep it alive while the sheet is shown
+    docInteractionController = UIDocumentInteractionController(url: url)
+    guard let controller = docInteractionController else {
+      Log.shared.error("📄 Failed to initialize UIDocumentInteractionController")
+      return
+    }
+
+    // Present share menu
+    let rect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 0, height: 0)
+    if !controller.presentOptionsMenu(from: rect, in: presenter.view, animated: true) {
+      Log.shared.error("📄 Failed to present share menu")
+    }
+  }
+
+  func shareDocument() {
+    guard let fileURL = documentURL else {
+      Log.shared.error("📄 Cannot share document: No valid file URL")
+      showDocumentError("File is not available for sharing")
+      return
+    }
+
+    guard let presenter = activeTopViewController()
+    else {
+      Log.shared.error("📄 Cannot find active view controller for share sheet")
+      return
+    }
+
+    let activityViewController = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+    if let popoverController = activityViewController.popoverPresentationController {
+      popoverController.sourceView = presenter.view
+      popoverController.sourceRect = CGRect(
+        x: presenter.view.bounds.midX,
+        y: presenter.view.bounds.midY,
+        width: 1,
+        height: 1
+      )
+    }
+    presenter.present(activityViewController, animated: true)
+  }
+
+  func showDocumentError(_ message: String) {
+    alertMessage = message
+    showingAlert = true
+  }
+
+  // MARK: - Document State Management
+
+  func determineDocumentState(_ document: InlineKit.Document) -> DocumentState {
+    // Check if file exists locally using the computed documentURL property
+    if documentURL != nil {
+      return .locallyAvailable
+    }
+
+    let documentInfo = documentInfo
+    let documentId = documentInfo.id
+    if FileDownloader.shared.isDocumentDownloadActive(documentId: documentId) {
+      return .downloading(bytesReceived: 0, totalBytes: Int64(document.size ?? 0))
+    }
+
+    return .needsDownload
+  }
+
+  // MARK: - Progress Monitoring
+
+  func startMonitoringProgress() {
+    progressSubscription?.cancel()
+
+    let documentId = documentInfo.id
+    progressSubscription = FileDownloader.shared.documentProgressPublisher(documentId: documentId)
+      .receive(on: DispatchQueue.main)
+      .sink { progress in
+        Log.shared.debug("📄 Document \(documentId) progress: \(progress)")
+
+        if progress.isComplete {
+          documentState = .locallyAvailable
+        } else if let error = progress.error {
+          Log.shared.error("Document download failed:", error: error)
+          documentState = .needsDownload
+        } else if FileDownloader.shared.isDocumentDownloadActive(documentId: documentId) {
+          documentState = .downloading(
+            bytesReceived: progress.bytesReceived,
+            totalBytes: progress.totalBytes > 0 ? progress.totalBytes : Int64(document.size ?? 0)
+          )
+        } else if progress.bytesReceived > 0 {
+          documentState = .downloading(
+            bytesReceived: progress.bytesReceived,
+            totalBytes: progress.totalBytes > 0 ? progress.totalBytes : Int64(document.size ?? 0)
+          )
+        }
+      }
+  }
+
+  func setupInitialState() {
+    // Only update state if we're not already in a downloading state
+    // This preserves download progress when the view reappears during scrolling
+    if case .downloading = documentState {
+      // Already downloading, preserve current state and restore progress monitoring
+      startMonitoringProgress()
+      return
+    }
+
+    documentState = determineDocumentState(document)
+    if case .downloading = documentState {
+      startMonitoringProgress()
+    }
+  }
+
+  func cleanup() {
+    progressSubscription?.cancel()
+    progressSubscription = nil
+  }
+}

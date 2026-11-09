@@ -1,0 +1,41 @@
+{
+  "$schema": "./sidebar.schema.json",
+  "groups": [
+    {
+      "title": "Getting Started",
+      "pages": [
+        { "slug": "index", "label": "Get Started" },
+        { "slug": "changelog", "label": "What's New" },
+        "downloads",
+        "cli"
+      ]
+    },
+    {
+      "title": "Agents",
+      "pages": [
+        { "slug": "agents", "label": "Set Up an Agent" },
+        { "slug": "add-inline", "label": "Add Inline to Your Agent" },
+        "mcp",
+        "openclaw",
+        "hermes"
+      ]
+    },
+    {
+      "title": "Developers",
+      "pages": [
+        { "slug": "developers", "label": "Overview" },
+        "applescript",
+        "realtime-api",
+        "rust-sdk",
+        "bot-api",
+        "creating-a-bot",
+        "bot-updates",
+        { "label": "Technical Docs", "href": "/docs/technical" }
+      ]
+    },
+    {
+      "title": "Policies",
+      "pages": ["security", { "label": "Legal", "href": "/legal", "external": true }]
+    }
+  ]
+}

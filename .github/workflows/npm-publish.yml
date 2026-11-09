@@ -1,0 +1,312 @@
+name: Publish npm package
+run-name: npm ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'protocol-v*'
+      - 'bot-api-types-v*'
+      - 'bot-client-v*'
+      - 'realtime-sdk-v*'
+      - 'openclaw-v*'
+      - 'hermes-agent-v*'
+      - 'chat-sdk-v*'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  prepare:
+    name: Prepare ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      channel: ${{ steps.release.outputs.channel }}
+      package-key: ${{ steps.release.outputs.package-key }}
+      package-name: ${{ steps.release.outputs.package-name }}
+      outcome: ${{ steps.release.outputs.outcome }}
+      reason: ${{ steps.release.outputs.reason }}
+      artifact-name: ${{ steps.artifact-id.outputs.name }}
+    defaults:
+      run:
+        working-directory: candidate
+    steps:
+      - name: Checkout trusted release policy
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          path: release-policy
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Qualify immutable tag on green main before candidate execution
+        id: release
+        working-directory: release-policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SURFACE: npm
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: node scripts/ci/assert-release-commit.mjs
+
+      - name: Checkout qualified candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.4'
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Validate package identity and published internal requirements
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: node scripts/ci/npm-release-preflight.mjs
+
+      - name: Install source workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build shared package prerequisites
+        run: |
+          bun run --cwd packages/protocol build
+          bun run --cwd packages/oauth-core build
+          bun run --cwd packages/bot-api-types build
+          bun run --cwd packages/sdk build
+
+      - name: Validate package
+        env:
+          RELEASE_KEY: ${{ steps.release.outputs.package-key }}
+          PACKAGE_DIR: ${{ steps.release.outputs.package-dir }}
+        run: |
+          case "$RELEASE_KEY" in
+            protocol|realtime-sdk|openclaw)
+              bun run --cwd "$PACKAGE_DIR" check
+              ;;
+            bot-api-types|bot-client|chat-sdk)
+              bun run --cwd "$PACKAGE_DIR" build
+              bun run --cwd "$PACKAGE_DIR" typecheck
+              bun run --cwd "$PACKAGE_DIR" lint
+              bun run --cwd "$PACKAGE_DIR" test
+              ;;
+            hermes-agent)
+              # The next step validates and dry-runs the exact tarball that is published.
+              :
+              ;;
+          esac
+
+      - name: Prepare Hermes isolated release directory
+        if: steps.release.outputs.package-key == 'hermes-agent'
+        id: hermes
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.sha }}
+        run: |
+          artifact_dir="$RUNNER_TEMP/npm-release-artifact"
+          mkdir -p "$artifact_dir"
+          stage_log="$(mktemp)"
+          node plugins/hermes-agent/scripts/release-stage.mjs --dry-run --verify-source-bundle --output-dir "$artifact_dir" --version "$RELEASE_VERSION" --tag "$RELEASE_TAG" --sha "$RELEASE_COMMIT" | tee "$stage_log"
+          artifact="$(sed -n 's/^Hermes release artifact: //p' "$stage_log" | tail -1)"
+          artifact_sha256="$(sed -n 's/^Hermes release artifact sha256: //p' "$stage_log" | tail -1)"
+          if [[ -z "$artifact" || -z "$artifact_sha256" || ! -f "$artifact" ]]; then
+            echo "Hermes release artifact was not created" >&2
+            exit 1
+          fi
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "artifact-sha256=$artifact_sha256" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: steps.release.outputs.package-key == 'hermes-agent'
+        with:
+          python-version: '3.13'
+
+      - name: Install latest stable Hermes for release gate
+        if: steps.release.outputs.package-key == 'hermes-agent'
+        id: hermes-host
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/install-hermes-host.sh "$RUNNER_TEMP/hermes-host" latest
+
+      - name: Validate exact Hermes release artifact against real host
+        if: steps.release.outputs.package-key == 'hermes-agent'
+        env:
+          HERMES_ARTIFACT: ${{ steps.hermes.outputs.artifact }}
+          HERMES_BIN: ${{ steps.hermes-host.outputs.hermes-bin }}
+          HERMES_PYTHON: ${{ steps.hermes-host.outputs.python-bin }}
+        run: node scripts/ci/check-hermes-admission.mjs --artifact "$HERMES_ARTIFACT" "$HERMES_BIN" "$HERMES_PYTHON"
+      - name: Validate native Hermes source installation
+        if: steps.release.outputs.package-key == 'hermes-agent'
+        env:
+          HERMES_BIN: ${{ steps.hermes-host.outputs.hermes-bin }}
+          HERMES_PYTHON: ${{ steps.hermes-host.outputs.python-bin }}
+        run: node scripts/ci/check-hermes-source.mjs plugins/hermes-agent/plugin/inline "$HERMES_BIN" "$HERMES_PYTHON"
+
+      - name: Validate exact Hermes release artifact in the Umbrel app image
+        if: steps.release.outputs.package-key == 'hermes-agent'
+        env:
+          HERMES_ARTIFACT: ${{ steps.hermes.outputs.artifact }}
+        run: bash scripts/ci/check-umbrel-hermes.sh --plugin-only
+
+      - name: Build and pack with registry dependencies outside the workspace
+        if: steps.release.outputs.package-key != 'hermes-agent'
+        id: package-artifact
+        env:
+          PACKAGE_KEY: ${{ steps.release.outputs.package-key }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.sha }}
+        run: |
+          node scripts/ci/stage-npm-release.mjs --package "$PACKAGE_KEY" --version "$RELEASE_VERSION" \
+            --tag "$RELEASE_TAG" --sha "$RELEASE_COMMIT" --output-dir "$RUNNER_TEMP/npm-release-artifact"
+
+      - name: Install exact packed artifact outside the workspace
+        if: steps.release.outputs.package-key != 'hermes-agent'
+        env:
+          PACKAGE_NAME: ${{ steps.release.outputs.package-name }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          PACKAGE_ARTIFACT: ${{ steps.package-artifact.outputs.artifact }}
+          PACKAGE_KEY: ${{ steps.release.outputs.package-key }}
+        run: |
+          install_dir="$RUNNER_TEMP/npm-release-install"
+          mkdir -p "$install_dir"
+          host=()
+          if [[ "$PACKAGE_KEY" == openclaw ]]; then
+            # OpenClaw is an optional peer; qualify this host plugin with its pinned host.
+            host_version="$(node -p "require('./plugins/openclaw/package.json').devDependencies.openclaw")"
+            host+=("openclaw@$host_version")
+          fi
+          npm install --prefix "$install_dir" --ignore-scripts --no-audit --no-fund "$PACKAGE_ARTIFACT" "${host[@]}"
+          PACKAGE_NAME="$PACKAGE_NAME" RELEASE_VERSION="$RELEASE_VERSION" INSTALL_DIR="$install_dir" node <<'NODE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const root = process.env.INSTALL_DIR
+          const name = process.env.PACKAGE_NAME
+          const expectedVersion = process.env.RELEASE_VERSION
+          const manifest = JSON.parse(fs.readFileSync(path.join(root, 'node_modules', name, 'package.json'), 'utf8'))
+          if (manifest.name !== name || manifest.version !== expectedVersion) throw new Error('Installed artifact identity mismatch')
+          for (const [dependency, version] of Object.entries(manifest.dependencies ?? {})) {
+            if (!dependency.startsWith('@inline-chat/')) continue
+            if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) continue
+            const installed = JSON.parse(fs.readFileSync(path.join(root, 'node_modules', dependency, 'package.json'), 'utf8'))
+            if (installed.version !== version) throw new Error(`Incorrect registry dependency ${dependency}`)
+          }
+          fs.writeFileSync(path.join(root, 'smoke.mjs'), 'await import(process.env.PACKAGE_NAME)\n')
+          NODE
+          (cd "$install_dir" && node smoke.mjs)
+
+      - name: Freeze artifact name for failed-job retries
+        id: artifact-id
+        run: echo "name=npm-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Retain the exact checked artifact and integrity receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.artifact-id.outputs.name }}
+          path: ${{ runner.temp }}/npm-release-artifact/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish verified ${{ needs.prepare.outputs.tag }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: npm-publish
+    concurrency:
+      group: npm-publisher-${{ needs.prepare.outputs.package-key }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    outputs:
+      outcome: ${{ steps.publish.outputs.outcome }}
+      reason: ${{ steps.publish.outputs.reason }}
+    steps:
+      - name: Checkout trusted publishing policy
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Recheck frozen source and immutable tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SURFACE: npm
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.sha }}
+        run: node scripts/ci/assert-release-commit.mjs
+
+      - name: Setup Node and npm registry
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Use npm with OIDC publish and dist-tag support
+        run: npm install --global npm@11.21.0
+
+      - name: Download retained artifact without building or running its scripts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.prepare.outputs.artifact-name }}
+          path: ${{ runner.temp }}/npm-release-artifact
+
+      - name: Publish or resume the exact immutable artifact
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.sha }}
+        run: node scripts/ci/publish-npm-release.mjs "$RUNNER_TEMP/npm-release-artifact"
+
+  summary:
+    name: Release outcome
+    if: ${{ always() }}
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Report publication or the step that stopped it
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          PREPARE_OUTCOME: ${{ needs.prepare.outputs.outcome }}
+          PREPARE_REASON: ${{ needs.prepare.outputs.reason }}
+          PUBLISH_OUTCOME: ${{ needs.publish.outputs.outcome }}
+          PUBLISH_REASON: ${{ needs.publish.outputs.reason }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.sha }}
+        run: |
+          outcome=failed
+          reason="release preparation $PREPARE_RESULT; publisher $PUBLISH_RESULT"
+          if [[ "$PREPARE_OUTCOME" == blocked || "$PREPARE_OUTCOME" == deferred ]]; then
+            outcome="$PREPARE_OUTCOME"; reason="$PREPARE_REASON"
+          elif [[ -n "$PUBLISH_OUTCOME" ]]; then
+            outcome="$PUBLISH_OUTCOME"; reason="$PUBLISH_REASON"
+          fi
+          bash scripts/ci/release-summary.sh "npm $RELEASE_TAG" "$outcome" "$reason" "$RELEASE_COMMIT"

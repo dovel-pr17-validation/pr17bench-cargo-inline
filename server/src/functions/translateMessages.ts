@@ -1,0 +1,320 @@
+import { db } from "@in/server/db"
+import { messages, translations } from "@in/server/db/schema"
+import { eq, and, desc, inArray, lt } from "drizzle-orm"
+import { decryptBinary } from "@in/server/modules/encryption/encryption"
+import { Log } from "@in/server/utils/log"
+import { MessageEntities, type InputPeer, type MessageTranslation } from "@inline-chat/protocol/core"
+import {
+  type ProcessedMessage,
+  type ProcessedMessageAndTranslation,
+  processMessageTranslation,
+} from "@in/server/db/models/messages"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { ChatModel } from "@in/server/db/models/chats"
+import { decryptMessage } from "@in/server/modules/encryption/encryptMessage"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { TranslationModule } from "@in/server/modules/translation2/translation"
+import { TranslationModel } from "@in/server/db/models/translations"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+
+const log = new Log("functions/translateMessages")
+
+type TranslateMessagesFnInput = {
+  peerId: InputPeer
+  messageIds: number[]
+  language: string
+}
+
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER
+const CONTEXT_MESSAGE_LIMIT = 5
+
+export async function translateMessages(
+  input: TranslateMessagesFnInput,
+  context: FunctionContext,
+): Promise<{ translations: MessageTranslation[] }> {
+  try {
+    // Validate message IDs
+    const validMessageIds = input.messageIds.filter((id) => Number.isInteger(id) && id > 0 && id <= MAX_SAFE_INTEGER)
+
+    if (validMessageIds.length !== input.messageIds.length) {
+      log.warn("Some message IDs were invalid and were filtered out", {
+        originalCount: input.messageIds.length,
+        validCount: validMessageIds.length,
+        invalidIds: input.messageIds.filter((id) => !Number.isInteger(id) || id <= 0 || id > MAX_SAFE_INTEGER),
+      })
+    }
+
+    if (validMessageIds.length === 0) {
+      throw new Error("No valid message IDs provided")
+    }
+
+    log.debug("Starting translation request", {
+      messageCount: validMessageIds.length,
+      language: input.language,
+    })
+
+    // Resolve the chat and require the caller's current access before reading
+    // originals, context, cached translations, or calling the provider.
+    const chat = await ChatModel.getAuthorizedChatFromInputPeer(input.peerId, context)
+    log.debug("Retrieved chat", { chatId: chat.id })
+
+    // Get messages
+    const msgs = await getMessagesAndTranslations({
+      chatId: chat.id,
+      messageIds: validMessageIds,
+      translationLanguage: input.language,
+    })
+
+    log.debug("Retrieved messages", {
+      messageCount: msgs.length,
+      requestedCount: input.messageIds.length,
+    })
+
+    // Get existing translations
+    let existingTranslations = await db._query.translations.findMany({
+      where: and(
+        eq(translations.chatId, chat.id),
+        eq(translations.language, input.language),
+        inArray(translations.messageId, input.messageIds),
+      ),
+    })
+
+    log.debug("Found existing translations", {
+      existingCount: existingTranslations.length,
+    })
+
+    // Filter out messages that already have translations
+    const messagesToTranslate = msgs.filter((msg) => {
+      const existingTranslation = existingTranslations.find((t) => t.messageId === msg.messageId)
+      const messageRevision = msg.rev ?? 0
+
+      if (existingTranslation) {
+        const translationMsgRevision = existingTranslation.msgRev ?? 0
+        if (messageRevision > translationMsgRevision) {
+          // Message revision is newer than existing translation, so we should translate it
+          // Important: drop it from the list of existing translations so we don't try to translate it again
+          existingTranslations = existingTranslations.filter((t) => t.messageId !== msg.messageId)
+          return true
+        } else {
+          // Translation is valid, so we should not translate it again
+          return false
+        }
+      }
+
+      // No existing translation, so we should translate it
+      return true
+    })
+
+    // Nothing to translate
+    if (!messagesToTranslate.length) {
+      log.debug("No new messages to translate, returning existing translations")
+      return {
+        translations: existingTranslations.map((t) => Encoders.translation({ translation: t })),
+      }
+    }
+
+    log.debug("Starting translation of new messages", {
+      newMessagesCount: messagesToTranslate.length,
+    })
+
+    // Get context messages if we have fewer than 5 messages to translate
+    let contextMessages: ProcessedMessage[] = []
+    if (messagesToTranslate.length < CONTEXT_MESSAGE_LIMIT) {
+      const oldestMessageId = Math.min(...messagesToTranslate.map((m) => m.messageId))
+      contextMessages = await getContextMessages({
+        chatId: chat.id,
+        beforeMessageId: oldestMessageId,
+        limit: CONTEXT_MESSAGE_LIMIT - messagesToTranslate.length,
+      })
+
+      log.debug("Retrieved context messages", {
+        contextCount: contextMessages.length,
+        oldestMessageId,
+      })
+    }
+
+    // Translate messages
+    const messageTranslations = await TranslationModule.translateMessages({
+      messages: messagesToTranslate,
+      contextMessages,
+      language: input.language,
+      chat,
+      actorId: context.currentUserId,
+    }).catch((error) => {
+      log.error("Failed to translate messages", {
+        error,
+        messageCount: messagesToTranslate.length,
+        language: input.language,
+      })
+      throw error
+    })
+
+    log.debug("Successfully translated messages", {
+      translatedCount: messageTranslations.length,
+    })
+
+    // Insert translations
+    let persistedTranslations: typeof messageTranslations = []
+    let skippedTranslations: typeof messageTranslations = []
+
+    try {
+      ;({ persistedTranslations, skippedTranslations } = await TranslationModel.insertTranslations(messageTranslations))
+    } catch (error) {
+      log.error("Failed to insert translations", {
+        error,
+        translationCount: messageTranslations.length,
+      })
+      throw error
+    }
+
+    if (skippedTranslations.length > 0) {
+      log.warn("Skipped translations for messages that no longer exist", {
+        skippedCount: skippedTranslations.length,
+        skippedMessageIds: skippedTranslations.map((translation) => translation.messageId),
+        persistedCount: persistedTranslations.length,
+      })
+    }
+
+    // Combine new and existing translations
+    const allTranslations = [
+      ...persistedTranslations.map((t) => Encoders.unencryptedTranslation({ translation: t })),
+      ...existingTranslations.map((t) => Encoders.translation({ translation: t })),
+    ]
+
+    log.debug("Returning combined translations", {
+      totalTranslations: allTranslations.length,
+      newTranslations: persistedTranslations.length,
+      skippedTranslations: skippedTranslations.length,
+      existingTranslations: existingTranslations.length,
+    })
+
+    return {
+      translations: allTranslations,
+    }
+  } catch (error) {
+    // Access denials are expected client errors, not translation failures.
+    if (error instanceof RealtimeRpcError) throw error
+    log.error("Failed to process translation request", {
+      error,
+      peerId: input.peerId,
+      messageCount: input.messageIds.length,
+      language: input.language,
+    })
+    throw error
+  }
+}
+
+// ----------------
+// HELPERS
+// ----------------
+
+/**
+ * Get context messages for translation to provide conversation context
+ */
+async function getContextMessages(input: {
+  chatId: number
+  beforeMessageId: number
+  limit: number
+}): Promise<ProcessedMessage[]> {
+  try {
+    const result = await db._query.messages.findMany({
+      where: and(eq(messages.chatId, input.chatId), lt(messages.messageId, input.beforeMessageId)),
+      orderBy: desc(messages.messageId),
+      limit: input.limit,
+    })
+
+    // Reverse to get chronological order (oldest first)
+    result.reverse()
+
+    return result.map((msg) => ({
+      ...msg,
+      // Decrypt text
+      text:
+        msg.textEncrypted && msg.textIv && msg.textTag
+          ? decryptMessage({
+              encrypted: msg.textEncrypted,
+              iv: msg.textIv,
+              authTag: msg.textTag,
+            })
+          : msg.text,
+
+      entities:
+        msg.entitiesEncrypted && msg.entitiesIv && msg.entitiesTag
+          ? MessageEntities.fromBinary(
+              decryptBinary({ encrypted: msg.entitiesEncrypted, iv: msg.entitiesIv, authTag: msg.entitiesTag }),
+            )
+          : null,
+      systemMessage: null,
+      blockContent: null,
+    }))
+  } catch (error) {
+    log.error("Failed to get context messages", {
+      error,
+      chatId: input.chatId,
+      beforeMessageId: input.beforeMessageId,
+      limit: input.limit,
+    })
+    // Return empty array if we can't get context messages - translation can still proceed
+    return []
+  }
+}
+
+async function getMessagesAndTranslations(input: {
+  chatId: number
+  messageIds: number[]
+  translationLanguage: string
+}): Promise<ProcessedMessageAndTranslation[]> {
+  try {
+    let result = await db._query.messages.findMany({
+      where: and(eq(messages.chatId, input.chatId), inArray(messages.messageId, input.messageIds)),
+      orderBy: desc(messages.messageId),
+      with: {
+        translations: {
+          where: eq(translations.language, input.translationLanguage),
+        },
+      },
+    })
+
+    log.debug("Retrieved messages from database", {
+      foundCount: result.length,
+      requestedCount: input.messageIds.length,
+    })
+
+    return result.map((msg) => {
+      let translation = msg.translations.find((t) => t.language === input.translationLanguage) ?? null
+      return {
+        ...msg,
+
+        // Decrypt text
+        text:
+          msg.textEncrypted && msg.textIv && msg.textTag
+            ? decryptMessage({
+                encrypted: msg.textEncrypted,
+                iv: msg.textIv,
+                authTag: msg.textTag,
+              })
+            : // legacy fallback
+              msg.text,
+
+        entities:
+          msg.entitiesEncrypted && msg.entitiesIv && msg.entitiesTag
+            ? MessageEntities.fromBinary(
+                decryptBinary({ encrypted: msg.entitiesEncrypted, iv: msg.entitiesIv, authTag: msg.entitiesTag }),
+              )
+            : null,
+        systemMessage: null,
+        blockContent: null,
+
+        // Get translation in language
+        translation: translation ? processMessageTranslation(translation) : null,
+      }
+    })
+  } catch (error) {
+    log.error("Failed to get messages and translations", {
+      error,
+      chatId: input.chatId,
+      messageCount: input.messageIds.length,
+    })
+    throw error
+  }
+}

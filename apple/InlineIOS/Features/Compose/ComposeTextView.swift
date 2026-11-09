@@ -1,0 +1,1299 @@
+import InlineKit
+import InlineUI
+import Logger
+import ObjectiveC
+import TextProcessing
+import UIKit
+import UniformTypeIdentifiers
+
+class ComposeTextView: UITextView {
+  private var placeholderLabel: UILabel?
+  weak var composeView: ComposeView?
+  private var trackingAccessoryView: UIView?
+  private var isProcessingInsertedAttachments = false
+  private var processedRanges = Set<String>()
+  private var recentlySentImageHashes = Set<Int>()
+  private let processingLock = NSLock()
+  private var pastedLinkSessionStorage: ComposePastedLinkSession?
+
+  private var pastedLinkSession: ComposePastedLinkSession {
+    if let pastedLinkSessionStorage { return pastedLinkSessionStorage }
+    let session = ComposePastedLinkSession(
+      snapshot: { [weak self] in
+        guard let self else { return nil }
+        return (NSAttributedString(attributedString: textStorage), selectedRange)
+      },
+      replace: { [weak self] range, replacement, selection, action in
+        self?.replacePastedLink(range: range, replacement: replacement, selection: selection, action: action) ?? false
+      }
+    )
+    pastedLinkSessionStorage = session
+    return session
+  }
+
+  override var text: String! {
+    didSet { resetPastedLinks() }
+  }
+
+  override var attributedText: NSAttributedString! {
+    didSet { resetPastedLinks() }
+  }
+
+  override var keyCommands: [UIKeyCommand]? {
+    var commands = super.keyCommands ?? []
+    if canHandleHardwareReturn {
+      let send = UIKeyCommand(input: "\r", modifierFlags: [], action: #selector(sendWithHardwareReturn(_:)))
+      let newline = UIKeyCommand(input: "\r", modifierFlags: .shift, action: #selector(insertHardwareNewline(_:)))
+      // UITextView otherwise handles Return as text input before custom key commands.
+      send.wantsPriorityOverSystemBehavior = true
+      newline.wantsPriorityOverSystemBehavior = true
+      commands += [send, newline]
+    }
+    if pastedLinkSessionStorage?.canRevert == true {
+      commands.append(UIKeyCommand(input: UIKeyCommand.inputEscape, modifierFlags: [], action: #selector(revertPastedLink(_:))))
+    }
+    return commands
+  }
+
+  private var canHandleHardwareReturn: Bool {
+    traitCollection.userInterfaceIdiom == .pad &&
+      INUserSettings.current.compose.sendWithReturnOnIPad && isEditable && markedTextRange == nil
+  }
+
+  @objc private func sendWithHardwareReturn(_ sender: UIKeyCommand) {
+    guard canHandleHardwareReturn else { return }
+    if composeView?.autocompleteManager?.handleKeyPress("Enter") == true { return }
+    composeView?.sendTapped()
+  }
+
+  @objc private func insertHardwareNewline(_ sender: UIKeyCommand) {
+    guard canHandleHardwareReturn else { return }
+    insertText("\n")
+  }
+
+  @objc private func revertPastedLink(_ sender: Any?) {
+    pastedLinkSessionStorage?.revertLatest()
+  }
+
+  override func deleteBackward() {
+    if pastedLinkSessionStorage?.revertAtCaret() == true { return }
+    super.deleteBackward()
+  }
+
+  func resetPastedLinks() { pastedLinkSessionStorage?.reset() }
+
+  func willChangePastedLinks(in range: NSRange, replacement: String) {
+    pastedLinkSessionStorage?.willChange(range: range, replacement: replacement)
+  }
+
+  override var inputAccessoryView: UIView? {
+    get {
+      trackingAccessoryView
+    }
+    set {
+      trackingAccessoryView = newValue
+    }
+  }
+
+  var placeholderText: String = "Message" {
+    didSet {
+      guard placeholderText != oldValue else { return }
+      placeholderLabel?.text = placeholderText
+      placeholderLabel?.invalidateIntrinsicContentSize()
+    }
+  }
+
+  init(composeView: ComposeView) {
+    self.composeView = composeView
+    super.init(frame: .zero, textContainer: nil)
+    setupTextView()
+    setupPlaceholder()
+    setupNotifications()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(self)
+  }
+
+  func setKeyboardTrackingAccessoryView(_ view: UIView?) {
+    trackingAccessoryView = view
+    if isFirstResponder {
+      reloadInputViews()
+    }
+  }
+
+  private func setupTextView() {
+    backgroundColor = .clear
+    allowsEditingTextAttributes = true
+    // Keyboard stickers, Memoji and Genmoji arrive as adaptive image glyphs, which keeps them
+    // distinct from dropped images (plain text attachments) so they can be sent as stickers.
+    supportsAdaptiveImageGlyph = true
+    font = .systemFont(ofSize: 17)
+    typingAttributes[.font] = font
+    textContainerInset = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
+    translatesAutoresizingMaskIntoConstraints = false
+    tintColor = ThemeManager.shared.selected.accent
+    dataDetectorTypes = []
+  }
+
+  private func setupPlaceholder() {
+    let label = UILabel()
+    label.text = placeholderText
+    label.font = .systemFont(ofSize: 17)
+    label.textColor = .secondaryLabel
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.textAlignment = .left
+    addSubview(label)
+
+    NSLayoutConstraint.activate([
+      label.leadingAnchor.constraint(
+        equalTo: leadingAnchor,
+        constant: textContainer.lineFragmentPadding + textContainerInset.left
+      ),
+      label.topAnchor.constraint(equalTo: topAnchor, constant: textContainerInset.top),
+    ])
+
+    placeholderLabel = label
+  }
+
+  private func setupNotifications() {
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(textDidChange),
+      name: UITextView.textDidChangeNotification,
+      object: self
+    )
+
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(keyboardWillShow),
+      name: UIResponder.keyboardWillShowNotification,
+      object: nil
+    )
+  }
+
+  @objc public func textDidChange() {
+    pastedLinkSessionStorage?.validate()
+    showPlaceholder(text.isEmpty)
+
+    if text.contains("￼") || attributedText.string.contains("￼") {
+      // Get the full context of the text
+      let fullText = attributedText.string
+      let components = fullText.components(separatedBy: "￼")
+
+      let isLikelyVoiceToSpeech = components.count == 2 &&
+        (components[0].isEmpty || components[1].isEmpty) &&
+        !hasValidStickerAttributes()
+
+      if !isLikelyVoiceToSpeech {
+        // handleStickerDetection()
+        checkForNewAttachments()
+      }
+    }
+
+    fixFontSizeAfterStickerInsertion()
+  }
+
+  @objc private func keyboardWillShow(_ notification: Notification) {}
+
+  func showPlaceholder(_ show: Bool) {
+    placeholderLabel?.alpha = show ? 1 : 0
+  }
+
+  override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+    if action == #selector(sendWithHardwareReturn(_:)) || action == #selector(insertHardwareNewline(_:)) {
+      return canHandleHardwareReturn
+    }
+    if action == #selector(paste(_:)), isEditable,
+       ExperimentalFeatureFlags.richMessageCopyEditingEnabled, MessageTextPasteboard.containsFormattedText() {
+      return true
+    }
+    return super.canPerformAction(action, withSender: sender)
+  }
+
+  override func copy(_ sender: Any?) {
+    if !ComposeTextPasteboard.copy(textStorage, selection: selectedRange) { super.copy(sender) }
+  }
+
+  override func cut(_ sender: Any?) {
+    guard ComposeTextPasteboard.copy(textStorage, selection: selectedRange) else {
+      super.cut(sender)
+      return
+    }
+    replaceSelection(with: NSAttributedString(), actionName: "Cut")
+  }
+
+  private func replaceSelection(with replacement: NSAttributedString, actionName: String) {
+    willChangePastedLinks(in: selectedRange, replacement: replacement.string)
+    composeView?.draftManager.invalidateLoadedEntities(overlapping: selectedRange)
+    let result = ComposeThreadLinkEditing.insertAttributedText(
+      replacement,
+      into: attributedText ?? NSAttributedString(),
+      selectedRange: selectedRange,
+      textColor: UIColor.label
+    )
+    registerFormattingUndo(actionName: actionName)
+    textStorage.setAttributedString(result.attributedString)
+    selectedRange = result.selectedRange
+    resetTypingAttributesToDefault()
+    InlineTextStyle.reapply(to: textStorage)
+
+    // Programmatic text assignment bypasses the normal delegate path.
+    textDidChange()
+    delegate?.textViewDidChange?(self)
+  }
+
+  override func paste(_ sender: Any?) {
+    if UIPasteboard.general.image != nil {
+      composeView?.handlePastedImage()
+    } else if selectedRange.length > 0, let urlString = pastedLinkURLString(from: .general) {
+      applyLink(urlString, to: selectedRange)
+    } else if let reference = ThreadReferencePasteboard.reference() {
+      let detector = ThreadLinkDetector()
+      var linkAttributes = typingAttributes
+      linkAttributes[.foregroundColor] = composeView?.linkColor ?? tintColor ?? UIColor.systemBlue
+      let result = detector.replaceThreadNumberReference(
+        in: attributedText ?? NSAttributedString(),
+        range: selectedRange,
+        with: reference,
+        trailingText: "",
+        linkAttributes: linkAttributes
+      )
+      attributedText = result.newAttributedText
+      selectedRange = NSRange(location: result.newCursorPosition, length: 0)
+      resetTypingAttributesToDefault()
+      textDidChange()
+      delegate?.textViewDidChange?(self)
+    } else if let pasted = ComposeTextPasteboard.attributedText(configuration: .init(
+      font: font ?? UIFont.systemFont(ofSize: 17),
+      primaryColor: UIColor.label,
+      linkColor: composeView?.linkColor ?? tintColor ?? UIColor.systemBlue,
+      convertMentionsToLink: false
+    )) {
+      replaceSelection(with: pasted, actionName: "Paste")
+    } else if let string = (ExperimentalFeatureFlags.richMessageCopyEditingEnabled ? MessageTextPasteboard.markdown() : nil)
+      ?? UIPasteboard.general.string ?? UIPasteboard.general.url?.absoluteString
+    {
+      let replacedRange = selectedRange
+      willChangePastedLinks(in: replacedRange, replacement: string)
+      composeView?.draftManager.invalidateLoadedEntities(overlapping: replacedRange)
+      let pasteResult = ComposeThreadLinkEditing.insertPlainText(
+        string,
+        into: attributedText ?? NSAttributedString(),
+        selectedRange: selectedRange,
+        typingAttributes: ExperimentalFeatureFlags.richMessageCopyEditingEnabled
+          ? [.font: UIFont.systemFont(ofSize: 17), .foregroundColor: UIColor.label] : typingAttributes,
+        textColor: UIColor.label
+      )
+      registerFormattingUndo(actionName: "Paste")
+      textStorage.setAttributedString(pasteResult.attributedString)
+      selectedRange = pasteResult.selectedRange
+      resetTypingAttributesToDefault()
+      let links = ComposeLinkPaste.links(
+        in: textStorage, range: NSRange(location: replacedRange.location, length: string.utf16.count)
+      )
+      for link in links {
+        textStorage.addAttributes(linkAttributes(urlString: link.url.absoluteString), range: link.range)
+      }
+      if !links.isEmpty { InlineTextStyle.reapply(to: textStorage) }
+
+      // Programmatic text assignment bypasses the normal delegate path.
+      // Route paste through the same change handlers as typing so send state stays in sync.
+      textDidChange()
+      delegate?.textViewDidChange?(self)
+      if INUserSettings.current.compose.replacePastedLinksWithTitles, let peer = composeView?.peerId {
+        pastedLinkSession.pasted(links: links) { url in
+          try await ExternalResourceSearchClient.resolveLinkLabel(peer: peer, url: url)
+        }
+      }
+    } else {
+      super.paste(sender)
+      fixFontSizeAfterStickerInsertion()
+      showPlaceholder(text.isEmpty)
+      composeView?.updateHeight()
+      if !text.isEmpty {
+        composeView?.buttonAppear()
+      }
+    }
+  }
+
+  private func pastedLinkURLString(from pasteboard: UIPasteboard) -> String? {
+    if let string = pasteboard.string {
+      return ComposeLinkPaste.normalizedURLString(from: string)
+    }
+
+    guard let url = pasteboard.url else { return nil }
+    return ComposeLinkPaste.normalizedURLString(from: url)
+  }
+
+  private func replacePastedLink(
+    range: NSRange,
+    replacement: NSAttributedString,
+    selection: NSRange,
+    action: String
+  ) -> Bool {
+    guard markedTextRange == nil else { return false }
+    registerFormattingUndo(actionName: action)
+    textStorage.replaceCharacters(in: range, with: replacement)
+    selectedRange = selection
+    resetTypingAttributesToDefault()
+    textDidChange()
+    delegate?.textViewDidChange?(self)
+    return true
+  }
+
+  override func toggleUnderline(_ sender: Any?) { toggleStyle(.underline, actionName: "Underline") }
+
+  func inlineStyleMenu() -> UIMenu {
+    let styles: [(InlineTextStyle, String, String)] = [
+      (.underline, "Underline", "underline"),
+      (.strikethrough, "Strikethrough", "strikethrough"),
+      (.highlight, "Highlight", "highlighter"),
+    ]
+    let range = clampedRange(selectedRange)
+    return UIMenu(title: "Text Styles", children: styles.map { style, title, symbol in
+      let enabled = range.length == 0
+        ? typingAttributes[style.marker] as? Bool == true
+        : style.isEnabled(in: textStorage, range: range)
+      return UIAction(title: title, image: UIImage(systemName: symbol), state: enabled ? .on : .off) { [weak self] _ in
+        self?.toggleStyle(style, actionName: title)
+      }
+    })
+  }
+
+  private func toggleStyle(_ style: InlineTextStyle, actionName: String) {
+    guard isEditable, selectedRange.location != NSNotFound else { return }
+    let range = clampedRange(selectedRange)
+    registerFormattingUndo(actionName: actionName)
+    if range.length == 0 {
+      typingAttributes = style.settingEnabled(typingAttributes[style.marker] as? Bool != true, in: typingAttributes)
+    } else {
+      let enabled = !style.isEnabled(in: textStorage, range: range)
+      textStorage.beginEditing()
+      style.setEnabled(enabled, in: textStorage, range: range)
+      textStorage.endEditing()
+      selectedRange = range
+    }
+    textDidChange()
+    delegate?.textViewDidChange?(self)
+  }
+
+  private func registerFormattingUndo(actionName: String) {
+    let previousText = NSAttributedString(attributedString: textStorage)
+    let previousSelection = selectedRange
+    let previousTyping = typingAttributes
+    undoManager?.registerUndo(withTarget: self) { target in
+      target.registerFormattingUndo(actionName: actionName)
+      target.textStorage.setAttributedString(previousText)
+      target.selectedRange = previousSelection
+      target.typingAttributes = previousTyping
+      target.textDidChange()
+      target.delegate?.textViewDidChange?(target)
+    }
+    undoManager?.setActionName(actionName)
+  }
+
+  private func applyLink(_ urlString: String, to range: NSRange) {
+    let safeRange = clampedRange(range)
+    guard safeRange.length > 0 else { return }
+    willChangePastedLinks(in: safeRange, replacement: (textStorage.string as NSString).substring(with: safeRange))
+
+    let selectedText = (attributedText.string as NSString).substring(with: safeRange)
+    guard !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+    textStorage.beginEditing()
+    textStorage.removeAttribute(.emailAddress, range: safeRange)
+    textStorage.removeAttribute(.phoneNumber, range: safeRange)
+    textStorage.addAttributes(linkAttributes(urlString: urlString), range: safeRange)
+    InlineTextStyle.reapply(to: textStorage)
+    textStorage.endEditing()
+
+    selectedRange = ComposeLinkPaste.selectionAfterApplyingLink(to: safeRange)
+    textDidChange()
+    delegate?.textViewDidChange?(self)
+  }
+
+  private func linkAttributes(urlString: String) -> [NSAttributedString.Key: Any] {
+    [
+      .foregroundColor: composeView?.linkColor ?? tintColor ?? ThemeManager.shared.selected.accent,
+      .link: urlString,
+      .underlineStyle: 0,
+    ]
+  }
+
+  private func clampedRange(_ range: NSRange) -> NSRange {
+    let length = attributedText.length
+    let location = min(max(0, range.location), length)
+    let safeLength = min(max(0, range.length), length - location)
+    return NSRange(location: location, length: safeLength)
+  }
+
+  private func fixFontSizeAfterStickerInsertion() {
+    guard let attributedText = attributedText?.mutableCopy() as? NSMutableAttributedString,
+          attributedText.length > 0
+    else {
+      return
+    }
+
+    // Attachment replacement characters are transient during drag/drop.
+    // Avoid normalizing the entire string here because it can wipe user text styling.
+    if attributedText.string.contains("\u{FFFC}") {
+      return
+    }
+
+    var needsFix = false
+    attributedText.enumerateAttribute(
+      .font,
+      in: NSRange(location: 0, length: attributedText.length),
+      options: []
+    ) { value, _, stop in
+      if let font = value as? UIFont, font.pointSize != 17 {
+        needsFix = true
+        stop.pointee = true
+      }
+    }
+
+    if needsFix {
+      attributedText.addAttribute(
+        .font,
+        value: UIFont.systemFont(ofSize: 17),
+        range: NSRange(location: 0, length: attributedText.length)
+      )
+      attributedText.addAttribute(
+        .foregroundColor,
+        value: UIColor.label,
+        range: NSRange(location: 0, length: attributedText.length)
+      )
+
+      self.attributedText = attributedText
+    }
+  }
+
+  public func checkForNewAttachments() {
+    guard !isProcessingInsertedAttachments, let attributedText else { return }
+
+    let snapshot = NSAttributedString(attributedString: attributedText)
+    let string = snapshot.string as NSString
+    var rangesToProcess: [NSRange] = []
+    var searchRange = NSRange(location: 0, length: string.length)
+
+    while searchRange.length > 0 {
+      let range = string.range(of: "\u{FFFC}", options: [], range: searchRange)
+      guard range.location != NSNotFound else { break }
+      rangesToProcess.append(range)
+
+      let nextLocation = NSMaxRange(range)
+      searchRange = NSRange(location: nextLocation, length: string.length - nextLocation)
+    }
+
+    guard !rangesToProcess.isEmpty else { return }
+
+    isProcessingInsertedAttachments = true
+    defer { isProcessingInsertedAttachments = false }
+
+    enum InsertedMedia {
+      case sticker(Data)
+      case droppedImage(UIImage)
+      case other
+    }
+
+    var stickerImageData: [Data] = []
+    var droppedAttachmentImages: [UIImage] = []
+    var actions: [(range: NSRange, attributes: [NSAttributedString.Key: Any], media: InsertedMedia)] = []
+
+    for range in rangesToProcess where range.location < snapshot.length {
+      let attributes = snapshot.attributes(at: range.location, effectiveRange: nil)
+      // Check stickers first: a sticker must never fall through to the dropped-photo path.
+      let media: InsertedMedia = if let glyph = attributes[.adaptiveImageGlyph] as? NSAdaptiveImageGlyph {
+        .sticker(glyph.imageContent)
+      } else if let droppedImage = imageFromTextAttachment(attributes: attributes) {
+        .droppedImage(droppedImage)
+      } else {
+        .other
+      }
+      switch media {
+        case let .sticker(data): stickerImageData.append(data)
+        case let .droppedImage(image): droppedAttachmentImages.append(image)
+        case .other: break
+      }
+      actions.append((range, attributes, media))
+    }
+
+    // Consume each transient replacement character before handing media to the composer.
+    // Descending ranges keep the UTF-16 locations valid while the text storage changes.
+    for action in actions.reversed() {
+      switch action.media {
+        case .sticker, .droppedImage:
+          safelyRemoveAttachment(at: action.range)
+        case .other:
+          processReplacementCharacter(at: action.range, attributes: action.attributes)
+      }
+    }
+
+    for data in stickerImageData {
+      sendStickerImage(data, metadata: ["source": "adaptive_image_glyph"])
+    }
+
+    guard let composeView, !droppedAttachmentImages.isEmpty else { return }
+    if droppedAttachmentImages.count == 1 {
+      composeView.handleDroppedImage(droppedAttachmentImages[0])
+    } else {
+      composeView.handleMultipleDroppedImages(droppedAttachmentImages)
+    }
+  }
+
+  private func imageFromTextAttachment(attributes: [NSAttributedString.Key: Any]) -> UIImage? {
+    guard let attachment = attributes[.attachment] as? NSTextAttachment else { return nil }
+
+    if let image = attachment.image {
+      return image
+    }
+
+    if let data = attachment.fileWrapper?.regularFileContents,
+       let image = UIImage(data: data)
+    {
+      return image
+    }
+
+    return nil
+  }
+
+  private func processReplacementCharacter(
+    at range: NSRange,
+    attributes: [NSAttributedString.Key: Any]
+  ) {
+    if !hasValidStickerAttributes() {
+      return
+    }
+
+    let rangeIdentifier = "\(range.location):\(range.length):\(Date().timeIntervalSince1970)"
+
+    processingLock.lock()
+    if processedRanges.contains(rangeIdentifier) {
+      processingLock.unlock()
+      return
+    }
+    processedRanges.insert(rangeIdentifier)
+    processingLock.unlock()
+
+    // DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+    processingLock.lock()
+    processedRanges.remove(rangeIdentifier)
+    processingLock.unlock()
+    // }
+
+    var finalImage: UIImage?
+    var imageSource = "unknown"
+
+    if let attachment = attributes[.attachment] as? NSTextAttachment {
+      if let image = attachment.image {
+        finalImage = image
+        imageSource = "attachment"
+      }
+    }
+
+    if finalImage == nil,
+       let adaptiveGlyph =
+       attributes[NSAttributedString.Key(rawValue: "CTAdaptiveImageProvider")] as? NSObject
+    {
+      if let image = extractImageFromAdaptiveGlyph(adaptiveGlyph) {
+        finalImage = image
+        imageSource = "adaptive_glyph"
+      }
+    }
+
+    if let image = finalImage {
+      var processedImage = image
+      if image.size.width < 10 || image.size.height < 10 {
+        let size = CGSize(width: 200, height: 200)
+        UIGraphicsBeginImageContextWithOptions(size, false, 0)
+        image.draw(in: CGRect(origin: .zero, size: size))
+        if let resizedImage = UIGraphicsGetImageFromCurrentImageContext() {
+          processedImage = resizedImage
+        }
+        UIGraphicsEndImageContext()
+      }
+
+      if let imageData = processedImage.pngData() ?? processedImage
+        .jpegData(compressionQuality: 0.9)
+      {
+        sendStickerImage(imageData, metadata: ["source": imageSource])
+        safelyRemoveAttachment(at: range)
+      }
+    }
+  }
+
+  // ??? sending char as sticker bug
+  private func extractImageFromAdaptiveGlyph(_ adaptiveGlyph: NSObject) -> UIImage? {
+    if adaptiveGlyph.responds(to: Selector(("imageContent"))) {
+      if let imageContent = adaptiveGlyph.perform(Selector(("imageContent")))?
+        .takeUnretainedValue()
+      {
+        if let image = imageContent as? UIImage {
+          return image
+        }
+
+        if let contentObject = imageContent as? NSObject {
+          if contentObject.responds(to: Selector(("image"))) {
+            if let image = contentObject.value(forKey: "image") as? UIImage {
+              return image
+            }
+          }
+        }
+      }
+    }
+
+    let singleParamMethods = [
+      "imageForPointSize:",
+      "imageAtSize:",
+      "imageForSize:",
+      "imageScaledToSize:",
+      "renderImageWithSize:",
+      "generateImageWithSize:",
+      "imageWithScale:",
+      "imageForScale:",
+    ]
+
+    let sizes = [
+      CGSize(width: 200, height: 200),
+      CGSize(width: 300, height: 300),
+      CGSize(width: 100, height: 100),
+      CGSize(width: 512, height: 512),
+    ]
+
+    for methodName in singleParamMethods {
+      if adaptiveGlyph.responds(to: Selector((methodName))) {
+        for size in sizes {
+          if let result = adaptiveGlyph.perform(
+            Selector((methodName)),
+            with: NSValue(cgSize: size)
+          )?
+            .takeUnretainedValue()
+          {
+            if let image = result as? UIImage {
+              return image
+            }
+          }
+
+          if methodName.contains("Scale") {
+            let scales: [CGFloat] = [1.0, 2.0, 3.0]
+            for scale in scales {
+              if let result = adaptiveGlyph.perform(
+                Selector((methodName)),
+                with: scale as NSNumber
+              )?
+                .takeUnretainedValue()
+              {
+                if let image = result as? UIImage {
+                  return image
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if adaptiveGlyph.responds(to: Selector(("nominalTextAttachment"))) {
+      if let attachment = adaptiveGlyph.perform(Selector(("nominalTextAttachment")))
+        .takeUnretainedValue() as? NSTextAttachment
+      {
+        if let image = attachment.image {
+          return image
+        }
+
+        if let fileWrapper = attachment.fileWrapper,
+           let data = fileWrapper.regularFileContents,
+           let image = UIImage(data: data)
+        {
+          return image
+        }
+      }
+    }
+
+    let propertyNames = [
+      "image", "originalImage", "_image", "cachedImage", "renderedImage",
+      "imageRepresentation", "imageValue", "displayImage", "previewImage",
+      "thumbnailImage", "fullSizeImage", "scaledImage",
+    ]
+
+    for propertyName in propertyNames {
+      if adaptiveGlyph.responds(to: Selector((propertyName))) {
+        if let image = adaptiveGlyph.value(forKey: propertyName) as? UIImage {
+          return image
+        }
+      }
+    }
+
+    var methodCount: UInt32 = 0
+    let methodList = class_copyMethodList(object_getClass(adaptiveGlyph), &methodCount)
+    if methodList != nil {
+      for i in 0 ..< Int(methodCount) {
+        if let method = methodList?[i] {
+          let selector = method_getName(method)
+        }
+      }
+      free(methodList)
+    }
+
+    return nil
+  }
+
+  // ??? sending char as sticker bug
+  private func captureTextViewForDebug() {
+    let captureRect = bounds.isEmpty ? CGRect(x: 0, y: 0, width: 300, height: 200) : bounds
+
+    let renderer = UIGraphicsImageRenderer(bounds: captureRect)
+    let image = renderer.image { context in
+      UIColor.systemBackground.setFill()
+      context.fill(captureRect)
+
+      layer.render(in: context.cgContext)
+    }
+
+    if let data = image.pngData() {
+      sendStickerImage(data, metadata: ["source": "debug_capture"])
+
+      NotificationCenter.default.post(
+        name: NSNotification.Name("DebugTextViewCapture"),
+        object: nil,
+        userInfo: ["image": image]
+      )
+    }
+  }
+
+  private func sendStickerImage(_ imageData: Data, metadata: [String: Any]) {
+    let imageHash = imageData.prefix(1_024).hashValue
+
+    processingLock.lock()
+
+    if recentlySentImageHashes.contains(imageHash) {
+      processingLock.unlock()
+      return
+    }
+
+    recentlySentImageHashes.insert(imageHash)
+    processingLock.unlock()
+
+    // DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+    processingLock.lock()
+    recentlySentImageHashes.remove(imageHash)
+    processingLock.unlock()
+    // }
+
+    if let originalImage = UIImage(data: imageData) {
+      Task {
+        guard let composeView = self.composeView else { return }
+
+        // Use the actor with async/await
+        let (optimizedImage, _) = await ImageProcessor.shared.processImage(originalImage)
+
+        DispatchQueue.main.async {
+          composeView.sendSticker(optimizedImage)
+          self.fixFontSizeAfterStickerInsertion()
+        }
+      }
+    }
+  }
+
+  private func removeAttachment(at range: NSRange) {
+    safelyRemoveAttachment(at: range)
+  }
+
+  private func safelyRemoveAttachment(at range: NSRange) {
+    let validRange = NSRange(
+      location: min(range.location, textStorage.length),
+      length: min(range.length, max(0, textStorage.length - range.location))
+    )
+
+    guard validRange.length > 0 else { return }
+
+    let previousSelection = selectedRange
+    textStorage.beginEditing()
+    textStorage.deleteCharacters(in: validRange)
+    textStorage.endEditing()
+
+    let removedEnd = NSMaxRange(validRange)
+    let selectionLocation: Int
+    if previousSelection.location >= removedEnd {
+      selectionLocation = previousSelection.location - validRange.length
+    } else if previousSelection.location > validRange.location {
+      selectionLocation = validRange.location
+    } else {
+      selectionLocation = previousSelection.location
+    }
+    selectedRange = NSRange(location: min(selectionLocation, textStorage.length), length: 0)
+
+    normalizeTypingAttributesAfterAttachmentRemoval()
+    updateTypingAttributesIfNeeded()
+  }
+
+  private func normalizeTypingAttributesAfterAttachmentRemoval() {
+    let defaultFontSize: CGFloat = 17
+
+    if textStorage.length == 0 {
+      font = .systemFont(ofSize: defaultFontSize)
+    }
+
+    var attributes = typingAttributes
+    attributes.removeValue(forKey: .attachment)
+    attributes.removeValue(forKey: NSAttributedString.Key(rawValue: "CTAdaptiveImageProvider"))
+
+    if let typingFont = attributes[.font] as? UIFont {
+      attributes[.font] = typingFont.withSize(defaultFontSize)
+    } else {
+      attributes[.font] = UIFont.systemFont(ofSize: defaultFontSize)
+    }
+    if attributes[.foregroundColor] == nil {
+      attributes[.foregroundColor] = UIColor.label
+    }
+
+    typingAttributes = attributes
+  }
+
+  private func hasValidStickerAttributes() -> Bool {
+    guard let attributedText else { return false }
+
+    var hasValidSticker = false
+    attributedText.enumerateAttribute(
+      .adaptiveImageGlyph,
+      in: NSRange(location: 0, length: attributedText.length),
+      options: []
+    ) { value, _, stop in
+      if value is NSAdaptiveImageGlyph {
+        hasValidSticker = true
+        stop.pointee = true
+      }
+    }
+
+    attributedText.enumerateAttribute(
+      .attachment,
+      in: NSRange(location: 0, length: attributedText.length),
+      options: []
+    ) { value, _, _ in
+      if let attachment = value as? NSTextAttachment {
+        // Check if the attachment has valid image data
+        if attachment.image != nil ||
+          (attachment.fileWrapper?.regularFileContents != nil)
+        {
+          hasValidSticker = true
+        }
+      }
+    }
+
+    // Also check for adaptive glyph with image content
+    attributedText.enumerateAttribute(
+      NSAttributedString.Key(rawValue: "CTAdaptiveImageProvider"),
+      in: NSRange(location: 0, length: attributedText.length),
+      options: []
+    ) { value, _, _ in
+      if let adaptiveGlyph = value as? NSObject,
+         adaptiveGlyph.responds(to: Selector(("imageContent")))
+      {
+        hasValidSticker = true
+      }
+    }
+
+    return hasValidSticker
+  }
+
+  /// Override typing attributes setter to prevent unwanted bold inheritance
+  override var typingAttributes: [NSAttributedString.Key: Any] {
+    get {
+      super.typingAttributes
+    }
+    set {
+      Log.shared.debug("🎯 TYPING ATTRS SET: \(newValue)")
+
+      // Check if we're trying to set bold attributes when we shouldn't
+      if let font = newValue[.font] as? UIFont,
+         font.fontDescriptor.symbolicTraits.contains(.traitBold)
+      {
+        Log.shared.debug("🎯 BOLD FONT DETECTED in typing attributes")
+
+        // Only allow bold if we're actually in the MIDDLE of a bold region, not at the end
+        let selectedRange = selectedRange
+        var shouldAllowBold = false
+
+        if selectedRange.length == 0, selectedRange.location > 0 {
+          let checkPosition = selectedRange.location - 1
+          if checkPosition < attributedText.length {
+            let attributes = attributedText.attributes(at: checkPosition, effectiveRange: nil)
+            let isPreviousCharBold = (attributes[.font] as? UIFont)?.fontDescriptor.symbolicTraits
+              .contains(.traitBold) == true
+            Log.shared.debug("🎯 Previous char is bold: \(isPreviousCharBold)")
+
+            // CRITICAL FIX: Only allow bold if we're WITHIN a bold region
+            // Check if the NEXT character is also bold (meaning we're in the middle)
+            // If cursor is at the end of bold text, we should NOT inherit bold
+            if isPreviousCharBold, selectedRange.location < attributedText.length {
+              let nextAttributes = attributedText.attributes(at: selectedRange.location, effectiveRange: nil)
+              let isNextCharBold = (nextAttributes[.font] as? UIFont)?.fontDescriptor.symbolicTraits
+                .contains(.traitBold) == true
+              shouldAllowBold = isNextCharBold
+              Log.shared.debug("🎯 Next char is bold: \(isNextCharBold), shouldAllowBold: \(shouldAllowBold)")
+            } else {
+              shouldAllowBold = false
+              Log.shared.debug("🎯 Previous char not bold or at end, shouldAllowBold: false")
+            }
+          }
+        }
+
+        if !shouldAllowBold {
+          Log.shared.debug("🛡️ BLOCKING bold typing attributes! Setting default instead.")
+          var defaultAttributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 17),
+            .foregroundColor: UIColor.label,
+          ]
+          for style in InlineTextStyle.allCases where newValue[style.marker] as? Bool == true {
+            defaultAttributes = style.settingEnabled(true, in: defaultAttributes)
+          }
+          super.typingAttributes = defaultAttributes
+          return
+        } else {
+          Log.shared.debug("🛡️ ALLOWING bold typing attributes (in middle of bold region)")
+        }
+      }
+
+      super.typingAttributes = newValue
+    }
+  }
+}
+
+extension ComposeTextView: UITextViewDelegate {
+  func textViewDidBeginEditing(_ textView: UITextView) {}
+
+  func textViewDidEndEditing(_ textView: UITextView) {}
+}
+
+extension ComposeTextView {
+  public func checkForNewAttachmentsImmediate() {
+    guard let attributedText else {
+      return
+    }
+
+    var foundAttachments = false
+
+    attributedText.enumerateAttribute(
+      .attachment,
+      in: NSRange(location: 0, length: attributedText.length),
+      options: []
+    ) { value, range, stop in
+      if let attachment = value as? NSTextAttachment {
+        foundAttachments = true
+
+        self.processTextAttachmentEnhanced(attachment, range: range)
+
+        stop.pointee = true
+      }
+    }
+  }
+
+  private func processTextAttachmentEnhanced(_ attachment: NSTextAttachment, range: NSRange) {
+    var finalImage: UIImage?
+    var imageSource = "unknown"
+
+    if let image = attachment.image {
+      finalImage = image
+      imageSource = "direct_image_property"
+    } else if let fileWrapper = attachment.fileWrapper {
+      if let data = fileWrapper.regularFileContents, let image = UIImage(data: data) {
+        finalImage = image
+        imageSource = "file_wrapper_data"
+      }
+    } else {
+      return
+    }
+
+    guard let image = finalImage else {
+      return
+    }
+
+//    let imageHash: Int = if let imageData = image.pngData()?.prefix(1_024) {
+//      imageData.hashValue
+//    } else {
+//      image.description.hashValue
+//    }
+//
+//    processingLock.lock()
+//
+//    if recentlySentImageHashes.contains(imageHash) {
+//      processingLock.unlock()
+//      return
+//    }
+//
+//    recentlySentImageHashes.insert(imageHash)
+//    processingLock.unlock()
+//
+//    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+//      self?.processingLock.lock()
+//      self?.recentlySentImageHashes.remove(imageHash)
+//      self?.processingLock.unlock()
+//    }
+
+    safelyRemoveAttachment(at: range)
+
+    if let composeView {
+      Task(priority: .userInitiated) { @MainActor in
+        composeView.handleDroppedImage(image)
+      }
+      return
+    }
+    // not used
+//    NotificationCenter.default.post(
+//      name: NSNotification.Name("StickerDetected"),
+//      object: nil,
+//      userInfo: ["image": image]
+//    )
+  }
+
+  private func findEnhancedParentComposeView() -> ComposeView? {
+    var responder: UIResponder? = self
+    while let nextResponder = responder?.next {
+      if let composeView = nextResponder as? ComposeView {
+        return composeView
+      }
+      responder = nextResponder
+    }
+
+    var currentView: UIView? = self
+    while let superview = currentView?.superview {
+      if let composeView = superview as? ComposeView {
+        return composeView
+      }
+      currentView = superview
+    }
+
+    if let window, let rootViewController = window.rootViewController {
+      var viewController: UIViewController? = rootViewController
+      while let vc = viewController {
+        if let composeView = vc.view.subviews
+          .first(where: { $0 is ComposeView }) as? ComposeView
+        {
+          return composeView
+        }
+        viewController = vc.presentedViewController
+      }
+    }
+
+    return nil
+  }
+}
+
+extension UIImage {
+  func isMainlyTransparent() -> Bool {
+    guard let cgImage else { return true }
+
+    let width = cgImage.width
+    let height = cgImage.height
+
+    if width < 10 || height < 10 {
+      return true
+    }
+
+    let bytesPerPixel = 4
+    let bytesPerRow = bytesPerPixel * width
+    let bitsPerComponent = 8
+
+    var data = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
+
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+
+    guard let context = CGContext(
+      data: &data,
+      width: width,
+      height: height,
+      bitsPerComponent: bitsPerComponent,
+      bytesPerRow: bytesPerRow,
+      space: colorSpace,
+      bitmapInfo: bitmapInfo
+    ) else { return true }
+
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    let sampleSize = min(100, width * height)
+    let strideLength = max(1, (width * height) / sampleSize)
+
+    var nonTransparentCount = 0
+
+    for i in stride(
+      from: 0,
+      to: width * height * bytesPerPixel,
+      by: strideLength * bytesPerPixel
+    ) {
+      let alpha = data[i + 3]
+      if alpha > 20 {
+        nonTransparentCount += 1
+      }
+    }
+
+    return nonTransparentCount < (sampleSize / 20)
+  }
+}
+
+// MARK: - UITextView Extensions for Mention Style Management
+
+extension UITextView {
+  /// Default attributes for this text view
+  var defaultTypingAttributes: [NSAttributedString.Key: Any] {
+    [
+      .font: font ?? UIFont.systemFont(ofSize: 17),
+      .foregroundColor: UIColor.label,
+    ]
+  }
+
+  /// Check if cursor is positioned after a mention
+  var isCursorAfterMention: Bool {
+    let selectedRange = selectedRange
+    guard selectedRange.length == 0, selectedRange.location > 0 else { return false }
+
+    let checkPosition = selectedRange.location - 1
+    guard checkPosition < attributedText.length else { return false }
+
+    let attributes = attributedText.attributes(at: checkPosition, effectiveRange: nil)
+    return attributes[.mentionUserId] != nil || attributes[.mentionGroupId] != nil
+  }
+
+  var isCursorAfterThreadLink: Bool {
+    let selectedRange = selectedRange
+    guard selectedRange.length == 0, selectedRange.location > 0 else { return false }
+
+    let checkPosition = selectedRange.location - 1
+    guard checkPosition < attributedText.length else { return false }
+
+    let attributes = attributedText.attributes(at: checkPosition, effectiveRange: nil)
+    return attributes[.threadLink] != nil
+  }
+
+  /// Check if cursor is positioned after bold text
+  var isCursorAfterBoldText: Bool {
+    let selectedRange = selectedRange
+    guard selectedRange.length == 0, selectedRange.location > 0 else { return false }
+
+    let checkPosition = selectedRange.location - 1
+    guard checkPosition < attributedText.length else { return false }
+
+    let attributes = attributedText.attributes(at: checkPosition, effectiveRange: nil)
+    if let font = attributes[.font] as? UIFont {
+      return font.fontDescriptor.symbolicTraits.contains(.traitBold)
+    }
+    return false
+  }
+
+  /// Check if current typing attributes have mention styling
+  var hasTypingAttributesMentionStyling: Bool {
+    let currentTypingAttributes = typingAttributes
+    return currentTypingAttributes[.mentionUserId] != nil ||
+      currentTypingAttributes[.mentionGroupId] != nil ||
+      (currentTypingAttributes[.foregroundColor] as? UIColor) == UIColor.systemBlue
+  }
+
+  var hasTypingAttributesThreadLinkStyling: Bool {
+    typingAttributes[.threadLink] != nil
+  }
+
+  /// Check if current typing attributes have bold styling
+  var hasTypingAttributesBoldStyling: Bool {
+    let currentTypingAttributes = typingAttributes
+    if let font = currentTypingAttributes[.font] as? UIFont {
+      return font.fontDescriptor.symbolicTraits.contains(.traitBold)
+    }
+    return false
+  }
+
+  /// Check if cursor is positioned within a code block (inline or pre)
+  var isCursorInCodeBlock: Bool {
+    let selectedRange = selectedRange
+    guard selectedRange.length == 0,
+          selectedRange.location > 0,
+          selectedRange.location <= attributedText.length else { return false }
+
+    let checkPosition = selectedRange.location - 1
+    guard checkPosition >= 0, checkPosition < attributedText.length else { return false }
+
+    let attributes = attributedText.attributes(at: checkPosition, effectiveRange: nil)
+    return ProcessEntities.isCursorInCodeBlock(attributes: attributes)
+  }
+
+  /// Reset typing attributes to default to prevent style leakage
+  func resetTypingAttributesToDefault() {
+    let defaultAttributes: [NSAttributedString.Key: Any] = [
+      .font: font ?? UIFont.systemFont(ofSize: 17),
+      .foregroundColor: UIColor.label,
+    ]
+
+    // Set typing attributes
+    typingAttributes = defaultAttributes
+
+    // If there's selected text, ensure it also gets the default attributes
+    let selectedRange = selectedRange
+    if selectedRange.length == 0, selectedRange.location > 0 {
+      // For cursor position, we just set typing attributes
+      typingAttributes = defaultAttributes
+    }
+  }
+
+  /// Update typing attributes based on cursor position to prevent style leakage
+  func updateTypingAttributesIfNeeded() {
+    let selectedRange = selectedRange
+
+    // If cursor is after a mention/bold text or typing attributes have special styling, reset to default
+    if selectedRange.length == 0,
+       isCursorAfterMention || isCursorAfterThreadLink || isCursorAfterBoldText ||
+       hasTypingAttributesMentionStyling || hasTypingAttributesThreadLinkStyling ||
+       hasTypingAttributesBoldStyling
+    {
+      let previousTyping = typingAttributes
+      resetTypingAttributesToDefault()
+      var attributes = typingAttributes
+      for style in InlineTextStyle.allCases where previousTyping[style.marker] as? Bool == true {
+        attributes = style.settingEnabled(true, in: attributes)
+      }
+      typingAttributes = attributes
+    }
+
+    // Check if cursor is within a code block and maintain monospace font
+    if selectedRange.length == 0,
+       selectedRange.location > 0,
+       selectedRange.location <= attributedText.length
+    {
+      let checkPosition = selectedRange.location - 1
+      guard checkPosition >= 0, checkPosition < attributedText.length else { return }
+
+      let attributes = attributedText.attributes(at: checkPosition, effectiveRange: nil)
+
+      // Use shared utility to determine if we're in a code block
+      if ProcessEntities.isCursorInCodeBlock(attributes: attributes) {
+        updateTypingAttributesForCodeBlock(attributes: attributes)
+      }
+    }
+  }
+
+  /// Updates typing attributes to maintain monospace font for code blocks
+  private func updateTypingAttributesForCodeBlock(attributes: [NSAttributedString.Key: Any]) {
+    let defaultFontSize: CGFloat = 17
+    let currentFont = attributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: defaultFontSize)
+    let monospaceFont = UIFont.monospacedSystemFont(ofSize: currentFont.pointSize, weight: .regular)
+
+    var newTypingAttributes = defaultTypingAttributes
+    newTypingAttributes[.font] = monospaceFont
+    for style in InlineTextStyle.allCases where attributes[style.marker] as? Bool == true {
+      newTypingAttributes = style.settingEnabled(true, in: newTypingAttributes)
+    }
+
+    // Preserve preCode or inlineCode attribute for continued typing
+    if attributes[NSAttributedString.Key("preCode")] != nil {
+      newTypingAttributes[NSAttributedString.Key("preCode")] = true
+    } else if attributes[NSAttributedString.Key("inlineCode")] != nil {
+      newTypingAttributes[NSAttributedString.Key("inlineCode")] = true
+    }
+
+    typingAttributes = newTypingAttributes
+  }
+}

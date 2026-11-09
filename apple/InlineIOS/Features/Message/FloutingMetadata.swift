@@ -1,0 +1,74 @@
+import InlineKit
+import UIKit
+
+class FloatingMetadataView: UIView {
+  private let metadataView: MessageTimeAndStatus
+  private let materialBackgroundView = UIView()
+
+  init(
+    fullMessage: FullMessage,
+    initiallyDisplaying status: MessageSendingStatus? = nil
+  ) {
+    metadataView = MessageTimeAndStatus(
+      fullMessage,
+      initiallyDisplaying: status
+    )
+    super.init(frame: .zero)
+
+    setupViews()
+    forceWhiteText()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func setupViews() {
+    materialBackgroundView.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+    materialBackgroundView.clipsToBounds = true
+    materialBackgroundView.translatesAutoresizingMaskIntoConstraints = false
+
+    addSubview(materialBackgroundView)
+    addSubview(metadataView)
+
+    metadataView.translatesAutoresizingMaskIntoConstraints = false
+
+    let contentVerticalPadding: CGFloat = 3
+    let contentHorizontalPadding: CGFloat = 6
+
+    NSLayoutConstraint.activate([
+      materialBackgroundView.topAnchor.constraint(equalTo: topAnchor),
+      materialBackgroundView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      materialBackgroundView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      materialBackgroundView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      metadataView.topAnchor.constraint(equalTo: topAnchor, constant: contentVerticalPadding),
+      metadataView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: contentHorizontalPadding),
+      metadataView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -contentHorizontalPadding),
+      metadataView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -contentVerticalPadding),
+    ])
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    UIView.performWithoutAnimation {
+      materialBackgroundView.layer.cornerRadius = materialBackgroundView.bounds.height / 2
+    }
+  }
+
+  private func forceWhiteText() {
+    for subview in metadataView.subviews {
+      if let label = subview as? UILabel {
+        label.textColor = .white
+      } else if let imageView = subview as? UIImageView {
+        imageView.tintColor = .white
+      }
+    }
+  }
+
+  func updateMessage(_ fullMessage: FullMessage, animated: Bool) {
+    metadataView.updateMessage(fullMessage, animated: animated)
+    forceWhiteText()
+  }
+}

@@ -1,0 +1,88 @@
+import { db } from "@in/server/db"
+import { ChatModel } from "@in/server/db/models/chats"
+import { botAvatarAssets, chatParticipants, files, userNotDeleted, users } from "@in/server/db/schema"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import { getSharedBotPresence } from "@in/server/modules/botPresence/shared"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { encodePeerFromInputPeer } from "@in/server/realtime/encoders/encodePeer"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { ModelError } from "@in/server/db/models/_errors"
+import { BotPresenceState_Kind, type GetBotPresenceInput, type GetBotPresenceResult } from "@inline-chat/protocol/core"
+import { and, asc, eq } from "drizzle-orm"
+import type { FunctionContext } from "./_types"
+
+export const getBotPresence = async (
+  input: GetBotPresenceInput,
+  context: FunctionContext,
+): Promise<GetBotPresenceResult> => {
+  const peerIdInput = input.peerId
+  if (!peerIdInput) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  const chat = await ChatModel.getChatFromInputPeerUnchecked(peerIdInput, context).catch((error) => {
+    if (
+      error instanceof ModelError &&
+      error.code === ModelError.Codes.CHAT_INVALID
+    ) {
+      throw RealtimeRpcError.PeerIdInvalid()
+    }
+    throw error
+  })
+  await AccessGuards.ensureChatAccess(chat, context.currentUserId)
+
+  const row =
+    chat.type === "private"
+      ? await getPrivateChatAvatar(chat.minUserId, chat.maxUserId, context.currentUserId)
+      : await getThreadAvatar(chat.id)
+
+  const peerId = encodePeerFromInputPeer({ inputPeer: peerIdInput, currentUserId: context.currentUserId })
+
+  if (!row) {
+    return {
+      state: { kind: BotPresenceState_Kind.IDLE },
+      peerId,
+    }
+  }
+
+  const avatar = row.avatar && row.file
+    ? Encoders.botAvatar({ avatar: row.avatar, file: row.file })
+    : undefined
+  return {
+    botUserId: BigInt(row.botUserId),
+    ...(avatar ? { avatar } : {}),
+    state: (await getSharedBotPresence(row.botUserId, chat.id)).state,
+    peerId,
+  }
+}
+
+async function getPrivateChatAvatar(minUserId: number | null, maxUserId: number | null, currentUserId: number) {
+  const botUserId = minUserId === currentUserId ? maxUserId : minUserId
+  if (!botUserId) {
+    return undefined
+  }
+
+  const [row] = await db
+    .select({ botUserId: users.id, avatar: botAvatarAssets, file: files })
+    .from(users)
+    .leftJoin(botAvatarAssets, eq(users.id, botAvatarAssets.botUserId))
+    .leftJoin(files, eq(botAvatarAssets.fileId, files.id))
+    .where(and(eq(users.id, botUserId), eq(users.bot, true), userNotDeleted()))
+    .limit(1)
+
+  return row
+}
+
+async function getThreadAvatar(chatId: number) {
+  const [row] = await db
+    .select({ botUserId: users.id, avatar: botAvatarAssets, file: files })
+    .from(chatParticipants)
+    .innerJoin(users, eq(chatParticipants.userId, users.id))
+    .leftJoin(botAvatarAssets, eq(users.id, botAvatarAssets.botUserId))
+    .leftJoin(files, eq(botAvatarAssets.fileId, files.id))
+    .where(and(eq(chatParticipants.chatId, chatId), eq(users.bot, true), userNotDeleted()))
+    .orderBy(asc(users.id))
+    .limit(1)
+
+  return row
+}

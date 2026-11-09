@@ -1,0 +1,362 @@
+name: macOS Direct Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Update channel for appcast"
+        type: choice
+        required: true
+        default: stable
+        options:
+          - stable
+          - beta
+          - tip
+      sparkle_version:
+        description: "Sparkle release version"
+        required: true
+        default: "2.7.3"
+      tag:
+        description: "Git tag to attach the DMG to (optional)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "macos-v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      HAS_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Preflight
+        id: preflight
+        env:
+          SCHEME: ${{ vars.MACOS_DIRECT_SCHEME }}
+          XCODE_PATH: ${{ vars.MACOS_XCODE_PATH }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+          MACOS_CI_KEYCHAIN_PWD: ${{ secrets.MACOS_CI_KEYCHAIN_PWD }}
+          MACOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.MACOS_PROVISIONING_PROFILE_BASE64 }}
+          MACOS_SPARKLE_PUBLIC_KEY: ${{ secrets.MACOS_SPARKLE_PUBLIC_KEY }}
+          MACOS_SPARKLE_PRIVATE_KEY: ${{ secrets.MACOS_SPARKLE_PRIVATE_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+          PUBLIC_RELEASES_R2_ACCESS_KEY_ID: ${{ secrets.PUBLIC_RELEASES_R2_ACCESS_KEY_ID }}
+          PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY: ${{ secrets.PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY }}
+          PUBLIC_RELEASES_R2_BUCKET: ${{ secrets.PUBLIC_RELEASES_R2_BUCKET }}
+          PUBLIC_RELEASES_R2_ENDPOINT: ${{ secrets.PUBLIC_RELEASES_R2_ENDPOINT }}
+          PUBLIC_RELEASES_R2_PUBLIC_BASE_URL: ${{ secrets.PUBLIC_RELEASES_R2_PUBLIC_BASE_URL }}
+          PUBLIC_RELEASES_R2_PREFIX: ${{ secrets.PUBLIC_RELEASES_R2_PREFIX }}
+        run: |
+          set -euo pipefail
+          required=(
+            MACOS_CERTIFICATE
+            MACOS_CERTIFICATE_PWD
+            MACOS_CERTIFICATE_NAME
+            MACOS_CI_KEYCHAIN_PWD
+            MACOS_PROVISIONING_PROFILE_BASE64
+            MACOS_SPARKLE_PUBLIC_KEY
+            MACOS_SPARKLE_PRIVATE_KEY
+            APPLE_ID
+            APPLE_PASSWORD
+            APPLE_TEAM_ID
+            PUBLIC_RELEASES_R2_ACCESS_KEY_ID
+            PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY
+            PUBLIC_RELEASES_R2_BUCKET
+            PUBLIC_RELEASES_R2_ENDPOINT
+            PUBLIC_RELEASES_R2_PUBLIC_BASE_URL
+          )
+          missing=0
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required secret: ${name}" >&2
+              missing=1
+            fi
+          done
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+          bash scripts/macos/check-notary-credentials.sh --no-env-file
+          sw_vers
+          echo "Available Xcodes:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          # Prefer the newest stable versioned Xcode install on CI so release builds stay
+          # on the latest stable toolchain even when the runner default lags behind.
+          stable_xcode_path="$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v '_beta\\.app$' | sort -V | tail -n 1 || true)"
+          beta_xcode_path="$(ls -d /Applications/Xcode_*_beta.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -n "${stable_xcode_path}" ]]; then
+            xcode_path="${stable_xcode_path}"
+          elif [[ -n "${XCODE_PATH:-}" && -d "${XCODE_PATH}" ]]; then
+            xcode_path="${XCODE_PATH}"
+          elif [[ -d "/Applications/Xcode.app" ]]; then
+            xcode_path="/Applications/Xcode.app"
+          else
+            xcode_path="${beta_xcode_path}"
+          fi
+          if [[ -z "${xcode_path}" ]]; then
+            echo "No suitable Xcode found on runner." >&2
+            exit 1
+          fi
+          echo "Using Xcode path: ${xcode_path}"
+          echo "xcode_path=${xcode_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set Xcode version
+        run: sudo xcode-select -s "${{ steps.preflight.outputs.xcode_path }}"
+
+      - name: Xcode Version
+        run: xcodebuild -version
+
+      - name: Verify Scheme
+        env:
+          SCHEME: ${{ vars.MACOS_DIRECT_SCHEME }}
+        run: |
+          set -euo pipefail
+          scheme="${SCHEME:-Inline (macOS)}"
+          echo "Using scheme: ${scheme}"
+          scheme_list=$(xcodebuild -list -project apple/Inline.xcodeproj)
+          if ! echo "${scheme_list}" | grep -Fq "${scheme}"; then
+            echo "Xcode scheme '${scheme}' not found in apple/Inline.xcodeproj." >&2
+            echo "Set MACOS_DIRECT_SCHEME repository variable to override." >&2
+            echo "Available schemes:" >&2
+            echo "${scheme_list}" | awk '/Schemes:/{flag=1;next} flag{print}' >&2
+            exit 1
+          fi
+
+      - name: Resolve Release Inputs
+        id: release_inputs
+        env:
+          CHANNEL_INPUT: ${{ github.event.inputs.channel }}
+          SPARKLE_INPUT: ${{ github.event.inputs.sparkle_version }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "channel=stable" >> "${GITHUB_OUTPUT}"
+            echo "sparkle_version=2.7.3" >> "${GITHUB_OUTPUT}"
+          else
+            echo "channel=${CHANNEL_INPUT}" >> "${GITHUB_OUTPUT}"
+            echo "sparkle_version=${SPARKLE_INPUT}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Install create-dmg
+        run: npm install --global create-dmg
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Import macOS signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+          MACOS_CI_KEYCHAIN_PWD: ${{ secrets.MACOS_CI_KEYCHAIN_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$MACOS_CI_KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$MACOS_CI_KEYCHAIN_PWD" build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CI_KEYCHAIN_PWD" build.keychain
+
+      - name: Build Direct DMG
+        env:
+          SPARKLE_VERSION: ${{ steps.release_inputs.outputs.sparkle_version }}
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+          SCHEME: ${{ vars.MACOS_DIRECT_SCHEME }}
+          SPARKLE_PUBLIC_KEY: ${{ secrets.MACOS_SPARKLE_PUBLIC_KEY }}
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+          MACOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.MACOS_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/macos/build-direct.sh
+
+      - name: Upload dSYMs to Sentry
+        if: env.HAS_SENTRY_AUTH_TOKEN == 'true'
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: usenoor
+          SENTRY_PROJECT: inline-ios-macos
+        run: |
+          set -euo pipefail
+          bun run scripts/macos/upload-dsyms.ts --search-root build/InlineMacDirect/Build/Products/Release
+
+      - name: Resolve Release Tag
+        id: release_tag
+        env:
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+          TAG_INPUT: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${TAG_INPUT}"
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [[ -z "${tag}" ]]; then
+            tag="${CHANNEL}"
+          fi
+          case "${tag}" in
+            stable|beta|tip)
+              if [[ "${tag}" != "${CHANNEL}" ]]; then
+                echo "Release tag ${tag} belongs to the ${tag} channel, not ${CHANNEL}." >&2
+                exit 1
+              fi
+              ;;
+          esac
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Update Moving Channel Tag
+        if: steps.release_tag.outputs.tag == steps.release_inputs.outputs.channel
+        env:
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_TAG}" != "${CHANNEL}" ]]; then
+            echo "Refusing to move ${RELEASE_TAG}; expected the ${CHANNEL} channel tag." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa "${RELEASE_TAG}" -m "Latest Sparkle ${CHANNEL} release" "${GITHUB_SHA}"
+          git push --force origin "${RELEASE_TAG}"
+
+      - name: Upload DMG to R2
+        env:
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+          DMG_PATH: build/macos-direct/Inline.dmg
+          PUBLIC_RELEASES_R2_ACCESS_KEY_ID: ${{ secrets.PUBLIC_RELEASES_R2_ACCESS_KEY_ID }}
+          PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY: ${{ secrets.PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY }}
+          PUBLIC_RELEASES_R2_BUCKET: ${{ secrets.PUBLIC_RELEASES_R2_BUCKET }}
+          PUBLIC_RELEASES_R2_ENDPOINT: ${{ secrets.PUBLIC_RELEASES_R2_ENDPOINT }}
+          PUBLIC_RELEASES_R2_PUBLIC_BASE_URL: ${{ secrets.PUBLIC_RELEASES_R2_PUBLIC_BASE_URL }}
+          UPLOAD_MODE: dmg
+        run: |
+          BUILD_NUMBER=$(git rev-list --count HEAD)
+          export BUILD_NUMBER
+          bun run scripts/macos/release-direct.ts
+
+      - name: Verify DMG availability
+        env:
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+          PUBLIC_RELEASES_R2_PUBLIC_BASE_URL: ${{ secrets.PUBLIC_RELEASES_R2_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+          BUILD_NUMBER=$(git rev-list --count HEAD)
+          BASE_URL="${PUBLIC_RELEASES_R2_PUBLIC_BASE_URL%/}"
+          DMG_URL="${BASE_URL}/mac/${CHANNEL}/${BUILD_NUMBER}/Inline.dmg"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsI "${DMG_URL}" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "DMG not reachable at ${DMG_URL}" >&2
+          exit 1
+
+      - name: Generate Appcast
+        env:
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.MACOS_SPARKLE_PRIVATE_KEY }}
+          PUBLIC_RELEASES_R2_PUBLIC_BASE_URL: ${{ secrets.PUBLIC_RELEASES_R2_PUBLIC_BASE_URL }}
+        run: |
+          BUILD_NUMBER=$(git rev-list --count HEAD)
+          COMMIT=$(git rev-parse --short HEAD)
+          COMMIT_LONG=$(git rev-parse HEAD)
+          APP_PATH="build/InlineMacDirect/Build/Products/Release/Inline.app"
+          INFO_PLIST="${APP_PATH}/Contents/Info.plist"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "${INFO_PLIST}")
+          BASE_URL="${PUBLIC_RELEASES_R2_PUBLIC_BASE_URL%/}"
+          DMG_URL="${BASE_URL}/mac/${CHANNEL}/${BUILD_NUMBER}/Inline.dmg"
+          APPCAST_URL="${BASE_URL}/mac/${CHANNEL}/appcast.xml"
+          SPARKLE_DIR=".action/sparkle"
+
+          echo "${SPARKLE_PRIVATE_KEY}" > signing.key
+          "${SPARKLE_DIR}/bin/sign_update" -f signing.key build/macos-direct/Inline.dmg > sign_update.txt
+          rm -f signing.key
+
+          if ! curl -fsSL "${APPCAST_URL}" -o appcast.xml; then
+            rm -f appcast.xml
+          fi
+
+          INLINE_BUILD="${BUILD_NUMBER}" \\
+          INLINE_VERSION="${VERSION}" \\
+          INLINE_CHANNEL="${CHANNEL}" \\
+          INLINE_DMG_URL="${DMG_URL}" \\
+          INLINE_MIN_MACOS="15.0" \\
+          INLINE_COMMIT="${COMMIT}" \\
+          INLINE_COMMIT_LONG="${COMMIT_LONG}" \\
+          python3 scripts/macos/update_appcast.py
+
+          python3 scripts/macos/validate_appcast.py \\
+            --appcast appcast_new.xml \\
+            --require-build "${BUILD_NUMBER}" \\
+            --require-url "${DMG_URL}"
+
+      - name: Upload Appcast to R2
+        env:
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+          APPCAST_PATH: appcast_new.xml
+          PUBLIC_RELEASES_R2_ACCESS_KEY_ID: ${{ secrets.PUBLIC_RELEASES_R2_ACCESS_KEY_ID }}
+          PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY: ${{ secrets.PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY }}
+          PUBLIC_RELEASES_R2_BUCKET: ${{ secrets.PUBLIC_RELEASES_R2_BUCKET }}
+          PUBLIC_RELEASES_R2_ENDPOINT: ${{ secrets.PUBLIC_RELEASES_R2_ENDPOINT }}
+          PUBLIC_RELEASES_R2_PUBLIC_BASE_URL: ${{ secrets.PUBLIC_RELEASES_R2_PUBLIC_BASE_URL }}
+          UPLOAD_MODE: appcast
+        run: |
+          BUILD_NUMBER=$(git rev-list --count HEAD)
+          export BUILD_NUMBER
+          bun run scripts/macos/release-direct.ts
+
+      - name: Upload DMG to GitHub Release
+        if: steps.release_tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+          CHANNEL: ${{ steps.release_inputs.outputs.channel }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          prerelease_flag=""
+          if [[ "${CHANNEL}" != "stable" ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" --title "${tag}" ${prerelease_flag} --notes "Automated macOS direct release."
+          else
+            if [[ "${CHANNEL}" != "stable" ]]; then
+              gh release edit "${tag}" --prerelease
+            fi
+          fi
+          gh release upload "${tag}" build/macos-direct/Inline.dmg --clobber
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: inline-macos-dmg
+          path: build/macos-direct/Inline.dmg

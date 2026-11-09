@@ -1,0 +1,429 @@
+name: Server Tests
+
+on:
+  workflow_call:
+    inputs:
+      publish_image:
+        description: Publish the qualified runtime image for a manual release
+        type: boolean
+        default: false
+      publish_only:
+        description: Allow a manual same-repository branch publication without production release
+        type: boolean
+        default: false
+    outputs:
+      runtime_image:
+        description: Immutable digest of the qualified runtime image
+        value: ${{ jobs.publish.outputs.runtime_image }}
+      standby_image:
+        description: Immutable digest of the qualified ARM64 Coolify image
+        value: ${{ jobs.publish.outputs.standby_image }}
+
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  # A called workflow inherits the caller's github.workflow; keep this namespace
+  # distinct from the manual release lock to avoid cancelling its own caller.
+  group: server-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container:
+    name: Server Linux image and migration commands
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: container_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Require manual branch publication or main release
+        if: ${{ inputs.publish_image }}
+        env:
+          PUBLISH_ONLY: ${{ inputs.publish_only }}
+        run: |
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = inline-chat/inline
+          test "$GITHUB_REF_TYPE" = branch
+          [[ "$GITHUB_REF" == refs/heads/* ]] || exit 1
+          case "$PUBLISH_ONLY" in
+            true) ;;
+            false) test "$GITHUB_REF" = refs/heads/main ;;
+            *) exit 1 ;;
+          esac
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - name: Check server container and Fly configuration contracts
+        run: bun test scripts/docker/server-context.test.ts scripts/docker/prune-workspace.test.ts scripts/ci/fly-release-machines.test.ts scripts/ci/server-image-publish.test.ts
+      - name: Export committed server build context
+        run: bun --no-env-file scripts/docker/server-context.ts "$GITHUB_SHA" "$RUNNER_TEMP/server-context"
+      - name: Build runtime and Coolify targets
+        run: |
+          docker build --platform linux/amd64 --target runtime --build-arg SOURCE_COMMIT="$GITHUB_SHA" -f "$RUNNER_TEMP/server-context/server/Dockerfile" -t inline-server:ci "$RUNNER_TEMP/server-context"
+          docker build --platform linux/amd64 --target coolify --build-arg SOURCE_COMMIT="$GITHUB_SHA" -f "$RUNNER_TEMP/server-context/server/Dockerfile" -t inline-server:ci-coolify "$RUNNER_TEMP/server-context"
+      - name: Exercise packaged migration and verification commands
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/container_test
+        run: |
+          if docker run --rm --network host -e DATABASE_URL inline-server:ci bun server/dist/verify-migrations.js; then
+            echo "Verification incorrectly accepted an empty database"
+            exit 1
+          fi
+          docker run --rm --network host -e DATABASE_URL inline-server:ci bun server/dist/migrate.js
+          docker run --rm --network host -e DATABASE_URL inline-server:ci bun server/dist/verify-migrations.js
+          docker run --rm --network host -e DATABASE_URL inline-server:ci bun server/scripts/migrate.ts
+          docker run --rm --network host -e DATABASE_URL inline-server:ci-coolify bun server/dist/migrate.js
+          docker run --rm --network host -e DATABASE_URL inline-server:ci-coolify bun server/scripts/verify-migrations.ts
+          docker run --rm --network host -e DATABASE_URL inline-server:ci-coolify bun server/scripts/migrate.ts
+          docker run --rm inline-server:ci-coolify wget --version
+
+      - name: Run HTTP, WebSocket, and drain smoke in the final image
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/container_test
+        run: |
+          docker run --rm --network host -e DATABASE_URL \
+            inline-server:ci bun server/dist/core-production-smoke.js --artifact
+
+      - name: Save the qualified runtime image
+        if: ${{ inputs.publish_image }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' inline-server:ci)" = "$GITHUB_SHA"
+          docker save inline-server:ci | gzip > "$RUNNER_TEMP/runtime-amd64.tar.gz"
+      - name: Retain the qualified runtime image for publication
+        if: ${{ inputs.publish_image }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: server-runtime-amd64
+          path: ${{ runner.temp }}/runtime-amd64.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  container-arm:
+    name: Server ARM64 Coolify image and runtime
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: container_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Require manual branch publication or main release
+        if: ${{ inputs.publish_image }}
+        env:
+          PUBLISH_ONLY: ${{ inputs.publish_only }}
+        run: |
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = inline-chat/inline
+          test "$GITHUB_REF_TYPE" = branch
+          [[ "$GITHUB_REF" == refs/heads/* ]] || exit 1
+          case "$PUBLISH_ONLY" in
+            true) ;;
+            false) test "$GITHUB_REF" = refs/heads/main ;;
+            *) exit 1 ;;
+          esac
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - name: Export committed server build context
+        run: bun --no-env-file scripts/docker/server-context.ts "$GITHUB_SHA" "$RUNNER_TEMP/server-context"
+      - name: Build the native ARM64 Coolify image
+        run: |
+          docker build --platform linux/arm64 --target coolify --build-arg SOURCE_COMMIT="$GITHUB_SHA" -f "$RUNNER_TEMP/server-context/server/Dockerfile" -t inline-server:ci-coolify "$RUNNER_TEMP/server-context"
+          test "$(docker image inspect --format '{{.Architecture}}' inline-server:ci-coolify)" = arm64
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' inline-server:ci-coolify)" = "$GITHUB_SHA"
+      - name: Verify migrations, native dependencies, HTTP, WebSocket, and drain
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/container_test
+        run: |
+          if docker run --rm --network host -e DATABASE_URL inline-server:ci-coolify bun server/dist/verify-migrations.js; then
+            echo "Verification incorrectly accepted an empty database"
+            exit 1
+          fi
+          docker run --rm --network host -e DATABASE_URL inline-server:ci-coolify bun server/dist/migrate.js
+          docker run --rm --network host -e DATABASE_URL inline-server:ci-coolify bun server/dist/verify-migrations.js
+          docker run --rm inline-server:ci-coolify wget --version
+          docker run --rm --network host -e DATABASE_URL inline-server:ci-coolify bun server/dist/core-production-smoke.js --artifact
+
+      - name: Save the qualified ARM64 image
+        if: ${{ inputs.publish_image }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Architecture}}' inline-server:ci-coolify)" = arm64
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' inline-server:ci-coolify)" = "$GITHUB_SHA"
+          docker save inline-server:ci-coolify | gzip > "$RUNNER_TEMP/coolify-arm64.tar.gz"
+      - name: Retain the qualified ARM64 image for publication
+        if: ${{ inputs.publish_image }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: server-coolify-arm64
+          path: ${{ runner.temp }}/coolify-arm64.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  test:
+    name: Server Typecheck, Lint, and Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      INLINE_TEST_REDIS_URL: redis://127.0.0.1:6379
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure public workspaces
+        run: bash scripts/ci/ensure-public-workspaces.sh
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Audit server runtime dependencies
+        run: bun server/scripts/security-audit.ts
+
+      - name: Check test discovery and focused tests
+        run: cd server && bun run test:check
+
+      - name: Test preview network boundaries
+        run: cd server && bun run test:preview
+
+      - name: Generate protos (drift check)
+        env:
+          SKIP_SWIFT_PROTO: "1"
+        run: |
+          bun run generate:proto
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+
+      - name: Build paired MCP integration artifact
+        run: |
+          bun run --cwd packages/protocol build
+          bun run --cwd packages/oauth-core build
+          bun run --cwd packages/sdk build
+          bun run --cwd packages/mcp build
+
+      - name: Run linter
+        run: cd server && bun lint
+
+      - name: Run strict migration linter
+        run: cd server && bun run lint:strict
+
+      - name: Test migration lint rules
+        run: cd server && bun run lint:rules
+
+      - name: Type check
+        run: cd server && bun typecheck
+
+      - name: Type check Effect foundation
+        run: cd server && bun run typecheck:effect
+
+      - name: Setup environment
+        run: |
+          {
+            echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/test_db"
+            echo "TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/test_db"
+            echo "RESEND_API_KEY=re_ci_placeholder"
+          } >> "$GITHUB_ENV"
+
+      - name: Install local integration executables
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server postgresql pgbouncer
+          pg_config --bindir >> "$GITHUB_PATH"
+
+      - name: Run Effect tests
+        run: cd server && bun run test:effect
+
+      - name: Smoke test the Bun/Effect HTTP kernel
+        run: cd server && bun run core:http-smoke
+
+      - name: Check route manifest
+        run: cd server && bun run contracts:routes
+
+      - name: Check OpenAPI manifests
+        run: cd server && bun run contracts:openapi
+
+      - name: Run database migrations
+        run: cd server && bun db:migrate
+
+      - name: Smoke test the production artifact
+        run: cd server && bun run core:artifact-smoke
+
+      - name: Smoke test the full core shadow
+        run: cd server && bun run core:smoke
+
+      - name: Run isolated server tests
+        run: cd server && bun run test:bun
+
+      - name: Audit selected tests, reports, and skips
+        if: always()
+        run: bun scripts/ci/audit-server-tests.ts server/.test-results
+
+      - name: Upload test reports and timings
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-test-results
+          path: server/.test-results/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Publish qualified images to public GHCR
+    needs: [container, container-arm, test]
+    if: ${{ inputs.publish_image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      runtime_image: ${{ steps.publish.outputs.runtime_image }}
+      standby_image: ${{ steps.publish.outputs.standby_image }}
+    steps:
+      - name: Require manual branch publication or main release
+        env:
+          PUBLISH_ONLY: ${{ inputs.publish_only }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = inline-chat/inline
+          test "$GITHUB_REF_TYPE" = branch
+          [[ "$GITHUB_REF" == refs/heads/* ]] || exit 1
+          case "$PUBLISH_ONLY" in
+            true) ;;
+            false) test "$GITHUB_REF" = refs/heads/main ;;
+            *) exit 1 ;;
+          esac
+      - name: Download the qualified runtime image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: server-runtime-amd64
+          path: ${{ runner.temp }}/server-images
+      - name: Download the qualified ARM64 image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: server-coolify-arm64
+          path: ${{ runner.temp }}/server-images
+      - name: Publish qualified images without rebuilding and verify anonymous access
+        id: publish
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]] || exit 1
+          test -n "$GHCR_TOKEN"
+          export DOCKER_CONFIG="$RUNNER_TEMP/ghcr-auth"
+          anonymous=$(mktemp -d)
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG" "$anonymous"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          repository=ghcr.io/inline-chat/inline-server
+          outputs=()
+          while read -r flavor architecture local_image output; do
+            docker load --input "$RUNNER_TEMP/server-images/$flavor.tar.gz"
+            test "$(docker image inspect --format '{{.Architecture}}' "$local_image")" = "$architecture"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$local_image")" = "$GITHUB_SHA"
+            tag="$repository:$flavor-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            docker tag "$local_image" "$tag"
+            docker push "$tag"
+            image=$(docker image inspect --format '{{json .RepoDigests}}' "$tag" | jq -er --arg prefix "$repository@sha256:" \
+              '[.[] | select(startswith($prefix))] | unique | if length == 1 then .[0] else error("Expected one GHCR digest") end')
+            [[ "$image" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+            # First publication may be private. Stop here until package visibility
+            # is public; neither origin should need a long-lived pull credential.
+            DOCKER_CONFIG="$anonymous" docker manifest inspect "$image" > /dev/null
+            outputs+=("$output=$image")
+          done <<'IMAGES'
+          runtime-amd64 amd64 inline-server:ci runtime_image
+          coolify-arm64 arm64 inline-server:ci-coolify standby_image
+          IMAGES
+          printf '%s\n' "${outputs[@]}" >> "$GITHUB_OUTPUT"
+
+  required:
+    name: Server validation required
+    if: ${{ always() }}
+    needs: [container, container-arm, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require every selected job to pass
+        env:
+          RESULTS_JSON: ${{ toJSON(needs) }}
+        run: node scripts/ci/validation-gates.mjs server

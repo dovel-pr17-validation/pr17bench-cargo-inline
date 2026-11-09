@@ -1,0 +1,256 @@
+import { describe, expect, test } from "bun:test"
+import { assertQueryTimeouts, cachedHealthProbe, combineHealthProbes, databaseApplicationName, databaseConnectionPolicy, directDatabaseUrl, makeDatabaseClients, QUERY_TIMEOUTS, HEALTH_TIMEOUTS } from "./connectionPolicy"
+
+const direct = "postgres://app:secret@db.example/test?sslmode=verify-full"
+const pooled = "postgres://app:secret@db.example:6432/test?sslmode=verify-full"
+const environment = { DATABASE_CONNECTION_MODE: "pgbouncer", DATABASE_DIRECT_URL: direct }
+
+describe("database connection safety", () => {
+  test("health aggregation returns its primary result after every child succeeds", async () => {
+    const rows = [{ database_time_millis: 1_000 }]
+    expect(await combineHealthProbes(Promise.resolve(rows), [Promise.resolve()])).toBe(rows)
+  })
+
+  test("health cancellation reaches every child even if an earlier cancellation throws", async () => {
+    const cancelled: string[] = []
+    const primary = Object.assign(Promise.resolve([]), {
+      cancel: () => { cancelled.push("direct"); throw new Error("cancel failed") },
+    })
+    const secondary = Object.assign(Promise.resolve(), {
+      cancel: () => { cancelled.push("pooled") },
+    })
+    const probe = combineHealthProbes(primary, [secondary])
+    expect(() => probe.cancel()).toThrow("cancel failed")
+    expect(cancelled).toEqual(["direct", "pooled"])
+    expect(await probe).toEqual([])
+  })
+
+  test("cached validation runs on the first probe, once per interval after a pass, and on every probe after a failure", async () => {
+    let now = 0
+    let runs = 0
+    let failing = false
+    const cancelled: number[] = []
+    const probe = cachedHealthProbe(() => {
+      const run = ++runs
+      return Object.assign(
+        failing ? Promise.reject(new Error("role timeouts drifted")) : Promise.resolve(),
+        { cancel: () => { cancelled.push(run) } },
+      )
+    }, { intervalMs: 60_000, now: () => now })
+
+    await probe()
+    expect(runs).toBe(1)
+    now = 59_999
+    expect(probe()).toBeUndefined()
+    now = 60_000
+    await probe()
+    expect(runs).toBe(2)
+
+    failing = true
+    now = 120_000
+    await expect(probe()).rejects.toThrow("role timeouts drifted")
+    now = 120_001
+    await expect(probe()).rejects.toThrow("role timeouts drifted")
+    expect(runs).toBe(4)
+    failing = false
+    await probe()
+    expect(runs).toBe(5)
+    now = 120_002
+    expect(probe()).toBeUndefined()
+
+    now = 200_000
+    const pending = probe()
+    pending?.cancel?.()
+    expect(cancelled).toEqual([6])
+    await pending
+  })
+
+  test("cached validation dates a pass from the probe start so a slow probe cannot extend the window", async () => {
+    let now = 0
+    let runs = 0
+    const gate = Promise.withResolvers<void>()
+    const probe = cachedHealthProbe(() => { runs += 1; return runs === 1 ? gate.promise : Promise.resolve() },
+      { intervalMs: 60_000, now: () => now })
+    const slow = probe()
+    now = 70_000
+    gate.resolve()
+    await slow
+    const fresh = probe()
+    expect(fresh).not.toBeUndefined()
+    expect(runs).toBe(2)
+    await fresh
+    now = 100_000
+    expect(probe()).toBeUndefined()
+  })
+
+  test("direct mode preserves the existing query and health timeout profiles", async () => {
+    const clients = makeDatabaseClients(direct)
+    try {
+      expect(clients.queryClient.options.max).toBe(10)
+      expect(clients.healthClient.options.max).toBe(1)
+      expect(clients.queryClient.options.connection).toMatchObject(QUERY_TIMEOUTS)
+      expect(clients.healthClient.options.connection).toMatchObject(HEALTH_TIMEOUTS)
+      await clients.validateStartup() // Direct mode remains lazy; no network required.
+    } finally { await clients.close() }
+  })
+
+  test("pooled startup omits unsupported GUCs while health retains its direct budgets", async () => {
+    const clients = makeDatabaseClients(pooled, environment)
+    try {
+      expect(clients.queryClient.options.connection).toEqual({ application_name: "inline-server" })
+      expect(clients.queryClient.options.prepare).toBe(true)
+      expect(clients.queryClient.options.ssl).toBe("verify-full")
+      expect(clients.healthClient.options.port).toEqual([5432])
+      expect(clients.healthClient.options.connection).toMatchObject(HEALTH_TIMEOUTS)
+    } finally { await clients.close() }
+  })
+
+  test("connections carry the origin in their application name", async () => {
+    expect(databaseApplicationName("inline-server", {})).toBe("inline-server")
+    expect(databaseApplicationName("inline-server", { FLY_REGION: "fra" })).toBe("inline-server:fly-fra")
+    expect(databaseApplicationName("inline-health", { FLY_REGION: "fra", INLINE_NODE_NAME: "nbg 1;" })).toBe("inline-health:nbg1")
+    const clients = makeDatabaseClients(pooled, { ...environment, FLY_REGION: "fra" })
+    try {
+      expect(clients.queryClient.options.connection).toEqual({ application_name: "inline-server:fly-fra" })
+      expect(clients.healthClient.options.connection).toMatchObject({ application_name: "inline-health:fly-fra" })
+    } finally { await clients.close() }
+  })
+
+  test("each connection mode honors the query cap and keeps one health connection", async () => {
+    for (const max of ["1", "3", "10"]) {
+      for (const [url, settings] of [[direct, {}], [pooled, environment]] as const) {
+        const clients = makeDatabaseClients(url, { ...settings, INLINE_DATABASE_QUERY_POOL_MAX: max })
+        try {
+          expect(clients.queryClient.options.max).toBe(Number(max))
+          expect(clients.healthClient.options.max).toBe(1)
+        } finally { await clients.close() }
+      }
+    }
+  })
+
+  test("URL options cannot override the configured query or health cap", async () => {
+    const clients = makeDatabaseClients(direct + "&max=200", { INLINE_DATABASE_QUERY_POOL_MAX: "3" })
+    try {
+      expect(clients.queryClient.options.max).toBe(3)
+      expect(clients.healthClient.options.max).toBe(1)
+    } finally { await clients.close() }
+  })
+
+  test("invalid query caps fail before constructing clients without echoing the value", () => {
+    for (const value of ["", "0", "11", "-1", "3.5", "3e0", "03", " 3", "3 ", "3\n", "NaN", "private-secret"]) {
+      expect(() => makeDatabaseClients(direct, { INLINE_DATABASE_QUERY_POOL_MAX: value }))
+        .toThrow("INLINE_DATABASE_QUERY_POOL_MAX must be an integer from 1 through 10.")
+    }
+  })
+
+  test("invalid prepared modes fail without echoing their value", () => {
+    expect(() => makeDatabaseClients(direct, { INLINE_DATABASE_PREPARED_QUERIES: "private-secret" }))
+      .toThrow("INLINE_DATABASE_PREPARED_QUERIES must be access or all-custom.")
+  })
+
+  test("pooled mode and a separate direct URL must be explicit", () => {
+    expect(() => databaseConnectionPolicy(pooled)).toThrow("explicit PgBouncer mode")
+    expect(() => databaseConnectionPolicy(pooled, { DATABASE_CONNECTION_MODE: "pgbouncer" })).toThrow("DATABASE_DIRECT_URL")
+    expect(() => databaseConnectionPolicy(direct, { DATABASE_CONNECTION_MODE: "typo" })).toThrow("must be direct or pgbouncer")
+    expect(() => directDatabaseUrl({ ...environment, DATABASE_DIRECT_URL: pooled })).toThrow("direct PostgreSQL")
+  })
+
+  test("rejects wrong database, insecure TLS and injected startup parameters", () => {
+    for (const url of [direct, pooled.replace("/test?", "/wrong?"), pooled.replace("db.example", "other.example"), pooled.replace("verify-full", "require"), pooled + "&sslmode=disable", pooled + "&statement_timeout=0", pooled + "&options=-c%20statement_timeout%3D0"]) {
+      expect(() => databaseConnectionPolicy(url, environment)).toThrow()
+    }
+    expect(() => databaseConnectionPolicy(pooled, { ...environment, DATABASE_DIRECT_URL: direct + "&statement_timeout=0" })).toThrow()
+    expect(() => databaseConnectionPolicy(pooled, { ...environment, DATABASE_DIRECT_URL: direct + "&sslmode=disable" })).toThrow()
+  })
+
+  test("migrations select only the explicit direct URL in pooled mode", () => {
+    expect(directDatabaseUrl({ DATABASE_URL: direct })).toBe(direct)
+    expect(directDatabaseUrl({ ...environment, DATABASE_URL: pooled })).toBe(direct)
+    expect(() => directDatabaseUrl({ DATABASE_CONNECTION_MODE: "pgbouncer", DATABASE_URL: pooled })).toThrow()
+    expect(() => directDatabaseUrl({ DATABASE_URL: pooled })).toThrow()
+  })
+
+  test("direct mode accepts the same endpoint with or without an override", () => {
+    expect(databaseConnectionPolicy(direct).healthUrl).toBe(direct)
+    const override = direct.replace("app:secret@", "migrator:other@").replace("db.example/", "db.example:5432/")
+    expect(databaseConnectionPolicy(direct, { DATABASE_DIRECT_URL: override }).healthUrl).toBe(override)
+    expect(directDatabaseUrl({ DATABASE_URL: direct, DATABASE_DIRECT_URL: override })).toBe(override)
+    expect(directDatabaseUrl({ DATABASE_DIRECT_URL: override })).toBe(override)
+  })
+
+  test("direct health and migration endpoints cannot target another host, database or port", () => {
+    for (const override of [
+      direct.replace("db.example", "other.example"),
+      direct.replace("/test?", "/other?"),
+      direct.replace("db.example/", "db.example:5433/"),
+    ]) {
+      const configured = { DATABASE_URL: direct, DATABASE_DIRECT_URL: override }
+      expect(() => databaseConnectionPolicy(direct, configured)).toThrow("same")
+      expect(() => directDatabaseUrl(configured)).toThrow("same")
+    }
+  })
+
+  test("standalone migration URL selection checks pooled endpoint identity", () => {
+    for (const queryUrl of [pooled.replace("db.example", "other.example"), pooled.replace("/test?", "/other?")]) {
+      expect(() => directDatabaseUrl({ ...environment, DATABASE_URL: queryUrl })).toThrow("same host and database")
+    }
+  })
+
+  test("dual endpoints require explicit database names and preserve driver pathname encoding", () => {
+    const implicit = "postgres://app:secret@db.example"
+    expect(directDatabaseUrl({ DATABASE_URL: implicit })).toBe(implicit)
+    expect(directDatabaseUrl({ DATABASE_DIRECT_URL: implicit })).toBe(implicit)
+    for (const override of [implicit, implicit + "/", implicit.replace("app:", "other:")]) {
+      expect(() => directDatabaseUrl({ DATABASE_URL: implicit, DATABASE_DIRECT_URL: override })).toThrow("explicitly name the database")
+    }
+    // postgres.js keeps database paths encoded, so these are different names.
+    expect(() => directDatabaseUrl({ DATABASE_URL: direct, DATABASE_DIRECT_URL: direct.replace("/test?", "/%74est?") })).toThrow("same host and database")
+  })
+
+  test("dual endpoint URLs cannot override startup database or user identity", () => {
+    for (const parameter of ["database=other", "user=other", "data%62ase=other"]) {
+      for (const configured of [
+        { DATABASE_URL: direct + "&" + parameter, DATABASE_DIRECT_URL: direct },
+        { DATABASE_URL: direct, DATABASE_DIRECT_URL: direct + "&" + parameter },
+      ]) {
+        expect(() => directDatabaseUrl(configured)).toThrow("must not override identity")
+        expect(() => databaseConnectionPolicy(configured.DATABASE_URL, configured)).toThrow("must not override identity")
+      }
+    }
+  })
+
+  test("standalone URL selection rejects malformed query and override URLs without exposing values", () => {
+    for (const invalid of ["postgres://private-user:private-password@", "https://private-user:private-password@db.example/test"]) {
+      for (const configured of [
+        { DATABASE_URL: invalid, DATABASE_DIRECT_URL: direct },
+        { DATABASE_URL: direct, DATABASE_DIRECT_URL: invalid },
+      ]) {
+        expect(() => directDatabaseUrl(configured)).toThrow("Database connection URL is invalid.")
+        try { directDatabaseUrl(configured) }
+        catch (error) {
+          expect(String(error)).not.toContain("private-user")
+          expect(String(error)).not.toContain("private-password")
+          expect(error).not.toHaveProperty("cause")
+        }
+      }
+    }
+  })
+
+  test("qualification rejects missing, disabled or changed timeout defaults", () => {
+    const rows = Object.entries(QUERY_TIMEOUTS).map(([name, value]) => ({ name, setting: String(value), unit: "ms" }))
+    expect(() => assertQueryTimeouts(rows)).not.toThrow()
+    expect(() => assertQueryTimeouts(rows.slice(1))).toThrow()
+    for (const setting of ["0", "30001", "NaN"]) {
+      expect(() => assertQueryTimeouts([{ ...rows[0]!, setting }, ...rows.slice(1)])).toThrow()
+    }
+    expect(() => assertQueryTimeouts(rows.map((row) => ({ ...row, unit: "s" })))).toThrow()
+  })
+
+  test("invalid URL errors never include credentials", () => {
+    for (const value of ["postgres://secret@", "https://user:secret@db.example/test"]) {
+      expect(() => databaseConnectionPolicy(value)).toThrow("Database connection URL is invalid")
+      try { databaseConnectionPolicy(value) }
+      catch (error) { expect(String(error)).not.toContain("secret") }
+    }
+  })
+})

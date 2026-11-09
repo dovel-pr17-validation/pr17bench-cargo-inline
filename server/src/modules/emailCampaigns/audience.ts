@@ -1,0 +1,305 @@
+import {
+  and,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  max,
+  or,
+  sql,
+} from "drizzle-orm"
+import { db } from "@in/server/db"
+import {
+  emailCampaignRecipients,
+  emailSuppressions,
+  sessions,
+  users,
+  waitlist,
+} from "@in/server/db/schema"
+import {
+  emailContactKey,
+} from "./contactCrypto"
+import { campaignEmailQuality } from "./emailQuality"
+import { orderCampaignRecipients } from "./selection"
+import {
+  createCampaignTimeZoneResolver,
+  filterCampaignRecipientsByTimeZone,
+  summarizeCampaignTimeZones,
+} from "./timeZones"
+import type {
+  CampaignAudiencePreview,
+  EmailCampaignAudience,
+  EmailCampaignSource,
+  ResolvedCampaignRecipient,
+} from "./types"
+
+const MAX_SOURCE_ROWS = 25_000
+
+interface Candidate {
+  readonly email: string
+  readonly name: string | null
+  readonly verified: boolean
+  readonly joinedAt: Date | null
+  readonly lastActive: Date | null
+  readonly platforms: readonly string[]
+  readonly source: EmailCampaignSource | "manual"
+  readonly timeZone: string | null
+}
+
+const dateBoundary = (value: string | undefined): Date | undefined => {
+  if (!value) return undefined
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? undefined : date
+}
+
+const loadInlineCandidates = async (): Promise<readonly Candidate[]> => {
+  const rows = await db
+    .select({
+      email: users.email,
+      name: users.firstName,
+      verified: users.emailVerified,
+      joinedAt: users.date,
+      lastActive: max(sessions.lastActive),
+      platforms: sql<string[]>`coalesce(array_remove(array_agg(distinct ${sessions.clientType}), null), '{}')`,
+      timeZone: users.timeZone,
+    })
+    .from(users)
+    .leftJoin(sessions, eq(sessions.userId, users.id))
+    .where(
+      and(
+        isNotNull(users.email),
+        or(isNull(users.deleted), eq(users.deleted, false)),
+        or(isNull(users.bot), eq(users.bot, false)),
+      ),
+    )
+    .groupBy(users.id)
+    .limit(MAX_SOURCE_ROWS + 1)
+
+  if (rows.length > MAX_SOURCE_ROWS) {
+    throw new Error(`Inline campaign audience exceeds the ${MAX_SOURCE_ROWS} row safety limit`)
+  }
+
+  return rows.flatMap((row) =>
+    row.email
+        ? [{
+          email: row.email,
+          name: row.name?.trim() || null,
+          verified: row.verified === true,
+          joinedAt: row.joinedAt,
+          lastActive: row.lastActive,
+          platforms: row.platforms,
+          source: "inline" as const,
+          timeZone: row.timeZone,
+        }]
+      : [],
+  )
+}
+
+const loadWaitlistCandidates = async (): Promise<readonly Candidate[]> => {
+  const rows = await db
+    .select({
+      email: waitlist.email,
+      name: waitlist.name,
+      verified: waitlist.verified,
+      joinedAt: waitlist.date,
+      timeZone: waitlist.timeZone,
+    })
+    .from(waitlist)
+    .limit(MAX_SOURCE_ROWS + 1)
+
+  if (rows.length > MAX_SOURCE_ROWS) {
+    throw new Error(`Waitlist campaign audience exceeds the ${MAX_SOURCE_ROWS} row safety limit`)
+  }
+
+  return rows.map((row) => ({
+    email: row.email,
+    name: row.name?.trim().split(/\s+/)[0] || null,
+    verified: row.verified,
+    joinedAt: row.joinedAt,
+    lastActive: null,
+    platforms: [],
+    source: "waitlist" as const,
+    timeZone: row.timeZone,
+  }))
+}
+
+export const resolveCampaignAudience = async (
+  audience: EmailCampaignAudience,
+): Promise<CampaignAudiencePreview> => {
+  const [inlineRows, waitlistRows] = await Promise.all([
+    audience.sources.includes("inline") || (
+      audience.excludeInlineUsers === true && audience.sources.includes("waitlist")
+    ) ? loadInlineCandidates() : [],
+    audience.sources.includes("waitlist") ? loadWaitlistCandidates() : [],
+  ])
+  const candidates: Candidate[] = [
+    ...(audience.sources.includes("inline") ? inlineRows : []),
+    ...waitlistRows,
+  ]
+  const inlineEmailKeys = new Set(inlineRows.flatMap((candidate) => {
+    const quality = campaignEmailQuality(candidate.email)
+    return quality.valid ? [emailContactKey(quality.email)] : []
+  }))
+  candidates.push(
+    ...audience.manualEmails.map((email) => ({
+      email,
+      name: null,
+      verified: true,
+      joinedAt: null,
+      lastActive: null,
+      platforms: [],
+      source: "manual" as const,
+      timeZone: null,
+    })),
+  )
+
+  const excluded = {
+    invalid: 0,
+    typo: 0,
+    unverified: 0,
+    inactive: 0,
+    platform: 0,
+    suppressed: 0,
+    priorCampaign: 0,
+    converted: 0,
+    duplicate: 0,
+    timeZone: 0,
+    limited: 0,
+  }
+  const joinedAfter = dateBoundary(audience.joinedAfter)
+  const joinedBefore = dateBoundary(audience.joinedBefore)
+  const activityCutoff = audience.activeWithinDays
+    ? new Date(Date.now() - audience.activeWithinDays * 86_400_000)
+    : undefined
+  const byKey = new Map<string, ResolvedCampaignRecipient>()
+  const timeZoneAt = new Date()
+  const resolveTimeZone = createCampaignTimeZoneResolver(timeZoneAt)
+
+  for (const candidate of candidates) {
+    const quality = campaignEmailQuality(candidate.email)
+    if (!quality.valid) {
+      excluded[quality.reason] += 1
+      continue
+    }
+    const email = quality.email
+    const timeZone = resolveTimeZone(candidate.timeZone)?.timeZone ?? null
+    if (audience.verifiedOnly && !candidate.verified) {
+      excluded.unverified += 1
+      continue
+    }
+    if (
+      candidate.source !== "manual" &&
+      joinedAfter &&
+      (!candidate.joinedAt || candidate.joinedAt < joinedAfter)
+    ) {
+      continue
+    }
+    if (
+      candidate.source !== "manual" &&
+      joinedBefore &&
+      (!candidate.joinedAt || candidate.joinedAt > joinedBefore)
+    ) {
+      continue
+    }
+    if (
+      candidate.source === "inline" &&
+      activityCutoff &&
+      (!candidate.lastActive || candidate.lastActive < activityCutoff)
+    ) {
+      excluded.inactive += 1
+      continue
+    }
+    if (
+      candidate.source === "inline" &&
+      audience.platforms.length > 0 &&
+      !audience.platforms.some((platform) =>
+        candidate.platforms.includes(platform),
+      )
+    ) {
+      excluded.platform += 1
+      continue
+    }
+
+    const emailKey = emailContactKey(email)
+    if (
+      candidate.source === "waitlist" &&
+      audience.excludeInlineUsers === true &&
+      inlineEmailKeys.has(emailKey)
+    ) {
+      excluded.converted += 1
+      continue
+    }
+    const existing = byKey.get(emailKey)
+    if (existing) {
+      excluded.duplicate += 1
+      if (!existing.sources.includes(candidate.source)) {
+        byKey.set(emailKey, {
+          ...existing,
+          sources: [...existing.sources, candidate.source],
+          timeZone: existing.timeZone ?? timeZone,
+        })
+      }
+      continue
+    }
+    byKey.set(emailKey, {
+      email,
+      name: candidate.name,
+      emailKey,
+      sources: [candidate.source],
+      joinedAt: candidate.joinedAt,
+      timeZone,
+    })
+  }
+
+  const keys = [...byKey.keys()]
+  if (keys.length > 0) {
+    const [suppressedRows, priorRows] = await Promise.all([
+      db
+        .select({ emailKey: emailSuppressions.emailKey })
+        .from(emailSuppressions)
+        .where(inArray(emailSuppressions.emailKey, keys)),
+      audience.excludeCampaignIds.length > 0
+        ? db
+            .selectDistinct({ emailKey: emailCampaignRecipients.emailKey })
+            .from(emailCampaignRecipients)
+            .where(
+              and(
+                inArray(emailCampaignRecipients.emailKey, keys),
+                inArray(emailCampaignRecipients.campaignId, audience.excludeCampaignIds),
+                inArray(emailCampaignRecipients.status, [
+                  "sending",
+                  "provider_accepted",
+                  "unknown",
+                ]),
+              ),
+            )
+        : Promise.resolve([]),
+    ])
+    for (const row of suppressedRows) {
+      if (byKey.delete(row.emailKey)) excluded.suppressed += 1
+    }
+    for (const row of priorRows) {
+      if (byKey.delete(row.emailKey)) excluded.priorCampaign += 1
+    }
+  }
+
+  const timeZoneSelection = filterCampaignRecipientsByTimeZone(
+    [...byKey.values()],
+    audience.timeZoneGroup ?? "all",
+    timeZoneAt,
+  )
+  excluded.timeZone = timeZoneSelection.excluded
+  const ranked = orderCampaignRecipients(
+    timeZoneSelection.recipients,
+    audience.selectionOrder ?? "random",
+    audience.sampleSeed,
+  )
+  const limit = audience.limit ?? ranked.length
+  excluded.limited = Math.max(0, ranked.length - limit)
+  const recipients = ranked.slice(0, limit)
+  return {
+    recipients,
+    excluded,
+    timeZones: summarizeCampaignTimeZones(recipients, timeZoneAt),
+  }
+}

@@ -1,0 +1,175 @@
+import Foundation
+import RealtimeV2
+
+/// Registry for mapping between transaction types and their string representations
+/// Used for serialization/deserialization in persistence layer
+public enum TransactionTypeRegistry {
+  /// Convert a transaction instance to its string type identifier
+  public static func typeString(for transaction: any Transaction2) -> String {
+    switch transaction {
+      case is SendMessageTransaction: "send_message"
+      case is AcknowledgeMessagesTransaction: "acknowledge_messages"
+      case is AddReactionTransaction: "add_reaction"
+      case is DeleteReactionTransaction: "delete_reaction"
+      case is EditMessageTransaction: "edit_message"
+      case is DeleteMessageTransaction: "delete_message"
+      case is DeleteMessageAttachmentTransaction: "delete_message_attachment"
+      case is ClearChatHistoryTransaction: "clear_chat_history"
+      case is CreateChatTransaction: "create_chat"
+      case is CreateSubthreadTransaction: "create_subthread"
+      case is ReserveChatIdsTransaction: "reserve_chat_ids"
+      case is GetChatTransaction: "get_chat"
+      case is GetThreadReferencesTransaction: "get_thread_references"
+      case is GetThreadSubthreadsTransaction: "get_thread_subthreads"
+      case is GetMeTransaction: "get_me"
+      case is GetSpaceMembersTransaction: "get_space_members"
+      case is GetUserGroupsTransaction: "get_user_groups"
+      case is CreateUserGroupTransaction: "create_user_group"
+      case is UpdateUserGroupTransaction: "update_user_group"
+      case is DeleteUserGroupTransaction: "delete_user_group"
+      case is GetSpaceUrlPreviewExclusionsTransaction: "get_space_url_preview_exclusions"
+      case is AddSpaceUrlPreviewExclusionTransaction: "add_space_url_preview_exclusion"
+      case is RemoveSpaceUrlPreviewExclusionTransaction: "remove_space_url_preview_exclusion"
+      case is InviteToSpaceTransaction: "invite_to_space"
+      case is InviteToInlineTransaction: "invite_to_inline"
+      case is SearchUsersTransaction: "search_users"
+      case is JoinPublicSpaceTransaction: "join_public_space"
+      case is JoinSpaceByInviteTokenTransaction: "join_space_by_invite_token"
+      case is GetSpaceInviteLinkTransaction: "get_space_invite_link"
+      case is SetSpaceInviteLinkEnabledTransaction: "set_space_invite_link_enabled"
+      case is DeleteChatTransaction: "delete_chat"
+      case is GetChatParticipantsTransaction: "get_chat_participants"
+      case is AddChatParticipantTransaction: "add_chat_participant"
+      case is RemoveChatParticipantTransaction: "remove_chat_participant"
+      case is UpdateChatVisibilityTransaction: "update_chat_visibility"
+      case is UpdateChatInfoTransaction: "update_chat_info"
+      case is UpdateDialogNotificationSettingsTransaction: "update_dialog_notification_settings"
+      case is UpdateDialogTranslationTransaction: "update_dialog_translation"
+      case is UpdateDialogFollowModeTransaction: "update_dialog_follow_mode"
+      case is MoveThreadTransaction: "move_thread"
+      case is PinMessageTransaction: "pin_message"
+      case is UnpinAllMessagesTransaction: "unpin_all_messages"
+      case is TranslateMessagesTransaction: "translate_messages"
+      case is UpdateUserSettingsTransaction: "update_user_settings"
+      case is MarkAsUnreadTransaction: "mark_as_unread"
+      case is ReadMessagesTransaction: "read_messages"
+      case is DeleteMemberTransaction: "delete_member"
+      case is UpdateMemberAccessTransaction: "update_member_access"
+      case is ForwardMessagesTransaction: "forward_messages"
+      case is CreateBotTransaction: "create_bot"
+      case is ListBotsTransaction: "list_bots"
+      case is DeleteBotTransaction: "delete_bot"
+      case is RevealBotTokenTransaction: "reveal_bot_token"
+      case is RotateBotTokenTransaction: "rotate_bot_token"
+      case is UpdateBotProfileTransaction: "update_bot_profile"
+      case is SetBotAvatarTransaction: "set_bot_avatar"
+      case is ClearBotAvatarTransaction: "clear_bot_avatar"
+      case is GetBotPresenceTransaction: "get_bot_presence"
+      case is SetBotPresenceStateTransaction: "set_bot_presence_state"
+      case is UpdatePushNotificationDetailsTransaction: "update_push_notification_details"
+      case is InvokeMessageActionTransaction: "invoke_message_action"
+      case is ShowInChatListTransaction: "show_in_chat_list"
+      case is UpdateDialogOpenTransaction: "update_dialog_open"
+      case is UpdateDialogOrderTransaction: "update_dialog_order"
+      case is CreateDialogFolderTransaction: "create_dialog_folder"
+      case is UpdateDialogFolderTransaction: "update_dialog_folder"
+      case is DeleteDialogFolderTransaction: "delete_dialog_folder"
+      default: "unknown"
+    }
+  }
+
+  /// Decode a transaction from its type string and JSON data
+  public static func decodeTransaction(type: String, data: Data) throws -> any Transaction2 {
+    let decoder = JSONDecoder()
+    switch type {
+      case "send_message": return try decoder.decode(SendMessageTransaction.self, from: data)
+      case "acknowledge_messages": return try decoder.decode(AcknowledgeMessagesTransaction.self, from: data)
+      case "add_reaction": return try decoder.decode(AddReactionTransaction.self, from: data)
+      case "delete_reaction": return try decoder.decode(DeleteReactionTransaction.self, from: data)
+      case "edit_message": return try decoder.decode(EditMessageTransaction.self, from: data)
+      case "delete_message": return try decoder.decode(DeleteMessageTransaction.self, from: data)
+      case "delete_message_attachment": return try decoder.decode(DeleteMessageAttachmentTransaction.self, from: data)
+      case "clear_chat_history": return try decoder.decode(ClearChatHistoryTransaction.self, from: data)
+      case "create_chat": return try decoder.decode(CreateChatTransaction.self, from: data)
+      case "create_subthread": return try decoder.decode(CreateSubthreadTransaction.self, from: data)
+      case "reserve_chat_ids": return try decoder.decode(ReserveChatIdsTransaction.self, from: data)
+      case "get_chat": return try decoder.decode(GetChatTransaction.self, from: data)
+      case "get_thread_references": return try decoder.decode(GetThreadReferencesTransaction.self, from: data)
+      case "get_thread_subthreads": return try decoder.decode(GetThreadSubthreadsTransaction.self, from: data)
+      case "get_me": return try decoder.decode(GetMeTransaction.self, from: data)
+      case "get_space_members": return try decoder.decode(GetSpaceMembersTransaction.self, from: data)
+      case "get_user_groups": return try decoder.decode(GetUserGroupsTransaction.self, from: data)
+      case "create_user_group": return try decoder.decode(CreateUserGroupTransaction.self, from: data)
+      case "update_user_group": return try decoder.decode(UpdateUserGroupTransaction.self, from: data)
+      case "delete_user_group": return try decoder.decode(DeleteUserGroupTransaction.self, from: data)
+      case "get_space_url_preview_exclusions":
+        return try decoder.decode(GetSpaceUrlPreviewExclusionsTransaction.self, from: data)
+      case "add_space_url_preview_exclusion":
+        return try decoder.decode(AddSpaceUrlPreviewExclusionTransaction.self, from: data)
+      case "remove_space_url_preview_exclusion":
+        return try decoder.decode(RemoveSpaceUrlPreviewExclusionTransaction.self, from: data)
+      case "invite_to_space": return try decoder.decode(InviteToSpaceTransaction.self, from: data)
+      case "invite_to_inline": return try decoder.decode(InviteToInlineTransaction.self, from: data)
+      case "search_users": return try decoder.decode(SearchUsersTransaction.self, from: data)
+      case "join_public_space": return try decoder.decode(JoinPublicSpaceTransaction.self, from: data)
+      case "join_space_by_invite_token": return try decoder.decode(JoinSpaceByInviteTokenTransaction.self, from: data)
+      case "get_space_invite_link": return try decoder.decode(GetSpaceInviteLinkTransaction.self, from: data)
+      case "set_space_invite_link_enabled":
+        return try decoder.decode(SetSpaceInviteLinkEnabledTransaction.self, from: data)
+      case "delete_chat": return try decoder.decode(DeleteChatTransaction.self, from: data)
+      case "get_chat_participants": return try decoder.decode(GetChatParticipantsTransaction.self, from: data)
+      case "add_chat_participant": return try decoder.decode(AddChatParticipantTransaction.self, from: data)
+      case "remove_chat_participant": return try decoder.decode(RemoveChatParticipantTransaction.self, from: data)
+      case "update_chat_visibility": return try decoder.decode(UpdateChatVisibilityTransaction.self, from: data)
+      case "update_chat_info": return try decoder.decode(UpdateChatInfoTransaction.self, from: data)
+      case "update_dialog_notification_settings":
+        return try decoder.decode(UpdateDialogNotificationSettingsTransaction.self, from: data)
+      case "update_dialog_translation": return try decoder.decode(UpdateDialogTranslationTransaction.self, from: data)
+      case "update_dialog_follow_mode":
+        return try decoder.decode(UpdateDialogFollowModeTransaction.self, from: data)
+      case "move_thread": return try decoder.decode(MoveThreadTransaction.self, from: data)
+      case "pin_message": return try decoder.decode(PinMessageTransaction.self, from: data)
+      case "unpin_all_messages": return try decoder.decode(UnpinAllMessagesTransaction.self, from: data)
+      case "translate_messages": return try decoder.decode(TranslateMessagesTransaction.self, from: data)
+      case "update_user_settings": return try decoder.decode(UpdateUserSettingsTransaction.self, from: data)
+      case "mark_as_unread": return try decoder.decode(MarkAsUnreadTransaction.self, from: data)
+      case "read_messages": return try decoder.decode(ReadMessagesTransaction.self, from: data)
+      case "delete_member": return try decoder.decode(DeleteMemberTransaction.self, from: data)
+      case "update_member_access": return try decoder.decode(UpdateMemberAccessTransaction.self, from: data)
+      case "forward_messages": return try decoder.decode(ForwardMessagesTransaction.self, from: data)
+      case "create_bot": return try decoder.decode(CreateBotTransaction.self, from: data)
+      case "list_bots": return try decoder.decode(ListBotsTransaction.self, from: data)
+      case "delete_bot": return try decoder.decode(DeleteBotTransaction.self, from: data)
+      case "reveal_bot_token": return try decoder.decode(RevealBotTokenTransaction.self, from: data)
+      case "rotate_bot_token": return try decoder.decode(RotateBotTokenTransaction.self, from: data)
+      case "update_bot_profile": return try decoder.decode(UpdateBotProfileTransaction.self, from: data)
+      case "set_bot_avatar": return try decoder.decode(SetBotAvatarTransaction.self, from: data)
+      case "clear_bot_avatar": return try decoder.decode(ClearBotAvatarTransaction.self, from: data)
+      case "get_bot_presence": return try decoder.decode(GetBotPresenceTransaction.self, from: data)
+      case "set_bot_presence_state": return try decoder.decode(SetBotPresenceStateTransaction.self, from: data)
+      case "update_push_notification_details":
+        return try decoder.decode(UpdatePushNotificationDetailsTransaction.self, from: data)
+      case "invoke_message_action":
+        return try decoder.decode(InvokeMessageActionTransaction.self, from: data)
+      case "show_chat_in_sidebar", "show_in_chat_list":
+        return try decoder.decode(ShowInChatListTransaction.self, from: data)
+      case "update_dialog_open":
+        return try decoder.decode(UpdateDialogOpenTransaction.self, from: data)
+      case "update_dialog_order":
+        return try decoder.decode(UpdateDialogOrderTransaction.self, from: data)
+      case "create_dialog_folder":
+        return try decoder.decode(CreateDialogFolderTransaction.self, from: data)
+      case "update_dialog_folder":
+        return try decoder.decode(UpdateDialogFolderTransaction.self, from: data)
+      case "delete_dialog_folder":
+        return try decoder.decode(DeleteDialogFolderTransaction.self, from: data)
+      default: throw TransactionTypeError.unknownTransactionType(type)
+    }
+  }
+}
+
+// MARK: - Errors
+
+public enum TransactionTypeError: Error {
+  case unknownTransactionType(String)
+}

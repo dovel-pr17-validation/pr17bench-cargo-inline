@@ -1,0 +1,1348 @@
+import { PREAUTH_METHODS } from "@in/server/realtime/admission"
+import { transcribeVoiceDraft } from "./voice.transcribeDraft"
+import { requestBotFilesystem, answerBotFilesystem } from "@in/server/functions/bot.filesystem"
+import { Method, type RpcCall, type RpcResult } from "@inline-chat/protocol/core"
+import type { HandlerContext } from "@in/server/realtime/types"
+import { getMe } from "@in/server/realtime/handlers/getMe"
+import { Log } from "@in/server/utils/log"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { deleteMessage } from "@in/server/realtime/handlers/messages.deleteMessage"
+import { deleteMessageAttachment } from "@in/server/realtime/handlers/messages.deleteMessageAttachment"
+import { clearChatHistoryHandler } from "@in/server/realtime/handlers/messages.clearChatHistory"
+import { sendMessage } from "@in/server/realtime/handlers/messages.sendMessage"
+import { getChatHistory } from "@in/server/realtime/handlers/messages.getChatHistory"
+import { getChatTranscript } from "@in/server/realtime/handlers/messages.getChatTranscript"
+import { getMessages } from "@in/server/realtime/handlers/messages.getMessages"
+import { getThreadReferences } from "@in/server/realtime/handlers/messages.getThreadReferences"
+import { getThreadSubthreads } from "@in/server/realtime/handlers/messages.getThreadSubthreads"
+import { getChat } from "@in/server/realtime/handlers/messages.getChat"
+import { searchMessages } from "@in/server/realtime/handlers/messages.searchMessages"
+import { searchExternalResources } from "@in/server/realtime/handlers/externalResources.search"
+import { addReaction } from "./messages.addReactions"
+import { deleteReaction } from "./messages.deleteReaction"
+import { editMessage } from "./messages.editMessage"
+import { createChat } from "@in/server/realtime/handlers/messages.createChat"
+import { getSpaceMembers } from "@in/server/realtime/handlers/space.getSpaceMembers"
+import { getSpace } from "@in/server/realtime/handlers/space.getSpace"
+import { deleteChatHandler } from "@in/server/realtime/handlers/messages.deleteChat"
+import { inviteToSpace } from "@in/server/functions/space.inviteToSpace"
+import { joinPublicSpace } from "@in/server/functions/space.joinPublicSpace"
+import { joinSpaceByInviteToken } from "@in/server/functions/space.joinByInviteToken"
+import { getSpaceInviteLink, setSpaceInviteLinkEnabled } from "@in/server/functions/space.inviteLinks"
+import { getChatParticipants } from "@in/server/realtime/handlers/messages.getChatParticipants"
+import { addChatParticipant } from "@in/server/realtime/handlers/messages.addChatParticipant"
+import { removeChatParticipant } from "@in/server/realtime/handlers/messages.removeChatParticipant"
+import { handleTranslateMessages } from "./translateMessages"
+import { handleGetChats } from "./messages.getChats"
+import { getUserSettingsHandler } from "./user.getUserSettings"
+import { updateUserSettingsHandler } from "./user.updateUserSettings"
+import { sendComposeActionHandler } from "./messages.sendComposeAction"
+import { createBotHandler } from "./createBot"
+import { listBotsHandler } from "./listBots"
+import { deleteBotHandler } from "./deleteBot"
+import { getBotCommandsHandler } from "./getBotCommands"
+import { getBotSkillsHandler } from "./getBotSkills"
+import { getBotConfigurationCatalogHandler } from "./getBotConfigurationCatalog"
+import { setBotCommandsHandler } from "./setBotCommands"
+import { getPeerBotCommandsHandler } from "./getPeerBotCommands"
+import { getPeerBotsHandler } from "./getPeerBots"
+import { getMyBotCapabilitiesHandler } from "./getMyBotCapabilities"
+import { setMyBotCapabilitiesHandler } from "./setMyBotCapabilities"
+import { requestBotChatSettingsHandler } from "./requestBotChatSettings"
+import { invokeBotChatSettingsItemHandler } from "./invokeBotChatSettingsItem"
+import { answerBotChatSettingsHandler } from "./answerBotChatSettings"
+import { revealBotTokenHandler } from "./revealBotToken"
+import { rotateBotTokenHandler } from "./rotateBotToken"
+import { updateBotProfileHandler } from "./updateBotProfile"
+import { setBotAvatarHandler } from "./setBotAvatar"
+import { clearBotAvatarHandler } from "./clearBotAvatar"
+import { getBotPresenceHandler } from "./getBotPresence"
+import { setBotPresenceStateHandler } from "./setBotPresenceState"
+import { deleteMemberHandler } from "@in/server/realtime/handlers/space.deleteMember"
+import { updateMemberAccessHandler } from "@in/server/realtime/handlers/space.updateMemberAccess"
+import { markAsUnread } from "./messages.markAsUnread"
+import { readMessages } from "./messages.readMessages"
+import { getUpdatesState } from "@in/server/realtime/handlers/updates.getUpdatesState"
+import { getUpdates } from "@in/server/realtime/handlers/updates.getUpdates"
+import { forwardMessagesHandler } from "@in/server/realtime/handlers/messages.forwardMessages"
+import { updateChatVisibilityHandler } from "@in/server/realtime/handlers/messages.updateChatVisibility"
+import { updateChatInfoHandler } from "@in/server/realtime/handlers/messages.updateChatInfo"
+import { pinMessageHandler } from "@in/server/realtime/handlers/messages.pinMessage"
+import { unpinAllMessagesHandler } from "@in/server/realtime/handlers/messages.unpinAllMessages"
+import { moveThreadHandler } from "@in/server/realtime/handlers/messages.moveThread"
+import { updateDialogNotificationSettings } from "@in/server/realtime/handlers/messages.updateDialogNotificationSettings"
+import { updateDialogFollowMode } from "@in/server/realtime/handlers/messages.updateDialogFollowMode"
+import { updateDialogTranslation } from "@in/server/realtime/handlers/messages.updateDialogTranslation"
+import { acknowledgeMessagesHandler } from "@in/server/realtime/handlers/messages.acknowledgeMessages"
+import { collapseHistoryHandler } from "@in/server/realtime/handlers/messages.collapseHistory"
+import { updatePushNotificationDetailsHandler } from "@in/server/realtime/handlers/user.updatePushNotificationDetails"
+import { reserveChatIds } from "@in/server/realtime/handlers/messages.reserveChatIds"
+import { invokeMessageAction } from "@in/server/realtime/handlers/messages.invokeMessageAction"
+import { answerMessageAction } from "@in/server/realtime/handlers/messages.answerMessageAction"
+import { createSubthread } from "@in/server/realtime/handlers/messages.createSubthread"
+import { revokeSessionHandler } from "@in/server/realtime/handlers/user.revokeSession"
+import { getSessionsHandler } from "@in/server/realtime/handlers/user.getSessions"
+import { createCliSessionHandler } from "@in/server/realtime/handlers/user.createCliSession"
+import {
+  changeUsernameHandler,
+  checkUsernameHandler,
+  getExternalProfilePhotoHandler,
+  setProfilePhotoHandler,
+  updateProfileHandler,
+} from "@in/server/realtime/handlers/user.account"
+import { showInChatList } from "@in/server/realtime/handlers/messages.showInChatList"
+import { updateDialogOpen } from "@in/server/realtime/handlers/messages.updateDialogOpen"
+import { updateDialogOrder } from "@in/server/realtime/handlers/messages.updateDialogOrder"
+import {
+  createDialogFolderHandler,
+  deleteDialogFolderHandler,
+  updateDialogFolderHandler,
+} from "@in/server/realtime/handlers/messages.dialogFolders"
+import {
+  addSpaceUrlPreviewExclusionHandler,
+  getSpaceUrlPreviewExclusionsHandler,
+  removeSpaceUrlPreviewExclusionHandler,
+} from "@in/server/realtime/handlers/space.urlPreviewExclusions"
+import { setSpacePhotoHandler } from "@in/server/realtime/handlers/space.profile"
+import { getSpaceSettingsHandler, toggleSpaceGridHandler } from "@in/server/realtime/handlers/space.settings"
+import {
+  openGridThreadHandler,
+  setGridTranscriptionHandler,
+  listGridTranscriptsHandler,
+  createGridRoomHandler,
+  deleteGridRoomHandler,
+  getGridHandler,
+  getGridHomeHandler,
+  joinGridRoomHandler,
+  leaveGridRoomHandler,
+  moveGridCallHereHandler,
+  prepareGridConnectionHandler,
+  setGridAvatarMicrophoneEnabledHandler,
+  setGridRoomLockedHandler,
+  setGridRoomTitleHandler,
+} from "@in/server/realtime/handlers/grid"
+import {
+  createUserGroupHandler,
+  deleteUserGroupHandler,
+  getUserGroupsHandler,
+  updateUserGroupHandler,
+} from "@in/server/realtime/handlers/space.userGroups"
+import {
+  disconnectConnector,
+  listConnectors,
+  prepareConnectorOAuth,
+} from "@in/server/functions/connectors"
+import { searchUsersHandler } from "@in/server/realtime/handlers/users.search"
+import { getUsersHandler } from "@in/server/realtime/handlers/users.get"
+import { inviteToInline } from "@in/server/functions/user.inviteToInline"
+import { resolveUrlPreviewHandler } from "@in/server/realtime/handlers/urlPreview.resolve"
+import {
+  createBotAgentHandler,
+  deleteBotAgentHandler,
+  getBotAgentHandler,
+  listBotAgentsHandler,
+  updateBotAgentHandler,
+} from "@in/server/realtime/handlers/bot.agents"
+import { nativeUploadOperations } from "@in/server/modules/uploads/operations"
+import { nativeDownloadOperations } from "@in/server/modules/files/downloads"
+import {
+  createExternalTaskV3,
+  createSpaceV3,
+  deleteSpaceV3,
+  getConnectorConfigV3,
+  leaveSpaceV3,
+  logOutV3,
+  setConnectorConfigV3,
+  unregisterDeviceV3,
+  updateDialogArchivedV3,
+  updateSessionV3,
+} from "@in/server/realtime/handlers/v3Migration"
+import {
+  connectAgentSessionHandler,
+  getAgentSessionHandler,
+  syncAgentSessionMessagesHandler,
+} from "@in/server/realtime/handlers/agentSessions"
+import { AgentHandlers } from "@in/server/realtime/handlers/agents"
+
+const log = new Log("Realtime.RPC")
+
+export const handleRpcCall = async (call: RpcCall, handlerContext: HandlerContext): Promise<RpcResult["result"]> => {
+  if (!handlerContext.userId && !PREAUTH_METHODS.has(call.method)) throw RealtimeRpcError.Unauthenticated()
+  log.trace("rpc call", Method[call.method])
+
+  switch (call.method) {
+    case Method.TRANSCRIBE_VOICE_DRAFT: {
+      if (call.input.oneofKind !== "transcribeVoiceDraft") throw RealtimeRpcError.BadRequest()
+      const result = await transcribeVoiceDraft(call.input.transcribeVoiceDraft, handlerContext)
+      return { oneofKind: "transcribeVoiceDraft", transcribeVoiceDraft: result }
+    }
+
+    case Method.CONNECT_AGENT_SESSION: {
+      if (call.input.oneofKind !== "connectAgentSession") throw RealtimeRpcError.BadRequest()
+      const result = await connectAgentSessionHandler(call.input.connectAgentSession, handlerContext)
+      return { oneofKind: "connectAgentSession", connectAgentSession: result }
+    }
+
+    case Method.SYNC_AGENT_SESSION_MESSAGES: {
+      if (call.input.oneofKind !== "syncAgentSessionMessages") throw RealtimeRpcError.BadRequest()
+      const result = await syncAgentSessionMessagesHandler(call.input.syncAgentSessionMessages, handlerContext)
+      return { oneofKind: "syncAgentSessionMessages", syncAgentSessionMessages: result }
+    }
+
+    case Method.GET_AGENT_SESSION: {
+      if (call.input.oneofKind !== "getAgentSession") throw RealtimeRpcError.BadRequest()
+      const result = await getAgentSessionHandler(call.input.getAgentSession, handlerContext)
+      return { oneofKind: "getAgentSession", getAgentSession: result }
+    }
+
+    case Method.REPORT_AGENT_RUNTIME: {
+      if (call.input.oneofKind !== "reportAgentRuntime") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.reportAgentRuntime(call.input.reportAgentRuntime, handlerContext.userId)
+      return { oneofKind: "reportAgentRuntime", reportAgentRuntime: result }
+    }
+
+    case Method.GET_AGENT_RUNTIME: {
+      if (call.input.oneofKind !== "getAgentRuntime") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.getAgentRuntime(call.input.getAgentRuntime, handlerContext.userId)
+      return { oneofKind: "getAgentRuntime", getAgentRuntime: result }
+    }
+
+    case Method.UPDATE_AGENT_SESSION_STATE: {
+      if (call.input.oneofKind !== "updateAgentSessionState") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.updateAgentSessionState(call.input.updateAgentSessionState, handlerContext.userId)
+      return { oneofKind: "updateAgentSessionState", updateAgentSessionState: result }
+    }
+
+    case Method.GET_AGENT_SESSION_STATES: {
+      if (call.input.oneofKind !== "getAgentSessionStates") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.getAgentSessionStates(call.input.getAgentSessionStates, handlerContext.userId)
+      return { oneofKind: "getAgentSessionStates", getAgentSessionStates: result }
+    }
+
+    case Method.LIST_AGENT_GRANTS: {
+      if (call.input.oneofKind !== "listAgentGrants") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.listAgentGrants(call.input.listAgentGrants, handlerContext.userId)
+      return { oneofKind: "listAgentGrants", listAgentGrants: result }
+    }
+
+    case Method.SET_AGENT_GRANT: {
+      if (call.input.oneofKind !== "setAgentGrant") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.setAgentGrant(call.input.setAgentGrant, handlerContext.userId)
+      return { oneofKind: "setAgentGrant", setAgentGrant: result }
+    }
+
+    case Method.DELETE_AGENT_GRANT: {
+      if (call.input.oneofKind !== "deleteAgentGrant") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.deleteAgentGrant(call.input.deleteAgentGrant, handlerContext.userId)
+      return { oneofKind: "deleteAgentGrant", deleteAgentGrant: result }
+    }
+
+    case Method.IMPORT_AGENT_GRANTS: {
+      if (call.input.oneofKind !== "importAgentGrants") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.importAgentGrants(call.input.importAgentGrants, handlerContext.userId)
+      return { oneofKind: "importAgentGrants", importAgentGrants: result }
+    }
+
+    case Method.GET_AGENT_PARTICIPATIONS: {
+      if (call.input.oneofKind !== "getAgentParticipations") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.getAgentParticipations(call.input.getAgentParticipations, handlerContext.userId)
+      return { oneofKind: "getAgentParticipations", getAgentParticipations: result }
+    }
+
+    case Method.SET_AGENT_PARTICIPATION: {
+      if (call.input.oneofKind !== "setAgentParticipation") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.setAgentParticipation(call.input.setAgentParticipation, handlerContext.userId)
+      return { oneofKind: "setAgentParticipation", setAgentParticipation: result }
+    }
+
+    case Method.UPDATE_AGENT_SETTINGS: {
+      if (call.input.oneofKind !== "updateAgentSettings") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.updateAgentSettings(call.input.updateAgentSettings, handlerContext.userId)
+      return { oneofKind: "updateAgentSettings", updateAgentSettings: result }
+    }
+
+    case Method.GET_AGENT_SETTINGS: {
+      if (call.input.oneofKind !== "getAgentSettings") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.getAgentSettings(call.input.getAgentSettings, handlerContext.userId)
+      return { oneofKind: "getAgentSettings", getAgentSettings: result }
+    }
+
+    case Method.CONTROL_AGENT_SESSION: {
+      if (call.input.oneofKind !== "controlAgentSession") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.controlAgentSession(call.input.controlAgentSession, handlerContext.userId)
+      return { oneofKind: "controlAgentSession", controlAgentSession: result }
+    }
+
+    case Method.MOVE_AGENT_SESSION: {
+      if (call.input.oneofKind !== "moveAgentSession") throw RealtimeRpcError.BadRequest()
+      const result = await AgentHandlers.moveAgentSession(call.input.moveAgentSession, handlerContext.userId)
+      return { oneofKind: "moveAgentSession", moveAgentSession: result }
+    }
+
+    case Method.GET_ME: {
+      if (call.input.oneofKind !== "getMe") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getMe(call.input, handlerContext)
+      return { oneofKind: "getMe", getMe: result }
+    }
+
+    case Method.DELETE_MESSAGES: {
+      if (call.input.oneofKind !== "deleteMessages") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await deleteMessage(call.input.deleteMessages, handlerContext)
+      return { oneofKind: "deleteMessages", deleteMessages: result }
+    }
+
+    case Method.DELETE_MESSAGE_ATTACHMENT: {
+      if (call.input.oneofKind !== "deleteMessageAttachment") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await deleteMessageAttachment(call.input.deleteMessageAttachment, handlerContext)
+      return { oneofKind: "deleteMessageAttachment", deleteMessageAttachment: result }
+    }
+
+    case Method.CLEAR_CHAT_HISTORY: {
+      if (call.input.oneofKind !== "clearChatHistory") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await clearChatHistoryHandler(call.input.clearChatHistory, handlerContext)
+      return { oneofKind: "clearChatHistory", clearChatHistory: result }
+    }
+
+    case Method.SEND_MESSAGE: {
+      if (call.input.oneofKind !== "sendMessage") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await sendMessage(call.input.sendMessage, handlerContext)
+      return { oneofKind: "sendMessage", sendMessage: result }
+    }
+
+    case Method.GET_CHAT_HISTORY: {
+      if (call.input.oneofKind !== "getChatHistory") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getChatHistory(call.input.getChatHistory, handlerContext)
+      return { oneofKind: "getChatHistory", getChatHistory: result }
+    }
+
+    case Method.GET_CHAT_TRANSCRIPT: {
+      if (call.input.oneofKind !== "getChatTranscript") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getChatTranscript(call.input.getChatTranscript, handlerContext)
+      return { oneofKind: "getChatTranscript", getChatTranscript: result }
+    }
+
+    case Method.GET_MESSAGES: {
+      if (call.input.oneofKind !== "getMessages") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getMessages(call.input.getMessages, handlerContext)
+      return { oneofKind: "getMessages", getMessages: result }
+    }
+
+    case Method.GET_THREAD_REFERENCES: {
+      if (call.input.oneofKind !== "getThreadReferences") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getThreadReferences(call.input.getThreadReferences, handlerContext)
+      return { oneofKind: "getThreadReferences", getThreadReferences: result }
+    }
+
+    case Method.GET_THREAD_SUBTHREADS: {
+      if (call.input.oneofKind !== "getThreadSubthreads") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getThreadSubthreads(call.input.getThreadSubthreads, handlerContext)
+      return { oneofKind: "getThreadSubthreads", getThreadSubthreads: result }
+    }
+
+    case Method.SEARCH_MESSAGES: {
+      if (call.input.oneofKind !== "searchMessages") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await searchMessages(call.input.searchMessages, handlerContext)
+      return { oneofKind: "searchMessages", searchMessages: result }
+    }
+
+    case Method.SEARCH_EXTERNAL_RESOURCES: {
+      if (call.input.oneofKind !== "searchExternalResources") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await searchExternalResources(
+        call.input.searchExternalResources,
+        handlerContext,
+      )
+      return {
+        oneofKind: "searchExternalResources",
+        searchExternalResources: result,
+      }
+    }
+
+    case Method.ADD_REACTION: {
+      if (call.input.oneofKind !== "addReaction") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await addReaction(call.input.addReaction, handlerContext)
+      return { oneofKind: "addReaction", addReaction: result }
+    }
+
+    case Method.DELETE_REACTION: {
+      if (call.input.oneofKind !== "deleteReaction") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await deleteReaction(call.input.deleteReaction, handlerContext)
+      return { oneofKind: "deleteReaction", deleteReaction: result }
+    }
+
+    case Method.EDIT_MESSAGE: {
+      if (call.input.oneofKind !== "editMessage") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await editMessage(call.input.editMessage, handlerContext)
+      return { oneofKind: "editMessage", editMessage: result }
+    }
+
+    case Method.CREATE_CHAT: {
+      if (call.input.oneofKind !== "createChat") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await createChat(call.input.createChat, handlerContext)
+      return { oneofKind: "createChat", createChat: result }
+    }
+
+    case Method.GET_BOT_COMMANDS: {
+      if (call.input.oneofKind !== "getBotCommands") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getBotCommandsHandler(call.input.getBotCommands, handlerContext)
+      return { oneofKind: "getBotCommands", getBotCommands: result }
+    }
+
+    case Method.SET_BOT_COMMANDS: {
+      if (call.input.oneofKind !== "setBotCommands") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await setBotCommandsHandler(call.input.setBotCommands, handlerContext)
+      return { oneofKind: "setBotCommands", setBotCommands: result }
+    }
+
+    case Method.GET_PEER_BOT_COMMANDS: {
+      if (call.input.oneofKind !== "getPeerBotCommands") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getPeerBotCommandsHandler(call.input.getPeerBotCommands, handlerContext)
+      return { oneofKind: "getPeerBotCommands", getPeerBotCommands: result }
+    }
+
+    case Method.GET_BOT_SKILLS: {
+      if (call.input.oneofKind !== "getBotSkills") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getBotSkillsHandler(call.input.getBotSkills, handlerContext)
+      return { oneofKind: "getBotSkills", getBotSkills: result }
+    }
+
+    case Method.GET_BOT_CONFIGURATION_CATALOG: {
+      if (call.input.oneofKind !== "getBotConfigurationCatalog") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getBotConfigurationCatalogHandler(
+        call.input.getBotConfigurationCatalog,
+        handlerContext,
+      )
+      return { oneofKind: "getBotConfigurationCatalog", getBotConfigurationCatalog: result }
+    }
+
+    case Method.GET_PEER_BOTS: {
+      if (call.input.oneofKind !== "getPeerBots") throw RealtimeRpcError.BadRequest()
+      const result = await getPeerBotsHandler(call.input.getPeerBots, handlerContext)
+      return { oneofKind: "getPeerBots", getPeerBots: result }
+    }
+
+    case Method.GET_MY_BOT_CAPABILITIES: {
+      if (call.input.oneofKind !== "getMyBotCapabilities") throw RealtimeRpcError.BadRequest()
+      const result = await getMyBotCapabilitiesHandler(handlerContext)
+      return { oneofKind: "getMyBotCapabilities", getMyBotCapabilities: result }
+    }
+
+    case Method.SET_MY_BOT_CAPABILITIES: {
+      if (call.input.oneofKind !== "setMyBotCapabilities") throw RealtimeRpcError.BadRequest()
+      const result = await setMyBotCapabilitiesHandler(call.input.setMyBotCapabilities, handlerContext)
+      return { oneofKind: "setMyBotCapabilities", setMyBotCapabilities: result }
+    }
+
+    case Method.REQUEST_BOT_FILESYSTEM: {
+      if (call.input.oneofKind !== "requestBotFilesystem") throw RealtimeRpcError.BadRequest()
+      const result = await requestBotFilesystem(call.input.requestBotFilesystem, { currentSessionId: handlerContext.sessionId, currentUserId: handlerContext.userId, currentConnectionId: handlerContext.connectionId })
+      return { oneofKind: "requestBotFilesystem", requestBotFilesystem: result }
+    }
+    case Method.ANSWER_BOT_FILESYSTEM: {
+      if (call.input.oneofKind !== "answerBotFilesystem") throw RealtimeRpcError.BadRequest()
+      const result = await answerBotFilesystem(call.input.answerBotFilesystem, { currentSessionId: handlerContext.sessionId, currentUserId: handlerContext.userId, currentConnectionId: handlerContext.connectionId })
+      return { oneofKind: "answerBotFilesystem", answerBotFilesystem: result }
+    }
+    case Method.REQUEST_BOT_CHAT_SETTINGS: {
+      if (call.input.oneofKind !== "requestBotChatSettings") throw RealtimeRpcError.BadRequest()
+      const result = await requestBotChatSettingsHandler(call.input.requestBotChatSettings, handlerContext)
+      return { oneofKind: "requestBotChatSettings", requestBotChatSettings: result }
+    }
+
+    case Method.INVOKE_BOT_CHAT_SETTINGS_ITEM: {
+      if (call.input.oneofKind !== "invokeBotChatSettingsItem") throw RealtimeRpcError.BadRequest()
+      const result = await invokeBotChatSettingsItemHandler(call.input.invokeBotChatSettingsItem, handlerContext)
+      return { oneofKind: "invokeBotChatSettingsItem", invokeBotChatSettingsItem: result }
+    }
+
+    case Method.ANSWER_BOT_CHAT_SETTINGS: {
+      if (call.input.oneofKind !== "answerBotChatSettings") throw RealtimeRpcError.BadRequest()
+      const result = await answerBotChatSettingsHandler(call.input.answerBotChatSettings, handlerContext)
+      return { oneofKind: "answerBotChatSettings", answerBotChatSettings: result }
+    }
+    case Method.GET_SPACE: {
+      if (call.input.oneofKind !== "getSpace") throw RealtimeRpcError.BadRequest()
+      const result = await getSpace(call.input.getSpace, handlerContext)
+      return { oneofKind: "getSpace", getSpace: result }
+    }
+    case Method.GET_SPACE_MEMBERS: {
+      if (call.input.oneofKind !== "getSpaceMembers") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getSpaceMembers(call.input.getSpaceMembers, handlerContext)
+      return { oneofKind: "getSpaceMembers", getSpaceMembers: result }
+    }
+
+    case Method.GET_SPACE_URL_PREVIEW_EXCLUSIONS: {
+      if (call.input.oneofKind !== "getSpaceUrlPreviewExclusions") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getSpaceUrlPreviewExclusionsHandler(call.input.getSpaceUrlPreviewExclusions, handlerContext)
+      return { oneofKind: "getSpaceUrlPreviewExclusions", getSpaceUrlPreviewExclusions: result }
+    }
+
+    case Method.ADD_SPACE_URL_PREVIEW_EXCLUSION: {
+      if (call.input.oneofKind !== "addSpaceUrlPreviewExclusion") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await addSpaceUrlPreviewExclusionHandler(call.input.addSpaceUrlPreviewExclusion, handlerContext)
+      return { oneofKind: "addSpaceUrlPreviewExclusion", addSpaceUrlPreviewExclusion: result }
+    }
+
+    case Method.REMOVE_SPACE_URL_PREVIEW_EXCLUSION: {
+      if (call.input.oneofKind !== "removeSpaceUrlPreviewExclusion") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await removeSpaceUrlPreviewExclusionHandler(
+        call.input.removeSpaceUrlPreviewExclusion,
+        handlerContext,
+      )
+      return { oneofKind: "removeSpaceUrlPreviewExclusion", removeSpaceUrlPreviewExclusion: result }
+    }
+
+    case Method.GET_SPACE_SETTINGS: {
+      if (call.input.oneofKind !== "getSpaceSettings") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getSpaceSettingsHandler(call.input.getSpaceSettings, handlerContext)
+      return { oneofKind: "getSpaceSettings", getSpaceSettings: result }
+    }
+
+    case Method.TOGGLE_SPACE_GRID: {
+      if (call.input.oneofKind !== "toggleSpaceGrid") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await toggleSpaceGridHandler(call.input.toggleSpaceGrid, handlerContext)
+      return { oneofKind: "toggleSpaceGrid", toggleSpaceGrid: result }
+    }
+
+    case Method.OPEN_GRID_THREAD: {
+      if (call.input.oneofKind !== "openGridThread") throw RealtimeRpcError.BadRequest()
+      const result = await openGridThreadHandler(call.input.openGridThread, handlerContext)
+      return { oneofKind: "openGridThread", openGridThread: result }
+    }
+
+    case Method.SET_GRID_TRANSCRIPTION: {
+      if (call.input.oneofKind !== "setGridTranscription") throw RealtimeRpcError.BadRequest()
+      const result = await setGridTranscriptionHandler(call.input.setGridTranscription, handlerContext)
+      return { oneofKind: "setGridTranscription", setGridTranscription: result }
+    }
+
+    case Method.LIST_GRID_TRANSCRIPTS: {
+      if (call.input.oneofKind !== "listGridTranscripts") throw RealtimeRpcError.BadRequest()
+      const result = await listGridTranscriptsHandler(call.input.listGridTranscripts, handlerContext)
+      return { oneofKind: "listGridTranscripts", listGridTranscripts: result }
+    }
+
+    case Method.GET_GRID: {
+      if (call.input.oneofKind !== "getGrid") throw RealtimeRpcError.BadRequest()
+      const result = await getGridHandler(call.input.getGrid, handlerContext)
+      return { oneofKind: "getGrid", getGrid: result }
+    }
+
+    case Method.GET_GRID_HOME: {
+      if (call.input.oneofKind !== "getGridHome") throw RealtimeRpcError.BadRequest()
+      const result = await getGridHomeHandler(call.input.getGridHome, handlerContext)
+      return { oneofKind: "getGridHome", getGridHome: result }
+    }
+
+    case Method.CREATE_GRID_ROOM: {
+      if (call.input.oneofKind !== "createGridRoom") throw RealtimeRpcError.BadRequest()
+      const result = await createGridRoomHandler(call.input.createGridRoom, handlerContext)
+      return { oneofKind: "createGridRoom", createGridRoom: result }
+    }
+
+    case Method.JOIN_GRID_ROOM: {
+      if (call.input.oneofKind !== "joinGridRoom") throw RealtimeRpcError.BadRequest()
+      const result = await joinGridRoomHandler(call.input.joinGridRoom, handlerContext)
+      return { oneofKind: "joinGridRoom", joinGridRoom: result }
+    }
+
+    case Method.LEAVE_GRID_ROOM: {
+      if (call.input.oneofKind !== "leaveGridRoom") throw RealtimeRpcError.BadRequest()
+      const result = await leaveGridRoomHandler(call.input.leaveGridRoom, handlerContext)
+      return { oneofKind: "leaveGridRoom", leaveGridRoom: result }
+    }
+
+    case Method.MOVE_GRID_CALL_HERE: {
+      if (call.input.oneofKind !== "moveGridCallHere") throw RealtimeRpcError.BadRequest()
+      const result = await moveGridCallHereHandler(call.input.moveGridCallHere, handlerContext)
+      return { oneofKind: "moveGridCallHere", moveGridCallHere: result }
+    }
+
+    case Method.SET_GRID_ROOM_TITLE: {
+      if (call.input.oneofKind !== "setGridRoomTitle") throw RealtimeRpcError.BadRequest()
+      const result = await setGridRoomTitleHandler(call.input.setGridRoomTitle, handlerContext)
+      return { oneofKind: "setGridRoomTitle", setGridRoomTitle: result }
+    }
+
+    case Method.SET_GRID_ROOM_LOCKED: {
+      if (call.input.oneofKind !== "setGridRoomLocked") throw RealtimeRpcError.BadRequest()
+      const result = await setGridRoomLockedHandler(call.input.setGridRoomLocked, handlerContext)
+      return { oneofKind: "setGridRoomLocked", setGridRoomLocked: result }
+    }
+
+    case Method.DELETE_GRID_ROOM: {
+      if (call.input.oneofKind !== "deleteGridRoom") throw RealtimeRpcError.BadRequest()
+      const result = await deleteGridRoomHandler(call.input.deleteGridRoom, handlerContext)
+      return { oneofKind: "deleteGridRoom", deleteGridRoom: result }
+    }
+
+    case Method.PREPARE_GRID_CONNECTION: {
+      if (call.input.oneofKind !== "prepareGridConnection") throw RealtimeRpcError.BadRequest()
+      const result = await prepareGridConnectionHandler(call.input.prepareGridConnection, handlerContext)
+      return { oneofKind: "prepareGridConnection", prepareGridConnection: result }
+    }
+
+    case Method.SET_GRID_AVATAR_MICROPHONE_ENABLED: {
+      if (call.input.oneofKind !== "setGridAvatarMicrophoneEnabled") throw RealtimeRpcError.BadRequest()
+      const result = await setGridAvatarMicrophoneEnabledHandler(
+        call.input.setGridAvatarMicrophoneEnabled,
+        handlerContext,
+      )
+      return { oneofKind: "setGridAvatarMicrophoneEnabled", setGridAvatarMicrophoneEnabled: result }
+    }
+
+    case Method.DELETE_CHAT: {
+      if (call.input.oneofKind !== "deleteChat") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await deleteChatHandler(call.input.deleteChat, handlerContext)
+      return { oneofKind: "deleteChat", deleteChat: result }
+    }
+
+    case Method.INVITE_TO_SPACE: {
+      if (call.input.oneofKind !== "inviteToSpace") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await inviteToSpace(call.input.inviteToSpace, {
+        currentUserId: handlerContext.userId,
+        currentSessionId: handlerContext.sessionId,
+      })
+      return { oneofKind: "inviteToSpace", inviteToSpace: result }
+    }
+
+    case Method.JOIN_PUBLIC_SPACE: {
+      if (call.input.oneofKind !== "joinPublicSpace") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await joinPublicSpace(call.input.joinPublicSpace, {
+        currentUserId: handlerContext.userId,
+        currentSessionId: handlerContext.sessionId,
+      })
+      return { oneofKind: "joinPublicSpace", joinPublicSpace: result }
+    }
+
+    case Method.JOIN_SPACE_BY_INVITE_TOKEN: {
+      if (call.input.oneofKind !== "joinSpaceByInviteToken") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await joinSpaceByInviteToken(call.input.joinSpaceByInviteToken, {
+        currentUserId: handlerContext.userId,
+        currentSessionId: handlerContext.sessionId,
+      })
+      return { oneofKind: "joinSpaceByInviteToken", joinSpaceByInviteToken: result }
+    }
+
+    case Method.GET_SPACE_INVITE_LINK: {
+      if (call.input.oneofKind !== "getSpaceInviteLink") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getSpaceInviteLink(call.input.getSpaceInviteLink, {
+        currentUserId: handlerContext.userId,
+        currentSessionId: handlerContext.sessionId,
+      })
+      return { oneofKind: "getSpaceInviteLink", getSpaceInviteLink: result }
+    }
+
+    case Method.SET_SPACE_INVITE_LINK_ENABLED: {
+      if (call.input.oneofKind !== "setSpaceInviteLinkEnabled") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await setSpaceInviteLinkEnabled(call.input.setSpaceInviteLinkEnabled, {
+        currentUserId: handlerContext.userId,
+        currentSessionId: handlerContext.sessionId,
+      })
+      return { oneofKind: "setSpaceInviteLinkEnabled", setSpaceInviteLinkEnabled: result }
+    }
+
+    case Method.GET_USER_GROUPS: {
+      if (call.input.oneofKind !== "getUserGroups") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getUserGroupsHandler(call.input.getUserGroups, handlerContext)
+      return { oneofKind: "getUserGroups", getUserGroups: result }
+    }
+
+    case Method.CREATE_USER_GROUP: {
+      if (call.input.oneofKind !== "createUserGroup") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await createUserGroupHandler(call.input.createUserGroup, handlerContext)
+      return { oneofKind: "createUserGroup", createUserGroup: result }
+    }
+
+    case Method.UPDATE_USER_GROUP: {
+      if (call.input.oneofKind !== "updateUserGroup") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await updateUserGroupHandler(call.input.updateUserGroup, handlerContext)
+      return { oneofKind: "updateUserGroup", updateUserGroup: result }
+    }
+
+    case Method.DELETE_USER_GROUP: {
+      if (call.input.oneofKind !== "deleteUserGroup") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await deleteUserGroupHandler(call.input.deleteUserGroup, handlerContext)
+      return { oneofKind: "deleteUserGroup", deleteUserGroup: result }
+    }
+
+    case Method.GET_CHAT_PARTICIPANTS: {
+      if (call.input.oneofKind !== "getChatParticipants") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getChatParticipants(call.input.getChatParticipants, handlerContext)
+      return { oneofKind: "getChatParticipants", getChatParticipants: result }
+    }
+
+    case Method.ADD_CHAT_PARTICIPANT: {
+      if (call.input.oneofKind !== "addChatParticipant") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await addChatParticipant(call.input.addChatParticipant, handlerContext)
+      return { oneofKind: "addChatParticipant", addChatParticipant: result }
+    }
+
+    case Method.REMOVE_CHAT_PARTICIPANT: {
+      if (call.input.oneofKind !== "removeChatParticipant") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await removeChatParticipant(call.input.removeChatParticipant, handlerContext)
+      return { oneofKind: "removeChatParticipant", removeChatParticipant: result }
+    }
+
+    case Method.TRANSLATE_MESSAGES: {
+      if (call.input.oneofKind !== "translateMessages") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await handleTranslateMessages(call.input.translateMessages, handlerContext)
+      return { oneofKind: "translateMessages", translateMessages: result }
+    }
+
+    case Method.GET_CHATS: {
+      if (call.input.oneofKind !== "getChats") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await handleGetChats(call.input.getChats, handlerContext)
+      return { oneofKind: "getChats", getChats: result }
+    }
+
+    case Method.GET_CHAT: {
+      if (call.input.oneofKind !== "getChat") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getChat(call.input.getChat, handlerContext)
+      return { oneofKind: "getChat", getChat: result }
+    }
+
+    case Method.GET_USER_SETTINGS: {
+      if (call.input.oneofKind !== "getUserSettings") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getUserSettingsHandler(call.input.getUserSettings, handlerContext)
+      return { oneofKind: "getUserSettings", getUserSettings: result }
+    }
+
+    case Method.UPDATE_USER_SETTINGS: {
+      if (call.input.oneofKind !== "updateUserSettings") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await updateUserSettingsHandler(call.input.updateUserSettings, handlerContext)
+      return { oneofKind: "updateUserSettings", updateUserSettings: result }
+    }
+
+    case Method.SEND_COMPOSE_ACTION: {
+      if (call.input.oneofKind !== "sendComposeAction") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await sendComposeActionHandler(call.input.sendComposeAction, handlerContext)
+      return { oneofKind: "sendComposeAction", sendComposeAction: result }
+    }
+
+    case Method.CREATE_BOT: {
+      if (call.input.oneofKind !== "createBot") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await createBotHandler(call.input.createBot, handlerContext)
+      return { oneofKind: "createBot", createBot: result }
+    }
+
+    case Method.LIST_BOTS: {
+      if (call.input.oneofKind !== "listBots") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await listBotsHandler(call.input.listBots, handlerContext)
+      return { oneofKind: "listBots", listBots: result }
+    }
+
+    case Method.DELETE_BOT: {
+      if (call.input.oneofKind !== "deleteBot") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await deleteBotHandler(call.input.deleteBot, handlerContext)
+      return { oneofKind: "deleteBot", deleteBot: result }
+    }
+
+    case Method.REVEAL_BOT_TOKEN: {
+      if (call.input.oneofKind !== "revealBotToken") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await revealBotTokenHandler(call.input.revealBotToken, handlerContext)
+      return { oneofKind: "revealBotToken", revealBotToken: result }
+    }
+
+    case Method.ROTATE_BOT_TOKEN: {
+      if (call.input.oneofKind !== "rotateBotToken") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await rotateBotTokenHandler(call.input.rotateBotToken, handlerContext)
+      return { oneofKind: "rotateBotToken", rotateBotToken: result }
+    }
+
+    case Method.UPDATE_BOT_PROFILE: {
+      if (call.input.oneofKind !== "updateBotProfile") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await updateBotProfileHandler(call.input.updateBotProfile, handlerContext)
+      return { oneofKind: "updateBotProfile", updateBotProfile: result }
+    }
+
+    case Method.SET_BOT_AVATAR: {
+      if (call.input.oneofKind !== "setBotAvatar") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await setBotAvatarHandler(call.input.setBotAvatar, handlerContext)
+      return { oneofKind: "setBotAvatar", setBotAvatar: result }
+    }
+
+    case Method.CLEAR_BOT_AVATAR: {
+      if (call.input.oneofKind !== "clearBotAvatar") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await clearBotAvatarHandler(call.input.clearBotAvatar, handlerContext)
+      return { oneofKind: "clearBotAvatar", clearBotAvatar: result }
+    }
+
+    case Method.GET_BOT_PRESENCE: {
+      if (call.input.oneofKind !== "getBotPresence") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getBotPresenceHandler(call.input.getBotPresence, handlerContext)
+      return { oneofKind: "getBotPresence", getBotPresence: result }
+    }
+
+    case Method.SET_BOT_PRESENCE_STATE: {
+      if (call.input.oneofKind !== "setBotPresenceState") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await setBotPresenceStateHandler(call.input.setBotPresenceState, handlerContext)
+      return { oneofKind: "setBotPresenceState", setBotPresenceState: result }
+    }
+
+    case Method.DELETE_MEMBER: {
+      if (call.input.oneofKind !== "deleteMember") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await deleteMemberHandler(call.input.deleteMember, handlerContext)
+      return { oneofKind: "deleteMember", deleteMember: result }
+    }
+
+    case Method.UPDATE_MEMBER_ACCESS: {
+      if (call.input.oneofKind !== "updateMemberAccess") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await updateMemberAccessHandler(call.input.updateMemberAccess, handlerContext)
+      return { oneofKind: "updateMemberAccess", updateMemberAccess: result }
+    }
+
+    case Method.MARK_AS_UNREAD: {
+      if (call.input.oneofKind !== "markAsUnread") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await markAsUnread(call.input.markAsUnread, handlerContext)
+      return { oneofKind: "markAsUnread", markAsUnread: result }
+    }
+
+    case Method.READ_MESSAGES: {
+      if (call.input.oneofKind !== "readMessages") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await readMessages(call.input.readMessages, handlerContext)
+      return { oneofKind: "readMessages", readMessages: result }
+    }
+    
+    case Method.GET_UPDATES_STATE: {
+      if (call.input.oneofKind !== "getUpdatesState") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getUpdatesState(call.input.getUpdatesState, handlerContext)
+      return { oneofKind: "getUpdatesState", getUpdatesState: result }
+    }
+
+    case Method.GET_UPDATES: {
+      if (call.input.oneofKind !== "getUpdates") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await getUpdates(call.input.getUpdates, handlerContext)
+      return { oneofKind: "getUpdates", getUpdates: result }
+    }
+
+    case Method.FORWARD_MESSAGES: {
+      if (call.input.oneofKind !== "forwardMessages") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await forwardMessagesHandler(call.input.forwardMessages, handlerContext)
+      return { oneofKind: "forwardMessages", forwardMessages: result }
+    }
+
+    case Method.UPDATE_CHAT_VISIBILITY: {
+      if (call.input.oneofKind !== "updateChatVisibility") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await updateChatVisibilityHandler(call.input.updateChatVisibility, handlerContext)
+      return { oneofKind: "updateChatVisibility", updateChatVisibility: result }
+    }
+
+    case Method.UPDATE_CHAT_INFO: {
+      if (call.input.oneofKind !== "updateChatInfo") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await updateChatInfoHandler(call.input.updateChatInfo, handlerContext)
+      return { oneofKind: "updateChatInfo", updateChatInfo: result }
+    }
+
+    case Method.MOVE_THREAD: {
+      if (call.input.oneofKind !== "moveThread") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await moveThreadHandler(call.input.moveThread, handlerContext)
+      return { oneofKind: "moveThread", moveThread: result }
+    }
+
+    case Method.PIN_MESSAGE: {
+      if (call.input.oneofKind !== "pinMessage") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await pinMessageHandler(call.input.pinMessage, handlerContext)
+      return { oneofKind: "pinMessage", pinMessage: result }
+    }
+
+    case Method.UNPIN_ALL_MESSAGES: {
+      if (call.input.oneofKind !== "unpinAllMessages") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await unpinAllMessagesHandler(call.input.unpinAllMessages, handlerContext)
+      return { oneofKind: "unpinAllMessages", unpinAllMessages: result }
+    }
+
+    case Method.UPDATE_DIALOG_NOTIFICATION_SETTINGS: {
+      if (call.input.oneofKind !== "updateDialogNotificationSettings") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      let result = await updateDialogNotificationSettings(call.input.updateDialogNotificationSettings, handlerContext)
+      return { oneofKind: "updateDialogNotificationSettings", updateDialogNotificationSettings: result }
+    }
+
+    case Method.UPDATE_DIALOG_TRANSLATION: {
+      if (call.input.oneofKind !== "updateDialogTranslation") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await updateDialogTranslation(call.input.updateDialogTranslation, handlerContext)
+      return { oneofKind: "updateDialogTranslation", updateDialogTranslation: result }
+    }
+    case Method.UPDATE_DIALOG_FOLLOW_MODE: {
+      if (call.input.oneofKind !== "updateDialogFollowMode") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await updateDialogFollowMode(call.input.updateDialogFollowMode, handlerContext)
+      return { oneofKind: "updateDialogFollowMode", updateDialogFollowMode: result }
+    }
+
+    case Method.ACKNOWLEDGE_MESSAGES: {
+      if (call.input.oneofKind !== "acknowledgeMessages") throw RealtimeRpcError.BadRequest()
+      const result = await acknowledgeMessagesHandler(call.input.acknowledgeMessages, handlerContext)
+      return { oneofKind: "acknowledgeMessages", acknowledgeMessages: result }
+    }
+
+    case Method.COLLAPSE_HISTORY: {
+      if (call.input.oneofKind !== "collapseHistory") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await collapseHistoryHandler(call.input.collapseHistory, handlerContext)
+      return { oneofKind: "collapseHistory", collapseHistory: result }
+    }
+
+    case Method.LIST_CONNECTORS: {
+      if (call.input.oneofKind !== "listConnectors") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await listConnectors(handlerContext)
+      return { oneofKind: "listConnectors", listConnectors: result }
+    }
+
+    case Method.PREPARE_CONNECTOR_OAUTH: {
+      if (call.input.oneofKind !== "prepareConnectorOAuth") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await prepareConnectorOAuth(call.input.prepareConnectorOAuth, handlerContext)
+      return { oneofKind: "prepareConnectorOAuth", prepareConnectorOAuth: result }
+    }
+
+    case Method.DISCONNECT_CONNECTOR: {
+      if (call.input.oneofKind !== "disconnectConnector") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await disconnectConnector(call.input.disconnectConnector, handlerContext)
+      return { oneofKind: "disconnectConnector", disconnectConnector: result }
+    }
+
+    case Method.SEARCH_USERS: {
+      if (call.input.oneofKind !== "searchUsers") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await searchUsersHandler(call.input.searchUsers, handlerContext)
+      return { oneofKind: "searchUsers", searchUsers: result }
+    }
+
+    case Method.GET_USERS: {
+      if (call.input.oneofKind !== "getUsers") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      return { oneofKind: "getUsers", getUsers: await getUsersHandler(call.input.getUsers, handlerContext) }
+    }
+
+    case Method.INVITE_TO_INLINE: {
+      if (call.input.oneofKind !== "inviteToInline") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await inviteToInline(call.input.inviteToInline, {
+        currentUserId: handlerContext.userId,
+        currentSessionId: handlerContext.sessionId,
+      })
+      return { oneofKind: "inviteToInline", inviteToInline: result }
+    }
+
+    case Method.RESOLVE_URL_PREVIEW: {
+      if (call.input.oneofKind !== "resolveUrlPreview") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await resolveUrlPreviewHandler(call.input.resolveUrlPreview, handlerContext)
+      return { oneofKind: "resolveUrlPreview", resolveUrlPreview: result }
+    }
+
+    case Method.CREATE_BOT_AGENT: {
+      if (call.input.oneofKind !== "createBotAgent") throw RealtimeRpcError.BadRequest()
+      const result = await createBotAgentHandler(call.input.createBotAgent, handlerContext)
+      return { oneofKind: "createBotAgent", createBotAgent: result }
+    }
+
+    case Method.GET_BOT_AGENT: {
+      if (call.input.oneofKind !== "getBotAgent") throw RealtimeRpcError.BadRequest()
+      const result = await getBotAgentHandler(call.input.getBotAgent, handlerContext)
+      return { oneofKind: "getBotAgent", getBotAgent: result }
+    }
+
+    case Method.LIST_BOT_AGENTS: {
+      if (call.input.oneofKind !== "listBotAgents") throw RealtimeRpcError.BadRequest()
+      const result = await listBotAgentsHandler(call.input.listBotAgents, handlerContext)
+      return { oneofKind: "listBotAgents", listBotAgents: result }
+    }
+
+    case Method.UPDATE_BOT_AGENT: {
+      if (call.input.oneofKind !== "updateBotAgent") throw RealtimeRpcError.BadRequest()
+      const result = await updateBotAgentHandler(call.input.updateBotAgent, handlerContext)
+      return { oneofKind: "updateBotAgent", updateBotAgent: result }
+    }
+
+    case Method.DELETE_BOT_AGENT: {
+      if (call.input.oneofKind !== "deleteBotAgent") throw RealtimeRpcError.BadRequest()
+      const result = await deleteBotAgentHandler(call.input.deleteBotAgent, handlerContext)
+      return { oneofKind: "deleteBotAgent", deleteBotAgent: result }
+    }
+
+    case Method.REGISTER_DEVICE: {
+      if (call.input.oneofKind !== "registerDevice") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await updatePushNotificationDetailsHandler(call.input.registerDevice, handlerContext)
+      return { oneofKind: "registerDevice", registerDevice: result }
+    }
+
+    case Method.CREATE_SUBTHREAD: {
+      if (call.input.oneofKind !== "createSubthread") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await createSubthread(call.input.createSubthread, handlerContext)
+      return { oneofKind: "createSubthread", createSubthread: result }
+    }
+
+    case Method.SHOW_IN_CHAT_LIST: {
+      if (call.input.oneofKind !== "showInChatList") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await showInChatList(call.input.showInChatList, handlerContext)
+      return { oneofKind: "showInChatList", showInChatList: result }
+    }
+
+    case Method.UPDATE_DIALOG_OPEN: {
+      if (call.input.oneofKind !== "updateDialogOpen") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await updateDialogOpen(call.input.updateDialogOpen, handlerContext)
+      return { oneofKind: "updateDialogOpen", updateDialogOpen: result }
+    }
+
+    case Method.UPDATE_DIALOG_ORDER: {
+      if (call.input.oneofKind !== "updateDialogOrder") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await updateDialogOrder(call.input.updateDialogOrder, handlerContext)
+      return { oneofKind: "updateDialogOrder", updateDialogOrder: result }
+    }
+
+    case Method.CREATE_DIALOG_FOLDER: {
+      if (call.input.oneofKind !== "createDialogFolder") throw RealtimeRpcError.BadRequest()
+      const result = await createDialogFolderHandler(call.input.createDialogFolder, handlerContext)
+      return { oneofKind: "createDialogFolder", createDialogFolder: result }
+    }
+
+    case Method.UPDATE_DIALOG_FOLDER: {
+      if (call.input.oneofKind !== "updateDialogFolder") throw RealtimeRpcError.BadRequest()
+      const result = await updateDialogFolderHandler(call.input.updateDialogFolder, handlerContext)
+      return { oneofKind: "updateDialogFolder", updateDialogFolder: result }
+    }
+
+    case Method.DELETE_DIALOG_FOLDER: {
+      if (call.input.oneofKind !== "deleteDialogFolder") throw RealtimeRpcError.BadRequest()
+      const result = await deleteDialogFolderHandler(call.input.deleteDialogFolder, handlerContext)
+      return { oneofKind: "deleteDialogFolder", deleteDialogFolder: result }
+    }
+
+    case Method.RESERVE_CHAT_IDS: {
+      if (call.input.oneofKind !== "reserveChatIds") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await reserveChatIds(call.input.reserveChatIds, handlerContext)
+      return { oneofKind: "reserveChatIds", reserveChatIds: result }
+    }
+
+    case Method.INVOKE_MESSAGE_ACTION: {
+      if (call.input.oneofKind !== "invokeMessageAction") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await invokeMessageAction(call.input.invokeMessageAction, handlerContext)
+      return { oneofKind: "invokeMessageAction", invokeMessageAction: result }
+    }
+
+    case Method.ANSWER_MESSAGE_ACTION: {
+      if (call.input.oneofKind !== "answerMessageAction") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await answerMessageAction(call.input.answerMessageAction, handlerContext)
+      return { oneofKind: "answerMessageAction", answerMessageAction: result }
+    }
+
+    case Method.REVOKE_SESSION: {
+      if (call.input.oneofKind !== "revokeSession") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await revokeSessionHandler(call.input.revokeSession, handlerContext)
+      return { oneofKind: "revokeSession", revokeSession: result }
+    }
+
+    case Method.GET_SESSIONS: {
+      if (call.input.oneofKind !== "getSessions") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getSessionsHandler(call.input.getSessions, handlerContext)
+      return { oneofKind: "getSessions", getSessions: result }
+    }
+    case Method.CREATE_CLI_SESSION: {
+      if (call.input.oneofKind !== "createCliSession") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await createCliSessionHandler(call.input.createCliSession, handlerContext)
+      return { oneofKind: "createCliSession", createCliSession: result }
+    }
+    case Method.CHECK_USERNAME: {
+      if (call.input.oneofKind !== "checkUsername") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await checkUsernameHandler(call.input.checkUsername, handlerContext)
+      return { oneofKind: "checkUsername", checkUsername: result }
+    }
+    case Method.CHANGE_USERNAME: {
+      if (call.input.oneofKind !== "changeUsername") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await changeUsernameHandler(call.input.changeUsername, handlerContext)
+      return { oneofKind: "changeUsername", changeUsername: result }
+    }
+    case Method.UPDATE_PROFILE: {
+      if (call.input.oneofKind !== "updateProfile") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await updateProfileHandler(call.input.updateProfile, handlerContext)
+      return { oneofKind: "updateProfile", updateProfile: result }
+    }
+    case Method.SET_SPACE_PHOTO: {
+      if (call.input.oneofKind !== "setSpacePhoto") throw RealtimeRpcError.BadRequest()
+      return { oneofKind: "setSpacePhoto", setSpacePhoto: await setSpacePhotoHandler(call.input.setSpacePhoto, handlerContext) }
+    }
+    case Method.SET_PROFILE_PHOTO: {
+      if (call.input.oneofKind !== "setProfilePhoto") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await setProfilePhotoHandler(call.input.setProfilePhoto, handlerContext)
+      return { oneofKind: "setProfilePhoto", setProfilePhoto: result }
+    }
+    case Method.GET_EXTERNAL_PROFILE_PHOTO: {
+      if (call.input.oneofKind !== "getExternalProfilePhoto") {
+        throw RealtimeRpcError.BadRequest()
+      }
+      const result = await getExternalProfilePhotoHandler(call.input.getExternalProfilePhoto, handlerContext)
+      return { oneofKind: "getExternalProfilePhoto", getExternalProfilePhoto: result }
+    }
+    case Method.CREATE_SPACE: {
+      if (call.input.oneofKind !== "createSpace") throw RealtimeRpcError.BadRequest()
+      return { oneofKind: "createSpace", createSpace: await createSpaceV3(call.input.createSpace, handlerContext) }
+    }
+    case Method.DELETE_SPACE: {
+      if (call.input.oneofKind !== "deleteSpace") throw RealtimeRpcError.BadRequest()
+      return { oneofKind: "deleteSpace", deleteSpace: await deleteSpaceV3(call.input.deleteSpace, handlerContext) }
+    }
+    case Method.LEAVE_SPACE: {
+      if (call.input.oneofKind !== "leaveSpace") throw RealtimeRpcError.BadRequest()
+      return { oneofKind: "leaveSpace", leaveSpace: await leaveSpaceV3(call.input.leaveSpace, handlerContext) }
+    }
+    case Method.GET_CONNECTOR_CONFIG: {
+      if (call.input.oneofKind !== "getConnectorConfig") throw RealtimeRpcError.BadRequest()
+      return {
+        oneofKind: "getConnectorConfig",
+        getConnectorConfig: await getConnectorConfigV3(call.input.getConnectorConfig, handlerContext),
+      }
+    }
+    case Method.SET_CONNECTOR_CONFIG: {
+      if (call.input.oneofKind !== "setConnectorConfig") throw RealtimeRpcError.BadRequest()
+      return {
+        oneofKind: "setConnectorConfig",
+        setConnectorConfig: await setConnectorConfigV3(call.input.setConnectorConfig, handlerContext),
+      }
+    }
+    case Method.CREATE_EXTERNAL_TASK: {
+      if (call.input.oneofKind !== "createExternalTask") throw RealtimeRpcError.BadRequest()
+      return {
+        oneofKind: "createExternalTask",
+        createExternalTask: await createExternalTaskV3(call.input.createExternalTask, handlerContext),
+      }
+    }
+    case Method.UNREGISTER_DEVICE: {
+      if (call.input.oneofKind !== "unregisterDevice") throw RealtimeRpcError.BadRequest()
+      return { oneofKind: "unregisterDevice", unregisterDevice: await unregisterDeviceV3(handlerContext) }
+    }
+    case Method.LOG_OUT: {
+      if (call.input.oneofKind !== "logOut") throw RealtimeRpcError.BadRequest()
+      return { oneofKind: "logOut", logOut: await logOutV3(handlerContext) }
+    }
+    case Method.GET_FILE_PART: {
+      if (call.input.oneofKind !== "getFilePart") throw RealtimeRpcError.BadRequest()
+      const result = await nativeDownloadOperations.getPart(call.input.getFilePart, handlerContext)
+      return { oneofKind: "getFilePart", getFilePart: result }
+    }
+    case Method.CREATE_UPLOAD: {
+      if (call.input.oneofKind !== "createUpload") throw RealtimeRpcError.BadRequest()
+      const result = await nativeUploadOperations.create(call.input.createUpload, handlerContext)
+      return { oneofKind: "createUpload", createUpload: result }
+    }
+    case Method.SAVE_UPLOAD_PART: {
+      if (call.input.oneofKind !== "saveUploadPart") throw RealtimeRpcError.BadRequest()
+      const result = await nativeUploadOperations.savePart(call.input.saveUploadPart, handlerContext)
+      return { oneofKind: "saveUploadPart", saveUploadPart: result }
+    }
+    case Method.GET_UPLOAD_STATE: {
+      if (call.input.oneofKind !== "getUploadState") throw RealtimeRpcError.BadRequest()
+      const result = await nativeUploadOperations.state(call.input.getUploadState, handlerContext)
+      return { oneofKind: "getUploadState", getUploadState: result }
+    }
+    case Method.FINISH_UPLOAD: {
+      if (call.input.oneofKind !== "finishUpload") throw RealtimeRpcError.BadRequest()
+      const result = await nativeUploadOperations.finish(call.input.finishUpload, handlerContext)
+      return { oneofKind: "finishUpload", finishUpload: result }
+    }
+    case Method.CANCEL_UPLOAD: {
+      if (call.input.oneofKind !== "cancelUpload") throw RealtimeRpcError.BadRequest()
+      const result = await nativeUploadOperations.cancel(call.input.cancelUpload, handlerContext)
+      return { oneofKind: "cancelUpload", cancelUpload: result }
+    }
+    case Method.UPDATE_SESSION: {
+      if (call.input.oneofKind !== "updateSession") throw RealtimeRpcError.BadRequest()
+      return { oneofKind: "updateSession", updateSession: await updateSessionV3(call.input.updateSession, handlerContext) }
+    }
+    case Method.UPDATE_DIALOG_ARCHIVED: {
+      if (call.input.oneofKind !== "updateDialogArchived") throw RealtimeRpcError.BadRequest()
+      return {
+        oneofKind: "updateDialogArchived",
+        updateDialogArchived: await updateDialogArchivedV3(call.input.updateDialogArchived, handlerContext),
+      }
+    }
+    default:
+      throw RealtimeRpcError.UnsupportedRpcMethod(call.method)
+  }
+}
+
+export const handlers = {
+  translateMessages: handleTranslateMessages,
+  getChats: handleGetChats,
+}

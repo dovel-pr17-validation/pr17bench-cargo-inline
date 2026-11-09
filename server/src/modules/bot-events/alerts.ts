@@ -1,0 +1,296 @@
+import { db } from "@in/server/db"
+import { users } from "@in/server/db/schema"
+import { eq } from "drizzle-orm"
+import { sendInlineOnlyBotEvent } from "@in/server/modules/bot-events"
+import { Log } from "@in/server/utils/log"
+import { SessionsModel } from "@in/server/db/models/sessions"
+import { formatSignupAttribution } from "@in/server/modules/auth/signupAttribution"
+
+const log = new Log("bot-events.alerts")
+
+const ADMIN_BASE_URL = "https://admin.inline.chat"
+
+type AlertUser = {
+  id: number
+  firstName: string | null
+  lastName: string | null
+  username: string | null
+  email: string | null
+  phoneNumber: string | null
+  pendingSetup: boolean | null
+}
+
+type AlertDevice = {
+  deviceName?: string | null
+  deviceId?: string | null
+  clientType?: string | null
+  clientVersion?: string | null
+  osVersion?: string | null
+}
+
+type AlertAuthContact = {
+  type: "email" | "phone"
+  value: string
+}
+
+async function getAlertUser(userId: number): Promise<AlertUser | null> {
+  try {
+    const user = await db
+      .select({
+        id: users.id,
+        firstName: users.firstName,
+        lastName: users.lastName,
+        username: users.username,
+        email: users.email,
+        phoneNumber: users.phoneNumber,
+        pendingSetup: users.pendingSetup,
+      })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+      .then(([u]) => u)
+
+    return user ?? null
+  } catch (error) {
+    log.error(error, "Failed to load user for alert", { userId })
+    return null
+  }
+}
+
+function userName(user: AlertUser): string | null {
+  const firstName = user.firstName ? compact(user.firstName) : null
+  const lastName = user.lastName ? compact(user.lastName) : null
+
+  return firstName && lastName ? `${firstName} ${lastName}` : firstName ?? lastName
+}
+
+function userLabel(user: AlertUser): string {
+  const name = userName(user)
+  const username = user.username ? compact(user.username) : null
+
+  if (name && username) return `${name} (@${username})`
+  if (username) return `@${username}`
+  if (name) return name
+  return `User ${user.id}`
+}
+
+function deviceDetails(device?: AlertDevice): string {
+  if (!device) return "unknown device"
+
+  const parts: string[] = []
+  if (device.deviceName) parts.push(device.deviceName)
+
+  const client = [device.clientType, device.clientVersion].filter(Boolean).join(" ")
+  if (client) parts.push(client)
+  if (device.osVersion) parts.push(`os ${device.osVersion}`)
+  if (parts.length === 0 && device.deviceId) parts.push(`device ${device.deviceId}`)
+
+  return parts.length > 0 ? parts.join(", ") : "unknown device"
+}
+
+function escapeMarkdownLinkLabel(label: string): string {
+  // Keep this minimal; our link labels are typically username/email/name.
+  // Removing bracket/paren characters avoids breaking `[label](url)` syntax.
+  return label.replaceAll("[", "").replaceAll("]", "").replaceAll("(", "").replaceAll(")", "")
+}
+
+function adminUserUrl(userId: number): string {
+  return `${ADMIN_BASE_URL}/users/${userId}`
+}
+
+function adminUserLink(user: AlertUser): string {
+  const label = escapeMarkdownLinkLabel(userLabel(user))
+  return `[${label}](${adminUserUrl(user.id)})`
+}
+
+export function formatSignupCompletedAlert(user: AlertUser, source = formatSignupAttribution()): string {
+  const lines = [
+    `Signup completed: ${adminUserLink(user)}`,
+    `name: ${userName(user) ?? "not set"}`,
+    `username: ${user.username ? `@${compact(user.username)}` : "not set"}`,
+  ]
+
+  if (user.email) lines.push(`email: ${compact(user.email)}`)
+  if (user.phoneNumber) lines.push(`phone: ${compact(user.phoneNumber)}`)
+  lines.push(source)
+
+  return lines.join("\n")
+}
+
+type AuthContactConfirmedProps = {
+  contact: AlertAuthContact
+  user?: AlertUser | null
+  source?: string
+  ip?: string
+  device?: AlertDevice
+}
+
+export async function loadSignupCompletedAlert(user: AlertUser, sessionId?: number): Promise<string> {
+  let source = formatSignupAttribution()
+  try {
+    if (sessionId && sessionId > 0) {
+      const session = await SessionsModel.getById(sessionId)
+      if (session.userId === user.id) {
+        source = formatSignupAttribution({
+          clientType: session.clientType,
+          clientVersion: session.clientVersion,
+          ip: session.personalData.ip,
+          attribution: session.personalData.signupAttribution,
+        })
+      }
+    }
+  } catch {
+    log.warn("Failed to load signup attribution", { userId: user.id })
+  }
+  return formatSignupCompletedAlert(user, source)
+}
+
+export function formatAuthContactConfirmedAlert(props: AuthContactConfirmedProps): string {
+  const userText = props.user ? `${adminUserLink(props.user)} with ` : ""
+  const profileState = props.user ? (props.user.pendingSetup === true ? "pending" : "complete") : "not created"
+  const flow = props.user?.pendingSetup === true || !props.user ? "signup" : "login"
+  const lines = [
+    `${props.contact.type === "email" ? "Email" : "Phone"} confirmed: ${userText}${authContactDetails(props.contact)}`,
+    `flow: ${flow}`,
+    `account: ${props.user ? "existing" : "new"}`,
+    `profile: ${profileState}`,
+    `source: ${props.source ? compact(props.source) : "unknown"}`,
+    `ip: ${props.ip ? compact(props.ip) : "unknown"}`,
+    `client: ${clientDetails(props.device)}`,
+  ]
+
+  return lines.join("\n")
+}
+
+function authContactDetails(contact: AlertAuthContact): string {
+  // Intentionally unmasked for now so auth alerts can help debug stuck users and abuse.
+  // TODO: replace raw contact details with admin-only auth logs plus safe alert fingerprints.
+  switch (contact.type) {
+    case "email":
+      return `email ${compact(contact.value)}`
+    case "phone":
+      return `phone ${compact(contact.value)}`
+  }
+}
+
+function clientDetails(device?: AlertDevice): string {
+  if (!device) return "unknown"
+
+  const parts: string[] = []
+  if (device.clientType) parts.push(compact(device.clientType))
+  if (device.clientVersion) parts.push(compact(device.clientVersion))
+  if (device.osVersion) parts.push(`os ${compact(device.osVersion)}`)
+  if (device.deviceName) parts.push(`device ${compact(device.deviceName)}`)
+  if (device.deviceId) parts.push(`deviceId ${compact(device.deviceId)}`)
+
+  return parts.length > 0 ? parts.join(", ") : "unknown"
+}
+
+function compact(value: string, maxLength = 160): string {
+  const text = value.replace(/\s+/g, " ").trim()
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text
+}
+
+export const BotAlerts = {
+  authAttempt(props: {
+    kind: "login" | "signup"
+    contact: AlertAuthContact
+    existing: boolean
+    source?: string
+    ip?: string
+    device?: AlertDevice
+    userId?: number | null
+    needsInviteCode?: boolean
+  }) {
+    void (async () => {
+      const user = props.userId ? await getAlertUser(props.userId) : null
+      const userText = user ? `${adminUserLink(user)} with ` : ""
+      const contactText = authContactDetails(props.contact)
+      const account = props.existing ? "existing" : "new"
+      const lines = [
+        `${props.kind === "login" ? "Login" : "Signup"} attempted: ${userText}${contactText}`,
+        `account: ${account}`,
+        `source: ${props.source ? compact(props.source) : "unknown"}`,
+        `ip: ${props.ip ? compact(props.ip) : "unknown"}`,
+        `client: ${clientDetails(props.device)}`,
+        `invite: ${props.needsInviteCode ? "required" : "not required"}`,
+      ]
+
+      sendInlineOnlyBotEvent(lines.join("\n"))
+    })()
+  },
+
+  inviteCodeTaken(props: {
+    source?: string
+    ip?: string
+  }) {
+    const lines = [
+      "Taken invite code attempt",
+      `source: ${props.source ? compact(props.source) : "unknown"}`,
+      `ip: ${props.ip ? compact(props.ip) : "unknown"}`,
+    ]
+
+    sendInlineOnlyBotEvent(lines.join("\n"))
+  },
+
+  signupCompleted(props: { user: AlertUser; sessionId?: number }) {
+    // Enrichment is best-effort and must not delay or fail profile completion.
+    void loadSignupCompletedAlert(props.user, props.sessionId).then(sendInlineOnlyBotEvent)
+  },
+
+  authContactConfirmed(props: AuthContactConfirmedProps) {
+    sendInlineOnlyBotEvent(formatAuthContactConfirmedAlert(props))
+  },
+
+  spaceInvite(props: { inviterUserId: number; invitedUserId: number; spaceId: number; spaceName: string | null }) {
+    return (async () => {
+      const [inviter, invited] = await Promise.all([getAlertUser(props.inviterUserId), getAlertUser(props.invitedUserId)])
+
+      const inviterText = inviter ? adminUserLink(inviter) : "Someone"
+      const invitedText = invited ? adminUserLink(invited) : "someone"
+      const spaceName = props.spaceName ?? "Unnamed"
+
+      sendInlineOnlyBotEvent(`Space invite: ${inviterText} invited ${invitedText} to "${spaceName}".`)
+    })()
+  },
+
+  spaceCreated(props: { creatorUserId: number; spaceId: number; spaceName: string | null; handle: string | null }) {
+    void (async () => {
+      const creator = await getAlertUser(props.creatorUserId)
+      const creatorText = creator ? adminUserLink(creator) : "Someone"
+      const spaceName = props.spaceName ?? "Unnamed"
+      const handleSuffix = props.handle ? ` (@${props.handle})` : ""
+
+      sendInlineOnlyBotEvent(`Space created: ${creatorText} created "${spaceName}"${handleSuffix}.`)
+    })()
+  },
+
+  botCreated(props: { creatorUserId: number; botUserId: number }) {
+    void (async () => {
+      const [creator, bot] = await Promise.all([getAlertUser(props.creatorUserId), getAlertUser(props.botUserId)])
+      const creatorText = creator ? adminUserLink(creator) : "Someone"
+      const botText = bot ? adminUserLink(bot) : "a bot"
+      sendInlineOnlyBotEvent(`Bot created: ${creatorText} created ${botText}.`)
+    })()
+  },
+
+  login(props: { userId: number; device?: AlertDevice }) {
+    void (async () => {
+      const user = await getAlertUser(props.userId)
+      const userText = user ? adminUserLink(user) : "Someone"
+      const emailText = user?.email ?? "no email"
+      const deviceText = deviceDetails(props.device)
+      sendInlineOnlyBotEvent(`Login: ${userText} (${emailText}) on ${deviceText}.`)
+    })()
+  },
+
+  logout(props: { userId: number; device?: AlertDevice }) {
+    void (async () => {
+      const user = await getAlertUser(props.userId)
+      const userText = user ? adminUserLink(user) : "Someone"
+      const emailText = user?.email ?? "no email"
+      const deviceText = deviceDetails(props.device)
+      sendInlineOnlyBotEvent(`Logout: ${userText} (${emailText}) on ${deviceText}.`)
+    })()
+  },
+}

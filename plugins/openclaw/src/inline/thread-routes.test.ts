@@ -1,0 +1,280 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  clearInlineReplyThreadRouteCacheForTest,
+  lookupInlineReplyThreadRoute,
+  lookupInlineReplyThreadRouteByThreadId,
+  rememberInlineReplyThreadRoute,
+} from "./thread-routes.js"
+import { clearInlineRuntime, setInlineRuntime } from "../runtime.js"
+
+describe("inline/thread-routes", () => {
+  const tempDirs: string[] = []
+
+  beforeEach(() => {
+    clearInlineReplyThreadRouteCacheForTest()
+    clearInlineRuntime()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    clearInlineReplyThreadRouteCacheForTest()
+    clearInlineRuntime()
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  function setStateDir(): string {
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "openclaw-inline-routes-"))
+    tempDirs.push(stateDir)
+    setInlineRuntime({
+      state: {
+        resolveStateDir: () => stateDir,
+      },
+      logging: {
+        getChildLogger: () => ({ warn: vi.fn() }),
+      },
+    } as any)
+    return stateDir
+  }
+
+  function routesFilePath(stateDir: string): string {
+    return path.join(stateDir, "inline", "reply-thread-routes", "default.json")
+  }
+
+  function writeRawRoutesFile(stateDir: string, contents: string): void {
+    mkdirSync(path.dirname(routesFilePath(stateDir)), { recursive: true })
+    writeFileSync(routesFilePath(stateDir), contents)
+  }
+
+  function writeRoutesFile(stateDir: string, updatedAt: number): void {
+    writeRawRoutesFile(
+      stateDir,
+      JSON.stringify({
+        version: 1,
+        routes: {
+          "default:parent:7000:agent:__any__": {
+            accountId: "default",
+            parentChatId: "7000",
+            threadId: "7100",
+            createdAt: updatedAt,
+            updatedAt,
+          },
+        },
+      }),
+    )
+  }
+
+  it("records and looks up active routes in memory", async () => {
+    rememberInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      threadId: 7100n,
+      parentMessageId: 700001n,
+      agentId: "main",
+      inlineAgentId: "researcher",
+    })
+
+    await expect(
+      lookupInlineReplyThreadRoute({
+        accountId: "default",
+        parentChatId: 7000n,
+        parentMessageId: 700001n,
+        agentId: "main",
+      }),
+    ).resolves.toMatchObject({
+      accountId: "default",
+      parentChatId: "7000",
+      threadId: "7100",
+      parentMessageId: "700001",
+      agentId: "main",
+      inlineAgentId: "researcher",
+    })
+  })
+
+  it("looks up remembered routes by child thread id", async () => {
+    rememberInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      threadId: 7100n,
+      parentMessageId: 700001n,
+      agentId: "main",
+    })
+
+    await expect(
+      lookupInlineReplyThreadRouteByThreadId({
+        accountId: "default",
+        threadId: 7100n,
+      }),
+    ).resolves.toMatchObject({
+      accountId: "default",
+      parentChatId: "7000",
+      threadId: "7100",
+      parentMessageId: "700001",
+      agentId: "main",
+    })
+  })
+
+  it("does not extend a route lifetime when the memory cache is read", async () => {
+    const start = 1_700_000_000_000
+    const ttlMs = 7 * 24 * 60 * 60 * 1000
+    const now = vi.spyOn(Date, "now")
+    now.mockReturnValue(start)
+
+    rememberInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      threadId: 7100n,
+      parentMessageId: 700001n,
+      agentId: "main",
+    })
+
+    now.mockReturnValue(start + ttlMs - 1)
+    await expect(
+      lookupInlineReplyThreadRouteByThreadId({
+        accountId: "default",
+        threadId: 7100n,
+      }),
+    ).resolves.toMatchObject({
+      accountId: "default",
+      parentChatId: "7000",
+      threadId: "7100",
+    })
+
+    now.mockReturnValue(start + ttlMs + 1)
+    await expect(
+      lookupInlineReplyThreadRouteByThreadId({
+        accountId: "default",
+        threadId: 7100n,
+      }),
+    ).resolves.toBeNull()
+  })
+
+  it("does not use an active route for a different parent message", async () => {
+    rememberInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      threadId: 7100n,
+      parentMessageId: 700001n,
+      agentId: "main",
+    })
+
+    await expect(
+      lookupInlineReplyThreadRoute({
+        accountId: "default",
+        parentChatId: 7000n,
+        parentMessageId: 700002n,
+        agentId: "main",
+      }),
+    ).resolves.toBeNull()
+  })
+
+  it("does not use another agent's active route when the requested agent has none", async () => {
+    rememberInlineReplyThreadRoute({
+      accountId: "default", parentChatId: 7000n, threadId: 7100n, agentId: "other",
+    })
+    await expect(lookupInlineReplyThreadRoute({
+      accountId: "default", parentChatId: 7000n, agentId: "main",
+    })).resolves.toBeNull()
+  })
+
+  it("isolates anchored routes for different OpenClaw agents", async () => {
+    rememberInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      parentMessageId: 700001n,
+      threadId: 7100n,
+      agentId: "main",
+    })
+    rememberInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      parentMessageId: 700001n,
+      threadId: 7200n,
+      agentId: "other",
+    })
+
+    await expect(lookupInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      parentMessageId: 700001n,
+      agentId: "main",
+    })).resolves.toMatchObject({ threadId: "7100", agentId: "main" })
+    await expect(lookupInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      parentMessageId: 700001n,
+      agentId: "other",
+    })).resolves.toMatchObject({ threadId: "7200", agentId: "other" })
+    await expect(lookupInlineReplyThreadRoute({
+      accountId: "default",
+      parentChatId: 7000n,
+      parentMessageId: 700001n,
+      agentId: "missing",
+    })).resolves.toBeNull()
+  })
+
+  it("reads active route files when keyed store is unavailable", async () => {
+    const stateDir = setStateDir()
+    writeRoutesFile(stateDir, Date.now())
+
+    await expect(
+      lookupInlineReplyThreadRoute({
+        accountId: "default",
+        parentChatId: 7000n,
+      }),
+    ).resolves.toMatchObject({
+      accountId: "default",
+      parentChatId: "7000",
+      threadId: "7100",
+    })
+  })
+
+  it("treats missing, invalid, and foreign route files as empty", async () => {
+    const stateDir = setStateDir()
+    const lookup = () => lookupInlineReplyThreadRoute({ accountId: "default", parentChatId: 7000n })
+
+    await expect(lookup()).resolves.toBeNull()
+    for (const contents of [
+      "{not json",
+      JSON.stringify([]),
+      JSON.stringify({ version: 2, routes: {} }),
+      JSON.stringify({ version: 1, routes: [] }),
+    ]) {
+      writeRawRoutesFile(stateDir, contents)
+      await expect(lookup()).resolves.toBeNull()
+    }
+  })
+
+  it("keeps existing route file entries when remembering a new route", async () => {
+    const stateDir = setStateDir()
+    writeRoutesFile(stateDir, Date.now())
+
+    rememberInlineReplyThreadRoute({ accountId: "default", parentChatId: 8000n, threadId: 8100n })
+
+    await vi.waitFor(() => {
+      const stored = JSON.parse(readFileSync(routesFilePath(stateDir), "utf8")) as {
+        version: number
+        routes: Record<string, { threadId: string }>
+      }
+      expect(stored.version).toBe(1)
+      expect(stored.routes["default:parent:7000:agent:__any__"]?.threadId).toBe("7100")
+      expect(stored.routes["default:parent:8000:agent:__any__"]?.threadId).toBe("8100")
+    })
+  })
+
+  it("ignores expired route files", async () => {
+    const stateDir = setStateDir()
+    writeRoutesFile(stateDir, Date.now() - 8 * 24 * 60 * 60 * 1000)
+
+    await expect(
+      lookupInlineReplyThreadRoute({
+        accountId: "default",
+        parentChatId: 7000n,
+      }),
+    ).resolves.toBeNull()
+  })
+})

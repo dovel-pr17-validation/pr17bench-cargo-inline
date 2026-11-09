@@ -1,0 +1,318 @@
+import Auth
+import InlineGrid
+import InlineKit
+import InlineUI
+import Logger
+import SwiftUI
+
+struct SpaceSettingsView: View {
+  let spaceId: Int64
+  let usesRouterNavigation: Bool
+  @EnvironmentObject private var navigation: Navigation
+  @EnvironmentObject private var data: DataManager
+  @EnvironmentStateObject private var viewModel: FullSpaceViewModel
+  @StateObject private var urlPreviewExclusions: SpaceUrlPreviewExclusionsViewModel
+  @StateObject private var userGroups: UserGroupsViewModel
+
+  init(spaceId: Int64, usesRouterNavigation: Bool = false) {
+    self.spaceId = spaceId
+    self.usesRouterNavigation = usesRouterNavigation
+    _viewModel = EnvironmentStateObject { env in
+      FullSpaceViewModel(db: env.appDatabase, spaceId: spaceId)
+    }
+    _urlPreviewExclusions = StateObject(wrappedValue: SpaceUrlPreviewExclusionsViewModel(spaceId: spaceId))
+    _userGroups = StateObject(wrappedValue: UserGroupsViewModel(db: AppDatabase.shared, spaceId: spaceId))
+  }
+
+  private var currentUserMember: FullMemberItem? {
+    viewModel.members.first { $0.userInfo.user.id == Auth.shared.getCurrentUserId() }
+  }
+
+  private var isCreator: Bool {
+    currentUserMember?.member.role == .owner
+  }
+
+  private var isAdminOrOwner: Bool {
+    let role = currentUserMember?.member.role
+    return role == .owner || role == .admin
+  }
+
+  var body: some View {
+    List {
+      Section {
+        HStack {
+          if let space = viewModel.space {
+            Group {
+              if isAdminOrOwner {
+                IOSSpacePhotoPicker(space: space, size: 64, savesImmediately: true)
+              } else {
+                SpaceAvatar(space: space, size: 64)
+              }
+            }
+            .padding(.trailing, 6)
+
+          } else {
+            Circle()
+              .fill(Color(.systemGray6))
+              .frame(width: 42, height: 42)
+              .padding(.trailing, 6)
+          }
+          VStack(alignment: .leading, spacing: 0) {
+            Text(viewModel.space?.nameWithoutEmoji ?? "Space")
+              .font(.body)
+              .fontWeight(.medium)
+                
+
+            Text("\(viewModel.members.count) \(viewModel.members.count == 1 ? "member" : "members")")
+              .font(.callout)
+                
+          }
+        }
+      }
+
+      Section {
+        if usesRouterNavigation {
+          NavigationLink(value: Destination.spaceIntegrations(spaceId: spaceId)) {
+            SpaceConnectorsLinkLabel()
+          }
+        } else {
+          NavigationLink(destination: SpaceIntegrationsView(spaceId: spaceId)) {
+            SpaceConnectorsLinkLabel()
+          }
+        }
+      }
+
+      if isAdminOrOwner {
+        SpaceGridSettingsSection(spaceId: spaceId)
+
+        UserGroupsSettingsSection(
+          viewModel: userGroups,
+          canManage: true
+        )
+
+        Section("URL Previews") {
+          SpaceUrlPreviewExclusionsSettingsView(viewModel: urlPreviewExclusions)
+        }
+      }
+
+      Section {
+        Button(role: .destructive) {
+          showSpaceActionAlert()
+        } label: {
+          if isCreator {
+            Label("Delete Space", systemImage: "trash.fill")
+              .foregroundColor(.red)
+          } else {
+            Label("Leave Space", systemImage: "rectangle.portrait.and.arrow.right.fill")
+              .foregroundColor(.red)
+          }
+        }
+      }
+    }
+    .listStyle(.insetGrouped)
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbarRole(.editor)
+    .hideTabBarIfNeeded()
+    .task {
+      if isAdminOrOwner {
+        await userGroups.loadIfNeeded()
+        await urlPreviewExclusions.loadIfNeeded()
+      }
+    }
+    .toolbar {
+      ToolbarItem(id: "settings", placement: .principal) {
+        HStack {
+          Image(systemName: "gearshape.fill")
+            .foregroundColor(.secondary)
+            .font(.callout)
+            .padding(.trailing, 4)
+          VStack(alignment: .leading) {
+            Text("\(viewModel.space?.nameWithoutEmoji ?? "Space") Settings")
+              .font(.body)
+              .fontWeight(.semibold)
+              .foregroundColor(.primary)
+          }
+        }
+      }
+    }
+  }
+
+  private func showSpaceActionAlert() {
+    let title = isCreator ? "Delete Space" : "Leave Space"
+    let message = isCreator
+      ? "Are you sure you want to delete this space? This action cannot be undone."
+      : "Are you sure you want to leave this space?"
+
+    let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+    alert.addAction(UIAlertAction(title: title, style: .destructive) { _ in
+      Task {
+        do {
+          if isCreator {
+            try await data.deleteSpace(spaceId: spaceId)
+          } else {
+            try await data.leaveSpace(spaceId: spaceId)
+          }
+          navigation.pop()
+
+          TabsManager.shared.setSelectedTab(.chats)
+        } catch {
+          Log.shared.error("Failed to \(isCreator ? "delete" : "leave") space", error: error)
+        }
+      }
+    })
+
+    if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+       let rootVC = windowScene.windows.first?.rootViewController
+    {
+      rootVC.topmostPresentedViewController.present(alert, animated: true)
+    }
+  }
+}
+
+private struct SpaceGridSettingsSection: View {
+  let spaceId: Int64
+  private let store = GridIOSRuntime.shared.rooms
+  @State private var isUpdating = false
+  @State private var failed = false
+
+  var body: some View {
+    Section {
+      Toggle(isOn: Binding(
+        get: { store.isEnabled(spaceID: spaceId) },
+        set: { enabled in
+          isUpdating = true
+          Task {
+            do {
+              try await store.setEnabled(enabled, spaceID: spaceId)
+            } catch {
+              failed = true
+            }
+            isUpdating = false
+          }
+        }
+      )) {
+        Label("Grid", systemImage: "waveform")
+      }
+      .disabled(isUpdating)
+    } footer: {
+      Text("Let members join voice rooms in this space.")
+    }
+    .task { await store.load(spaceID: spaceId) }
+    .alert("Couldn't update Grid", isPresented: $failed) {
+      Button("OK", role: .cancel) {}
+    }
+  }
+}
+
+private struct SpaceConnectorsLinkLabel: View {
+  var body: some View {
+    HStack {
+      Image(systemName: "app.connected.to.app.below.fill")
+        .foregroundColor(.white)
+        .frame(width: 25, height: 25)
+        .background(Color.purple)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+      Text("Connectors")
+        .padding(.leading, 4)
+      Spacer()
+    }
+    .padding(.vertical, 2)
+  }
+}
+
+private struct SpaceUrlPreviewExclusionsSettingsView: View {
+  @ObservedObject var viewModel: SpaceUrlPreviewExclusionsViewModel
+  @State private var draft = ""
+
+  private var canAdd: Bool {
+    draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false && viewModel.isMutating == false
+  }
+
+  var body: some View {
+    HStack(spacing: 8) {
+      TextField("example.com or example.com/path", text: $draft)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+        .keyboardType(.URL)
+        .onSubmit(add)
+
+      Button(action: add) {
+        Image(systemName: "plus.circle.fill")
+      }
+      .disabled(!canAdd)
+    }
+    .task {
+      await viewModel.loadIfNeeded()
+    }
+
+    if viewModel.isLoading {
+      HStack {
+        ProgressView()
+        Text("Loading exclusions...")
+          .foregroundStyle(.secondary)
+      }
+    } else if viewModel.exclusions.isEmpty {
+      Text("No exclusions")
+        .foregroundStyle(.secondary)
+    } else {
+      ForEach(viewModel.exclusions) { exclusion in
+        SpaceUrlPreviewExclusionRow(
+          exclusion: exclusion,
+          isMutating: viewModel.isMutating,
+          onRemove: {
+            Task {
+              await viewModel.remove(id: exclusion.id)
+            }
+          }
+        )
+      }
+    }
+
+    if let error = viewModel.errorMessage {
+      Text(error)
+        .font(.footnote)
+        .foregroundStyle(.red)
+    }
+  }
+
+  private func add() {
+    guard canAdd else { return }
+    let value = draft
+    Task {
+      await viewModel.add(value: value)
+      if viewModel.errorMessage == nil {
+        draft = ""
+      }
+    }
+  }
+}
+
+private struct SpaceUrlPreviewExclusionRow: View {
+  let exclusion: SpaceUrlPreviewExclusionItem
+  let isMutating: Bool
+  let onRemove: () -> Void
+
+  var body: some View {
+    HStack(spacing: 10) {
+      Image(systemName: exclusion.pathPrefix == nil ? "network" : "link")
+        .foregroundColor(.secondary)
+        .frame(width: 24, height: 24)
+
+      Text(exclusion.displayValue)
+        .lineLimit(1)
+        .truncationMode(.middle)
+
+      Spacer()
+
+      Button(role: .destructive, action: onRemove) {
+        Image(systemName: "trash")
+      }
+      .disabled(isMutating)
+    }
+  }
+}
+
+#Preview {
+  SpaceSettingsView(spaceId: 1)
+}

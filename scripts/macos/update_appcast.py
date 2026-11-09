@@ -1,0 +1,151 @@
+"""
+Generate or update a Sparkle appcast for Inline macOS builds.
+
+Inputs:
+  - sign_update.txt: output from Sparkle `sign_update`
+  - appcast.xml: existing appcast (optional)
+
+Environment:
+  - INLINE_BUILD
+  - INLINE_VERSION
+  - INLINE_CHANNEL
+  - INLINE_DMG_URL
+  - INLINE_MIN_MACOS
+  - INLINE_HARDWARE_REQUIREMENTS (optional, default: arm64)
+  - INLINE_COMMIT (optional)
+  - INLINE_COMMIT_LONG (optional)
+  - INLINE_EXPERIMENTAL_TIP (optional, 1 for a non-commit snapshot release)
+  - ALLOW_NEW_APPCAST (must be 1 after an explicit remote 404)
+
+Output:
+  - appcast_new.xml
+"""
+
+import os
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+
+build = os.environ["INLINE_BUILD"]
+version = os.environ.get("INLINE_VERSION", build)
+channel = os.environ.get("INLINE_CHANNEL", "stable")
+if channel not in {"stable", "beta", "tip"}:
+    raise SystemExit(f"Invalid INLINE_CHANNEL: {channel}")
+dmg_url = os.environ["INLINE_DMG_URL"]
+min_macos = os.environ.get("INLINE_MIN_MACOS", "").strip()
+if not min_macos:
+    raise SystemExit("Missing required env var: INLINE_MIN_MACOS")
+hardware_requirements = os.environ.get("INLINE_HARDWARE_REQUIREMENTS", "arm64").strip()
+commit = os.environ.get("INLINE_COMMIT", "")
+commit_long = os.environ.get("INLINE_COMMIT_LONG", "")
+experimental_tip = os.environ.get("INLINE_EXPERIMENTAL_TIP", "0") == "1"
+allow_new_appcast = os.environ.get("ALLOW_NEW_APPCAST", "0") == "1"
+
+appcast_path = Path(os.environ.get("APPCAST_PATH", "appcast.xml"))
+output_path = Path(os.environ.get("APPCAST_OUTPUT", "appcast_new.xml"))
+sign_update_path = Path(os.environ.get("SIGN_UPDATE_PATH", "sign_update.txt"))
+
+now = datetime.now(timezone.utc)
+
+# Read sign_update output
+attrs = {}
+with open(sign_update_path, "r", encoding="utf-8") as f:
+    for pair in f.read().split(" "):
+        if not pair or "=" not in pair:
+            continue
+        key, value = pair.split("=", 1)
+        value = value.strip()
+        if value and value[0] == '"':
+            value = value[1:-1]
+        attrs[key] = value
+
+SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+namespaces = {"sparkle": SPARKLE_NS}
+ET.register_namespace("sparkle", SPARKLE_NS)
+
+def sparkle_tag(name: str) -> str:
+    return f"{{{SPARKLE_NS}}}{name}"
+
+def find_sparkle_child(item: ET.Element, name: str) -> ET.Element | None:
+    child = item.find(sparkle_tag(name))
+    if child is None:
+        child = item.find(f"sparkle:{name}", namespaces)
+    if child is None:
+        child = item.find(f"sparkle:{name}")
+    return child
+
+if appcast_path.exists():
+    try:
+        et = ET.parse(appcast_path)
+        root = et.getroot()
+    except ET.ParseError as error:
+        raise SystemExit(f"Refusing to replace malformed existing appcast ({appcast_path}): {error}")
+    channels = root.findall("channel")
+    if root.tag != "rss" or len(channels) != 1:
+        raise SystemExit(
+            f"Refusing to replace invalid existing appcast structure ({appcast_path}): "
+            "expected one <rss><channel> feed"
+        )
+else:
+    if not allow_new_appcast:
+        raise SystemExit("Existing appcast is missing; refusing to create a new feed without ALLOW_NEW_APPCAST=1")
+    root = ET.Element("rss", {"version": "2.0"})
+    et = ET.ElementTree(root)
+
+channel_el = root.find("channel")
+if channel_el is None:
+    # This is reachable only for an explicitly authorized first publication.
+    channel_el = ET.SubElement(root, "channel")
+    title = ET.SubElement(channel_el, "title")
+    title.text = f"Inline macOS ({channel})"
+    link = ET.SubElement(channel_el, "link")
+    link.text = "https://inline.chat"
+    description = ET.SubElement(channel_el, "description")
+    description.text = "Inline macOS updates"
+
+# Remove any existing item with the same build number
+for item in list(channel_el.findall("item")):
+    version_el = find_sparkle_child(item, "version")
+    if version_el is not None and (version_el.text or "").strip() == build:
+        channel_el.remove(item)
+
+item = ET.SubElement(channel_el, "item")
+
+item_title = ET.SubElement(item, "title")
+item_title.text = f"Inline {version}"
+
+pub_date = ET.SubElement(item, "pubDate")
+pub_date.text = now.strftime("%a, %d %b %Y %H:%M:%S %z")
+
+sparkle_version = ET.SubElement(item, sparkle_tag("version"))
+sparkle_version.text = build
+
+sparkle_short = ET.SubElement(item, sparkle_tag("shortVersionString"))
+sparkle_short.text = version
+
+sparkle_min = ET.SubElement(item, sparkle_tag("minimumSystemVersion"))
+sparkle_min.text = min_macos
+
+if hardware_requirements:
+    sparkle_hardware = ET.SubElement(item, sparkle_tag("hardwareRequirements"))
+    sparkle_hardware.text = hardware_requirements
+
+if experimental_tip:
+    description = ET.SubElement(item, "description")
+    description.text = f"<p>Experimental tip build {build}.</p>"
+elif commit:
+    description = ET.SubElement(item, "description")
+    description.text = f"<p>Build {build} from commit {commit}.</p>"
+
+enclosure = ET.SubElement(item, "enclosure")
+enclosure.set("url", dmg_url)
+enclosure.set("type", "application/octet-stream")
+for key, value in attrs.items():
+    if key.startswith("sparkle:"):
+        enclosure.set(sparkle_tag(key.split(":", 1)[1]), value)
+    else:
+        enclosure.set(key, value)
+
+output_path.parent.mkdir(parents=True, exist_ok=True)
+et.write(output_path, xml_declaration=True, encoding="utf-8")

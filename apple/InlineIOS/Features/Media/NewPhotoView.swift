@@ -1,0 +1,516 @@
+import InlineKit
+import InlineProtocol
+import InlineUI
+import Logger
+import Nuke
+import NukeExtensions
+import NukeUI
+import SwiftUI
+import UIKit
+
+final class NewPhotoView: UIView {
+  // MARK: - Properties
+
+  private static let imageFadeDuration: TimeInterval = 0.22
+
+  private var fullMessage: FullMessage
+
+  static let maximumWidth: CGFloat = 280
+  static let maximumHeight: CGFloat = 400
+  static let minimumWidth: CGFloat = 180
+  private let maxWidth = NewPhotoView.maximumWidth
+  private let maxHeight = NewPhotoView.maximumHeight
+  private let minWidth = NewPhotoView.minimumWidth
+  private let cornerRadius = MessageBubbleGeometry.cornerRadius
+  private let maskLayer = CAShapeLayer()
+
+  var isSticker: Bool {
+    fullMessage.message.isSticker == true
+  }
+
+  private var hasText: Bool {
+    fullMessage.message.text?.isEmpty == false
+  }
+
+  private var hasReply: Bool {
+    fullMessage.message.repliedToMessageId != nil
+  }
+
+  private var hasForwardHeader: Bool {
+    fullMessage.message.forwardFromUserId != nil
+  }
+
+  private struct ImageDimensions {
+    let width: CGFloat
+    let height: CGFloat
+  }
+
+  let imageView: LazyImageView = {
+    let view = LazyImageView()
+    view.contentMode = .scaleAspectFit
+    view.clipsToBounds = true
+    view.translatesAutoresizingMaskIntoConstraints = false
+
+    let activityIndicator = UIActivityIndicatorView(style: .medium)
+    activityIndicator.startAnimating()
+    view.placeholderView = activityIndicator
+
+    return view
+  }()
+
+  private let tinyThumbnailBackgroundView: InlineTinyThumbnailBackgroundView = {
+    let view = InlineTinyThumbnailBackgroundView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private let highlightOverlay: UIView = {
+    let view = UIView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.backgroundColor = UIColor.white.withAlphaComponent(0.1)
+    view.alpha = 0
+    view.isUserInteractionEnabled = false
+    return view
+  }()
+
+  private var imageConstraints: [NSLayoutConstraint] = []
+  /// The size the next message view planned for this photo. Its planner shrinks media to fit
+  /// narrow rows, so the view takes this size instead of its own when set.
+  var plannedSize: CGSize? {
+    didSet {
+      if plannedSize != oldValue { setupImageConstraints() }
+    }
+  }
+
+  /// Set when this photo reaches the bubble's bottom edge: the image continues past the view's
+  /// bounds into the tail, and overlays stay on the bubble's body.
+  var bubbleBleed: MessageBubbleTailGeometry.MediaBleed? {
+    didSet {
+      guard bubbleBleed != oldValue else { return }
+      for constraint in bleedLeadingConstraints {
+        constraint.constant = -(bubbleBleed?.leadingBleed ?? 0)
+      }
+      for constraint in bleedTrailingConstraints {
+        constraint.constant = bubbleBleed?.trailingBleed ?? 0
+      }
+      // The photo was planned for the body, so the wider image crops instead of stretching.
+      imageView.imageView.contentMode = bubbleBleed == nil ? .scaleToFill : .scaleAspectFill
+      setupImageConstraints()
+      updateMask()
+    }
+  }
+
+  private var bleedLeadingConstraints: [NSLayoutConstraint] = []
+  private var bleedTrailingConstraints: [NSLayoutConstraint] = []
+
+  var onTap: ((FullMessage, UIView, UIImage?, URL) -> Void)?
+
+  // MARK: - Initialization
+
+  init(_ fullMessage: FullMessage) {
+    self.fullMessage = fullMessage
+    super.init(frame: .zero)
+
+    setupViews()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  // MARK: - Setup
+
+  private func shouldCropNarrowImage(width: Int, height: Int) -> Bool {
+    Self.cropsNarrowImage(width: width, height: height, hasCaption: hasText)
+  }
+
+  private static func cropsNarrowImage(width: Int, height: Int, hasCaption: Bool) -> Bool {
+    let aspectRatio = CGFloat(width) / CGFloat(height)
+    return aspectRatio < 0.75 && hasCaption // Narrow image with caption
+  }
+
+  private func calculateImageDimensions(width: Int, height: Int) -> ImageDimensions {
+    let size = Self.displaySize(width: width, height: height, hasCaption: hasText)
+    return ImageDimensions(
+      width: isSticker ? size.width / 2 : size.width,
+      height: isSticker ? size.height / 2 : size.height
+    )
+  }
+
+  /// The size this view gives a `width`×`height` photo in a bubble; the next message view plans
+  /// with it. Photos without a known size use `minimumWidth` square.
+  static func displaySize(width: Int?, height: Int?, hasCaption: Bool) -> CGSize {
+    guard let width, let height, width > 0, height > 0 else {
+      return CGSize(width: minimumWidth, height: minimumWidth)
+    }
+    let maxWidth = maximumWidth
+    let maxHeight = maximumHeight
+    let minWidth = minimumWidth
+    let aspectRatio = CGFloat(width) / CGFloat(height)
+    let preferredWidth: CGFloat = 280 // Width for narrow images with captions
+
+    var calculatedWidth: CGFloat
+    var calculatedHeight: CGFloat
+
+    // For very narrow images with captions, use fixed dimensions to enable cropping
+    if cropsNarrowImage(width: width, height: height, hasCaption: hasCaption) {
+      calculatedWidth = preferredWidth
+      calculatedHeight = maxHeight
+    } else {
+      if width > height {
+        calculatedWidth = min(maxWidth, CGFloat(width))
+        calculatedHeight = calculatedWidth / aspectRatio
+      } else {
+        calculatedHeight = min(maxHeight, CGFloat(height))
+        calculatedWidth = calculatedHeight * aspectRatio
+      }
+
+      if calculatedHeight > maxHeight {
+        calculatedHeight = maxHeight
+        calculatedWidth = calculatedHeight * aspectRatio
+      }
+
+      if calculatedWidth > maxWidth {
+        calculatedWidth = maxWidth
+        calculatedHeight = calculatedWidth / aspectRatio
+      }
+
+      // Enforce minimum width for narrow images without captions
+      if calculatedWidth < minWidth {
+        calculatedWidth = minWidth
+        calculatedHeight = calculatedWidth / aspectRatio
+      }
+    }
+
+    return CGSize(width: calculatedWidth, height: calculatedHeight)
+  }
+
+  private func setupImageConstraints() {
+    if !imageConstraints.isEmpty {
+      NSLayoutConstraint.deactivate(imageConstraints)
+      imageConstraints.removeAll()
+    }
+
+    guard let photoInfo = fullMessage.photoInfo,
+          let width = photoInfo.bestPhotoSize()?.width,
+          let height = photoInfo.bestPhotoSize()?.height
+    else {
+      let size = minWidth
+      imageConstraints = [
+        widthAnchor.constraint(equalToConstant: plannedSize?.width ?? size),
+        heightAnchor.constraint(equalToConstant: plannedSize?.height ?? size),
+
+        imageView.topAnchor.constraint(equalTo: topAnchor),
+        imageView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: -(bubbleBleed?.leadingBleed ?? 0)),
+        imageView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: bubbleBleed?.trailingBleed ?? 0),
+        imageView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      ]
+      NSLayoutConstraint.activate(imageConstraints)
+      return
+    }
+
+    // Set content mode based on whether we should crop narrow images
+    if shouldCropNarrowImage(width: width, height: height) {
+      imageView.contentMode = .scaleAspectFill
+    } else {
+      imageView.contentMode = .scaleAspectFit
+    }
+
+    let dimensions = plannedSize.map { ImageDimensions(width: $0.width, height: $0.height) }
+      ?? calculateImageDimensions(width: width, height: height)
+
+    if !isSticker {
+      let widthConstraint = widthAnchor.constraint(equalToConstant: dimensions.width)
+      let heightConstraint = heightAnchor.constraint(equalToConstant: dimensions.height)
+
+      if shouldCropNarrowImage(width: width, height: height) {
+        // For narrow images with captions, center the image and let it be cropped
+        let imageViewCenterXConstraint = imageView.centerXAnchor.constraint(equalTo: centerXAnchor)
+        let imageViewCenterYConstraint = imageView.centerYAnchor.constraint(equalTo: centerYAnchor)
+
+        // Calculate aspect ratio for this specific case
+        let aspectRatio = CGFloat(width) / CGFloat(height)
+
+        // Set aspect ratio constraint to maintain original proportions
+        let aspectRatioConstraint = imageView.widthAnchor.constraint(
+          equalTo: imageView.heightAnchor,
+          multiplier: aspectRatio
+        )
+
+        // Set width to container width, height will be calculated by aspect ratio
+        let imageViewWidthConstraint = imageView.widthAnchor.constraint(equalTo: widthAnchor)
+
+        imageConstraints = [
+          widthConstraint, heightConstraint,
+          imageViewCenterXConstraint, imageViewCenterYConstraint,
+          imageViewWidthConstraint, aspectRatioConstraint,
+        ]
+      } else {
+        // Normal case - fill the container
+        let imageViewTopConstraint = imageView.topAnchor.constraint(equalTo: topAnchor)
+        let imageViewLeadingConstraint = imageView.leadingAnchor.constraint(
+          equalTo: leadingAnchor,
+          constant: -(bubbleBleed?.leadingBleed ?? 0)
+        )
+        let imageViewTrailingConstraint = imageView.trailingAnchor.constraint(
+          equalTo: trailingAnchor,
+          constant: bubbleBleed?.trailingBleed ?? 0
+        )
+        let imageViewBottomConstraint = imageView.bottomAnchor.constraint(equalTo: bottomAnchor)
+
+        imageConstraints = [
+          widthConstraint, heightConstraint,
+          imageViewTopConstraint, imageViewLeadingConstraint, imageViewTrailingConstraint, imageViewBottomConstraint,
+        ]
+      }
+    }
+
+    else {
+      // Add extra vertical padding for PNG stickers
+      let verticalPadding: CGFloat = 16.0
+
+      let widthConstraint = widthAnchor.constraint(equalToConstant: dimensions.width)
+      let heightConstraint = heightAnchor.constraint(equalToConstant: dimensions.height + (verticalPadding * 2))
+
+      // Center the image view within the container with padding
+      let imageViewTopConstraint = imageView.topAnchor.constraint(equalTo: topAnchor, constant: verticalPadding)
+      let imageViewLeadingConstraint = imageView.leadingAnchor.constraint(equalTo: leadingAnchor)
+      let imageViewTrailingConstraint = imageView.trailingAnchor.constraint(equalTo: trailingAnchor)
+      let imageViewBottomConstraint = imageView.bottomAnchor.constraint(
+        equalTo: bottomAnchor,
+        constant: -verticalPadding
+      )
+
+      // Set a fixed height for the imageView to ensure it doesn't stretch
+      let imageViewHeightConstraint = imageView.heightAnchor.constraint(equalToConstant: dimensions.height)
+
+      imageConstraints = [
+        widthConstraint, heightConstraint,
+        imageViewTopConstraint, imageViewLeadingConstraint, imageViewTrailingConstraint, imageViewBottomConstraint,
+        imageViewHeightConstraint,
+      ]
+    }
+
+    NSLayoutConstraint.activate(imageConstraints)
+  }
+
+  private func setupViews() {
+    backgroundColor = isSticker ? .clear : UIColor.gray.withAlphaComponent(0.05)
+    addSubview(tinyThumbnailBackgroundView)
+    addSubview(imageView)
+    addSubview(highlightOverlay)
+
+    bleedLeadingConstraints = [
+      tinyThumbnailBackgroundView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      highlightOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+    ]
+    bleedTrailingConstraints = [
+      tinyThumbnailBackgroundView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      highlightOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+    ]
+    NSLayoutConstraint.activate(bleedLeadingConstraints + bleedTrailingConstraints + [
+      tinyThumbnailBackgroundView.topAnchor.constraint(equalTo: topAnchor),
+      tinyThumbnailBackgroundView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      highlightOverlay.topAnchor.constraint(equalTo: topAnchor),
+      highlightOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+
+    setupImageConstraints()
+    setupGestures()
+    setupMask()
+    updateTinyThumbnailBackground()
+    updateImage()
+  }
+
+  private func setupGestures() {
+    let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+    addGestureRecognizer(tapGesture)
+  }
+
+  private func setupMask() {
+    maskLayer.fillColor = UIColor.black.cgColor
+    layer.mask = maskLayer
+  }
+
+  private func updateMask() {
+    if let bubbleBleed {
+      maskLayer.path = bubbleBleed.maskPath(in: bounds)
+      return
+    }
+
+    let width = bounds.width
+    let height = bounds.height
+
+    // Edges meeting a header above, or a caption or reactions below, stay square.
+    var roundingCorners: UIRectCorner = []
+    if !hasReply, !hasForwardHeader { roundingCorners.formUnion([.topLeft, .topRight]) }
+    if !hasText, fullMessage.reactions.isEmpty { roundingCorners.formUnion([.bottomLeft, .bottomRight]) }
+
+    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+    let bezierPath = UIBezierPath(
+      roundedRect: bounds,
+      byRoundingCorners: roundingCorners,
+      cornerRadii: CGSize(width: cornerRadius, height: cornerRadius)
+    )
+
+    maskLayer.path = bezierPath.cgPath
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    updateMask()
+  }
+
+  // MARK: - Image Loading
+
+  public func update(with fullMessage: FullMessage) {
+    let prev = self.fullMessage
+    self.fullMessage = fullMessage
+    updateMask()
+    updateTinyThumbnailBackground()
+
+    if
+      prev.photoInfo?.id == fullMessage.photoInfo?.id,
+      prev.photoInfo?.bestPhotoSize()?.localPath == fullMessage.photoInfo?.bestPhotoSize()?.localPath
+    {
+      Log.shared.debug("not reloading image view")
+      return
+    }
+    setupImageConstraints()
+    updateImage()
+  }
+
+  private func updateTinyThumbnailBackground() {
+    tinyThumbnailBackgroundView.setPhoto(isSticker ? nil : fullMessage.photoInfo)
+    updateImageTransition()
+  }
+
+  private func updateImage() {
+    if let url = imageLocalUrl() {
+      setImageRequest(for: url)
+    } else {
+      if let photoInfo = fullMessage.photoInfo {
+        Task.detached(priority: .userInitiated) { [weak self] in
+          guard let self else { return }
+
+          await FileCache.shared.download(photo: photoInfo, reloadMessageOnFinish: fullMessage.message)
+
+          Task { @MainActor in
+            if let newUrl = self.imageLocalUrl() {
+              self.setImageRequest(for: newUrl)
+            }
+          }
+        }
+      }
+
+      updateImageTransition()
+      imageView.url = nil
+    }
+  }
+
+  private func setImageRequest(for url: URL) {
+    let request = ImageRequest(
+      url: url,
+      processors: [.resize(width: 300)],
+      priority: .high
+    )
+
+    updateImageTransition()
+    imageView.request = request
+  }
+
+  private func updateImageTransition() {
+    imageView.transition = tinyThumbnailBackgroundView.isHidden ? nil : .fadeIn(duration: Self.imageFadeDuration)
+  }
+
+  private func imageLocalUrl() -> URL? {
+    guard let photoSize = fullMessage.photoInfo?.bestPhotoSize() else { return nil }
+
+    if let localPath = photoSize.localPath {
+      let url = FileCache.getUrl(for: .photos, localPath: localPath)
+      return url
+    }
+
+    return nil
+  }
+
+  private func imageCdnUrl() -> URL? {
+    guard let photoSize = fullMessage.photoInfo?.bestPhotoSize(),
+          let cdnUrl = photoSize.cdnUrl else { return nil }
+
+    return URL(string: cdnUrl)
+  }
+
+  // MARK: - User Interactions
+
+  @objc private func handleTap() {
+    guard fullMessage.message.isSticker != true else { return }
+    guard let url = imageLocalUrl() ?? imageCdnUrl() else { return }
+
+    if let onTap {
+      onTap(fullMessage, imageView, imageView.imageView.image, url)
+      return
+    }
+
+    let imageViewer = MediaGalleryViewController(
+      imageURL: url,
+      sourceView: imageView,
+      sourceImage: imageView.imageView.image
+    )
+
+    findViewController()?.present(imageViewer, animated: false)
+  }
+
+  @objc func image(_ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer) {
+    if let error {
+      print("Error saving image: \(error.localizedDescription)")
+    } else {
+      print("Image saved successfully")
+    }
+  }
+
+  private func findViewController() -> UIViewController? {
+    var responder: UIResponder? = self
+    while let nextResponder = responder?.next {
+      if let viewController = nextResponder as? UIViewController {
+        return viewController
+      }
+      responder = nextResponder
+    }
+    return nil
+  }
+
+  // MARK: - First Responder
+
+  override var canBecomeFirstResponder: Bool {
+    true
+  }
+
+  // MARK: - Highlight
+
+  func showHighlight() {
+    highlightOverlay.layer.removeAllAnimations()
+    highlightOverlay.alpha = 0
+    UIView.animate(withDuration: 0.18, animations: { [weak self] in
+      self?.highlightOverlay.alpha = 1
+    }) { [weak self] _ in
+      guard let self else { return }
+      UIView.animate(withDuration: 0.5, delay: 0.2, options: [], animations: {
+        self.highlightOverlay.alpha = 0
+      }, completion: nil)
+    }
+  }
+
+  func clearHighlight() {
+    highlightOverlay.layer.removeAllAnimations()
+    highlightOverlay.alpha = 0
+  }
+}
+
+extension NewPhotoView {
+  func getCurrentImage() -> UIImage? {
+    imageView.imageView.image
+  }
+}

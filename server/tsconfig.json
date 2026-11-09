@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "declarationDir": "dist",
+  },
+
+  "references": [
+    {
+      "path": "../packages/oauth-core"
+    },
+    {
+      "path": "../packages/protocol"
+    },
+    {
+      "path": "../packages/bot-api-types"
+    },
+    {
+      "path": "./packages/url-preview"
+    }
+  ],
+
+  "include": ["src", "scripts", "bench", "drizzle.config.ts"]
+}

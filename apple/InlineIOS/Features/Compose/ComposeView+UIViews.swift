@@ -1,0 +1,371 @@
+import InlineProtocol
+import UIKit
+
+private final class ComposeGlassGroupView: UIView {
+  private let rootView: UIView
+  let contentView: UIView
+
+  override init(frame: CGRect) {
+    if #available(iOS 26.0, *) {
+      let effect = UIGlassContainerEffect()
+      effect.spacing = 8
+      let visualEffectView = UIVisualEffectView(effect: effect)
+      rootView = visualEffectView
+      contentView = visualEffectView.contentView
+    } else {
+      let view = UIView()
+      rootView = view
+      contentView = view
+    }
+
+    super.init(frame: frame)
+
+    translatesAutoresizingMaskIntoConstraints = false
+    backgroundColor = .clear
+    rootView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(rootView)
+
+    NSLayoutConstraint.activate([
+      rootView.topAnchor.constraint(equalTo: topAnchor),
+      rootView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      rootView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      rootView.bottomAnchor.constraint(equalTo: bottomAnchor),
+    ])
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    guard !isHidden, alpha > 0, isUserInteractionEnabled else { return nil }
+
+    for view in contentView.subviews.reversed() {
+      // A hidden side circle (the agent stop circle when idle) overlaps the
+      // send button; it must not swallow touches meant for the capsule.
+      guard !view.isHidden, view.alpha > 0.01 else { continue }
+      let convertedPoint = convert(point, to: view)
+      guard view.point(inside: convertedPoint, with: event) else { continue }
+
+      if let plusButton = view as? ComposePlusGlassButton {
+        return plusButton.hitTest(convertedPoint, with: event)
+      }
+
+      if let effectView = view as? UIVisualEffectView {
+        let contentPoint = convert(point, to: effectView.contentView)
+        if let result = effectView.contentView.hitTest(contentPoint, with: event),
+           result !== effectView.contentView
+        {
+          return result
+        }
+        continue
+      }
+
+      if let result = view.hitTest(convertedPoint, with: event) {
+        return result
+      }
+    }
+
+    return nil
+  }
+}
+
+final class ComposePlusGlassButton: UIVisualEffectView {
+  private enum Constants {
+    static let hitTargetExpansion: CGFloat = 4
+    static let cornerRadius: CGFloat = 21
+  }
+
+  var onTouchDown: (() -> Void)?
+  var onTap: (() -> Void)?
+
+  private let imageView = UIImageView()
+  private var isPressed = false {
+    didSet {
+      guard oldValue != isPressed else { return }
+      UIView.animate(
+        withDuration: 0.12,
+        delay: 0,
+        options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseInOut]
+      ) {
+        self.alpha = self.isPressed ? 0.58 : 1
+      }
+    }
+  }
+
+  init(
+    systemImage: String = "plus",
+    pointSize: CGFloat = 16,
+    iconColor: UIColor = .secondaryLabel,
+    accessibilityLabel: String = "Add"
+  ) {
+    if #available(iOS 26.0, *) {
+      let glassEffect = UIGlassEffect(style: .regular)
+      glassEffect.isInteractive = true
+      super.init(effect: glassEffect)
+    } else {
+      super.init(effect: nil)
+      backgroundColor = .secondarySystemBackground
+    }
+
+    setup(systemImage: systemImage, pointSize: pointSize, iconColor: iconColor, accessibilityLabel: accessibilityLabel)
+  }
+
+  /// Swaps the glyph in place, e.g. stop and resume on the agent run circle.
+  func setSymbol(_ systemImage: String, pointSize: CGFloat, accessibilityLabel: String) {
+    imageView.image = UIImage(systemName: systemImage)?.withConfiguration(
+      UIImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
+    )
+    self.accessibilityLabel = accessibilityLabel
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+    bounds.insetBy(
+      dx: -Constants.hitTargetExpansion,
+      dy: -Constants.hitTargetExpansion
+    ).contains(point)
+  }
+
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    guard !isHidden, alpha > 0.01, isUserInteractionEnabled, self.point(inside: point, with: event) else {
+      return nil
+    }
+
+    return self
+  }
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+    isPressed = true
+    onTouchDown?()
+    super.touchesBegan(touches, with: event)
+  }
+
+  override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+    let shouldTap = touches.contains { touch in
+      point(inside: touch.location(in: self), with: event)
+    }
+    isPressed = false
+    if shouldTap {
+      onTap?()
+    }
+    super.touchesEnded(touches, with: event)
+  }
+
+  override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+    isPressed = false
+    super.touchesCancelled(touches, with: event)
+  }
+
+  private func setup(systemImage: String, pointSize: CGFloat, iconColor: UIColor, accessibilityLabel: String) {
+    translatesAutoresizingMaskIntoConstraints = false
+    isUserInteractionEnabled = true
+    layer.cornerRadius = Constants.cornerRadius
+    layer.cornerCurve = .continuous
+    layer.masksToBounds = true
+    isAccessibilityElement = true
+    accessibilityTraits = .button
+
+    imageView.translatesAutoresizingMaskIntoConstraints = false
+    setSymbol(systemImage, pointSize: pointSize, accessibilityLabel: accessibilityLabel)
+    imageView.tintColor = iconColor
+    imageView.contentMode = .center
+    contentView.addSubview(imageView)
+
+    NSLayoutConstraint.activate([
+      imageView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+      imageView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+    ])
+  }
+
+  override func accessibilityActivate() -> Bool {
+    onTouchDown?()
+    onTap?()
+    return true
+  }
+}
+
+extension ComposeView {
+  func makeTextView() -> ComposeTextView {
+    let view = ComposeTextView(composeView: self)
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.delegate = self
+    return view
+  }
+
+  func makeSendButton() -> UIButton {
+    let button = UIButton()
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.frame = CGRect(origin: .zero, size: buttonSize)
+
+    var config = UIButton.Configuration.plain()
+    config.image = UIImage(systemName: "arrow.up")?.withConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)
+    )
+    config.baseForegroundColor = .white
+    config.background.backgroundColor = ThemeManager.shared.selected.accent
+    config.cornerStyle = .capsule
+
+    button.addTarget(self, action: #selector(buttonTouchDown), for: .touchDown)
+    button.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
+
+    let silentAction = UIAction(
+      title: "Send without notification",
+      image: UIImage(systemName: "bell.slash"),
+      handler: { [weak self] _ in
+        self?.sendMessage(sendMode: .modeSilent)
+      }
+    )
+    button.menu = UIMenu(children: [silentAction])
+    button.showsMenuAsPrimaryAction = false
+
+    button.configurationUpdateHandler = { [weak button] _ in
+      guard let button else { return }
+      if !button.isUserInteractionEnabled || button.alpha <= 0.01 {
+        button.layer.removeAllAnimations()
+        button.transform = .identity
+        return
+      }
+
+      if button.isHighlighted {
+        UIView.animate(
+          withDuration: 0.4,
+          delay: 0,
+          options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseInOut]
+        ) {
+          button.transform = CGAffineTransform(scaleX: 0.75, y: 0.75)
+        }
+      } else {
+        let currentScale =
+          CGFloat((button.layer.presentation()?.value(forKeyPath: "transform.scale.y") as? NSNumber)?.floatValue ?? Float(button.transform.a))
+        button.transform = CGAffineTransform(scaleX: currentScale, y: currentScale)
+
+        UIView.animate(
+          withDuration: 0.25,
+          delay: 0,
+          options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseInOut]
+        ) {
+          button.transform = .identity
+        }
+      }
+    }
+
+    button.configuration = config
+    button.isUserInteractionEnabled = true
+
+    // Hide initially
+    button.alpha = 0.0
+
+    return button
+  }
+
+  func makeVoiceButton() -> ComposeVoiceButton {
+    let button = ComposeVoiceButton()
+    button.addTarget(self, action: #selector(buttonTouchDown), for: .touchDown)
+    button.addTarget(self, action: #selector(startVoiceRecordingTapped), for: .touchUpInside)
+    // Press-and-hold recording is handled by `voiceHoldGesture` on the compose view.
+
+    return button
+  }
+
+  func makeComposeGlassContainer() -> UIView {
+    ComposeGlassGroupView()
+  }
+
+  func composeGlassContentView() -> UIView {
+    (composeGlassContainer as? ComposeGlassGroupView)?.contentView ?? composeGlassContainer
+  }
+
+  func composeContentView() -> UIView {
+    (composeAndButtonContainer as? UIVisualEffectView)?.contentView ?? composeAndButtonContainer
+  }
+
+  func makePlusButton() -> UIView {
+    let button = ComposePlusGlassButton(iconColor: .label)
+    button.onTouchDown = { [weak self] in
+      self?.buttonTouchDown()
+    }
+    button.onTap = { [weak self] in
+      self?.plusTapped()
+    }
+    return button
+  }
+
+  /// Stop or resume beside the bar while an agent's turn runs and the agent
+  /// card is not showing; inside the card the row has its own circle.
+  func makeAgentRunButton() -> ComposePlusGlassButton {
+    let button = ComposePlusGlassButton(systemImage: "stop.fill", pointSize: 13, accessibilityLabel: "Stop")
+    button.isHidden = true
+    button.alpha = 0
+    button.onTouchDown = { [weak self] in
+      self?.buttonTouchDown()
+    }
+    button.onTap = { [weak self] in
+      self?.agentChain?.toggleRun()
+    }
+    return button
+  }
+
+  @objc func buttonTouchDown() {
+    let feedbackGenerator = UIImpactFeedbackGenerator(style: .light)
+    feedbackGenerator.prepare()
+    feedbackGenerator.impactOccurred(intensity: 1.0)
+  }
+
+  func makeComposeAndButtonContainer() -> UIView {
+    if #available(iOS 26.0, *) {
+      let glassEffect = UIGlassEffect(style: .regular)
+      glassEffect.isInteractive = true
+      let view = UIVisualEffectView(effect: glassEffect)
+      view.translatesAutoresizingMaskIntoConstraints = false
+      view.isUserInteractionEnabled = true
+      view.cornerConfiguration = .capsule(maximumRadius: 20)
+      return view
+    }
+
+    let view = UIView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.isUserInteractionEnabled = true
+    view.backgroundColor = .secondarySystemBackground.withAlphaComponent(0.8)
+    view.layer.cornerRadius = 20
+    view.layer.cornerCurve = .continuous
+    view.clipsToBounds = true
+    return view
+  }
+
+  func makeEmbedContainerView() -> UIView {
+    let view = UIView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.isUserInteractionEnabled = true
+    view.backgroundColor = .clear
+    view.clipsToBounds = true
+    view.isHidden = true
+    return view
+  }
+
+  func makeAttachmentScrollView() -> UIScrollView {
+    let view = UIScrollView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.showsHorizontalScrollIndicator = false
+    view.showsVerticalScrollIndicator = false
+    view.alwaysBounceHorizontal = true
+    view.alwaysBounceVertical = false
+    view.delaysContentTouches = false
+    view.isHidden = true
+    return view
+  }
+
+  func makeAttachmentStackView() -> UIStackView {
+    let view = UIStackView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.axis = .horizontal
+    view.alignment = .center
+    view.spacing = 8
+    return view
+  }
+}

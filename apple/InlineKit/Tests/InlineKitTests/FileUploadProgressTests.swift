@@ -1,0 +1,150 @@
+import Testing
+@testable import InlineKit
+
+@Suite("File Upload Progress")
+struct FileUploadProgressTests {
+  @Test("uploading snapshot clamps bytes and computes fraction")
+  func testUploadingSnapshotClamp() {
+    let snapshot = UploadProgressSnapshot.uploading(
+      id: "video_1",
+      bytesSent: 2_500,
+      totalBytes: 2_000
+    )
+
+    #expect(snapshot.stage == .uploading)
+    #expect(snapshot.bytesSent == 2_000)
+    #expect(snapshot.totalBytes == 2_000)
+    #expect(snapshot.fractionCompleted == 1.0)
+  }
+
+  @Test("transport progress clamps invalid values")
+  func testTransferProgressClamp() {
+    let progress = ApiClient.UploadTransferProgress(
+      bytesSent: -5,
+      totalBytes: -10,
+      fractionCompleted: 1.5
+    )
+
+    #expect(progress.bytesSent == 0)
+    #expect(progress.totalBytes == 0)
+    #expect(progress.fractionCompleted == 1.0)
+  }
+
+  @Test("mapTransferProgress uses logical total bytes when available")
+  func testMapTransferProgressUsesLogicalTotal() {
+    let transfer = ApiClient.UploadTransferProgress(
+      bytesSent: 1_000,
+      totalBytes: 10_000,
+      fractionCompleted: 0.25
+    )
+
+    let snapshot = FileUploader.mapTransferProgress(
+      uploadId: "video_42",
+      transferProgress: transfer,
+      logicalTotalBytes: 2_000_000
+    )
+
+    #expect(snapshot.stage == .uploading)
+    #expect(snapshot.bytesSent == 500_000)
+    #expect(snapshot.totalBytes == 2_000_000)
+    #expect(snapshot.fractionCompleted == 0.25)
+  }
+
+  @Test("mapTransferProgress falls back to transport totals without logical size")
+  func testMapTransferProgressFallbackToTransportTotals() {
+    let transfer = ApiClient.UploadTransferProgress(
+      bytesSent: 3_000,
+      totalBytes: 2_000,
+      fractionCompleted: 0.5
+    )
+
+    let snapshot = FileUploader.mapTransferProgress(
+      uploadId: "video_43",
+      transferProgress: transfer,
+      logicalTotalBytes: 0
+    )
+
+    #expect(snapshot.stage == .uploading)
+    #expect(snapshot.bytesSent == 3_000)
+    #expect(snapshot.totalBytes == 3_000)
+    #expect(snapshot.fractionCompleted == 1.0)
+  }
+
+  @Test("pending document upload defaults to processing before progress arrives")
+  func testPendingDocumentUploadDefaultsToProcessing() {
+    let state = DocumentPendingUploadDisplayState.resolve(
+      isPendingMessage: true,
+      localDocumentId: 42,
+      progress: nil
+    )
+
+    #expect(state == .processing)
+  }
+
+  @Test("pending document upload exposes byte progress while uploading")
+  func testPendingDocumentUploadUploadingState() {
+    let state = DocumentPendingUploadDisplayState.resolve(
+      isPendingMessage: true,
+      localDocumentId: 42,
+      progress: .uploading(id: "document_42", bytesSent: 512, totalBytes: 1024)
+    )
+
+    #expect(state == .uploading(bytesSent: 512, totalBytes: 1024))
+  }
+
+  @Test("failed upload attempt remains pending while its message can retry")
+  func testPendingDocumentUploadFailureRemainsPending() {
+    let state = DocumentPendingUploadDisplayState.resolve(
+      isPendingMessage: true,
+      localDocumentId: 42,
+      progress: .failed(id: "document_42", error: nil)
+    )
+
+    #expect(state == .processing)
+  }
+
+  @Test("document upload state is inactive for non-pending messages")
+  func testPendingDocumentUploadInactiveWhenMessageIsNotPending() {
+    let state = DocumentPendingUploadDisplayState.resolve(
+      isPendingMessage: false,
+      localDocumentId: 42,
+      progress: .uploading(id: "document_42", bytesSent: 512, totalBytes: 1024)
+    )
+
+    #expect(state == .inactive)
+  }
+
+  @Test("failed message stays failed even with a completed local upload")
+  func failedMessageDoesNotAppearComplete() {
+    let snapshots: [UploadProgressSnapshot?] = [nil, .completed(id: "document_42", totalBytes: 297_000_000)]
+    for progress in snapshots {
+      #expect(DocumentPendingUploadDisplayState.resolve(
+        isPendingMessage: false, isFailedMessage: true, localDocumentId: 42, progress: progress
+      ) == .failed)
+    }
+  }
+
+  @Test("download progress clamps invalid totals without reporting completion")
+  func testDownloadProgressClamp() {
+    let snapshot = DownloadProgress(
+      id: "doc_1",
+      bytesReceived: 512,
+      totalBytes: -1
+    )
+
+    #expect(snapshot.bytesReceived == 512)
+    #expect(snapshot.totalBytes == 0)
+    #expect(snapshot.progress == 0)
+    #expect(!snapshot.isComplete)
+  }
+
+  @Test("download completion is explicit even for unknown totals")
+  func testDownloadProgressExplicitCompletion() {
+    let snapshot = DownloadProgress.completed(id: "video_1", totalBytes: 0)
+
+    #expect(snapshot.bytesReceived == 0)
+    #expect(snapshot.totalBytes == 0)
+    #expect(snapshot.progress == 1)
+    #expect(snapshot.isComplete)
+  }
+}

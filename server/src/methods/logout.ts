@@ -1,0 +1,62 @@
+import { db } from "@in/server/db"
+import { eq } from "drizzle-orm"
+import { sessions } from "@in/server/db/schema"
+import { InlineError } from "@in/server/types/errors"
+import { type Static, Type } from "@sinclair/typebox"
+import type { HandlerContext } from "@in/server/controllers/helpers"
+import { connectionManager } from "../ws/connections"
+import { BotAlerts } from "@in/server/modules/bot-events/alerts"
+import { SessionsModel } from "@in/server/db/models/sessions"
+import { revokeSession } from "@in/server/modules/sessions/revokeSession"
+
+export const Input = Type.Object({})
+
+export const Response = Type.Undefined()
+
+export const handler = async (
+  input: Static<typeof Input>,
+  context: HandlerContext,
+  options: { preserveConnectionId?: string } = {},
+): Promise<Static<typeof Response>> => {
+  try {
+    const session = await SessionsModel.getById(context.currentSessionId).catch(() => null)
+
+    await revokeSession({
+      actor: "user",
+      actorUserId: context.currentUserId,
+      targetUserId: context.currentUserId,
+      sessionId: context.currentSessionId,
+      preserveConnectionId: options.preserveConnectionId,
+    })
+    await db.delete(sessions).where(eq(sessions.id, context.currentSessionId))
+
+    // Best-effort internal alert (should never affect the user action).
+    BotAlerts.logout({
+      userId: context.currentUserId,
+      device: session
+        ? {
+            deviceName: session.personalData.deviceName,
+            deviceId: session.deviceId,
+            clientType: session.clientType,
+            clientVersion: session.clientVersion,
+            osVersion: session.osVersion,
+          }
+        : undefined,
+    })
+
+    setTimeout(() => {
+      connectionManager.sessionLoggedOut(
+        context.currentUserId,
+        context.currentSessionId,
+        options.preserveConnectionId,
+      )
+    }, 50)
+
+    return undefined
+  } catch (error) {
+    throw new InlineError(
+      InlineError.ApiError.INTERNAL,
+      { cause: error },
+    )
+  }
+}

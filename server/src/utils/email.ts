@@ -1,0 +1,251 @@
+import {
+  sendEmail as sendEmailViaSES,
+} from "@in/server/libs/ses"
+import {
+  sendEmail as sendEmailViaResend,
+} from "@in/server/libs/resend"
+import { CodeEmail } from "@inline-chat/email-templates"
+import { SEND_EMAIL, isProd } from "@in/server/env"
+import { styleText } from "node:util"
+import { Log } from "@in/server/utils/log"
+import type { UserName } from "@in/server/modules/cache/userNames"
+import { render } from "@react-email/render"
+import * as React from "react"
+import { getServerConfig } from "@in/server/modules/serverConfig"
+import {
+  TRANSACTIONAL_EMAIL_FROM_ADDRESS,
+  transactionalEmailReplyTo,
+  type TransactionalEmailSender,
+} from "@in/server/modules/email/transactionalIdentity"
+
+export const sendTransactionalEmailWithProvider: TransactionalEmailSender = async (input) => {
+  if (input.provider === "ses") {
+    const result = await sendEmailViaSES({
+      to: input.to,
+      from: TRANSACTIONAL_EMAIL_FROM_ADDRESS,
+      content: input.content,
+    })
+    return { messageId: result.MessageId ?? null }
+  }
+
+  const result = await sendEmailViaResend({
+    from: `Inline <${TRANSACTIONAL_EMAIL_FROM_ADDRESS}>`,
+    to: input.to,
+    subject: input.content.subject,
+    text: input.content.text,
+    html: input.content.html,
+    replyTo: transactionalEmailReplyTo(input.provider),
+  })
+
+  if (result.error) throw result.error
+  return { messageId: result.data?.id ?? null }
+}
+
+type SendEmailInput = {
+  to: string
+  content: SendEmailContent
+}
+
+/**
+ * The content of the email to send
+ *
+ * @see CodeTemplateInput
+ * @see InvitedToSpaceTemplateInput
+ */
+type SendEmailContent =
+  | CodeTemplateInput
+  | InvitedToSpaceTemplateInput
+  | InvitedToInlineTemplateInput
+  | AdminActionTemplateInput
+
+export const sendEmail = async (input: SendEmailInput) => {
+  const template = await getTemplate(input.content)
+
+  if (!isProd && !SEND_EMAIL) {
+    // let's log the email beautifully with formatting, subject, email, from and text so it's easy to read and matches the email
+
+    Log.shared.info(
+      `
+-- email preview -------------------------------
+${styleText("blueBright", "Subject:")} ${template.subject}
+${styleText("blueBright", "To:")} ${input.to}
+
+${template.text}
+
+${styleText("cyan", "[Preview email. Force sending via SEND_EMAIL=1]")}
+------------------------------------------------
+    `.trim(),
+    )
+    return
+  }
+
+  const provider = await getServerConfig("email.default_provider")
+  await sendTransactionalEmailWithProvider({
+    provider: provider.value,
+    to: input.to,
+    content: template,
+  })
+}
+
+// ----------------------------------------------------------------------------
+// Templates
+// ----------------------------------------------------------------------------
+interface TemplateInput {
+  template: string
+  variables: Record<string, unknown>
+}
+
+type TextTemplate = {
+  subject: string
+  text: string
+  html?: string
+}
+
+const getTemplate = async (content: SendEmailContent): Promise<TextTemplate> => {
+  switch (content.template) {
+    case "code":
+      return CodeTemplate(content.variables)
+
+    case "invitedToSpace":
+      return InvitedToSpaceTemplate(content.variables)
+
+    case "invitedToInline":
+      return InvitedToInlineTemplate(content.variables)
+
+    case "adminAction":
+      return AdminActionTemplate(content.variables)
+  }
+}
+
+interface CodeTemplateInput extends TemplateInput {
+  template: "code"
+  variables: {
+    code: string
+    firstName: string | undefined
+    isExistingUser: boolean
+  }
+}
+
+interface InvitedToSpaceTemplateInput extends TemplateInput {
+  template: "invitedToSpace"
+  variables: {
+    email: string
+    spaceName: string
+    isExistingUser: boolean
+    firstName: string | undefined
+    invitedByUserName: UserName | undefined
+  }
+}
+
+interface InvitedToInlineTemplateInput extends TemplateInput {
+  template: "invitedToInline"
+  variables: {
+    firstName: string | undefined
+    invitedByName: string
+  }
+}
+
+interface AdminActionTemplateInput extends TemplateInput {
+  template: "adminAction"
+  variables: {
+    actionTaken: string
+    actorEmail: string
+    ip?: string | null
+    userAgent?: string | null
+    timestamp: string
+  }
+}
+
+async function CodeTemplate({ code, firstName, isExistingUser }: CodeTemplateInput["variables"]): Promise<TextTemplate> {
+  const codeType = isExistingUser ? "login" : "signup"
+  const subject = `Your Inline ${codeType} code: ${code}`
+  const text = `
+Hey ${firstName ? `${firstName},` : "-"}
+
+Here's your verification code for Inline ${codeType}: ${code}
+
+Inline Team
+  `.trim()
+  const html = await render(
+    React.createElement(CodeEmail, {
+      code,
+      firstName,
+      isExistingUser,
+    }),
+  )
+  return { subject, text, html }
+}
+
+function InvitedToSpaceTemplate({
+  email,
+  spaceName,
+  isExistingUser,
+  firstName,
+  invitedByUserName,
+}: InvitedToSpaceTemplateInput["variables"]): TextTemplate {
+  const subject = `You've been invited to "${spaceName}"`
+  const invitedByName = invitedByUserName
+    ? `by "${invitedByUserName.firstName ?? invitedByUserName.username ?? invitedByUserName.email}"`
+    : ""
+  const text = `
+Hey ${firstName ? `${firstName},` : "-"}
+
+You've been invited to join "${spaceName}" ${invitedByName} on Inline.
+
+${
+  isExistingUser
+    ? `You can start chatting by opening the Inline app. Make sure you're logged in with the email: ${email}.`
+    : `
+To start chatting, get the app from TestFlight from one of the links below. Then, sign up via your email: "${email}".
+
+For iPhone/iPad: https://testflight.apple.com/join/FkC3f7fz
+(Here's a video showing how to install: https://www.loom.com/share/73f951f0963843f588c921751ac82603)
+
+For Mac: https://testflight.apple.com/join/Z8zUcWZH
+    `
+}
+  `.trim()
+  return { subject, text }
+}
+
+function InvitedToInlineTemplate({
+  firstName,
+  invitedByName,
+}: InvitedToInlineTemplateInput["variables"]): TextTemplate {
+  const subject = `${invitedByName} invited you to chat on Inline`
+  const text = `
+Hey ${firstName ? `${firstName},` : "-"}
+
+${invitedByName} invited you to chat on Inline.
+
+Open Inline to start the conversation: https://inline.chat/download
+
+Inline Team
+  `.trim()
+  return { subject, text }
+}
+
+function AdminActionTemplate({
+  actionTaken,
+  actorEmail,
+  ip,
+  userAgent,
+  timestamp,
+}: AdminActionTemplateInput["variables"]): TextTemplate {
+  const subject = `Inline admin activity: ${actionTaken}`
+  const text = `
+Admin activity detected.
+
+Action: ${actionTaken}
+Actor: ${actorEmail}
+Time: ${timestamp}
+IP: ${ip ?? "unknown"}
+User agent: ${userAgent ?? "unknown"}
+
+If this wasn't you, rotate credentials immediately.
+
+Inline Team
+  `.trim()
+
+  return { subject, text }
+}

@@ -1,0 +1,246 @@
+import AppKit
+import Combine
+import InlineKit
+import InlineUI
+import Logger
+import SwiftUI
+
+class MentionTableCellView: NSTableCellView {
+  private var avatarView: ChatIconSwiftUIBridge?
+  private var groupIconView: NSImageView?
+  private let nameLabel = NSTextField()
+  private let usernameLabel = NSTextField()
+  private let containerView = NSView()
+
+  // state
+  private var currentItem: MentionCompletionItem?
+  private var _isSelected: Bool = false
+  private var hoverTrackingArea: NSTrackingArea?
+  private var isHovered = false {
+    didSet {
+      guard isHovered != oldValue else { return }
+      updateAppearance()
+    }
+  }
+
+  // Custom selection state property
+  var isSelected: Bool {
+    get { _isSelected }
+    set {
+      guard _isSelected != newValue else { return }
+      _isSelected = newValue
+      setAccessibilitySelected(newValue)
+      updateAppearance()
+    }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    setupView()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func setupView() {
+    // Container for hover effect
+    containerView.wantsLayer = true
+    containerView.layer?.cornerRadius = 8
+    containerView.layer?.cornerCurve = .continuous
+    containerView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(containerView)
+
+    // Name label - make it more compact
+    nameLabel.isBordered = false
+    nameLabel.isEditable = false
+    nameLabel.backgroundColor = .clear
+    nameLabel.font = .systemFont(ofSize: 13, weight: .regular)
+    nameLabel.textColor = .labelColor
+    nameLabel.lineBreakMode = .byTruncatingTail
+    nameLabel.translatesAutoresizingMaskIntoConstraints = false
+    containerView.addSubview(nameLabel)
+
+    // Username label - make it more compact
+    usernameLabel.isBordered = false
+    usernameLabel.isEditable = false
+    usernameLabel.backgroundColor = .clear
+    usernameLabel.font = .systemFont(ofSize: 11, weight: .regular)
+    usernameLabel.textColor = .secondaryLabelColor
+    usernameLabel.lineBreakMode = .byTruncatingTail
+    usernameLabel.translatesAutoresizingMaskIntoConstraints = false
+    containerView.addSubview(usernameLabel)
+
+    NSLayoutConstraint.activate([
+      containerView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+      containerView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+      containerView.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+      containerView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+    ])
+  }
+
+  func configure(with item: MentionCompletionItem) {
+    guard item != currentItem else { return }
+    currentItem = item
+
+    nameLabel.stringValue = item.title
+    usernameLabel.stringValue = item.subtitle ?? ""
+    usernameLabel.isHidden = item.subtitle == nil
+    setAccessibilityLabel([item.title, item.subtitle].compactMap { $0 }.joined(separator: ", "))
+
+    // Remove existing avatar if any
+    avatarView?.removeFromSuperview()
+    avatarView = nil
+    groupIconView?.removeFromSuperview()
+    groupIconView = nil
+
+    let iconView: NSView
+    switch item {
+    case let .user(user):
+      let newAvatarView = ChatIconSwiftUIBridge(
+        .user(user.userInfo),
+        size: MentionCompletionMenu.Layout.avatarSize,
+        showsBotOnlineIndicator: true
+      )
+      newAvatarView.translatesAutoresizingMaskIntoConstraints = false
+      containerView.addSubview(newAvatarView)
+      avatarView = newAvatarView
+      iconView = newAvatarView
+
+    case .group:
+      let imageView = NSImageView()
+      imageView.image = NSImage(systemSymbolName: "person.2.fill", accessibilityDescription: nil)
+      imageView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+      imageView.wantsLayer = true
+      imageView.layer?.cornerRadius = MentionCompletionMenu.Layout.avatarSize / 2
+      imageView.translatesAutoresizingMaskIntoConstraints = false
+      containerView.addSubview(imageView)
+      groupIconView = imageView
+      iconView = imageView
+
+    case let .agent(agent):
+      let newAvatarView = ChatIconSwiftUIBridge(
+        .user(agent.botUserInfo),
+        size: MentionCompletionMenu.Layout.avatarSize,
+        showsBotOnlineIndicator: true
+      )
+      newAvatarView.translatesAutoresizingMaskIntoConstraints = false
+      containerView.addSubview(newAvatarView)
+      avatarView = newAvatarView
+      iconView = newAvatarView
+    }
+
+    // Vertical layout - name and username stacked vertically
+    NSLayoutConstraint.activate([
+      iconView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor, constant: 8),
+      iconView.centerYAnchor.constraint(equalTo: containerView.centerYAnchor),
+      iconView.widthAnchor.constraint(equalToConstant: MentionCompletionMenu.Layout.avatarSize),
+      iconView.heightAnchor.constraint(equalToConstant: MentionCompletionMenu.Layout.avatarSize),
+
+      nameLabel.leadingAnchor.constraint(
+        equalTo: iconView.trailingAnchor,
+        constant: MentionCompletionMenu.Layout.avatarNameSpacing
+      ),
+      nameLabel.topAnchor.constraint(
+        equalTo: containerView.topAnchor,
+        constant: MentionCompletionMenu.Layout.verticalPadding
+      ),
+      nameLabel.trailingAnchor.constraint(
+        lessThanOrEqualTo: containerView.trailingAnchor,
+        constant: -MentionCompletionMenu.Layout.horizontalPadding
+      ),
+
+      usernameLabel.leadingAnchor.constraint(
+        equalTo: iconView.trailingAnchor,
+        constant: MentionCompletionMenu.Layout.avatarNameSpacing
+      ),
+      usernameLabel.topAnchor.constraint(
+        equalTo: nameLabel.bottomAnchor,
+        constant: MentionCompletionMenu.Layout.nameUsernameSpacing
+      ),
+      usernameLabel.trailingAnchor.constraint(
+        lessThanOrEqualTo: containerView.trailingAnchor,
+        constant: -MentionCompletionMenu.Layout.horizontalPadding
+      ),
+    ])
+
+    // Set content compression resistance so username can shrink if needed
+    nameLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+    usernameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    updateAppearance()
+  }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let hoverTrackingArea {
+      removeTrackingArea(hoverTrackingArea)
+    }
+    let trackingArea = NSTrackingArea(
+      rect: .zero,
+      options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+      owner: self
+    )
+    addTrackingArea(trackingArea)
+    hoverTrackingArea = trackingArea
+  }
+
+  override func mouseEntered(with event: NSEvent) {
+    isHovered = true
+  }
+
+  override func mouseExited(with event: NSEvent) {
+    isHovered = false
+  }
+
+  override func prepareForReuse() {
+    super.prepareForReuse()
+    isHovered = false
+  }
+
+  /// A hidden menu gets no exit event, so it would reappear with a stale hover.
+  override func viewDidHide() {
+    super.viewDidHide()
+    isHovered = false
+  }
+
+  private func updateAppearance() {
+    if isSelected {
+      // Selected state: accent background with white text
+      containerView.layer?.backgroundColor = NSColor.selectedContentBackgroundColor
+        .resolvedColor(with: effectiveAppearance)
+        .cgColor
+      nameLabel.textColor = .alternateSelectedControlTextColor
+      usernameLabel.textColor = NSColor.alternateSelectedControlTextColor.withAlphaComponent(0.9)
+    } else {
+      // Normal state: standard text colors, with a light fill under the pointer
+      let backgroundColor: NSColor = isHovered
+        ? NSColor.labelColor.withAlphaComponent(0.08)
+        : .clear
+      containerView.layer?.backgroundColor = backgroundColor
+        .resolvedColor(with: effectiveAppearance)
+        .cgColor
+      nameLabel.textColor = .labelColor
+      usernameLabel.textColor = .secondaryLabelColor
+    }
+
+    if let groupIconView {
+      groupIconView.contentTintColor = isSelected ? .white : .secondaryLabelColor
+      let backgroundColor: NSColor = isSelected ? .white : .quaternaryLabelColor
+      groupIconView.layer?.backgroundColor = backgroundColor
+        .withAlphaComponent(0.2)
+        .resolvedColor(with: effectiveAppearance)
+        .cgColor
+    }
+  }
+
+  override func draw(_ dirtyRect: NSRect) {
+    // Don't call super.draw to prevent any native background drawing
+    // Our custom styling in updateAppearance handles all background drawing
+  }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    updateAppearance()
+  }
+}

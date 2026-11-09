@@ -1,0 +1,500 @@
+name: Deploy Server
+
+# Manual publication may select a branch in this repository. Production releases
+# remain main-only; no arbitrary ref input or push trigger. Restrict production
+# environments to main as an independent deployment fence.
+#
+# A normal release owns both origins: qualify both images, migrate once, then
+# release and smoke-test the Nuremberg fallback before Fly, so a ready origin
+# exists throughout. Every step is safe to repeat: after a partial failure,
+# "Re-run failed jobs" resumes where it stopped. `origins` releases one origin
+# alone when that is deliberately needed. CI uses public GHCR images and
+# Coolify's API; no host SSH key or registry pull credential is needed.
+on:
+  workflow_dispatch:
+    inputs:
+      origins:
+        description: Origins to release (both keeps the fallback in step with Fly)
+        type: choice
+        default: both
+        options: [both, fly, nuremberg]
+      publish_only:
+        description: Qualify and publish this branch's images for rehearsal; do not deploy
+        type: boolean
+        default: false
+      bootstrap:
+        description: Create the first API-only Machine, then await protected cutover approval before enabling workers
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-deploy-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate manual publication or main release
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          PUBLISH_ONLY: ${{ inputs.publish_only }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          ORIGINS: ${{ inputs.origins }}
+        run: |
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = inline-chat/inline
+          test "$GITHUB_REF_TYPE" = branch
+          [[ "$GITHUB_REF" == refs/heads/* ]] || exit 1
+          case "$PUBLISH_ONLY:$BOOTSTRAP" in
+            true:false) ;;
+            false:false|false:true) test "$GITHUB_REF" = refs/heads/main ;;
+            *) exit 1 ;;
+          esac
+          case "$ORIGINS" in
+            both|nuremberg) test "$BOOTSTRAP" = false ;;
+            fly) ;;
+            *) exit 1 ;;
+          esac
+
+  qualify:
+    name: Qualify and publish the exact release image
+    needs: validate
+    permissions:
+      contents: read
+      packages: write # Only the called, manual publisher receives this permission.
+    uses: ./.github/workflows/server-test.yml
+    with:
+      publish_image: true
+      publish_only: ${{ inputs.publish_only }}
+
+  prepared:
+    name: Report the qualified image for rehearsal or bootstrap
+    needs: qualify
+    if: ${{ inputs.publish_only }}
+    runs-on: ubuntu-latest
+    env:
+      RUNTIME_IMAGE: ${{ needs.qualify.outputs.runtime_image }}
+      STANDBY_IMAGE: ${{ needs.qualify.outputs.standby_image }}
+    steps:
+      - name: Record the exact image without accessing production
+        run: |
+          [[ "$RUNTIME_IMAGE" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+          [[ "$STANDBY_IMAGE" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+          printf 'Prepared `%s` at `%s` for rehearsal or initial bootstrap. Production preflight, migrations, and deployment were skipped.\n' \
+            "$GITHUB_SHA" "$RUNTIME_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          printf 'ARM64 Coolify image: `%s`. No Hetzner deployment was performed.\n' "$STANDBY_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+  preflight:
+    name: Check both origins and save the release plan before DDL
+    needs: qualify
+    if: ${{ github.ref == 'refs/heads/main' && !inputs.publish_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      BOOTSTRAP: ${{ inputs.bootstrap }}
+      ORIGINS: ${{ inputs.origins }}
+      RELEASE_SHA: ${{ github.sha }}
+      RUNTIME_IMAGE: ${{ needs.qualify.outputs.runtime_image }}
+      STANDBY_IMAGE: ${{ needs.qualify.outputs.standby_image }}
+      FLY_ORIGIN_IP: ${{ vars.FLY_ORIGIN_IP }}
+      NBG_ORIGIN_IP: ${{ secrets.NBG_ORIGIN_IP }}
+      COOLIFY_URL: ${{ vars.COOLIFY_URL }}
+      COOLIFY_APP_UUID: ${{ vars.NBG_COOLIFY_APP_UUID }}
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_NBG_TOKEN }}
+      SMOKE_BOT_TOKEN: ${{ secrets.SMOKE_BOT_TOKEN }}
+      SMOKE_CHAT_ID: ${{ vars.SMOKE_CHAT_ID }}
+    outputs:
+      baseline: ${{ steps.baseline.outputs.baseline }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.4"
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+        with:
+          version: "0.4.107"
+      - name: Check required configuration and anonymous image access
+        env:
+          MIGRATION_URL: ${{ secrets.PRODUCTION_DATABASE_MIGRATION_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$FLY_API_TOKEN" && test -n "$MIGRATION_URL"
+          if [[ "$BOOTSTRAP" != true ]]; then
+            test -n "$SMOKE_BOT_TOKEN" && test -n "$SMOKE_CHAT_ID" && test -n "$FLY_ORIGIN_IP"
+          fi
+          if [[ "$ORIGINS" != fly ]]; then
+            test -n "$NBG_ORIGIN_IP" && test -n "$COOLIFY_URL" && test -n "$COOLIFY_APP_UUID" && test -n "$COOLIFY_TOKEN"
+          fi
+          mkdir -p "$RUNNER_TEMP/anonymous-registry"
+          for image in "$RUNTIME_IMAGE" "$STANDBY_IMAGE"; do
+            [[ "$image" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+            DOCKER_CONFIG="$RUNNER_TEMP/anonymous-registry" docker manifest inspect "$image" > /dev/null
+          done
+      - name: Restore an existing release plan without replacing its original baseline
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-plan"
+          name=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name == "server-release-plan" and .expired == false)] | max_by(.id) | .name // empty')
+          if [[ -n "$name" ]]; then
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$name" --dir "$RUNNER_TEMP/release-plan"
+          fi
+      - name: Validate public Machine compatibility and service readiness
+        run: |
+          set -euo pipefail
+          flyctl machine list --config server/fly.toml --json > "$RUNNER_TEMP/machines.json"
+          filter=scripts/ci/fly-release-machines.jq
+          if [[ "$BOOTSTRAP" = true ]]; then filter=scripts/ci/fly-release-machines-bootstrap.jq; fi
+          jq -ce -f "$filter" "$RUNNER_TEMP/machines.json" > "$RUNNER_TEMP/fly-baseline.json"
+      - name: Check Coolify and the selected smoke account without sending messages
+        env:
+          NBG_BASELINE_FILE: ${{ runner.temp }}/nbg-baseline.json
+        run: |
+          set -euo pipefail
+          if [[ "$BOOTSTRAP" != true ]]; then
+            revision=$(jq -er '.revision' "$RUNNER_TEMP/fly-baseline.json")
+            bun --no-env-file scripts/ci/release-smoke.ts --preflight --origin fly --ip "$FLY_ORIGIN_IP" --revision "$revision"
+          fi
+          if [[ "$ORIGINS" != fly ]]; then
+            bun --no-env-file scripts/ci/nbg-release.ts --preflight
+            bun --no-env-file scripts/ci/release-smoke.ts --preflight --origin nuremberg --ip "$NBG_ORIGIN_IP"
+          fi
+      - name: Verify the dedicated cross-origin fixture without sending messages
+        if: ${{ !inputs.bootstrap && inputs.origins == 'both' }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNTIME_IMAGE" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+          docker run --rm --entrypoint bun \
+            -e SMOKE_BOT_TOKEN -e SMOKE_CHAT_ID \
+            "$RUNTIME_IMAGE" --no-env-file server/dist/realtime-cross-origin-smoke.js \
+            --fly-ip "$FLY_ORIGIN_IP" --nbg-ip "$NBG_ORIGIN_IP" --preflight
+      - name: Save the qualified image identities and original restore targets
+        id: baseline
+        run: |
+          set -euo pipefail
+          plan="$RUNNER_TEMP/release-plan/release.json"
+          if [[ -f "$plan" ]]; then
+            jq -e --arg sha "$GITHUB_SHA" --arg runtime "$RUNTIME_IMAGE" --arg standby "$STANDBY_IMAGE" \
+              --arg origins "$ORIGINS" --argjson bootstrap "$BOOTSTRAP" \
+              '.schema == 1 and .sha == $sha and .runtime_image == $runtime and .standby_image == $standby and .origins == $origins and .bootstrap == $bootstrap' "$plan" > /dev/null
+            echo 'created=false' >> "$GITHUB_OUTPUT"
+          else
+            if [[ "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
+              echo 'Original release plan is unavailable; start a new dispatch rather than recapturing a changed baseline.' >&2
+              exit 1
+            fi
+            nbg=null
+            if [[ "$ORIGINS" != fly ]]; then nbg=$(cat "$RUNNER_TEMP/nbg-baseline.json"); fi
+            migration=$(jq -er '.entries[-1].tag' server/drizzle/meta/_journal.json)
+            jq -n --arg sha "$GITHUB_SHA" --arg runtime "$RUNTIME_IMAGE" --arg standby "$STANDBY_IMAGE" \
+              --arg migration "$migration" --arg origins "$ORIGINS" --argjson bootstrap "$BOOTSTRAP" \
+              --slurpfile fly "$RUNNER_TEMP/fly-baseline.json" --argjson nuremberg "$nbg" \
+              '{schema:1,sha:$sha,runtime_image:$runtime,standby_image:$standby,migration_head:$migration,origins:$origins,bootstrap:$bootstrap,fly:$fly[0],nuremberg:$nuremberg}' > "$plan"
+            echo 'created=true' >> "$GITHUB_OUTPUT"
+          fi
+          baseline=$(jq -ce '.fly' "$plan")
+          printf 'baseline=%s\n' "$baseline" >> "$GITHUB_OUTPUT"
+      - name: Retain the plan before any database or origin change
+        if: steps.baseline.outputs.created == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: server-release-plan
+          path: ${{ runner.temp }}/release-plan/release.json
+          retention-days: 90
+          if-no-files-found: error
+
+  migrate:
+    name: Migrate and verify with the qualified image
+    needs: [qualify, preflight]
+    if: ${{ github.ref == 'refs/heads/main' && !inputs.publish_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      RUNTIME_IMAGE: ${{ needs.qualify.outputs.runtime_image }}
+    steps:
+      - name: Pull and verify the qualified image revision
+        run: |
+          set -euo pipefail
+          [[ "$RUNTIME_IMAGE" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+          docker pull "$RUNTIME_IMAGE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$RUNTIME_IMAGE")" = "$GITHUB_SHA"
+      - name: Apply and verify the migration ledger
+        env:
+          # DDL credentials belong only to this step, never to the API Machines.
+          DATABASE_DIRECT_URL: ${{ secrets.PRODUCTION_DATABASE_MIGRATION_URL }}
+          DATABASE_CONNECTION_MODE: direct
+        run: |
+          test -n "$DATABASE_DIRECT_URL"
+          docker run --rm -e DATABASE_DIRECT_URL -e DATABASE_CONNECTION_MODE \
+            "$RUNTIME_IMAGE" bun server/dist/migrate.js
+          docker run --rm -e DATABASE_DIRECT_URL -e DATABASE_CONNECTION_MODE \
+            "$RUNTIME_IMAGE" bun server/dist/verify-migrations.js
+
+  nuremberg:
+    name: Release and smoke-test the Nuremberg fallback
+    needs: [qualify, preflight, migrate]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && !inputs.publish_only && inputs.origins != 'fly' && needs.migrate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      outcome: ${{ steps.release.outputs.outcome }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ github.sha }}
+      STANDBY_IMAGE: ${{ needs.qualify.outputs.standby_image }}
+      NBG_ORIGIN_IP: ${{ secrets.NBG_ORIGIN_IP }}
+      COOLIFY_URL: ${{ vars.COOLIFY_URL }}
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_NBG_TOKEN }}
+      COOLIFY_APP_UUID: ${{ vars.NBG_COOLIFY_APP_UUID }}
+      SMOKE_BOT_TOKEN: ${{ secrets.SMOKE_BOT_TOKEN }}
+      SMOKE_CHAT_ID: ${{ vars.SMOKE_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.4"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: server-release-plan
+          path: ${{ runner.temp }}/release-plan
+      - name: Restore the latest recorded Coolify deployment for this run
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nbg-state"
+          name=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select((.name | startswith("nbg-release-state-")) and .expired == false)] | max_by(.id) | .name // empty')
+          if [[ -n "$name" ]]; then
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$name" --dir "$RUNNER_TEMP/nbg-state"
+          fi
+      - name: Pin, deploy and verify the exact ARM64 image through Coolify
+        id: release
+        env:
+          RELEASE_PLAN: ${{ runner.temp }}/release-plan/release.json
+          NBG_STATE_FILE: ${{ runner.temp }}/nbg-state/receipt.json
+        run: bun --no-env-file scripts/ci/nbg-release.ts
+      - name: Verify canonical routing still reaches the unchanged Fly release
+        if: inputs.origins == 'nuremberg'
+        run: |
+          set -euo pipefail
+          revision=$(jq -er '.fly.revision' "$RUNNER_TEMP/release-plan/release.json")
+          bun --no-env-file scripts/ci/release-smoke.ts --preflight --origin canonical --revision "$revision"
+      - name: Retain the deployment receipt even when verification fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nbg-release-state-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nbg-state/receipt.json
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true
+
+  deploy:
+    name: Replace the public Machines and verify readiness
+    needs: [qualify, preflight, migrate, nuremberg]
+    # Fly waits for a verified fallback, or runs alone when only Fly was chosen.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && !inputs.publish_only && inputs.origins != 'nuremberg' && needs.migrate.result == 'success' && (needs.nuremberg.result == 'success' || needs.nuremberg.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    outputs:
+      bootstrap_baseline: ${{ steps.verify.outputs.bootstrap_baseline }}
+      outcome: ${{ steps.replace.outputs.outcome }}
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      RUNTIME_IMAGE: ${{ needs.qualify.outputs.runtime_image }}
+      BASELINE: ${{ needs.preflight.outputs.baseline }}
+      BOOTSTRAP: ${{ inputs.bootstrap }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+        with:
+          version: "0.4.107"
+      - name: Revalidate the recorded baseline and deploy the same digest
+        id: replace
+        run: |
+          test -n "$FLY_API_TOKEN"
+          [[ "$RUNTIME_IMAGE" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+          flyctl machine list --config server/fly.toml --json > "$RUNNER_TEMP/machines-before.json"
+          filter=scripts/ci/fly-release-machines.jq
+          if [[ "$BOOTSTRAP" = true ]]; then filter=scripts/ci/fly-release-machines-bootstrap.jq; fi
+          current=$(jq -ce -f "$filter" "$RUNNER_TEMP/machines-before.json")
+          # A re-run after Fly already took this digest has nothing to replace.
+          if [[ "$BOOTSTRAP" != true ]] &&
+            jq -e --argjson baseline "$BASELINE" --arg digest "${RUNTIME_IMAGE##*@}" --arg sha "$GITHUB_SHA" \
+              '.count == $baseline.count and .digest == $digest and .revision == $sha' <<< "$current" > /dev/null; then
+            echo "Fly already serves $GITHUB_SHA; verifying only."
+            echo "outcome=already-current" >> "${GITHUB_OUTPUT:-/dev/null}"
+            exit 0
+          fi
+          echo "outcome=published" >> "${GITHUB_OUTPUT:-/dev/null}"
+          test "$current" = "$BASELINE"
+          MACHINE_IDS=$(jq -er '.ids' <<< "$BASELINE")
+          if [[ "$BOOTSTRAP" = true ]]; then
+            API_ID=$(jq -r '.api.id // empty' <<< "$BASELINE")
+            if [[ -n "$API_ID" ]]; then
+              flyctl deploy --config server/fly.toml --image "$RUNTIME_IMAGE" \
+                --only-machines "$API_ID" --strategy bluegreen --ha=false --signal SIGTERM --wait-timeout 5m --yes \
+                --env INLINE_PROCESS_ROLE=api
+            else
+              exclusions=()
+              if [[ -n "$MACHINE_IDS" ]]; then exclusions=(--exclude-machines "$MACHINE_IDS"); fi
+              flyctl deploy --config server/fly.toml --image "$RUNTIME_IMAGE" \
+                "${exclusions[@]}" --strategy immediate --ha=false --wait-timeout 5m --yes \
+                --vm-cpu-kind shared --vm-cpus 6 --vm-memory 1536 --env INLINE_PROCESS_ROLE=api
+            fi
+          else
+            flyctl deploy --config server/fly.toml --image "$RUNTIME_IMAGE" \
+              --only-machines "$MACHINE_IDS" --strategy bluegreen --ha=false \
+              --signal SIGTERM --wait-timeout 5m --yes
+          fi
+      - name: Verify baseline count, image revision, and service health
+        id: verify
+        run: |
+          BASELINE_COUNT=1
+          if [[ "$BOOTSTRAP" != true ]]; then BASELINE_COUNT=$(jq -er '.count' <<< "$BASELINE"); fi
+          bash scripts/ci/fly-release-wait.sh "$RUNNER_TEMP/machines-after.json" \
+            "$BASELINE_COUNT" "${RUNTIME_IMAGE##*@}" "$GITHUB_SHA"
+          current=$(jq -ce -f scripts/ci/fly-release-machines.jq "$RUNNER_TEMP/machines-after.json")
+          if [[ "$BOOTSTRAP" = true ]]; then
+            after=$(jq -ce -f scripts/ci/fly-release-machines-bootstrap.jq "$RUNNER_TEMP/machines-after.json")
+            test "$(jq -c 'del(.api)' <<< "$after")" = "$(jq -c 'del(.api)' <<< "$BASELINE")"
+            snapshot=$(jq -ce '.api' <<< "$after")
+            printf 'bootstrap_baseline=%s\n' "$snapshot" >> "$GITHUB_OUTPUT"
+          fi
+          jq -e --argjson count "$BASELINE_COUNT" --arg digest "${RUNTIME_IMAGE##*@}" --arg sha "$GITHUB_SHA" \
+            '.count == $count and .digest == $digest and .revision == $sha' <<< "$current" > /dev/null
+          printf 'Released `%s` at `%s`; %s public Machine(s) passed Fly service checks.\n' \
+            "$GITHUB_SHA" "$RUNTIME_IMAGE" "$BASELINE_COUNT" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$BOOTSTRAP" = true ]]; then
+            printf 'API-only bootstrap is ready. Qualify authenticated paths, transfer routing, and stop the old all-role API before approving production-cutover.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: ${{ !inputs.bootstrap }}
+        with:
+          bun-version: "1.4.4"
+      - name: Smoke-test the canonical route
+        if: ${{ !inputs.bootstrap }}
+        env:
+          FLY_ORIGIN_IP: ${{ vars.FLY_ORIGIN_IP }}
+          SMOKE_BOT_TOKEN: ${{ secrets.SMOKE_BOT_TOKEN }}
+          SMOKE_CHAT_ID: ${{ vars.SMOKE_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          bun --no-env-file scripts/ci/release-smoke.ts --origin fly --revision "$GITHUB_SHA" --ip "$FLY_ORIGIN_IP"
+          bun --no-env-file scripts/ci/release-smoke.ts --origin canonical --revision "$GITHUB_SHA"
+      - name: Verify large live messages across both origins
+        if: ${{ !inputs.bootstrap && inputs.origins == 'both' }}
+        env:
+          FLY_ORIGIN_IP: ${{ vars.FLY_ORIGIN_IP }}
+          NBG_ORIGIN_IP: ${{ secrets.NBG_ORIGIN_IP }}
+          SMOKE_BOT_TOKEN: ${{ secrets.SMOKE_BOT_TOKEN }}
+          SMOKE_CHAT_ID: ${{ vars.SMOKE_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNTIME_IMAGE" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+          docker run --rm --entrypoint bun \
+            -e SMOKE_BOT_TOKEN -e SMOKE_CHAT_ID \
+            "$RUNTIME_IMAGE" --no-env-file server/dist/realtime-cross-origin-smoke.js \
+            --revision "$GITHUB_SHA" --fly-ip "$FLY_ORIGIN_IP" --nbg-ip "$NBG_ORIGIN_IP" --confirm-test-writes
+
+  activate:
+    name: Enable workers on the same qualified bootstrap image
+    needs: [qualify, deploy]
+    if: ${{ github.ref == 'refs/heads/main' && !inputs.publish_only && inputs.bootstrap }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Required-reviewer protection must be configured before bootstrap dispatch.
+    # Approval means routing is verified and the old all-role API is stopped.
+    environment: production-cutover
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      RUNTIME_IMAGE: ${{ needs.qualify.outputs.runtime_image }}
+      BOOTSTRAP_BASELINE: ${{ needs.deploy.outputs.bootstrap_baseline }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+        with:
+          version: "0.4.107"
+      - name: Recheck the exact API-only Machine
+        run: |
+          [[ "$RUNTIME_IMAGE" =~ ^ghcr\.io/inline-chat/inline-server@sha256:[a-f0-9]{64}$ ]] || exit 1
+          flyctl machine list --config server/fly.toml --json > "$RUNNER_TEMP/before-activation.json"
+          current=$(jq -ce -f scripts/ci/fly-release-machines.jq "$RUNNER_TEMP/before-activation.json")
+          jq -e --argjson expected "$BOOTSTRAP_BASELINE" --arg digest "${RUNTIME_IMAGE##*@}" --arg sha "$GITHUB_SHA" \
+            '.count == 1 and .ids == $expected.id and .digest == $digest and .revision == $sha' <<< "$current" > /dev/null
+          snapshot=$(jq -c '[.[] | select(.state != "destroyed" and (.config.services // [] | length) > 0)] | .[0] |
+            {id, version, digest: .image_ref.digest, revision: .image_ref.labels["org.opencontainers.image.revision"]}' "$RUNNER_TEMP/before-activation.json")
+          test "$snapshot" = "$BOOTSTRAP_BASELINE"
+          jq -e '[.[] | select(.state != "destroyed" and (.config.services // [] | length) > 0)] | all(.[];
+            .config.env.INLINE_PROCESS_ROLE == "api" and .config.env.INLINE_INGRESS_HOST == "api.inline.chat")' \
+            "$RUNNER_TEMP/before-activation.json" > /dev/null
+      - name: Verify the predecessor is durably stopped
+        env:
+          FLY_API_TOKEN: ${{ secrets.LEGACY_FLY_READ_TOKEN }}
+          PREDECESSOR_FLY_APP: ${{ vars.PREDECESSOR_FLY_APP }}
+          PREDECESSOR_MACHINE_ID: ${{ vars.PREDECESSOR_MACHINE_ID }}
+        run: |
+          test -n "$FLY_API_TOKEN"
+          test "$PREDECESSOR_FLY_APP" = inline-fra-standby
+          test -n "$PREDECESSOR_MACHINE_ID"
+          flyctl machine list --app "$PREDECESSOR_FLY_APP" --json > "$RUNNER_TEMP/predecessor.json"
+          jq -e --arg predecessor "$PREDECESSOR_MACHINE_ID" -f scripts/ci/fly-release-machines-legacy.jq \
+            "$RUNNER_TEMP/predecessor.json" > /dev/null
+      - name: Activate the same qualified digest with workers
+        run: |
+          MACHINE_ID=$(jq -er '.id' <<< "$BOOTSTRAP_BASELINE")
+          flyctl deploy --config server/fly.toml --image "$RUNTIME_IMAGE" \
+            --only-machines "$MACHINE_ID" --strategy bluegreen --ha=false --signal SIGTERM --wait-timeout 5m --yes
+      - name: Verify the all-role Machine
+        run: |
+          bash scripts/ci/fly-release-wait.sh "$RUNNER_TEMP/after-activation.json" \
+            1 "${RUNTIME_IMAGE##*@}" "$GITHUB_SHA"
+          current=$(jq -ce -f scripts/ci/fly-release-machines.jq "$RUNNER_TEMP/after-activation.json")
+          jq -e --arg digest "${RUNTIME_IMAGE##*@}" --arg sha "$GITHUB_SHA" \
+            '.count == 1 and .digest == $digest and .revision == $sha' <<< "$current" > /dev/null
+          jq -e '[.[] | select(.state != "destroyed" and (.config.services // [] | length) > 0)] | all(.[];
+            .config.env.INLINE_PROCESS_ROLE == "all" and .config.env.INLINE_INGRESS_HOST == "api.inline.chat")' \
+            "$RUNNER_TEMP/after-activation.json" > /dev/null
+          printf 'Activated workers for `%s` at `%s`; one all-role public Machine passed service checks.\n' \
+            "$GITHUB_SHA" "$RUNTIME_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    name: Release outcome
+    needs: [validate, qualify, prepared, preflight, migrate, nuremberg, deploy, activate]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+      - name: Report the outcome per origin
+        env:
+          ORIGINS: ${{ inputs.origins }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          PUBLISH_ONLY: ${{ inputs.publish_only }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: bash scripts/ci/server-release-summary.sh

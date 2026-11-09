@@ -1,0 +1,169 @@
+import { encryptedText } from "./encrypted"
+import { pgTable, boolean, pgEnum, unique, uniqueIndex, check, timestamp, index } from "drizzle-orm/pg-core"
+import { users } from "./users"
+import { spaces } from "./spaces"
+import { sql } from "drizzle-orm"
+import { relations } from "drizzle-orm/_relations"
+import { creationDate } from "@in/server/db/schema/common"
+import { integer, type AnyPgColumn } from "drizzle-orm/pg-core"
+import { messages } from "@in/server/db/schema/messages"
+import { foreignKey } from "drizzle-orm/pg-core"
+import { dialogs } from "@in/server/db/schema/dialogs"
+import { bytea } from "@in/server/db/schema/common"
+
+export const chatTypeEnum = pgEnum("chat_types", ["private", "thread"])
+
+export const chats = pgTable(
+  "chats",
+  {
+    id: integer().primaryKey().generatedByDefaultAsIdentity(),
+    type: chatTypeEnum().notNull(),
+    title: encryptedText("title", "chats.title", 150),
+    titleHash: bytea("title_hash"),
+    /** null is legacy/unknown; false stays retryable until generation succeeds. */
+    autoTitleGenerated: boolean("auto_title_generated").default(false),
+    description: encryptedText("description", "chats.description"),
+
+    /** Most recent message id */
+    lastMsgId: integer("last_msg_id"),
+
+    /** Highest message id ever allocated in this chat; never decreases when history is deleted. */
+    messageIdCounter: integer("message_id_counter").notNull().default(0),
+
+    /** optional, if part of a space */
+    spaceId: integer("space_id").references(() => spaces.id),
+
+    /** optional, required for space chats, defaults to false */
+    publicThread: boolean("public_thread"),
+
+    /** optional, required for space chats, thread number */
+    threadNumber: integer("thread_number"),
+
+    /** optional, creator user id (required for home threads) */
+    createdBy: integer("created_by").references(() => users.id),
+
+    /** true when a thread has not been explicitly titled */
+    isUntitled: boolean("is_untitled"),
+
+    /** structural parent chat for linked subthreads */
+    parentChatId: integer("parent_chat_id").references((): AnyPgColumn => chats.id),
+
+    /** anchored parent message for reply-thread subthreads */
+    parentMessageId: integer("parent_message_id"),
+
+    /** optional, required for private chats, least user id */
+    minUserId: integer("min_user_id").references(() => users.id),
+    /** optional, required for private chats, greatest user id */
+    maxUserId: integer("max_user_id").references(() => users.id),
+
+    date: creationDate,
+
+    emoji: encryptedText("emoji", "chats.emoji", 20),
+
+    /** Encoded AgentThreadContext. Visible chat metadata, not provider session state. */
+    agentContext: bytea("agent_context"),
+
+    /** Sequence of the updates for the chat */
+    updateSeq: integer("update_seq").default(0),
+
+    /** Independent MCP reaction replay position; never consumes native updateSeq. */
+    mcpReactionSeq: integer("mcp_reaction_seq").notNull().default(0),
+
+    /** Date of the last update */
+    lastUpdateDate: timestamp("last_update_date", {
+      mode: "date",
+      precision: 3,
+    }),
+  },
+  (table) => ({
+    titleLookupIndex: index("chats_title_hash_idx").on(table.titleHash, table.spaceId, table.createdBy),
+    /** Ensure correctness */
+    userIdsCheckConstraint: check("user_ids_check", sql`${table.minUserId} <= ${table.maxUserId}`),
+    /** Ensure single private chat exists for each user pair */
+    userIdsUniqueContraint: unique("user_ids_unique").on(table.minUserId, table.maxUserId),
+
+    /** Ensure unique space thread number */
+    spaceThreadNumberUniqueContraint: unique("space_thread_number_unique").on(table.spaceId, table.threadNumber),
+
+    /** Ensure unique thread numbers within user scopes. */
+    userThreadNumberUniqueIndex: uniqueIndex("user_thread_number_unique")
+      .on(table.createdBy, table.threadNumber)
+      .where(sql`${table.spaceId} is null and ${table.threadNumber} is not null`),
+
+    /** Allow at most one reply-thread subthread per parent message. */
+    replyThreadParentUniqueConstraint: unique("reply_thread_parent_unique").on(table.parentChatId, table.parentMessageId),
+
+    /** Ensure lastMsgId is valid */
+    lastMsgIdForeignKey: foreignKey({
+      name: "last_msg_id_fk",
+      columns: [table.id, table.lastMsgId],
+      foreignColumns: [messages.chatId, messages.messageId],
+    }),
+
+    /** Ensure anchored parent messages belong to the declared parent chat. */
+    parentMessageForeignKey: foreignKey({
+      name: "parent_message_id_fk",
+      columns: [table.parentChatId, table.parentMessageId],
+      foreignColumns: [messages.chatId, messages.messageId],
+    }),
+
+    /** Message anchors require a structural parent chat. */
+    parentMessageRequiresParentChatConstraint: check(
+      "parent_message_requires_parent_chat",
+      sql`${table.parentMessageId} is null or ${table.parentChatId} is not null`,
+    ),
+
+    parentChatIdIndex: index("chats_parent_chat_id_idx").on(table.parentChatId),
+    /** Repair discovery and catalog refresh filter every reachable chat by recency. */
+    lastUpdateDateIndex: index("chats_last_update_date_idx").on(table.lastUpdateDate),
+  }),
+)
+
+export const chatParticipants = pgTable(
+  "chat_participants",
+  {
+    id: integer().primaryKey().generatedAlwaysAsIdentity(),
+    chatId: integer("chat_id")
+      .references(() => chats.id)
+      .notNull(),
+    userId: integer("user_id")
+      .references(() => users.id)
+      .notNull(),
+    date: creationDate,
+  },
+  (table) => ({
+    /** Ensure unique participant per chat */
+    uniqueParticipant: unique("unique_participant").on(table.chatId, table.userId),
+  }),
+)
+
+export const chatsRelations = relations(chats, ({ one, many }) => ({
+  space: one(spaces, {
+    fields: [chats.spaceId],
+    references: [spaces.id],
+  }),
+
+  lastMsg: one(messages, {
+    fields: [chats.id, chats.lastMsgId],
+    references: [messages.chatId, messages.messageId],
+  }),
+
+  dialogs: many(dialogs),
+  participants: many(chatParticipants),
+}))
+
+export const chatParticipantsRelations = relations(chatParticipants, ({ one }) => ({
+  chat: one(chats, {
+    fields: [chatParticipants.chatId],
+    references: [chats.id],
+  }),
+  user: one(users, {
+    fields: [chatParticipants.userId],
+    references: [users.id],
+  }),
+}))
+
+export type DbChat = typeof chats.$inferSelect
+export type DbNewChat = typeof chats.$inferInsert
+export type DbChatParticipant = typeof chatParticipants.$inferSelect
+export type DbNewChatParticipant = typeof chatParticipants.$inferInsert

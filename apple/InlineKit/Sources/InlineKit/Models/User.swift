@@ -1,0 +1,687 @@
+import Auth
+import Foundation
+import GRDB
+import ImageIO
+import InlineProtocol
+import Logger
+import UniformTypeIdentifiers
+
+public struct ApiUserProfilePhotoReference: Codable, Hashable, Sendable {
+  public let cdnURL: String?
+  public let fileUniqueID: String?
+
+  public init(cdnURL: String?, fileUniqueID: String?) {
+    self.cdnURL = cdnURL
+    self.fileUniqueID = fileUniqueID
+  }
+}
+
+public struct ApiUser: Codable, Hashable, Sendable {
+  public var id: Int64
+  public var email: String?
+  public var firstName: String?
+  public var lastName: String?
+  public var bio: String?
+  public var online: Bool?
+  public var pendingSetup: Bool?
+  public var phoneNumber: String?
+  public var lastOnline: Int?
+  public var date: Int
+  public var username: String?
+  public var photo: [ApiPhoto]?
+  public var timeZone: String?
+  public var bot: Bool? = nil
+  /// Compact V3 profile-photo reference. Legacy API responses continue using `photo`.
+  public var profilePhoto: ApiUserProfilePhotoReference? = nil
+  public static let preview = Self(
+    id: 1,
+    email: "mo@inline.chat",
+    firstName: "Mo",
+    lastName: nil,
+    date: 162_579_240,
+    username: "mo"
+  )
+
+  public var anyName: String {
+    firstName ?? username ?? email?.components(separatedBy: "@").first ?? "User \(id)"
+  }
+
+  public var avatarURL: URL? {
+    let value = photo?.first?.temporaryUrl ?? profilePhoto?.cdnURL
+    return value.flatMap(URL.init(string:))
+  }
+
+  public var avatarFileUniqueID: String? {
+    photo?.first?.fileUniqueId ?? profilePhoto?.fileUniqueID
+  }
+
+  public var hasConfiguredProfilePhoto: Bool {
+    photo?.first != nil || profilePhoto != nil
+  }
+}
+
+public extension ApiUser {
+  init(from user: InlineProtocol.User) {
+    self.init(
+      id: user.id,
+      email: user.hasEmail ? user.email : nil,
+      firstName: user.hasFirstName ? user.firstName : nil,
+      lastName: user.hasLastName ? user.lastName : nil,
+      bio: user.hasBio ? user.bio : nil,
+      online: user.hasStatus ? user.status.online == .online : nil,
+      pendingSetup: user.hasPendingSetup ? user.pendingSetup : nil,
+      phoneNumber: user.hasPhoneNumber ? user.phoneNumber : nil,
+      lastOnline: user.hasStatus && user.status.hasLastOnline ? Int(user.status.lastOnline.date) : nil,
+      date: Int(Date().timeIntervalSince1970),
+      username: user.hasUsername ? user.username : nil,
+      photo: nil,
+      timeZone: user.hasTimeZone ? user.timeZone : nil,
+      bot: user.hasBot ? user.bot : false,
+      profilePhoto: user.hasProfilePhoto
+        ? ApiUserProfilePhotoReference(
+          cdnURL: user.profilePhoto.hasCdnURL ? user.profilePhoto.cdnURL : nil,
+          fileUniqueID: user.profilePhoto.hasFileUniqueID ? user.profilePhoto.fileUniqueID : nil
+        )
+        : nil
+    )
+  }
+}
+
+public struct User: FetchableRecord, Identifiable, Codable, Hashable, PersistableRecord, Sendable,
+  Equatable
+{
+  public var id: Int64
+  public var email: String?
+  public var firstName: String?
+  public var lastName: String?
+  public var bio: String?
+  public var date: Date?
+  public var username: String?
+  public var phoneNumber: String?
+  public var pendingSetup: Bool?
+  public var online: Bool?
+  public var lastOnline: Date?
+  public var timeZone: String?
+  public var profileFileId: String?
+  public var profileCdnUrl: String?
+  public var profileLocalPath: String?
+  public var profileFileUniqueId: String?
+  public var bot: Bool = false
+
+  public enum Columns {
+    static let id = Column(CodingKeys.id)
+    static let email = Column(CodingKeys.email)
+    static let firstName = Column(CodingKeys.firstName)
+    static let lastName = Column(CodingKeys.lastName)
+    static let bio = Column(CodingKeys.bio)
+    static let date = Column(CodingKeys.date)
+    static let username = Column(CodingKeys.username)
+    static let phoneNumber = Column(CodingKeys.phoneNumber)
+    static let pendingSetup = Column(CodingKeys.pendingSetup)
+    static let online = Column(CodingKeys.online)
+    static let lastOnline = Column(CodingKeys.lastOnline)
+    static let timeZone = Column(CodingKeys.timeZone)
+    static let profileFileId = Column(CodingKeys.profileFileId)
+    static let profileCdnUrl = Column(CodingKeys.profileCdnUrl)
+    static let profileLocalPath = Column(CodingKeys.profileLocalPath)
+    static let profileFileUniqueId = Column(CodingKeys.profileFileUniqueId)
+    static let bot = Column(CodingKeys.bot)
+  }
+
+  // Add hasMany for all files (including historical profile photos)
+  public static let photos = hasMany(
+    File.self,
+    using: ForeignKey(["profileForUserId"], to: ["id"])
+  )
+  public var photos: QueryInterfaceRequest<File> {
+    request(for: User.photos)
+  }
+
+  public static let members = hasMany(Member.self)
+  public static let dialog = hasOne(Dialog.self)
+  public static let spaces = hasMany(Space.self, through: members, using: Member.space)
+
+  public var members: QueryInterfaceRequest<Member> {
+    request(for: User.members)
+  }
+
+  public var spaces: QueryInterfaceRequest<Space> {
+    request(for: User.spaces)
+  }
+
+  public var dialog: QueryInterfaceRequest<Dialog> {
+    request(for: User.dialog)
+  }
+
+  public static let chat = hasOne(
+    Chat.self,
+    using: ForeignKey([Chat.Columns.peerUserId], to: [Columns.id])
+  )
+  public var chat: QueryInterfaceRequest<Chat> {
+    request(for: User.chat)
+  }
+
+  public static let messages = hasMany(Message.self)
+  public var messages: QueryInterfaceRequest<Message> {
+    request(for: User.messages)
+  }
+
+  public static let deletedInstance = Self(
+    id: -1,
+    email: nil,
+    firstName: "Deleted",
+    lastName: nil,
+    username: nil
+  )
+
+  public static let previewUserId: Int64 = 1
+  public static let preview = Self(
+    id: 1,
+    email: "preview@example.com",
+    firstName: "John",
+    lastName: "Doe",
+    username: "jdoe"
+  )
+
+  public init(
+    id: Int64 = Int64.random(in: 1 ... 5_000), email: String?, firstName: String?,
+    lastName: String? = nil, username: String? = nil, bio: String? = nil
+  ) {
+    self.id = id
+    self.email = email
+    self.firstName = firstName
+    self.lastName = lastName
+    self.bio = bio
+    date = Date.now
+    self.username = username
+    bot = false
+  }
+
+  // MARK: - Computed
+
+  private static let nameFormatter = PersonNameComponentsFormatter()
+  public var fullName: String {
+    resolvedFullName ?? ""
+  }
+
+  public var displayName: String {
+    resolvedFullName
+      ?? normalizedUserText(username)
+      ?? normalizedUserText(email)
+      ?? normalizedUserText(phoneNumber)
+      ?? "User"
+  }
+
+  public var shortDisplayName: String {
+    normalizedUserText(firstName)
+      ?? normalizedUserText(username)
+      ?? normalizedUserText(email)
+      ?? normalizedUserText(phoneNumber)
+      ?? "User"
+  }
+
+  public var needsDisplayNameFetch: Bool {
+    resolvedFullName == nil &&
+      normalizedUserText(username) == nil &&
+      normalizedUserText(email) == nil &&
+      normalizedUserText(phoneNumber) == nil
+  }
+
+  public var needsFullFetch: Bool {
+    needsDisplayNameFetch
+  }
+
+  private var resolvedFullName: String? {
+    let components = PersonNameComponents(
+      givenName: firstName,
+      familyName: lastName
+    )
+
+    if let formatted = normalizedUserText(Self.nameFormatter.string(from: components)) {
+      return formatted
+    }
+
+    let direct = [firstName, lastName]
+      .compactMap(normalizedUserText)
+      .joined(separator: " ")
+    return normalizedUserText(direct)
+  }
+}
+
+public extension User {
+  static func fetch(id: Int64, from database: AppDatabase) async throws -> User? {
+    try await database.dbWriter.read { db in
+      try User.fetchOne(db, key: id)
+    }
+  }
+
+  init(from apiUser: ApiUser) {
+    id = apiUser.id
+    email = apiUser.email
+    firstName = apiUser.firstName
+    lastName = apiUser.lastName
+    bio = apiUser.bio
+    username = apiUser.username
+    date = Self.fromTimestamp(from: apiUser.date)
+    online = apiUser.online
+    lastOnline = apiUser.lastOnline.flatMap { Self.lastOnlineDate(from: Int64($0)) }
+    pendingSetup = apiUser.pendingSetup ?? false
+    phoneNumber = apiUser.phoneNumber ?? nil
+    timeZone = apiUser.timeZone ?? nil
+    bot = apiUser.bot ?? false
+  }
+
+  static func fromTimestamp(from: Int) -> Date {
+    Date(timeIntervalSince1970: Double(from))
+  }
+
+  /// Presence timestamps are protocol Unix seconds. Keep values inside the range that
+  /// Foundation and GRDB can round-trip through SQLite's four-digit-year date format.
+  static func lastOnlineDate(from timestamp: Int64) -> Date? {
+    guard (0 ... 253_402_300_799).contains(timestamp) else { return nil }
+    return Date(timeIntervalSince1970: TimeInterval(timestamp))
+  }
+
+  func isCurrentUser() -> Bool {
+    id == Auth.shared.getCurrentUserId()
+  }
+}
+
+// TODO: add a get color item for the user
+
+public struct UserWithPhoto: Codable, Hashable {
+  public var user: User
+  public var photo: File?
+}
+
+public extension User {
+  static func userInfoQuery() -> QueryInterfaceRequest<UserInfo> {
+    User
+      .including(all: User.photos.forKey(UserInfo.CodingKeys.profilePhoto))
+      .asRequest(of: UserInfo.self)
+  }
+}
+
+public extension ApiUser {
+  @discardableResult
+  func saveFull(
+    _ db: Database
+  )
+    throws -> User
+  {
+    let existing = try? User.fetchOne(db, id: id)
+    var user = User(from: self)
+
+    var profileCdnUrl = profilePhoto?.cdnURL
+    var profileFileUniqueId = profilePhoto?.fileUniqueID
+
+    // TODO: support clearing photo
+    var file: File? = nil
+
+    if let photo = photo?.first {
+      profileCdnUrl = photo.temporaryUrl
+      profileFileUniqueId = photo.fileUniqueId
+      // save file
+      file = try? File.save(db, apiPhoto: photo, forUserId: user.id)
+    }
+
+    // remove old photos except new ones for existing users
+    if let file,
+       let existing,
+       // main file changed
+       existing.profileFileId != file.id
+    {
+      // clear all other files for this user
+      try File
+        .filter(Column("profileForUserId") == user.id)
+        .filter(Column("id") != file.id)
+        .deleteAll(db)
+    }
+
+    if let existing {
+      // Check if we need to clear local cache due to profile photo change
+      let shouldClearCache = existing.shouldInvalidateLocalCache(
+        newFileUniqueId: profileFileUniqueId,
+        newFileId: file?.id
+      )
+
+      // keep existing values
+      user.profileFileId = file?.id ?? existing.profileFileId
+      user.phoneNumber = user.phoneNumber ?? existing.phoneNumber
+      user.email = user.email ?? existing.email
+      user.pendingSetup = user.pendingSetup ?? existing.pendingSetup
+      user.timeZone = user.timeZone ?? existing.timeZone
+      user.bot = bot ?? existing.bot
+      user.profileCdnUrl = profileCdnUrl ?? existing.profileCdnUrl
+      user.profileLocalPath = shouldClearCache ? nil : existing.profileLocalPath
+      user.profileFileUniqueId = profileFileUniqueId ?? existing.profileFileUniqueId
+
+      // Remove old cached file from disk if cache is being invalidated
+      if shouldClearCache, let localURL = existing.getLocalURL() {
+        try? FileManager.default.removeItem(at: localURL)
+      }
+
+      try user.save(db)
+      // ... anything else?
+    } else {
+      // NEW USER
+      // attach main photo
+      user.profileFileId = file?.id
+      user.profileCdnUrl = profileCdnUrl
+      user.profileFileUniqueId = file?.fileUniqueId ?? profilePhoto?.fileUniqueID
+
+      // TODO: handle multiple files
+      try user.save(db)
+    }
+
+    return user
+  }
+}
+
+// Inline Protocol
+public extension User {
+  init(from user: InlineProtocol.User) {
+    let min = user.hasMin && user.min == true
+
+    id = user.id
+    firstName = user.hasFirstName ? user.firstName : nil
+    lastName = user.hasLastName ? user.lastName : nil
+    bio = user.hasBio ? user.bio : nil
+    username = user.hasUsername ? user.username : nil
+    timeZone = user.hasTimeZone ? user.timeZone : nil
+    date = Date() // unused field
+    // don't preserve pendingSetup
+    bot = user.hasBot ? user.bot : false
+
+    if !min {
+      email = user.hasEmail ? user.email : nil
+      phoneNumber = user.hasPhoneNumber ? user.phoneNumber : nil
+      pendingSetup = user.hasPendingSetup ? user.pendingSetup : nil
+    }
+
+    // Min users carry status only for bots, whose presence is server-derived.
+    if user.hasStatus {
+      online = user.status.online == .online
+      lastOnline = user.status.hasLastOnline
+        ? Self.lastOnlineDate(from: user.status.lastOnline.date)
+        : nil
+    }
+
+    if user.hasProfilePhoto {
+      profileCdnUrl = user.profilePhoto.hasCdnURL ? user.profilePhoto.cdnURL : nil
+      // Extract file unique ID from protocol if available
+      if user.profilePhoto.hasFileUniqueID {
+        profileFileUniqueId = user.profilePhoto.fileUniqueID
+      }
+      // Note: Don't clear profileFileUniqueId if not provided - preserve existing value
+    }
+  }
+
+  static func save(
+    _ db: Database, user protocolUser: InlineProtocol.User
+  )
+    throws -> User
+  {
+    let existing = try? User.fetchOne(db, id: protocolUser.id)
+    var user = User(from: protocolUser)
+
+    if let existing {
+      // Check if we need to clear local cache due to profile photo change
+      let preservesOmittedFields = protocolUser.hasMin && protocolUser.min
+      let removesProfilePhoto = !preservesOmittedFields && !protocolUser.hasProfilePhoto
+      let shouldClearCache = removesProfilePhoto
+        ? existing.stableAvatarIdentity != nil
+        : existing.shouldInvalidateLocalCache(newFileUniqueId: user.profileFileUniqueId)
+
+      // keep existing values
+      user.profileFileId = removesProfilePhoto ? nil : existing.profileFileId
+      user.date = existing.date
+      if preservesOmittedFields {
+        user.firstName = user.firstName ?? existing.firstName
+        user.lastName = user.lastName ?? existing.lastName
+        user.bio = user.bio ?? existing.bio
+        user.username = user.username ?? existing.username
+        user.phoneNumber = user.phoneNumber ?? existing.phoneNumber
+        user.email = user.email ?? existing.email
+        user.timeZone = user.timeZone ?? existing.timeZone
+        user.pendingSetup = user.pendingSetup ?? existing.pendingSetup
+        user.online = user.online ?? existing.online
+        user.lastOnline = user.lastOnline ?? existing.lastOnline
+      }
+      user.profileCdnUrl = removesProfilePhoto ? nil : user.profileCdnUrl ?? existing.profileCdnUrl
+      user.profileLocalPath = shouldClearCache ? nil : existing.profileLocalPath
+      user.profileFileUniqueId = removesProfilePhoto ? nil : user.profileFileUniqueId ?? existing.profileFileUniqueId
+      // Preserve bot flag if not present in the update payload.
+      if protocolUser.hasBot == false {
+        user.bot = existing.bot
+      }
+
+      // Remove old cached file from disk if cache is being invalidated
+      if shouldClearCache, let localURL = existing.getLocalURL() {
+        try? FileManager.default.removeItem(at: localURL)
+      }
+
+      // don't preserve pendingSetup
+      try user.save(db)
+    } else {
+      // Backward compatible as the new API doesn't send date for users
+      user.date = Date()
+      try user.save(db)
+    }
+
+    return user
+  }
+}
+
+// MARK: - Photo helpers
+
+public extension User {
+  /// Files written from an unprocessed, identity-checked remote photo request.
+  static let remoteProfilePhotoCacheFilePrefix = "RemoteUserAvatar-v1-"
+
+  private static func getProfileCacheDirectory() -> URL {
+    FileHelpers.getLocalCacheDirectory(for: .photos)
+  }
+
+  func getLocalURL() -> URL? {
+    guard let profileLocalPath else {
+      return nil
+    }
+    return
+      User.getProfileCacheDirectory()
+        .appending(path: profileLocalPath)
+  }
+
+  func getRemoteURL() -> URL? {
+    guard let profileCdnUrl else {
+      return nil
+    }
+    return URL(string: profileCdnUrl)
+  }
+
+  static func cacheImageData(
+    userId: Int64,
+    data: Data,
+    expectedSourceURL: URL? = nil,
+    expectedAvatarIdentity: String? = nil,
+    accountToken: AuthAccountMutationToken? = nil,
+    auth: AuthHandle = Auth.shared.handle,
+    database: AppDatabase = .shared,
+    directory: URL? = nil
+  ) async throws {
+    Log.shared.debug("Trying to cache image data")
+
+    let directory = directory ?? User.getProfileCacheDirectory()
+    let format = imageFormat(for: data)
+    let prefix = expectedSourceURL == nil ? "User" : Self.remoteProfilePhotoCacheFilePrefix
+    let localPath = "\(prefix)\(UUID().uuidString).\(format.fileExtension)"
+    let localUrl = directory.appendingPathComponent(localPath)
+
+    do {
+      try data.write(to: localUrl, options: .atomic)
+
+      let oldLocalUrl = try await database.dbWriter.write { db -> URL? in
+        if let accountToken {
+          try auth.validateAccountMutation(accountToken)
+        }
+        let oldLocalPath = try storeCachedProfilePhoto(
+          db,
+          userId: userId,
+          localPath: localPath,
+          expectedSourceURL: expectedSourceURL,
+          expectedAvatarIdentity: expectedAvatarIdentity
+        )
+
+        guard let oldLocalPath, oldLocalPath != localPath else { return nil }
+        return directory.appendingPathComponent(oldLocalPath)
+      }
+
+      if let oldLocalUrl, oldLocalUrl != localUrl {
+        try? FileManager.default.removeItem(at: oldLocalUrl)
+      }
+    } catch {
+      try? FileManager.default.removeItem(at: localUrl)
+      throw error
+    }
+  }
+
+  /// Validate and attach in the same transaction so an old download cannot overwrite a newer photo.
+  internal static func storeCachedProfilePhoto(
+    _ db: Database,
+    userId: Int64,
+    localPath: String,
+    expectedSourceURL: URL?,
+    expectedAvatarIdentity: String?
+  ) throws -> String? {
+    guard let user = try User.fetchOne(db, id: userId) else {
+      throw UserAvatarCacheError.userNotFound(userId)
+    }
+    if let expectedSourceURL {
+      // Views resolve a missing User photo identity through the photo File, as `UserInfo` does.
+      let fileAvatarIdentity = user.stableAvatarIdentity == nil
+        ? try user.photos.fetchAll(db).first?.stableAvatarIdentity
+        : nil
+      guard user.getRemoteURL() == expectedSourceURL,
+            expectedAvatarIdentity == user.stableAvatarIdentity
+            || (fileAvatarIdentity != nil && expectedAvatarIdentity == fileAvatarIdentity)
+      else {
+        throw UserAvatarCacheError.stalePhoto
+      }
+    }
+    try User.filter(id: userId).updateAll(db, [
+      Column("profileLocalPath").set(to: localPath),
+    ])
+    return user.profileLocalPath
+  }
+
+  private static func imageFormat(for data: Data) -> ImageFormat {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let type = CGImageSourceGetType(source),
+          let utType = UTType(type as String)
+    else {
+      return .jpeg
+    }
+
+    if utType.conforms(to: .png) {
+      return .png
+    }
+
+    return .jpeg
+  }
+
+  /// Check if the local cache should be invalidated based on profile photo identity changes.
+  /// Used internally by save methods to automatically handle cache invalidation
+  func shouldInvalidateLocalCache(newFileUniqueId: String?, newFileId: String? = nil) -> Bool {
+    if let newId = normalizedAvatarIdentityValue(newFileUniqueId),
+       newId != normalizedAvatarIdentityValue(profileFileUniqueId)
+    {
+      return true
+    }
+
+    if normalizedAvatarIdentityValue(newFileUniqueId) == nil,
+       let newId = normalizedAvatarIdentityValue(newFileId),
+       newId != normalizedAvatarIdentityValue(profileFileId)
+    {
+      return true
+    }
+
+    return false
+  }
+
+  /// Clear the local cache if the profile file unique ID has changed
+  mutating func clearLocalCacheIfNeeded(newFileUniqueId: String?) {
+    if shouldInvalidateLocalCache(newFileUniqueId: newFileUniqueId) {
+      let localURL = getLocalURL()
+
+      // Clear local path to force re-download
+      profileLocalPath = nil
+      profileFileUniqueId = newFileUniqueId
+
+      // Optionally remove the cached file from disk
+      if let localURL {
+        Task.detached {
+          try? FileManager.default.removeItem(at: localURL)
+        }
+      }
+    }
+  }
+}
+
+public extension File {
+  var stableAvatarIdentity: String? {
+    if let fileUniqueId = normalizedAvatarIdentityValue(fileUniqueId) {
+      return "unique:\(fileUniqueId)"
+    }
+    if let fileId = normalizedAvatarIdentityValue(id) {
+      return "id:\(fileId)"
+    }
+    if let localPath = normalizedAvatarIdentityValue(localPath) {
+      return "local:\(localPath)"
+    }
+    return nil
+  }
+}
+
+public extension User {
+  var stableAvatarIdentity: String? {
+    if let fileUniqueId = normalizedAvatarIdentityValue(profileFileUniqueId) {
+      return "unique:\(fileUniqueId)"
+    }
+    if let fileId = normalizedAvatarIdentityValue(profileFileId) {
+      return "id:\(fileId)"
+    }
+    if let localPath = normalizedAvatarIdentityValue(profileLocalPath) {
+      return "local:\(localPath)"
+    }
+    return nil
+  }
+}
+
+public extension UserInfo {
+  static func placeholder(id: Int64) -> UserInfo {
+    UserInfo(user: User(id: id, email: nil, firstName: nil), profilePhotos: nil)
+  }
+
+  var stableAvatarIdentity: String? {
+    user.stableAvatarIdentity ?? profilePhoto?.first?.stableAvatarIdentity
+  }
+}
+
+private func normalizedUserText(_ value: String?) -> String? {
+  guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+    return nil
+  }
+  return trimmed
+}
+
+private func normalizedAvatarIdentityValue(_ value: String?) -> String? {
+  guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+    return nil
+  }
+  return trimmed
+}
+
+private enum UserAvatarCacheError: Error {
+  case userNotFound(Int64)
+  case stalePhoto
+}

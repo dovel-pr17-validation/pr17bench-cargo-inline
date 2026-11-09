@@ -1,0 +1,147 @@
+import { db } from "@in/server/db"
+import { userNotDeleted, users } from "@in/server/db/schema/users"
+import { generateToken, hashToken } from "@in/server/utils/auth"
+import { SessionsModel } from "@in/server/db/models/sessions"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { Log } from "@in/server/utils/log"
+import { checkUsernameAvailable } from "@in/server/methods/checkUsername"
+import { isValidUsername, normalizeUsername } from "@in/server/utils/normalize"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { BotTokensModel } from "@in/server/db/models/botTokens"
+import { and, eq, sql } from "drizzle-orm"
+import { BotAlerts } from "@in/server/modules/bot-events/alerts"
+import {
+  getPublicHandleAvailability,
+  lockPublicHandleNamespace,
+} from "@in/server/modules/spaces/spaceHandle"
+
+import { type CreateBotInput, type CreateBotResult } from "@inline-chat/protocol/core"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { addSpaceMember } from "@in/server/functions/space.addMember.shared"
+
+const log = new Log("createBot")
+export const MAX_BOTS_PER_USER = 30
+
+export const createBot = async (input: CreateBotInput, context: FunctionContext): Promise<CreateBotResult> => {
+  // Validate input
+  const trimmedName = input.name?.trim()
+  if (!trimmedName || trimmedName.length === 0) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  if (!input.username || input.username.trim().length < 2) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  const normalizedUsername = normalizeUsername(input.username)
+  const normalizedUsernameLower = normalizedUsername.toLowerCase()
+
+  if (!isValidUsername(normalizedUsername) || !normalizedUsernameLower.endsWith("bot")) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  const existingBotsResult = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(users)
+    .where(
+      and(
+        eq(users.bot, true),
+        eq(users.botCreatorId, context.currentUserId),
+        userNotDeleted(),
+      ),
+    )
+  const existingBots = existingBotsResult[0]?.count ?? 0
+
+  if (existingBots >= MAX_BOTS_PER_USER) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  // Check if username is available
+  const isUsernameAvailable = await checkUsernameAvailable(normalizedUsername, {})
+  if (!isUsernameAvailable) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  // Create bot user
+  const bot = await db.transaction(async (tx) => {
+    await lockPublicHandleNamespace(tx, normalizedUsername)
+    const availability = await getPublicHandleAvailability(tx, normalizedUsername)
+    if (availability !== "available") {
+      throw RealtimeRpcError.BadRequest()
+    }
+
+    const [botUser] = await tx
+      .insert(users)
+      .values({
+        firstName: trimmedName,
+        username: normalizedUsername,
+        bot: true,
+        botCreatorId: context.currentUserId,
+        pendingSetup: false,
+        emailVerified: false,
+        phoneVerified: false,
+      })
+      .returning()
+    return botUser
+  })
+
+  if (!bot) {
+    log.error("Failed to create bot user", { input, currentUserId: context.currentUserId })
+    throw RealtimeRpcError.InternalError()
+  }
+
+  // Best-effort internal alert (should never affect the user action).
+  BotAlerts.botCreated({ creatorUserId: context.currentUserId, botUserId: bot.id })
+
+  // Generate token for the bot
+  const { token } = await generateToken(bot.id)
+
+  // Create session for the bot (bots use api client type)
+  const session = await SessionsModel.create({
+    userId: bot.id,
+    tokenHash: hashToken(token),
+    personalData: {},
+    clientType: "api",
+  })
+
+  await BotTokensModel.create({
+    botUserId: bot.id,
+    sessionId: session.id,
+    token,
+  })
+
+  // Add bot to space if specified
+  if (input.addToSpace) {
+    try {
+      const spaceId = Number(input.addToSpace)
+
+      await addSpaceMember({
+        spaceId,
+        actorUserId: context.currentUserId,
+        target: { kind: "userId", userId: bot.id },
+        admission: "manageMembers",
+        role: "member",
+        canAccessPublicChats: true,
+      })
+
+      log.info("Bot successfully added to space", {
+        botId: bot.id,
+        spaceId,
+        creatorId: context.currentUserId,
+      })
+    } catch (error) {
+      log.error("Failed to add bot to space", {
+        botId: bot.id,
+        spaceId: input.addToSpace,
+        error,
+      })
+      // Don't throw here - bot creation succeeded, space invitation failed
+      // The bot can still be used, just not in the specified space
+    }
+  }
+
+  return {
+    bot: Encoders.user({ user: bot, min: false }),
+    token,
+  }
+}

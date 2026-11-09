@@ -1,0 +1,41 @@
+{
+  // Sweetpad formatter
+  "sweetpad.format.path": "swiftformat",
+  "sweetpad.format.args": ["--quiet", "${file}"],
+
+  // Setup .swift formatter
+  "[swift]": {
+    "editor.defaultFormatter": "sweetpad.sweetpad"
+  },
+
+  // Show folder names in file tabs
+  "workbench.editor.labelFormat": "short",
+  "editor.formatOnSave": true,
+
+  // Spell check
+  "cSpell.enabledFileTypes": {
+    "swift": true
+  },
+  "cSpell.words": [
+    "Autoresizing",
+    "Bezeled",
+    "Deinitialization",
+    "GRDB",
+    "Rajabifard",
+    "stylex",
+    "Sublayer",
+    "sublayers",
+    "Subview",
+    "Superlayer",
+    "superview"
+  ],
+
+  // Protocol Buffers
+  "protoc": {
+    "compile_on_save": false,
+    "options": ["--proto_path=${workspaceRoot}/proto"]
+  },
+
+  // Swift Path
+  "sweetpad.build.xcodeWorkspacePath": "apple/Inline.xcodeproj/project.xcworkspace"
+}

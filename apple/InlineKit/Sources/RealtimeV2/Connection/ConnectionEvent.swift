@@ -1,0 +1,87 @@
+public enum ConnectionEvent: Sendable {
+  case start
+  case stop
+  case connectNow
+  case userInitiatedOperationStarted
+  case userInitiatedOperationFinished
+  case mediaRetentionChanged(eligible: Bool, revision: UInt64)
+
+  case authAvailable
+  case authLost
+
+  // Retained for source compatibility with the original public event surface.
+  // ConnectionManager's adapters use the richer path event below.
+  case networkAvailable
+  case networkUnavailable
+  case networkPathChanged(isAvailable: Bool, routeChanged: Bool, quality: ConnectionNetworkQuality)
+
+  // Retained for source compatibility. Platform lifecycle adapters use the
+  // explicit retention variants below.
+  case appForeground
+  case appBackground
+  case applicationActive(transportWasRetained: Bool)
+  case applicationInactive(keepConnection: Bool)
+  case systemWake
+  case wakeProbeCompleted(sessionID: UInt64, isHealthy: Bool)
+
+  case transportConnecting(sessionID: UInt64)
+  case transportConnected(sessionID: UInt64)
+  case transportDisconnected(sessionID: UInt64, errorDescription: String?)
+
+  case protocolOpen(sessionID: UInt64)
+  case protocolAuthFailed
+  case connectTimeout
+
+  case pingTimeout
+  case backoffFired
+  case backgroundGraceExpired
+  /// Periodic check while the manager is not connected; reports a stuck episode and restores
+  /// a missing deadline even when no other event arrives.
+  case livenessWatchdog
+}
+
+extension ConnectionEvent {
+  var diagnosticName: String {
+    switch self {
+    case .start: "start"
+    case .stop: "stop"
+    case .connectNow: "connectNow"
+    case .userInitiatedOperationStarted: "userInitiatedOperationStarted"
+    case .userInitiatedOperationFinished: "userInitiatedOperationFinished"
+    case .mediaRetentionChanged: "mediaRetentionChanged"
+    case .authAvailable: "authAvailable"
+    case .authLost: "authLost"
+    case .networkAvailable: "networkAvailable"
+    case .networkUnavailable: "networkUnavailable"
+    case .networkPathChanged: "networkPathChanged"
+    case .appForeground: "appForeground"
+    case .appBackground: "appBackground"
+    case .applicationActive: "applicationActive"
+    case .applicationInactive: "applicationInactive"
+    case .systemWake: "systemWake"
+    case .wakeProbeCompleted: "wakeProbeCompleted"
+    case .transportConnecting: "transportConnecting"
+    case .transportConnected: "transportConnected"
+    case .transportDisconnected: "transportDisconnected"
+    case .protocolOpen: "protocolOpen"
+    case .protocolAuthFailed: "protocolAuthFailed"
+    case .connectTimeout: "connectTimeout"
+    case .pingTimeout: "pingTimeout"
+    case .backoffFired: "backoffFired"
+    case .backgroundGraceExpired: "backgroundGraceExpired"
+    case .livenessWatchdog: "livenessWatchdog"
+    }
+  }
+
+  /// The attempt a transport lifecycle event belongs to; nil for every other event.
+  var transportSessionID: UInt64? {
+    switch self {
+    case let .transportConnecting(sessionID), let .transportConnected(sessionID), let .protocolOpen(sessionID):
+      sessionID
+    case let .transportDisconnected(sessionID, _):
+      sessionID
+    default:
+      nil
+    }
+  }
+}

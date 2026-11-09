@@ -1,0 +1,114 @@
+import SwiftUI
+
+struct OnboardingWelcome: View {
+  @EnvironmentObject var windowViewModel: MainWindowViewModel
+  @EnvironmentObject var onboardingViewModel: OnboardingViewModel
+  @State private var isVisible = false
+
+  var animation: Animation {
+    .easeOut(duration: 0.5)
+  }
+
+  var body: some View {
+    VStack {
+      Spacer()
+
+      Image("AppIcon")
+        .opacity(isVisible ? 1 : 0)
+        .offset(y: isVisible ? 0 : -30)
+        .animation(animation.delay(0.1), value: isVisible)
+
+      Text("Welcome to Inline")
+        .font(
+          .custom(Fonts.RedHatDisplay, size: 32, relativeTo: .title)
+        ).fontWeight(.bold)
+        .padding(.bottom, 0.5)
+        .opacity(isVisible ? 1 : 0)
+        .offset(y: isVisible ? 0 : 20)
+        .animation(animation.delay(0.4), value: isVisible)
+
+      Text("The interface for multiplayer work")
+        .font(.system(size: 20.0, weight: .regular))
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+        .opacity(isVisible ? 1 : 0)
+        .offset(y: isVisible ? 0 : 20)
+        .animation(animation.delay(0.5), value: isVisible)
+
+      Spacer()
+
+      InlineButton(size: .large, style: .primary, shiny: isVisible) {
+        onboardingViewModel.navigate(to: .getStarted)
+      } label: {
+        Text("Get Started").padding(.horizontal, 40)
+      }
+      .padding(.bottom, 30)
+      .opacity(isVisible ? 1 : 0)
+      .offset(y: isVisible ? 0 : 20)
+      .animation(animation.delay(0.6), value: isVisible)
+
+      Footer()
+        .opacity(isVisible ? 1 : 0)
+        .animation(animation.delay(0.9), value: isVisible)
+    }
+    .padding()
+    .frame(minHeight: 400)
+    .onAppear {
+      DispatchQueue.main.async {
+        isVisible = true
+      }
+    }
+  }
+
+  struct Footer: View {
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+      HStack(alignment: .bottom) {
+        Spacer()
+
+        VStack(spacing: 2) {
+          Text("By continuing, you acknowledge that you understand and agree to the")
+          HStack(spacing: 3) {
+            Button("Terms of Service") {
+              if let url = URL(string: "https://inline.chat/legal/terms") {
+                openURL(url)
+              }
+            }
+            Text("and")
+            Button("Privacy Policy") {
+              if let url = URL(string: "https://inline.chat/legal/privacy") {
+                openURL(url)
+              }
+            }
+          }
+        }
+        .buttonStyle(.link)
+        .font(.footnote)
+        .tint(.secondary)
+        .foregroundStyle(.tertiary)
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: 360)
+
+        Spacer()
+      }
+      .overlay(alignment: .bottomLeading) {
+        Button("inline.chat") {
+          if let url = URL(string: "https://inline.chat") {
+            openURL(url)
+          }
+        }
+        .buttonStyle(.link)
+        .font(.footnote)
+        .tint(Color.secondary)
+      }
+    }
+  }
+}
+
+#Preview {
+  Onboarding()
+    .environmentObject(MainWindowViewModel())
+    .environmentObject(OnboardingViewModel())
+    .frame(width: 900, height: 600)
+}

@@ -1,0 +1,1697 @@
+import AppKit
+import Auth
+import Combine
+import GRDB
+import InlineKit
+import InlineMacUI
+import InlineUI
+import Logger
+import SwiftUI
+import Translation
+
+struct AllChatsRouteView: View {
+  @Environment(\.dependencies) private var dependencies
+  @Environment(\.nav) private var nav
+  @EnvironmentStateObject private var viewModel: AllChatsViewModel
+  @ObservedObject private var settings = AppSettings.shared
+  @State private var rowLayout: AllChatsRowLayout = .twoLine
+  @State private var listFilter: AllChatsListFilter = .all
+  @State private var confirmationPresentation = AllChatsConfirmationPresentation()
+  @AppStorage private var pinnedExpanded: Bool
+  @AppStorage private var selectedSpaceIDValue: String
+  @AppStorage private var excludedHomeSpaceIDsValue: String
+
+  private let filter: AllChatsFilter
+
+  init(archived: Bool = false) {
+    filter = archived ? .archived : .chats
+    let account = Auth.shared.getCurrentUserId().map(String.init) ?? "signed-out"
+    _pinnedExpanded = AppStorage(
+      wrappedValue: true,
+      "macos.allChats.pinnedExpanded.\(account)"
+    )
+    _selectedSpaceIDValue = AppStorage(
+      wrappedValue: "",
+      "macos.allChats.selectedSpaceID.\(account)"
+    )
+    _excludedHomeSpaceIDsValue = AppStorage(
+      wrappedValue: "",
+      "macos.allChats.excludedHomeSpaceIDs.\(account)"
+    )
+    _viewModel = EnvironmentStateObject { env in
+      AllChatsViewModel(db: env.appDatabase)
+    }
+  }
+
+  var body: some View {
+    let title = pageTitle
+    let presentation = viewModel.presentation(
+      for: filter,
+      listFilter: listFilter,
+      spaceId: selectedSpaceID,
+      homeSpaceExclusions: homeSpaceExclusions
+    )
+
+    ScrollView {
+      VStack(spacing: 0) {
+        if showsAllChatsNewThreadCompose,
+           #available(macOS 26.0, *),
+           let dependencies
+        {
+          AllChatsNewThreadComposeHost(
+            dependencies: dependencies,
+            spaces: composeSpaces,
+            selectedSpaceID: selectedSpaceID,
+            placement: .top
+          )
+          .padding(.top, 10)
+        }
+
+        if viewModel.isLoading {
+          ProgressView()
+            .controlSize(.small)
+            .frame(maxWidth: .infinity, minHeight: 300)
+        } else if viewModel.errorText != nil || showsEmptyFilterState(presentation: presentation) {
+          RoutePlaceholderView(
+            title: viewModel.errorText ?? emptyTitle,
+            systemImage: viewModel.errorText == nil ? emptySystemImage : "exclamationmark.triangle"
+          )
+          .frame(maxWidth: .infinity, minHeight: 300)
+        } else {
+          chatList(presentation: presentation)
+        }
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.horizontal, 12)
+    }
+    .navigationTitle(title)
+    .toolbar(removing: .title)
+    .toolbar {
+      let titleItem =
+        MacToolbarItem(placement: .navigation, priority: .high, label: "") {
+          RouteToolbarSpacePickerTitleItem(
+            title: title,
+            selectedSpaceID: selectedSpaceID,
+            homeTitle: "Home",
+            spaces: toolbarSpaces,
+            showsIndicator: false,
+            help: "Choose All Chats Space",
+            onSelect: selectAllChatsSpace
+          )
+        }
+
+      if #available(macOS 26.0, *) {
+        titleItem.sharedBackgroundVisibility(.hidden)
+      } else {
+        titleItem
+      }
+
+      if #available(macOS 26.0, *) {
+        ToolbarSpacer(.flexible)
+      } else {
+        ToolbarItem {
+          Spacer()
+        }
+      }
+
+      if filter == .chats {
+        ToolbarItem {
+          ControlGroup {
+            AllChatsViewOptionsMenu(
+              listFilter: $listFilter,
+              spaces: selectedSpaceID == nil ? toolbarSpaces : [],
+              homeSpaceExclusions: homeSpaceExclusions,
+              onToggleHomeSpaceExclusion: toggleHomeSpaceExclusion
+            )
+            archiveButton
+          }
+          .controlGroupStyle(.navigation)
+        }
+      } else {
+        ToolbarItem {
+          archiveButton
+        }
+      }
+
+      // Keep the alternate row layout available in source, but do not expose
+      // it in production while the toolbar is dedicated to chat filtering.
+      // ToolbarItem { rowLayoutMenu }
+    }
+    .onEscapeKey("all_chats_archive_escape", enabled: filter == .archived) {
+      closeArchiveFilter()
+    }
+    .onExitCommand {
+      guard filter == .archived else { return }
+      closeArchiveFilter()
+    }
+    .alert(
+      confirmationPresentation.request?.title ?? "Confirm",
+      isPresented: $confirmationPresentation.isPresented,
+      presenting: confirmationPresentation.request
+    ) { request in
+      Button("Cancel", role: .cancel) {
+        confirmationPresentation.dismiss()
+      }
+
+      Button(request.actionTitle, role: .destructive) {
+        confirmationPresentation.dismiss()
+        perform(request)
+      }
+    } message: { request in
+      Text(request.message)
+    }
+  }
+
+  private func chatList(presentation: AllChatsPresentation) -> some View {
+    LazyVStack(alignment: .leading, spacing: 0) {
+      if filter == .chats, !showsAllChatsNewThreadCompose {
+        NewThreadListRow(action: createNewThread)
+      }
+
+      if !presentation.pinnedItems.isEmpty {
+        AllChatsPinnedSection(isExpanded: $pinnedExpanded) {
+          chatRows(presentation.pinnedItems)
+        }
+      }
+
+      ForEach(presentation.sections) { section in
+        VStack(alignment: .leading, spacing: 0) {
+          AllChatsSectionHeader(title: section.title)
+          chatRows(section.items)
+        }
+      }
+    }
+  }
+
+  private func chatRows(_ items: [AllChatsItem]) -> some View {
+    ForEach(items) { item in
+      ChatListRow(
+        item: item,
+        selected: nav.currentRoute.selectedPeer == item.peerId,
+        showsSpaceName: selectedSpaceID == nil,
+        layout: rowLayout,
+        unreadBadgeStyle: settings.unreadBadgeStyle,
+        switchToSpace: openSpace,
+        requestConfirmation: { confirmation in
+          present(confirmation, for: item)
+        },
+        action: {
+          open(item)
+        }
+      )
+    }
+  }
+
+  private var pageTitle: String {
+    filter.title(spaceName: activeSpaceName)
+  }
+
+  private var activeSpaceName: String? {
+    viewModel.spaceName(id: selectedSpaceID)
+  }
+
+  private var selectedSpaceID: Int64? {
+    Int64(selectedSpaceIDValue)
+  }
+
+  private var homeSpaceExclusions: HomeSpaceExclusions {
+    HomeSpaceExclusions(rawValue: excludedHomeSpaceIDsValue)
+  }
+
+  private var showsAllChatsNewThreadCompose: Bool {
+    guard filter == .chats, dependencies != nil else {
+      return false
+    }
+    if #available(macOS 26.0, *) {
+      return true
+    }
+    return false
+  }
+
+  private var composeSpaces: [AllChatsComposeSpace] {
+    viewModel.spacesById.values
+      .map { AllChatsComposeSpace(id: $0.id, title: $0.displayName) }
+      .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+  }
+
+  private var toolbarSpaces: [RouteToolbarSpacePickerItem] {
+    composeSpaces.map {
+      RouteToolbarSpacePickerItem(id: $0.id, name: $0.title)
+    }
+  }
+
+  private func selectAllChatsSpace(_ spaceID: Int64?) {
+    selectedSpaceIDValue = spaceID.map(String.init) ?? ""
+  }
+
+  private func open(_ item: AllChatsItem) {
+    if let dependencies {
+      if nav.selectedSpaceId == nil {
+        dependencies.requestOpenChatInHome(peer: item.peerId)
+      } else {
+        dependencies.requestOpenChat(peer: item.peerId)
+      }
+      return
+    }
+
+    if nav.selectedSpaceId == nil {
+      nav.selectHome()
+    }
+    nav.open(.chat(peer: item.peerId))
+  }
+
+  private func openSpace(_ spaceId: Int64) {
+    nav.selectSpace(spaceId)
+  }
+
+  private func createNewThread() {
+    guard let dependencies else {
+      nav.open(.newChat(spaceId: selectedSpaceID))
+      return
+    }
+
+    NewThreadAction.start(dependencies: dependencies, spaceId: selectedSpaceID)
+  }
+
+  private var rowLayoutMenu: some View {
+    Menu {
+      Button {
+        rowLayout = rowLayout == .twoLine ? .titlePreviewLine : .twoLine
+      } label: {
+        if rowLayout == .titlePreviewLine {
+          Label("Title and Preview on One Line", systemImage: "checkmark")
+        } else {
+          Text("Title and Preview on One Line")
+        }
+      }
+    } label: {
+      Label("View Options", systemImage: "line.3.horizontal.decrease")
+    }
+    .help("View Options")
+  }
+
+  private func toggleHomeSpaceExclusion(_ spaceID: Int64) {
+    excludedHomeSpaceIDsValue = homeSpaceExclusions.toggling(spaceID).rawValue
+  }
+
+  private var archiveButton: some View {
+    Button(action: toggleArchiveFilter) {
+      Label(filter.archiveButtonTitle, systemImage: filter.archiveButtonSystemImage)
+    }
+    .help(filter.archiveButtonTitle)
+  }
+
+  private func showsEmptyFilterState(presentation: AllChatsPresentation) -> Bool {
+    presentation.isEmpty && (filter == .archived || listFilter == .unread)
+  }
+
+  private var emptyTitle: String {
+    listFilter == .unread ? "No unread chats" : filter.emptyTitle
+  }
+
+  private var emptySystemImage: String {
+    listFilter == .unread ? "checkmark.message" : filter.emptySystemImage
+  }
+
+  private func toggleArchiveFilter() {
+    if filter == .archived {
+      closeArchiveFilter()
+    } else {
+      openArchiveFilter()
+    }
+  }
+
+  private func openArchiveFilter() {
+    guard filter != .archived else { return }
+    nav.open(.archivedChats)
+  }
+
+  private func closeArchiveFilter() {
+    guard filter == .archived else { return }
+
+    if previousRoute == .allChats {
+      nav.goBack()
+    } else {
+      nav.replace(.allChats)
+    }
+  }
+
+  private func present(_ confirmation: AllChatsRowConfirmation, for item: AllChatsItem) {
+    confirmationPresentation.present(
+      AllChatsConfirmationRequest(confirmation: confirmation, item: item)
+    )
+  }
+
+  private func perform(_ request: AllChatsConfirmationRequest) {
+    switch request.confirmation {
+    case .archive:
+      archive(request)
+    case let .destructive(action):
+      performDestructiveAction(action, peer: request.peer)
+    }
+  }
+
+  private func archive(_ request: AllChatsConfirmationRequest) {
+    Task(priority: .userInitiated) {
+      do {
+        if let dependencies {
+          try await dependencies.appUndo.archiveChat(
+            peer: request.peer,
+            spaceID: request.spaceID,
+            using: dependencies
+          )
+        } else {
+          try await DataManager.shared.updateDialog(
+            peerId: request.peer,
+            archived: true,
+            spaceId: request.spaceID,
+            deleteEmptyThreadIfArchiving: false
+          )
+        }
+
+        navigateOutIfSelected(request.peer)
+      } catch {
+        Log.shared.error("Failed to update archive state", error: error)
+      }
+    }
+  }
+
+  @MainActor
+  private func performDestructiveAction(_ action: ChatDestructiveAction, peer: Peer) {
+    ChatDestructiveActionRunner.perform(action, peer: peer, dependencies: dependencies) {
+      navigateOutIfSelected(peer)
+    }
+  }
+
+  @MainActor
+  private func navigateOutIfSelected(_ peer: Peer) {
+    guard isSelectedInCurrentNavigation(peer) else { return }
+
+    dependencies?.nav2?.navigate(to: .empty)
+    dependencies?.nav3?.open(.empty)
+    nav.open(.empty)
+  }
+
+  @MainActor
+  private func isSelectedInCurrentNavigation(_ peer: Peer) -> Bool {
+    if nav.currentRoute.selectedPeer == peer {
+      return true
+    }
+
+    if dependencies?.nav3?.currentRoute.selectedPeer == peer {
+      return true
+    }
+
+    if case let .chat(selectedPeer)? = dependencies?.nav2?.currentRoute, selectedPeer == peer {
+      return true
+    }
+
+    return false
+  }
+
+  private var previousRoute: Nav3Route? {
+    let index = nav.historyIndex - 1
+    guard nav.history.indices.contains(index) else { return nil }
+    return nav.history[index].route
+  }
+}
+
+private struct AllChatsViewOptionsMenu: View {
+  @Binding var listFilter: AllChatsListFilter
+  let spaces: [RouteToolbarSpacePickerItem]
+  let homeSpaceExclusions: HomeSpaceExclusions
+  let onToggleHomeSpaceExclusion: (Int64) -> Void
+
+  var body: some View {
+    Menu {
+      Picker("Filter Chats", selection: $listFilter) {
+        Text("All Chats").tag(AllChatsListFilter.all)
+        Text("Unread").tag(AllChatsListFilter.unread)
+      }
+      .labelsHidden()
+      .pickerStyle(.inline)
+
+      if spaces.isEmpty == false {
+        Divider()
+
+        Menu {
+          ForEach(spaces) { space in
+            Button {
+              onToggleHomeSpaceExclusion(space.id)
+            } label: {
+              if homeSpaceExclusions.contains(space.id) {
+                Label(space.name, systemImage: "checkmark")
+              } else {
+                Text(space.name)
+              }
+            }
+          }
+        } label: {
+          Label("Exclude Spaces from Home", systemImage: "eye.slash")
+        }
+      }
+    } label: {
+      Label("View Options", systemImage: listFilterSystemImage)
+        .labelStyle(.iconOnly)
+    }
+    .tint(hasActiveViewFilter ? Color(nsColor: .systemBlue) : Color.primary)
+    .help("View Options")
+    .accessibilityValue(listFilterAccessibilityValue)
+  }
+
+  private var listFilterSystemImage: String {
+    hasActiveViewFilter == false
+      ? "line.3.horizontal.decrease"
+      : "line.3.horizontal.decrease.circle.fill"
+  }
+
+  private var hasActiveViewFilter: Bool {
+    listFilter == .unread
+      || (spaces.isEmpty == false && homeSpaceExclusions.isEmpty == false)
+  }
+
+  private var listFilterAccessibilityValue: String {
+    let excludedCount = spaces.isEmpty ? 0 : homeSpaceExclusions.spaceIDs.count
+    return switch (listFilter, excludedCount) {
+    case (.all, 0):
+      "All Chats"
+    case (.unread, 0):
+      "Unread"
+    case (.all, 1):
+      "All Chats, 1 space excluded"
+    case (.unread, 1):
+      "Unread, 1 space excluded"
+    case (.all, let count):
+      "All Chats, \(count) spaces excluded"
+    case (.unread, let count):
+      "Unread, \(count) spaces excluded"
+    }
+  }
+
+}
+
+private struct AllChatsPinnedSection<Rows: View>: View {
+  @Binding var isExpanded: Bool
+  let rows: Rows
+
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  init(isExpanded: Binding<Bool>, @ViewBuilder rows: () -> Rows) {
+    _isExpanded = isExpanded
+    self.rows = rows()
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      AllChatsPinnedSectionHeader(isExpanded: isExpanded, action: toggle)
+      if isExpanded {
+        rows
+      }
+    }
+  }
+
+  private func toggle() {
+    withAnimation(reduceMotion ? nil : .smooth(duration: 0.18)) {
+      isExpanded.toggle()
+    }
+  }
+}
+
+private struct AllChatsPinnedSectionHeader: View {
+  let isExpanded: Bool
+  let action: () -> Void
+
+  var body: some View {
+    HStack(spacing: 6) {
+      Text("Pinned")
+        .frame(maxWidth: .infinity, alignment: .leading)
+      Button(action: action) {
+        Image(systemName: "chevron.down")
+          .font(.caption.weight(.semibold))
+          .rotationEffect(.degrees(isExpanded ? 0 : -90))
+          .frame(width: 20, height: 20)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("Pinned")
+      .accessibilityValue(accessibilityValue)
+      .accessibilityHint(accessibilityHint)
+    }
+    .font(.system(size: 12, weight: .semibold))
+    .foregroundStyle(.secondary)
+    .lineLimit(1)
+    .padding(.horizontal, 8)
+    .padding(.top, 12)
+    .padding(.bottom, 2)
+  }
+
+  private var accessibilityValue: LocalizedStringKey {
+    isExpanded ? "Expanded" : "Collapsed"
+  }
+
+  private var accessibilityHint: LocalizedStringKey {
+    isExpanded ? "Collapses pinned chats" : "Expands pinned chats"
+  }
+}
+
+private enum AllChatsRowLayout: Equatable {
+  case twoLine
+  case titlePreviewLine
+}
+
+private enum AllChatsListFilter: Equatable {
+  case all
+  case unread
+
+  func includes(_ item: AllChatsItem) -> Bool {
+    switch self {
+    case .all:
+      true
+    case .unread:
+      item.unread
+    }
+  }
+}
+
+private enum AllChatsFilter: Equatable {
+  case chats
+  case archived
+
+  var title: String {
+    switch self {
+    case .chats:
+      "All Chats"
+    case .archived:
+      "Archived Chats"
+    }
+  }
+
+  func title(spaceName: String?) -> String {
+    guard let spaceName, spaceName.isEmpty == false else {
+      return title
+    }
+
+    switch self {
+    case .chats:
+      return "\(spaceName) / All Chats"
+    case .archived:
+      return "Archived \(spaceName) Chats"
+    }
+  }
+
+  var emptyTitle: String {
+    switch self {
+    case .chats:
+      "No chats"
+    case .archived:
+      "No archived chats"
+    }
+  }
+
+  var emptySystemImage: String {
+    switch self {
+    case .chats:
+      "bubble.left"
+    case .archived:
+      "archivebox"
+    }
+  }
+
+  var archiveButtonTitle: String {
+    switch self {
+    case .chats:
+      "Archive"
+    case .archived:
+      "Show Chats"
+    }
+  }
+
+  var archiveButtonSystemImage: String {
+    switch self {
+    case .chats:
+      "archivebox"
+    case .archived:
+      "archivebox.fill"
+    }
+  }
+
+  func includes(_ item: AllChatsItem) -> Bool {
+    switch self {
+    case .chats:
+      item.archived == false
+    case .archived:
+      item.archived
+    }
+  }
+}
+
+private struct AllChatsSectionHeader: View {
+  let title: String
+
+  var body: some View {
+    Text(title)
+      .font(.system(size: 12, weight: .semibold))
+      .foregroundStyle(.secondary)
+      .lineLimit(1)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 8)
+      .padding(.top, 12)
+      .padding(.bottom, 2)
+  }
+}
+
+@MainActor
+final class AllChatsViewModel: ObservableObject {
+  @Published private(set) var items: [AllChatsItem] = []
+  @Published private(set) var spacesById: [Int64: Space] = [:]
+  @Published private(set) var isLoading = true
+  @Published private(set) var errorText: String?
+
+  private let db: AppDatabase
+  private let log = Log.scoped("AllChatsViewModel")
+  private var chatsCancellable: AnyCancellable?
+  private var spacesCancellable: AnyCancellable?
+  private var translationCancellable: AnyCancellable?
+  private var translationLanguageCancellable: AnyCancellable?
+  private var chatsRetryTask: Task<Void, Never>?
+  private var chatsRetryAttempt = 0
+  private var snapshots: [ChatListItemSnapshot] = []
+
+  init(db: AppDatabase) {
+    self.db = db
+    translationCancellable = TranslationState.shared.subject.sink { [weak self] event in
+      guard let self else { return }
+      let (peer, _) = event
+      guard snapshots.contains(where: { $0.peer == peer }) else { return }
+      apply(Self.makeItems(snapshots))
+      observeChats()
+    }
+    translationLanguageCancellable = NotificationCenter.default
+      .publisher(for: .translationLanguageChanged)
+      .sink { [weak self] _ in
+        self?.observeChats()
+      }
+    observeChats()
+    observeSpaces()
+  }
+
+  private func observeChats() {
+    chatsCancellable?.cancel()
+    chatsCancellable = nil
+    chatsRetryTask?.cancel()
+    chatsRetryTask = nil
+
+    #if DEBUG
+    db.warnIfInMemoryDatabaseForObservation("AllChatsViewModel.chats")
+    #endif
+
+    chatsCancellable = ValueObservation
+      .tracking { db in
+        try ChatListDatabaseQuery.fetchSnapshots(
+          db,
+          spaceID: nil,
+          includeSpaceChatsInHome: true,
+          translationLanguage: UserLocale.getCurrentLanguage(),
+          includePreviewSenderIdentity: true
+        )
+      }
+      .publisher(in: db.dbWriter, scheduling: .immediate)
+      .sink(
+        receiveCompletion: { [weak self] completion in
+          guard let self else { return }
+
+          if case let .failure(error) = completion {
+            isLoading = false
+            errorText = items.isEmpty ? "Couldn’t load chats. Retrying…" : nil
+            log.error("All chats observation failed: \(Self.safeErrorName(error))")
+            scheduleChatsObservationRetry()
+          }
+        },
+        receiveValue: { [weak self] snapshots in
+          guard let self else { return }
+          self.snapshots = snapshots
+          apply(Self.makeItems(snapshots))
+        }
+      )
+  }
+
+  private func observeSpaces() {
+    spacesCancellable = ValueObservation
+      .tracking { db in
+        try Space.catalogActive().fetchAll(db)
+      }
+      .publisher(in: db.dbWriter, scheduling: .immediate)
+      .sink(
+        receiveCompletion: { [weak self] completion in
+          guard case let .failure(error) = completion else { return }
+          self?.log.error("All chats spaces observation failed: \(error.localizedDescription)")
+        },
+        receiveValue: { [weak self] spaces in
+          self?.spacesById = Dictionary(uniqueKeysWithValues: spaces.map { ($0.id, $0) })
+        }
+      )
+  }
+
+  private func apply(_ items: [AllChatsItem]) {
+    self.items = items
+      .sorted { lhs, rhs in
+        if lhs.lastActivityDate == rhs.lastActivityDate {
+          return Dialog.getDialogId(peerId: lhs.peerId)
+            > Dialog.getDialogId(peerId: rhs.peerId)
+        }
+        return lhs.lastActivityDate > rhs.lastActivityDate
+      }
+
+    chatsRetryAttempt = 0
+    chatsRetryTask?.cancel()
+    chatsRetryTask = nil
+    errorText = nil
+    isLoading = false
+  }
+
+  private func scheduleChatsObservationRetry() {
+    guard chatsRetryTask == nil else { return }
+    chatsRetryAttempt &+= 1
+    let delay = min(pow(2, Double(min(chatsRetryAttempt - 1, 5))) * 0.25, 8)
+    chatsRetryTask = Task { [weak self] in
+      try? await Task.sleep(for: .seconds(delay))
+      guard Task.isCancelled == false, let self else { return }
+      chatsRetryTask = nil
+      observeChats()
+    }
+  }
+
+  private nonisolated static func safeErrorName(_ error: Error) -> String {
+    if error is RowDecodingError {
+      return "RowDecodingError"
+    }
+    if let error = error as? DatabaseError {
+      return "DatabaseError(\(error.resultCode.rawValue))"
+    }
+    return String(reflecting: type(of: error))
+  }
+
+  private nonisolated static func makeItems(
+    _ snapshots: [ChatListItemSnapshot]
+  ) -> [AllChatsItem] {
+    snapshots.map(AllChatsItem.init)
+  }
+
+  fileprivate func presentation(
+    for filter: AllChatsFilter,
+    listFilter: AllChatsListFilter,
+    spaceId: Int64?,
+    homeSpaceExclusions: HomeSpaceExclusions
+  ) -> AllChatsPresentation {
+    let filteredItems = items.filter { item in
+      let isInSpaceScope = if let spaceId {
+        item.spaceId == spaceId
+      } else {
+        homeSpaceExclusions.includesInHome(spaceID: item.spaceId)
+      }
+
+      return item.chatListHidden == false
+        && filter.includes(item)
+        && listFilter.includes(item)
+        && isInSpaceScope
+    }
+    let timelineItems = filter == .chats
+      ? filteredItems.filter { !$0.pinned }
+      : filteredItems
+    return AllChatsPresentation(
+      // macOS All Chats intentionally omits pinned chats. iOS owns its
+      // separate pinned projection and remains unchanged.
+      pinnedItems: [],
+      sections: Self.makeSections(items: timelineItems)
+    )
+  }
+
+  fileprivate func spaceName(id: Int64?) -> String? {
+    guard let id else { return nil }
+    return spacesById[id]?.displayName
+  }
+
+  private static func makeSections(items: [AllChatsItem]) -> [AllChatsSection] {
+    let calendar = Calendar.current
+    var sections: [AllChatsSection] = []
+
+    for item in items {
+      let period = ChatListTimelinePeriod.classify(
+        item.lastActivityDate,
+        calendar: calendar
+      )
+      if sections.last?.id == period {
+        sections[sections.count - 1].items.append(item)
+      } else {
+        sections.append(AllChatsSection(
+          id: period,
+          title: ChatListTimelinePeriodTitle.string(for: period, calendar: calendar),
+          items: [item]
+        ))
+      }
+    }
+
+    return sections
+  }
+
+  private static func pinnedOrdered(_ lhs: AllChatsItem, _ rhs: AllChatsItem) -> Bool {
+    switch (lhs.pinnedOrder, rhs.pinnedOrder) {
+    case let (lhsOrder?, rhsOrder?) where lhsOrder != rhsOrder:
+      return lhsOrder < rhsOrder
+    case (_?, nil):
+      return true
+    case (nil, _?):
+      return false
+    default:
+      if lhs.lastActivityDate != rhs.lastActivityDate {
+        return lhs.lastActivityDate > rhs.lastActivityDate
+      }
+      return lhs.chatId > rhs.chatId
+    }
+  }
+}
+
+struct AllChatsPresentation: Equatable {
+  let pinnedItems: [AllChatsItem]
+  let sections: [AllChatsSection]
+
+  var isEmpty: Bool {
+    pinnedItems.isEmpty && sections.isEmpty
+  }
+}
+
+struct AllChatsSection: Identifiable, Equatable {
+  let id: ChatListTimelinePeriod
+  let title: String
+  var items: [AllChatsItem]
+}
+
+struct AllChatsItem: Identifiable, Equatable {
+  let id: Peer
+  let peerId: Peer
+  let chatId: Int64
+  let parentChatId: Int64?
+  let title: String
+  let subtitle: String
+  let lastActivityDate: Date
+  let unread: Bool
+  let unreadCount: Int
+  let unreadMark: Bool
+  let prominentUnreadIndicator: Bool
+  let isOpen: Bool
+  let pinned: Bool
+  let pinnedOrder: String?
+  let folderID: Int64?
+  let archived: Bool
+  let chatListHidden: Bool
+  let identity: ChatListIdentityDescriptor?
+  let previewSender: AllChatsPreviewSender?
+  let spaceId: Int64?
+  let spaceName: String?
+  let chatType: ChatType?
+  let chatCreatedBy: Int64?
+  let chatIsPublic: Bool?
+
+  init(snapshot: ChatListItemSnapshot) {
+    id = snapshot.peer
+    peerId = snapshot.peer
+    chatId = snapshot.chatID
+    parentChatId = snapshot.parentChatID
+    title = snapshot.title
+    let showsTranslation = TranslationState.shared.isTranslationEnabled(for: snapshot.peer)
+    subtitle = (showsTranslation ? snapshot.translatedPreviewText : nil)
+      ?? snapshot.previewText
+      ?? "No messages"
+    lastActivityDate = snapshot.lastUpdatedAt ?? Date.distantPast
+    unreadCount = snapshot.unreadCount
+    unreadMark = snapshot.unreadMark
+    unread = snapshot.isUnread
+    prominentUnreadIndicator = snapshot.isProminent
+    isOpen = snapshot.isOpen
+    pinned = snapshot.isPinned
+    pinnedOrder = snapshot.pinnedOrder
+    folderID = snapshot.folderID
+    archived = snapshot.isArchived
+    chatListHidden = snapshot.isChatListHidden
+    identity = snapshot.identity
+    if let name = snapshot.previewSenderName, name.isEmpty == false {
+      previewSender = AllChatsPreviewSender(
+        name: name,
+        identity: snapshot.previewSenderIdentity
+      )
+    } else {
+      previewSender = nil
+    }
+    spaceId = snapshot.spaceID
+    spaceName = snapshot.spaceName
+    chatType = snapshot.chatType
+    chatCreatedBy = snapshot.chatCreatedBy
+    chatIsPublic = snapshot.chatIsPublic
+  }
+}
+
+struct AllChatsPreviewSender: Equatable {
+  let name: String
+  let identity: ChatListUserAvatarDescriptor?
+}
+
+private struct NewThreadListRow: View {
+  let action: () -> Void
+
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var isHovered = false
+
+  private static let iconSize: CGFloat = 30
+  private static let rowHeight: CGFloat = 40
+  private static let horizontalPadding: CGFloat = 8
+  private static let cornerRadius: CGFloat = 6
+
+  var body: some View {
+    Button(action: action) {
+      HStack(spacing: 9) {
+        Circle()
+          .fill(.quinary)
+          .frame(width: Self.iconSize, height: Self.iconSize)
+          .overlay {
+            Image(systemName: "square.and.pencil")
+              .font(.system(size: Self.iconSize * 0.42, weight: .regular))
+              .foregroundStyle(.secondary)
+          }
+
+        Text("New thread")
+          .font(.system(size: 13, weight: .regular))
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+
+        Spacer(minLength: 0)
+      }
+      .frame(maxWidth: .infinity, minHeight: Self.rowHeight, alignment: .leading)
+      .padding(.horizontal, Self.horizontalPadding)
+      .contentShape(.rect(cornerRadius: Self.cornerRadius))
+      .background(background)
+    }
+    .buttonStyle(.plain)
+    .inlineTooltip(
+      "New thread",
+      shortcut: .command("N")
+    )
+    .accessibilityLabel("New Thread")
+    .accessibilityAddTraits(.isButton)
+    .onHover { isHovered = $0 }
+  }
+
+  private var background: some View {
+    RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+      .fill(backgroundColor)
+  }
+
+  private var backgroundColor: Color {
+    if isHovered {
+      return colorScheme == .dark ? .white.opacity(0.06) : .black.opacity(0.04)
+    }
+
+    return .clear
+  }
+}
+
+private enum AllChatsRowConfirmation: Equatable {
+  case archive
+  case destructive(ChatDestructiveAction)
+
+  var title: String {
+    switch self {
+    case .archive:
+      "Archive Chat?"
+    case let .destructive(action):
+      action.title
+    }
+  }
+
+  var actionTitle: String {
+    switch self {
+    case .archive:
+      "Archive"
+    case let .destructive(action):
+      action.shortTitle
+    }
+  }
+
+  func message(chatTitle: String) -> String {
+    switch self {
+    case .archive:
+      "\(chatTitle) will move to Archived Chats. You can find it from the Archive button in the toolbar."
+    case let .destructive(action):
+      action.confirmationMessage(chatTitle: chatTitle)
+    }
+  }
+}
+
+private struct AllChatsConfirmationRequest: Equatable {
+  let confirmation: AllChatsRowConfirmation
+  let peer: Peer
+  let chatTitle: String
+  let spaceID: Int64?
+
+  init(confirmation: AllChatsRowConfirmation, item: AllChatsItem) {
+    self.confirmation = confirmation
+    peer = item.peerId
+    chatTitle = item.title
+    spaceID = item.spaceId
+  }
+
+  var title: String {
+    confirmation.title
+  }
+
+  var actionTitle: String {
+    confirmation.actionTitle
+  }
+
+  var message: String {
+    confirmation.message(chatTitle: chatTitle)
+  }
+}
+
+private struct AllChatsConfirmationPresentation {
+  var request: AllChatsConfirmationRequest?
+
+  var isPresented: Bool {
+    get { request != nil }
+    set {
+      if newValue == false {
+        request = nil
+      }
+    }
+  }
+
+  mutating func present(_ request: AllChatsConfirmationRequest) {
+    self.request = request
+  }
+
+  mutating func dismiss() {
+    request = nil
+  }
+}
+
+private struct ChatListRow: View {
+  let item: AllChatsItem
+  let selected: Bool
+  let showsSpaceName: Bool
+  let layout: AllChatsRowLayout
+  let unreadBadgeStyle: UnreadBadgeStyle
+  let switchToSpace: (Int64) -> Void
+  let requestConfirmation: (AllChatsRowConfirmation) -> Void
+  let action: () -> Void
+
+  @Environment(\.dependencies) private var dependencies
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var isHovered = false
+  @State private var showsRenameSheet = false
+
+  private static let iconSize: CGFloat = 30
+  private static let compactIconSize: CGFloat = 22
+  private static let twoLineRowHeight: CGFloat = 50
+  private static let oneLineRowHeight: CGFloat = 40
+  private static let oneLineTitleWidth: CGFloat = 164
+  private static let oneLineTrailingWidth: CGFloat = 80
+  private static let horizontalPadding: CGFloat = 8
+  private static let verticalPadding: CGFloat = 0
+  private static let cornerRadius: CGFloat = 6
+  private static let titleFont: Font = .system(size: 13, weight: .medium)
+
+  private var rowHeight: CGFloat {
+    layout == .titlePreviewLine ? Self.oneLineRowHeight : Self.twoLineRowHeight
+  }
+
+  private var rowIconSize: CGFloat {
+    layout == .titlePreviewLine ? Self.compactIconSize : Self.iconSize
+  }
+
+  private var rowIconSpacing: CGFloat {
+    layout == .titlePreviewLine ? 7 : 9
+  }
+
+  private var peerId: Peer {
+    item.peerId
+  }
+
+  private var destructiveAction: ChatDestructiveAction? {
+    ChatDestructiveActionResolver.action(
+      peer: peerId,
+      chatType: item.chatType,
+      chatCreatedBy: item.chatCreatedBy,
+      chatSpaceId: item.spaceId,
+      chatIsPublic: item.chatIsPublic,
+      currentUserId: dependencies?.auth.getCurrentUserId()
+    )
+  }
+
+  var body: some View {
+    ZStack(alignment: .leading) {
+      if unreadBadgeStyle == .dot {
+        unreadIndicator
+          .padding(.leading, Theme.sidebarItemUnreadDotLeadingSpacing)
+      }
+
+      HStack(spacing: rowIconSpacing) {
+        icon
+          .frame(width: rowIconSize, height: rowIconSize)
+
+        rowContent
+      }
+      .padding(.leading, Theme.sidebarItemInnerSpacing)
+      .padding(.trailing, Self.horizontalPadding)
+    }
+    .frame(height: rowHeight)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(.vertical, Self.verticalPadding)
+    .animation(.smoothSnappy, value: item.unread)
+    .animation(.smoothSnappy, value: item.unreadCount)
+    .animation(.smoothSnappy, value: item.unreadMark)
+    .animation(.smoothSnappy, value: item.prominentUnreadIndicator)
+    .animation(.smoothSnappy, value: unreadBadgeStyle)
+    .contentShape(.rect(cornerRadius: Self.cornerRadius))
+    .background(background)
+    .onTapGesture(perform: openFromClick)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel(item.title)
+    .accessibilityAddTraits(.isButton)
+    .accessibilityAddTraits(selected ? .isSelected : [])
+    .onHover { isHovered = $0 }
+    .contextMenu {
+      Button {
+        openInNewTab()
+      } label: {
+        Label("Open in New Tab", systemImage: "plus.rectangle.on.rectangle")
+      }
+
+      Button {
+        MainWindowOpenCoordinator.shared.openNewWindow(.chat(peer: peerId))
+      } label: {
+        Label("Open in New Window", systemImage: "macwindow")
+      }
+
+      Button {
+        ChatMenuActions.copyLink(for: peerId)
+      } label: {
+        Label("Copy Link", systemImage: "link")
+      }
+
+      if item.parentChatId != nil {
+        Button {
+          showsRenameSheet = true
+        } label: {
+          Label("Rename Thread…", systemImage: "pencil")
+        }
+      }
+
+      Button {
+        openInSidebar()
+      } label: {
+        Label("Open in Sidebar", systemImage: "sidebar.left")
+      }
+
+      Divider()
+
+      if item.pinned || item.folderID == nil {
+        Button {
+          togglePin()
+        } label: {
+          Label(item.pinned ? "Unpin" : "Pin", systemImage: item.pinned ? "pin.slash.fill" : "pin.fill")
+        }
+      }
+
+      Button {
+        toggleReadUnread()
+      } label: {
+        Label(
+          item.unread ? "Mark Read" : "Mark Unread",
+          systemImage: item.unread ? "checkmark.message.fill" : "envelope.badge.fill"
+        )
+      }
+
+      if item.archived {
+        Button {
+          unarchive()
+        } label: {
+          Label("Unarchive", systemImage: "archivebox")
+        }
+      } else {
+        Button(role: .destructive) {
+          requestConfirmation(.archive)
+        } label: {
+          Label("Archive", systemImage: "archivebox")
+        }
+      }
+
+      if let destructiveAction {
+        Divider()
+
+        Button(role: .destructive) {
+          requestConfirmation(.destructive(destructiveAction))
+        } label: {
+          Label(destructiveAction.title, systemImage: destructiveAction.systemImage)
+        }
+      }
+    }
+    .sheet(isPresented: $showsRenameSheet) {
+      RenameChatSheet(peer: peerId, initialTitle: item.title)
+    }
+  }
+
+  @ViewBuilder
+  private var rowContent: some View {
+    switch layout {
+    case .twoLine:
+      twoLineContent
+    case .titlePreviewLine:
+      titlePreviewLineContent
+    }
+  }
+
+  private var twoLineContent: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      HStack(alignment: .firstTextBaseline, spacing: 8) {
+        titleText
+          .frame(maxWidth: .infinity, alignment: .leading)
+
+        trailingInfo()
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      HStack(alignment: .center, spacing: 8) {
+        AllChatsPreviewLine(
+          text: item.subtitle,
+          sender: item.previewSender,
+          showsProfilePhotos: true
+        )
+
+        if unreadBadgeStyle == .numbered {
+          unreadIndicator
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private var titlePreviewLineContent: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 8) {
+      titleText
+        .frame(width: Self.oneLineTitleWidth, alignment: .leading)
+
+      AllChatsPreviewLine(
+        text: item.subtitle,
+        sender: item.previewSender,
+        showsProfilePhotos: false
+      )
+      .layoutPriority(1)
+
+      trailingInfo(maxWidth: Self.oneLineTrailingWidth)
+        .frame(width: Self.oneLineTrailingWidth, alignment: .trailing)
+        .layoutPriority(1)
+
+      if unreadBadgeStyle == .numbered {
+        unreadIndicator
+          .fixedSize(horizontal: true, vertical: false)
+          .layoutPriority(2)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private var titleText: some View {
+    Text(item.title)
+      .font(Self.titleFont)
+      .foregroundStyle(.primary)
+      .lineLimit(1)
+  }
+
+  private func trailingInfo(maxWidth: CGFloat = 190) -> some View {
+    AllChatsTrailingInfo(
+      item: item,
+      showsSpaceName: showsSpaceName,
+      switchToSpace: switchToSpace,
+      maxWidth: maxWidth
+    )
+  }
+
+  private var unreadIndicator: some View {
+    UnreadBadge(
+      unreadCount: item.unread ? item.unreadCount : 0,
+      hasUnreadMark: item.unread && item.unreadMark,
+      prominent: item.prominentUnreadIndicator,
+      style: unreadBadgeStyle,
+      dotSize: Theme.sidebarItemUnreadDotSize
+    )
+    .layoutPriority(1)
+  }
+
+  @ViewBuilder
+  private var icon: some View {
+    if layout == .titlePreviewLine {
+      compactIcon
+    } else {
+      fullIcon
+    }
+  }
+
+  @ViewBuilder
+  private var fullIcon: some View {
+    switch item.identity {
+    case let .thread(descriptor):
+      SidebarThreadIcon(
+        emoji: descriptor.emoji,
+        isReplyThread: descriptor.isReplyThread,
+        size: Self.iconSize,
+        shape: .circle
+      )
+    case let .user(descriptor):
+      avatar(descriptor, size: Self.iconSize)
+    case nil:
+      Circle()
+        .fill(Color.primary.opacity(0.08))
+        .overlay {
+          Image(systemName: "bubble.left")
+            .font(.system(size: 16, weight: .medium))
+            .foregroundStyle(.secondary)
+        }
+    }
+  }
+
+  @ViewBuilder
+  private var compactIcon: some View {
+    switch item.identity {
+    case let .thread(descriptor):
+      SidebarThreadIcon(
+        emoji: descriptor.emoji,
+        isReplyThread: descriptor.isReplyThread,
+        size: Self.compactIconSize,
+        shape: .roundedSquare
+      )
+    case let .user(descriptor):
+      avatar(descriptor, size: Self.compactIconSize)
+    case nil:
+      SidebarThreadIcon(
+        emoji: nil,
+        size: Self.compactIconSize,
+        shape: .roundedSquare
+      )
+    }
+  }
+
+  private func avatar(
+    _ descriptor: ChatListUserAvatarDescriptor,
+    size: CGFloat
+  ) -> some View {
+    UserAvatar(
+      userID: descriptor.userID,
+      firstName: descriptor.firstName,
+      lastName: descriptor.lastName,
+      email: descriptor.email,
+      username: descriptor.username,
+      stableAvatarIdentity: descriptor.stableAvatarIdentity,
+      remoteURL: descriptor.remoteURL,
+      localURL: descriptor.localURL,
+      size: size
+    )
+    .equatable()
+  }
+
+  private var background: some View {
+    RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+      .fill(backgroundColor)
+  }
+
+  private var backgroundColor: Color {
+    if selected {
+      return colorScheme == .dark ? .white.opacity(0.1) : .black.opacity(0.07)
+    }
+
+    if isHovered {
+      return colorScheme == .dark ? .white.opacity(0.06) : .black.opacity(0.04)
+    }
+
+    return .clear
+  }
+
+  private func openFromClick() {
+    let flags = NSApp.currentEvent?.modifierFlags
+
+    if flags?.contains(.option) == true {
+      openInSidebar()
+      return
+    }
+
+    if flags?.contains(.command) == true {
+      openInNewTab()
+      return
+    }
+
+    action()
+  }
+
+  private func openInNewTab() {
+    MainWindowOpenCoordinator.shared.openTab(.chat(peer: peerId))
+  }
+
+  private func openInSidebar() {
+    Task(priority: .userInitiated) {
+      do {
+        guard item.isOpen == false else {
+          ToastCenter.shared.showInfo("Already open")
+          return
+        }
+        try await InboxMembershipService.shared.open(peer: peerId)
+        ToastCenter.shared.showSuccess("Opened in sidebar")
+      } catch {
+        ToastCenter.shared.showError("Couldn’t open in sidebar")
+        Log.shared.error("Failed to open chat in sidebar", error: error)
+      }
+    }
+  }
+
+  private func togglePin() {
+    Task(priority: .userInitiated) {
+      do {
+        try await DataManager.shared.updateDialog(peerId: peerId, pinned: !item.pinned)
+      } catch {
+        Log.shared.error("Failed to update pin status", error: error)
+      }
+    }
+  }
+
+  private func toggleReadUnread() {
+    Task(priority: .userInitiated) {
+      do {
+        if item.unread {
+          UnreadManager.shared.readAll(peerId, chatId: item.chatId)
+          return
+        }
+
+        guard let dependencies else { return }
+        try await dependencies.realtimeV2.send(.markAsUnread(peerId: peerId))
+      } catch {
+        Log.shared.error("Failed to update read/unread status", error: error)
+      }
+    }
+  }
+
+  private func unarchive() {
+    Task(priority: .userInitiated) {
+      do {
+        try await DataManager.shared.updateDialog(
+          peerId: peerId,
+          archived: false,
+          spaceId: item.spaceId
+        )
+      } catch {
+        Log.shared.error("Failed to update archive state", error: error)
+      }
+    }
+  }
+}
+
+private struct AllChatsPreviewLine: View {
+  let text: String
+  let sender: AllChatsPreviewSender?
+  let showsProfilePhotos: Bool
+
+  private static let iconSize: CGFloat = 14
+  private static let textFont: Font = .system(size: 13, weight: .regular)
+
+  var body: some View {
+    HStack(alignment: .center, spacing: 4) {
+      if let sender {
+        if showsProfilePhotos {
+          if let identity = sender.identity {
+            UserAvatar(
+              userID: identity.userID,
+              firstName: identity.firstName,
+              lastName: identity.lastName,
+              email: identity.email,
+              username: identity.username,
+              stableAvatarIdentity: identity.stableAvatarIdentity,
+              remoteURL: identity.remoteURL,
+              localURL: identity.localURL,
+              size: Self.iconSize
+            )
+            .equatable()
+            .frame(width: Self.iconSize, height: Self.iconSize)
+          }
+        }
+
+        (Text(sender.name)
+          .font(Self.textFont)
+          + Text(": \(text)")
+          .font(Self.textFont))
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.tail)
+          .layoutPriority(1)
+      } else {
+        Text(text)
+          .font(Self.textFont)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.tail)
+          .layoutPriority(1)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct AllChatsTrailingInfo: View {
+  let item: AllChatsItem
+  let showsSpaceName: Bool
+  let switchToSpace: (Int64) -> Void
+  let maxWidth: CGFloat
+
+  var body: some View {
+    HStack(spacing: 3) {
+      if showsSpaceName,
+         let spaceId = item.spaceId,
+         let spaceName = cleanSpaceName {
+        AllChatsSpacePill(name: spaceName) {
+          switchToSpace(spaceId)
+        }
+
+        if showsTime {
+          Text("•")
+            .font(.system(size: 11))
+            .foregroundStyle(.tertiary)
+        }
+      }
+
+      AllChatsTimeLabel(date: item.lastActivityDate)
+        .equatable()
+        .layoutPriority(1)
+    }
+    .frame(maxWidth: maxWidth, alignment: .trailing)
+  }
+
+  private var cleanSpaceName: String? {
+    guard let spaceName = item.spaceName?.trimmingCharacters(in: .whitespacesAndNewlines),
+          spaceName.isEmpty == false
+    else {
+      return nil
+    }
+
+    return spaceName
+  }
+
+  private var showsTime: Bool {
+    AllChatsDateFormatter.rowTitle(for: item.lastActivityDate, calendar: .current) != nil
+  }
+}
+
+private struct AllChatsSpacePill: View {
+  let name: String
+  let action: () -> Void
+
+  @Environment(\.colorScheme) private var colorScheme
+  @State private var isHovered = false
+
+  var body: some View {
+    Button(action: action) {
+      Text(name)
+        .font(.system(size: 11))
+        .foregroundStyle(.tertiary)
+        .lineLimit(1)
+        .truncationMode(.tail)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+        .background(background)
+    }
+    .buttonStyle(.plain)
+    .help("Show \(name) Chats")
+    .onHover { isHovered = $0 }
+  }
+
+  private var background: some View {
+    RoundedRectangle(cornerRadius: 4, style: .continuous)
+      .fill(isHovered ? hoverColor : .clear)
+  }
+
+  private var hoverColor: Color {
+    colorScheme == .dark ? .white.opacity(0.08) : .black.opacity(0.05)
+  }
+}
+
+private struct AllChatsTimeLabel: View, Equatable {
+  let date: Date
+
+  var body: some View {
+    if let time = AllChatsDateFormatter.rowTitle(for: date, calendar: .current) {
+      Text(time)
+        .font(.system(size: 11))
+        .foregroundStyle(.tertiary)
+        .lineLimit(1)
+    }
+  }
+}
+
+private enum AllChatsDateFormatter {
+  private static let rowTimeFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.setLocalizedDateFormatFromTemplate("jm")
+    return formatter
+  }()
+
+  private static let weekdayTimeFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.setLocalizedDateFormatFromTemplate("EEEjm")
+    return formatter
+  }()
+
+  private static let otherYearFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.setLocalizedDateFormatFromTemplate("MMM d, y")
+    return formatter
+  }()
+
+  static func rowTitle(for date: Date, calendar: Calendar) -> String? {
+    guard date != Date.distantPast else { return nil }
+
+    let now = Date()
+    if calendar.isDateInToday(date) {
+      return rowTimeFormatter.string(from: date)
+    }
+
+    let day = calendar.startOfDay(for: date)
+    let today = calendar.startOfDay(for: now)
+    let days = calendar.dateComponents([.day], from: day, to: today).day
+
+    if let days, days > 0, days < 7 {
+      return weekdayTimeFormatter.string(from: date)
+    }
+
+    return nil
+  }
+}
+
+#Preview {
+  AllChatsRouteView()
+    .appDatabase(.populated())
+    .environment(dependencies: AppDependencies())
+}

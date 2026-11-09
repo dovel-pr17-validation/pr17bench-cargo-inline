@@ -1,0 +1,123 @@
+import Foundation
+import Testing
+
+@testable import InlineProtocol
+
+@Suite("Realtime V3 logging policy")
+struct RealtimeV3LoggingPolicyTests {
+  @Test("routine connection endings stay out of production logs")
+  func routineConnectionEndingsAreDebugOnly() {
+    #expect(InlineProtocolV3Connection.failureLogLevel(for: CancellationError()) == .debug)
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: URLError(.networkConnectionLost)
+      ) == .debug
+    )
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.closed
+      ) == .debug
+    )
+  }
+
+  @Test("recoverable pressure and timeout remain warnings")
+  func recoverablePressureRemainsWarning() {
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.timeout
+      ) == .warning
+    )
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.updateBufferOverflow
+      ) == .warning
+    )
+  }
+
+  @Test("authorization invalidation is elevated once by the transport owner")
+  func authorizationInvalidationIsNotDuplicated() {
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.authorizationInvalidated
+      ) == .debug
+    )
+  }
+
+  @Test("only an explicit session-revoked close is terminal")
+  func closeReasonDistinguishesRevocationFromUnavailableAuthorization() {
+    #expect(InlineProtocolV3Connection.authorizationCloseError(
+      code: 4401, reason: Data("authorization_unavailable".utf8)
+    ) == .authorizationInvalidated)
+    #expect(InlineProtocolV3Connection.authorizationCloseError(
+      code: 4401, reason: Data("session_revoked".utf8)
+    ) == .authorizationInvalidated)
+    #expect(InlineProtocolV3Connection.authorizationCloseError(
+      code: 4401, reason: Data("session_revoked_confirmed".utf8)
+    ) == .sessionRevoked)
+    #expect(InlineProtocolV3Connection.authorizationCloseError(
+      code: 1001, reason: Data("session_revoked".utf8)
+    ) == nil)
+  }
+
+  @Test("protocol and credential failures remain errors")
+  func protocolFailuresRemainErrors() {
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.inboundMessageTooLarge
+      ) == .error
+    )
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.invalidKey
+      ) == .error
+    )
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.protocolFailure
+      ) == .error
+    )
+    #expect(
+      InlineProtocolV3Connection.failureLogLevel(
+        for: InlineProtocolV3ConnectionError.unexpectedResponse
+      ) == .error
+    )
+  }
+
+  @Test("connection failures expose bounded privacy-safe categories")
+  func connectionFailuresExposePrivacySafeCategories() {
+    #expect(
+      InlineProtocolV3ConnectionError.inboundMessageTooLarge.privacySafeErrorCategory
+        == "realtime_v3:inbound_message_too_large"
+    )
+    #expect(
+      InlineProtocolV3ConnectionError.invalidKey.privacySafeErrorCategory
+        == "realtime_v3:invalid_key"
+    )
+    #expect(
+      InlineProtocolV3ConnectionError.protocolFailure.privacySafeErrorCategory
+        == "realtime_v3:protocol_failure"
+    )
+    #expect(
+      InlineProtocolV3ConnectionError.unexpectedResponse.privacySafeErrorCategory
+        == "realtime_v3:unexpected_response"
+    )
+
+    var rpcError = RpcError()
+    rpcError.errorCode = .peerIDInvalid
+    rpcError.code = 400
+    rpcError.message = "private-message-sentinel"
+    let rpcCategory = InlineProtocolV3ConnectionError.rpc(rpcError).privacySafeErrorCategory
+    #expect(rpcCategory == "realtime_v3:rpc:5:400")
+    #expect(!rpcCategory.contains(rpcError.message))
+  }
+
+  @Test("normalizes Foundation's oversized-message receive failure")
+  func normalizesOversizedMessageFailure() {
+    let error = NSError(
+      domain: NSPOSIXErrorDomain,
+      code: Int(POSIXErrorCode.EMSGSIZE.rawValue)
+    )
+    let normalized = InlineProtocolV3Connection.normalizedWebSocketReceiveError(error)
+    #expect(normalized as? InlineProtocolV3ConnectionError == .inboundMessageTooLarge)
+  }
+}

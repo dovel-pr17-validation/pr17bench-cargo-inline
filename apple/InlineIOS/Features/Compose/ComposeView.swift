@@ -1,0 +1,2886 @@
+import AVFoundation
+import Combine
+import CoreServices
+import ImageIO
+import InlineKit
+import InlineProtocol
+import InlineUI
+import Logger
+import MobileCoreServices
+import PhotosUI
+import QuickLook
+import SwiftUI
+import TextProcessing
+import UIKit
+import UniformTypeIdentifiers
+
+class ComposeView: UIView, NSTextLayoutManagerDelegate {
+  enum InlineCommandExecution {
+    case completed
+    case openThread(LocalThreadCommandResult)
+  }
+
+  // MARK: - Configuration Constants
+
+  private let log = Log.scoped("ComposeView")
+
+  let maxHeight: CGFloat = 350
+  let buttonSize: CGSize = .init(width: 32, height: 32)
+  let linkColor: UIColor = ThemeManager.shared.selected.accent
+  private let telegramSendButtonShowDuration: TimeInterval = 0.2
+  private let telegramSendButtonHideDuration: TimeInterval = 0.14
+  private let telegramSendButtonBlurDuration: TimeInterval = 0.18
+  private let telegramSendButtonBlurRadius: CGFloat = 4.0
+
+  static let minHeight: CGFloat = 46.0
+  static let textViewVerticalPadding: CGFloat = 0.0
+  static let textViewHorizantalPadding: CGFloat = 12.0
+  static let textViewHorizantalMargin: CGFloat = 7.0
+  static let textViewVerticalMargin: CGFloat = 5.6
+
+  // MARK: - Properties
+
+  var composeHeightConstraint: NSLayoutConstraint!
+  var prevTextHeight: CGFloat = 0.0
+  var overlayView: UIView?
+  var isOverlayVisible = false
+  weak var sendAnimationCoordinator: SendMessageAnimationCoordinator?
+  var phaseObserver: AnyCancellable?
+  private var voicePhaseObserver: AnyCancellable?
+  /// Installed on the compose view, not the mic button, so the hold survives the
+  /// button hiding when the recorder UI takes its place.
+  private lazy var voiceHoldGesture: UILongPressGestureRecognizer = {
+    let gesture = UILongPressGestureRecognizer(target: self, action: #selector(handleVoiceHold(_:)))
+    gesture.minimumPressDuration = 0.25
+    gesture.allowableMovement = 20
+    gesture.delegate = self
+    return gesture
+  }()
+  /// The current recording was started by press-and-hold and stops on release.
+  private var isVoiceHoldRecording = false
+  /// Released before the recorder reached `.recording`; stop once it does.
+  private var stopVoiceWhenRecordingStarts = false
+  private var sceneObserverTokens: [NSObjectProtocol] = []
+  private var pendingSendAnimationHeightChange = false
+  private var composeLeadingToPlusConstraint: NSLayoutConstraint?
+  private var composeLeadingExpandedConstraint: NSLayoutConstraint?
+
+  let buttonBottomPadding: CGFloat = -4.0
+  let buttonTrailingPadding: CGFloat = -6.0
+  let buttonLeadingPadding: CGFloat = 10.0
+  private let composeEdgeInset: CGFloat = 7.0
+  private let composePlusSpacing: CGFloat = 9.5
+  private let composePlusButtonVisualSize: CGFloat = 42.0
+  private let composePlusButtonBottomInset: CGFloat = 4.0
+  private let composeHorizontalInset: CGFloat = 10.0
+  private let composeControlTrailingInset: CGFloat = 6.0
+
+  // MARK: - State Management
+
+  var isButtonVisible = false
+  var selectedImage: UIImage?
+  var showingPhotoPreview: Bool = false
+  var imageCaption: String = ""
+
+  enum MediaPickerMode {
+    case photos
+    case videos
+  }
+
+  struct PendingVideoAttachment {
+    let id: String
+    var thumbnailImage: UIImage?
+  }
+
+  var attachmentItems: [String: FileMediaItem] = [:]
+  var pendingVideoAttachments: [PendingVideoAttachment] = []
+  var canceledPendingVideoAttachmentIds: Set<String> = []
+  private var pendingMediaSendState = ComposePendingMediaSendState()
+  private var queuedPendingVideoSendMode: MessageSendMode?
+  private lazy var pendingMediaSendWatchdog = ComposePendingMediaSendWatchdog(
+    timeout: .seconds(300)
+  )
+  private var attachmentUploadProgress: [String: UploadProgressSnapshot] = [:]
+  private var attachmentUploadSubscriptions: [String: AnyCancellable] = [:]
+  private var attachmentUploadBindingTasks: [String: Task<Void, Never>] = [:]
+  private var attachmentUploadStartTasks: [String: Task<Void, Never>] = [:]
+  private var quickLookPreviewURL: URL?
+  private var documentInteractionController: UIDocumentInteractionController?
+
+  private var hasActiveAttachmentUploads: Bool {
+    guard ComposeAttachmentUploadBehavior.shouldStartUploadsInCompose() else { return false }
+
+    for attachmentId in attachmentItems.keys {
+      if attachmentUploadStartTasks[attachmentId] != nil || attachmentUploadBindingTasks[attachmentId] != nil {
+        return true
+      }
+
+      guard let progress = attachmentUploadProgress[attachmentId] else {
+        continue
+      }
+
+      if progress.stage == .processing || progress.stage == .uploading {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  func commandLaunchState() -> ComposeCommandLaunchState {
+    let state = peerId.map { ChatState.shared.getState(peer: $0) }
+    return ComposeCommandLaunchState(
+      text: textView.text ?? "",
+      isEditing: state?.editingMessageId != nil,
+      isForwarding: state?.forwardContext != nil,
+      hasAttachments: !attachmentItems.isEmpty,
+      hasPendingAttachments: !pendingVideoAttachments.isEmpty || hasActiveAttachmentUploads,
+      isVoiceActive: isVoiceActive
+    )
+  }
+
+  var canSend: Bool {
+    if isVoiceActive {
+      return false
+    }
+
+    let normalizedText = (textView.text ?? "").replacingOccurrences(of: "\u{FFFC}", with: "")
+    let hasText = !normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let hasAttachments = !attachmentItems.isEmpty
+    let hasForward = peerId.map { ChatState.shared.getState(peer: $0).forwardContext != nil } ?? false
+    let hasPendingVideos = !pendingVideoAttachments.isEmpty
+    return ComposeSendEligibility.canSend(
+      hasText: hasText,
+      hasAttachments: hasAttachments,
+      hasForward: hasForward,
+      hasPendingVideos: hasPendingVideos,
+      hasActiveAttachmentUploads: hasActiveAttachmentUploads
+    )
+  }
+
+  var onHeightChange: ((CGFloat, ComposeHeightChangeAnimation) -> Void)?
+  var executeInlineCommand: ((InlineCommandAction) async throws -> InlineCommandExecution?)?
+  private let submitAttachmentSend: (TransactionSendMessage) -> Void
+  private var inlineCommandTask: Task<Void, Never>?
+  var peerId: InlineKit.Peer? {
+    didSet {
+      if oldValue != peerId {
+        textView.resetPastedLinks()
+        cancelPendingAttachmentsForDestinationChange()
+      }
+      updateEmbedState(animated: false)
+      updateVoiceAvailability(animated: false)
+      configureAgentChain()
+    }
+  }
+  var chatId: Int64? {
+    didSet {
+      if oldValue != chatId { cancelPendingAttachmentsForDestinationChange() }
+      updateEmbedState(animated: false)
+      updateVoiceAvailability(animated: false)
+      configureAgentChain()
+    }
+  }
+  var spaceId: Int64? {
+    didSet {
+      autocompleteManager?.configure(spaceId: spaceId)
+    }
+  }
+  // Compatibility slots for the retained legacy manager files. The active composer never initializes them.
+  var mentionManager: MentionManager?
+  var slashCommandManager: SlashCommandManager?
+  private lazy var mentionedParticipantsAccess = MentionedParticipantsAccessManager(composeView: self)
+  var autocompleteManager: ComposeAutocompleteManager?
+  let draftManager: DraftManager
+
+  let previewViewModel = SwiftUIPhotoPreviewViewModel()
+  let multiPhotoPreviewViewModel = SwiftUIPhotoPreviewViewModel()
+  var isPickerPresented = false
+  var activePickerMode: MediaPickerMode = .photos
+  var currentPreviewUsesAttachmentPicker = false
+  weak var attachmentPickerViewController: UIViewController?
+
+  // MARK: - UI Components
+
+  lazy var textView = makeTextView()
+  lazy var sendButton = makeSendButton()
+  lazy var plusButton = makePlusButton()
+  lazy var voiceButton = makeVoiceButton()
+  lazy var composeGlassContainer = makeComposeGlassContainer()
+  lazy var composeAndButtonContainer = makeComposeAndButtonContainer()
+  lazy var attachmentScrollView = makeAttachmentScrollView()
+  lazy var attachmentStackView = makeAttachmentStackView()
+  private(set) lazy var voiceViewModel = ComposeVoiceRecordingViewModel()
+  private lazy var voiceInputHostingController: UIHostingController<ComposeVoiceInputView> = {
+    let controller = UIHostingController(rootView: ComposeVoiceInputView(
+      viewModel: voiceViewModel,
+      onStop: { [weak self] in
+        self?.stopVoiceRecording()
+      },
+      onPlay: { [weak self] in
+        self?.toggleVoicePlayback()
+      },
+      onDiscard: { [weak self] in
+        self?.discardVoiceRecordingTapped()
+      },
+      onSend: { [weak self] in
+        self?.voiceSendTapped(sendMode: nil)
+      },
+      onSendSilently: { [weak self] in
+        self?.voiceSendTapped(sendMode: .modeSilent)
+      }
+    ))
+    controller.safeAreaRegions = []
+    return controller
+  }()
+  private lazy var voiceInputView: UIView = {
+    let view = voiceInputHostingController.view!
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.backgroundColor = .clear
+    view.isHidden = true
+    return view
+  }()
+  private lazy var embedContainerView = makeEmbedContainerView()
+  var embedContainerHeightConstraint: NSLayoutConstraint?
+  var attachmentContainerHeightConstraint: NSLayoutConstraint?
+  private var embedView: ComposeEmbedView?
+  private var currentEmbedMessageId: Int64?
+  private var currentEmbedMode: ComposeEmbedViewContent.Mode?
+  private var currentEmbedMessageChatId: Int64?
+
+  // Agent card (ComposeView+Agent.swift)
+  var agentChain: ComposeAgentChainModel?
+  var agentCancellables: Set<AnyCancellable> = []
+  var isAgentLayout = false
+  let agentRowState = ComposeAgentRowState()
+  lazy var agentRowHostingController = makeAgentRowHostingController()
+  var agentRowView: UIView { agentRowHostingController.view }
+  var textViewBottomToContentConstraint: NSLayoutConstraint?
+  var textViewBottomToAgentRowConstraint: NSLayoutConstraint?
+  var textViewTrailingToSendConstraint: NSLayoutConstraint?
+  var textViewTrailingToContentConstraint: NSLayoutConstraint?
+  let agentPopoverDelegate = ComposeAgentPopoverDelegate()
+  lazy var agentRunButton = makeAgentRunButton()
+  /// The run state last delivered by the model's publisher.
+  var agentRunWork: AgentWorkState?
+  var composeTrailingToEdgeConstraint: NSLayoutConstraint?
+  var composeTrailingToRunConstraint: NSLayoutConstraint?
+
+  // MARK: - Initialization
+
+  deinit {
+    inlineCommandTask?.cancel()
+    stopDraftSaveTimer()
+    clearAttachmentUploadTracking(cancelUploads: true)
+    removeObservers()
+  }
+
+  override convenience init(frame: CGRect) {
+    self.init(frame: frame, draftManager: DraftManager(debounceDelay: 2.0))
+  }
+
+  init(
+    frame: CGRect,
+    draftManager: DraftManager,
+    submitAttachmentSend: @escaping (TransactionSendMessage) -> Void = {
+      _ = Transactions.shared.mutate(transaction: .sendMessage($0))
+    }
+  ) {
+    self.draftManager = draftManager
+    self.submitAttachmentSend = submitAttachmentSend
+    super.init(frame: frame)
+    setupViews()
+    setupScenePhaseObserver()
+    setupChatStateObservers()
+    setupStickerObserver()
+    setupVoicePhaseObserver()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  @objc func handleStickerDetected(_ notification: Notification) {
+    if UIPasteboard.general.image != nil {
+      handlePastedImage()
+    } else {
+      if let image = notification.userInfo?["image"] as? UIImage {
+        // Ensure we're on the main thread
+        DispatchQueue.main.async(qos: .userInitiated) { [weak self] in
+          self?.sendSticker(image)
+        }
+      }
+    }
+  }
+
+  // MARK: - View Lifecycle
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if window != nil {
+      setupAutocompleteManager()
+      layoutIfNeeded()
+      let hasEmbed = (embedContainerHeightConstraint?.constant ?? 0) > 0
+      if hasEmbed || isAgentLayout || !attachmentItems.isEmpty || !pendingVideoAttachments.isEmpty || !(textView.text?.isEmpty ?? true) {
+        updateHeight()
+      }
+    }
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+
+    let hasEmbed = (embedContainerHeightConstraint?.constant ?? 0) > 0
+
+    // Update height after layout if text view now has proper bounds and there's text, attachments, or an embed
+    // The agent card is taller than the bar even when empty.
+    if textView.bounds.width > 0, hasEmbed || isAgentLayout || !attachmentItems.isEmpty || !pendingVideoAttachments.isEmpty || !(textView.text?.isEmpty ?? true) {
+      updateHeight()
+    }
+  }
+
+  override func removeFromSuperview() {
+    textView.resetPastedLinks()
+    voiceViewModel.cancel()
+    saveDraft()
+    stopDraftSaveTimer()
+    resetMentionManager()
+    super.removeFromSuperview()
+  }
+
+  func resetMentionManager() {
+    autocompleteManager?.cleanup()
+    autocompleteManager = nil
+  }
+
+  override func resignFirstResponder() -> Bool {
+    dismissOverlay()
+    return super.resignFirstResponder()
+  }
+
+  private func dismissOverlay() {
+    guard isOverlayVisible, let overlay = overlayView else { return }
+
+    UIView.animate(withDuration: 0.15, delay: 0, options: .curveEaseIn) {
+      overlay.alpha = 0
+      overlay.transform = CGAffineTransform(scaleX: 0.8, y: 0.8)
+        .concatenating(CGAffineTransform(translationX: 0, y: 10))
+      self.plusButton.backgroundColor = .clear
+    } completion: { _ in
+      overlay.removeFromSuperview()
+      self.overlayView = nil
+      self.isOverlayVisible = false
+      self.gestureRecognizers?.removeAll()
+    }
+  }
+
+  func sendSticker(_ image: UIImage) {
+    guard let peerId else {
+      log.debug("No peerId available")
+      return
+    }
+    let targetChatId = chatId ?? 0
+    let replyToMsgId = ChatState.shared.getState(peer: peerId).replyingMessageId
+
+    Task.detached(priority: .userInitiated) { @MainActor in
+      let photoInfo = try FileCache.savePhoto(image: image, optimize: true)
+      let mediaItem = FileMediaItem.photo(photoInfo)
+
+      await Transactions.shared.mutate(
+        transaction: .sendMessage(
+          .init(
+            text: nil,
+            peerId: peerId,
+            chatId: targetChatId,
+            mediaItems: [mediaItem],
+            replyToMsgId: replyToMsgId,
+            isSticker: true
+          )
+        )
+      )
+    }
+
+    if let chatId { IntentDonationCoordinator.donateOutgoing(peerId: peerId, chatId: chatId) }
+
+    ChatState.shared.clearEditingMessageId(peer: peerId)
+    ChatState.shared.clearReplyingMessageId(peer: peerId)
+
+    resetComposeStateWithoutSendAnimation()
+  }
+
+  func setupViews() {
+    clearBackground()
+
+    addSubview(composeGlassContainer)
+
+    let glassContent = composeGlassContentView()
+    glassContent.addSubview(plusButton)
+    glassContent.addSubview(composeAndButtonContainer)
+    glassContent.addSubview(agentRunButton)
+
+    let composeContent = composeContentView()
+
+    // Add embed container, textView, and sendButton to the container
+    composeContent.addSubview(embedContainerView)
+    composeContent.addSubview(attachmentScrollView)
+    attachmentScrollView.addSubview(attachmentStackView)
+    composeContent.addSubview(textView)
+    composeContent.addSubview(sendButton)
+    composeContent.addSubview(voiceButton)
+    composeContent.addSubview(voiceInputView)
+    composeContent.addSubview(agentRowView)
+    addGestureRecognizer(voiceHoldGesture)
+
+    setupInitialHeight()
+    setupConstraints()
+    addDropInteraction()
+    refreshAttachmentPreviews()
+    updateVoiceAvailability(animated: false)
+  }
+
+  func clearBackground() {
+    backgroundColor = .clear
+  }
+
+  func setupInitialHeight() {
+    composeHeightConstraint = heightAnchor.constraint(equalToConstant: Self.minHeight)
+  }
+
+  func addDropInteraction() {
+    let dropInteraction = UIDropInteraction(delegate: self)
+    addInteraction(dropInteraction)
+  }
+
+  func setupConstraints() {
+    let embedHeightConstraint = embedContainerView.heightAnchor
+      .constraint(equalToConstant: 0)
+    let attachmentHeightConstraint = attachmentScrollView.heightAnchor
+      .constraint(equalToConstant: 0)
+    let glassContent = composeGlassContentView()
+    let composeContent = composeContentView()
+    let composeLeadingToPlusConstraint = composeAndButtonContainer.leadingAnchor
+      .constraint(equalTo: plusButton.trailingAnchor, constant: composePlusSpacing)
+    let composeLeadingExpandedConstraint = composeAndButtonContainer.leadingAnchor
+      .constraint(equalTo: glassContent.leadingAnchor, constant: composeEdgeInset)
+    composeLeadingToPlusConstraint.identifier = "Compose.leadingToSideButton"
+    composeLeadingExpandedConstraint.identifier = "Compose.leadingExpanded"
+    composeLeadingExpandedConstraint.isActive = false
+    embedContainerHeightConstraint = embedHeightConstraint
+    attachmentContainerHeightConstraint = attachmentHeightConstraint
+    self.composeLeadingToPlusConstraint = composeLeadingToPlusConstraint
+    self.composeLeadingExpandedConstraint = composeLeadingExpandedConstraint
+
+    // Chat layout: the text runs to the send button and the bottom edge.
+    // Agent layout: the text spans the card and sits on the agent row.
+    let textViewBottomToContent = textView.bottomAnchor.constraint(equalTo: composeContent.bottomAnchor)
+    let textViewBottomToAgentRow = textView.bottomAnchor.constraint(equalTo: agentRowView.topAnchor)
+    let textViewTrailingToSend = textView.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -12)
+    let textViewTrailingToContent = textView.trailingAnchor.constraint(
+      equalTo: composeContent.trailingAnchor,
+      constant: -composeHorizontalInset
+    )
+    textViewBottomToAgentRow.isActive = false
+    textViewTrailingToContent.isActive = false
+    let composeTrailingToEdge = composeAndButtonContainer.trailingAnchor
+      .constraint(equalTo: glassContent.trailingAnchor, constant: -composeEdgeInset)
+    let composeTrailingToRun = composeAndButtonContainer.trailingAnchor
+      .constraint(equalTo: agentRunButton.leadingAnchor, constant: -composePlusSpacing)
+    composeTrailingToRun.isActive = false
+    composeTrailingToEdgeConstraint = composeTrailingToEdge
+    composeTrailingToRunConstraint = composeTrailingToRun
+    textViewBottomToContentConstraint = textViewBottomToContent
+    textViewBottomToAgentRowConstraint = textViewBottomToAgentRow
+    textViewTrailingToSendConstraint = textViewTrailingToSend
+    textViewTrailingToContentConstraint = textViewTrailingToContent
+
+    NSLayoutConstraint.activate([
+      composeHeightConstraint,
+
+      composeGlassContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+      composeGlassContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+      composeGlassContainer.topAnchor.constraint(equalTo: topAnchor),
+      composeGlassContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      plusButton.leadingAnchor.constraint(equalTo: glassContent.leadingAnchor, constant: composeEdgeInset),
+      plusButton.bottomAnchor.constraint(
+        equalTo: glassContent.bottomAnchor,
+        constant: -composePlusButtonBottomInset
+      ),
+      plusButton.widthAnchor.constraint(equalToConstant: composePlusButtonVisualSize),
+      plusButton.heightAnchor.constraint(equalToConstant: composePlusButtonVisualSize),
+
+      // Container constraints
+      composeLeadingToPlusConstraint,
+      composeTrailingToEdge,
+      agentRunButton.trailingAnchor.constraint(equalTo: glassContent.trailingAnchor, constant: -composeEdgeInset),
+      agentRunButton.bottomAnchor.constraint(
+        equalTo: glassContent.bottomAnchor,
+        constant: -composePlusButtonBottomInset
+      ),
+      agentRunButton.widthAnchor.constraint(equalToConstant: composePlusButtonVisualSize),
+      agentRunButton.heightAnchor.constraint(equalToConstant: composePlusButtonVisualSize),
+      composeAndButtonContainer.topAnchor.constraint(equalTo: glassContent.topAnchor),
+      composeAndButtonContainer.bottomAnchor.constraint(
+        equalTo: glassContent.bottomAnchor,
+        constant: buttonBottomPadding
+      ),
+
+      // Embed constraints within container
+      embedContainerView.leadingAnchor.constraint(equalTo: composeContent.leadingAnchor, constant: composeHorizontalInset),
+      embedContainerView.trailingAnchor.constraint(equalTo: composeContent.trailingAnchor, constant: -composeHorizontalInset),
+      embedContainerView.topAnchor.constraint(equalTo: composeContent.topAnchor),
+      embedHeightConstraint,
+
+      // Attachment strip within container
+      attachmentScrollView.leadingAnchor.constraint(equalTo: composeContent.leadingAnchor, constant: composeHorizontalInset),
+      attachmentScrollView.trailingAnchor.constraint(equalTo: composeContent.trailingAnchor, constant: -composeHorizontalInset),
+      attachmentScrollView.topAnchor.constraint(equalTo: embedContainerView.bottomAnchor),
+      attachmentHeightConstraint,
+
+      attachmentStackView.leadingAnchor.constraint(equalTo: attachmentScrollView.contentLayoutGuide.leadingAnchor),
+      attachmentStackView.trailingAnchor.constraint(equalTo: attachmentScrollView.contentLayoutGuide.trailingAnchor),
+      attachmentStackView.topAnchor.constraint(equalTo: attachmentScrollView.contentLayoutGuide.topAnchor),
+      attachmentStackView.bottomAnchor.constraint(equalTo: attachmentScrollView.contentLayoutGuide.bottomAnchor),
+      attachmentStackView.heightAnchor.constraint(equalTo: attachmentScrollView.frameLayoutGuide.heightAnchor),
+
+      // TextView constraints within container
+      textView.leadingAnchor.constraint(equalTo: composeContent.leadingAnchor, constant: composeHorizontalInset),
+      textView.topAnchor.constraint(equalTo: attachmentScrollView.bottomAnchor, constant: 3),
+      textViewBottomToContent,
+      textViewTrailingToSend,
+
+      // Agent row: from the leading edge to the send button, on the send
+      // button's baseline. Hidden outside the agent layout.
+      agentRowView.leadingAnchor.constraint(equalTo: composeContent.leadingAnchor, constant: 4),
+      agentRowView.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -2),
+      agentRowView.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+      agentRowView.heightAnchor.constraint(equalToConstant: Self.agentRowHeight),
+
+      // SendButton constraints within container
+      sendButton.trailingAnchor.constraint(equalTo: composeContent.trailingAnchor, constant: -composeControlTrailingInset),
+      sendButton.bottomAnchor.constraint(
+        equalTo: composeContent.bottomAnchor,
+        constant: -5
+      ),
+      sendButton.widthAnchor.constraint(equalToConstant: buttonSize.width),
+      sendButton.heightAnchor.constraint(equalToConstant: buttonSize.height),
+    ])
+
+    NSLayoutConstraint.activate([
+      voiceButton.centerXAnchor.constraint(equalTo: sendButton.centerXAnchor),
+      voiceButton.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+      voiceButton.widthAnchor.constraint(equalToConstant: ComposeVoiceButton.size),
+      voiceButton.heightAnchor.constraint(equalToConstant: ComposeVoiceButton.size),
+
+      // Voice controls use 44pt hit frames; offset so the 32pt primary circle lands on the send button's spot.
+      voiceInputView.leadingAnchor.constraint(equalTo: composeContent.leadingAnchor, constant: 4),
+      voiceInputView.trailingAnchor.constraint(
+        equalTo: composeContent.trailingAnchor,
+        constant: -composeControlTrailingInset + (44 - buttonSize.width) / 2
+      ),
+      voiceInputView.topAnchor.constraint(equalTo: attachmentScrollView.bottomAnchor),
+      voiceInputView.bottomAnchor.constraint(equalTo: composeContent.bottomAnchor),
+    ])
+  }
+
+  func buttonDisappear(animated: Bool = true) {
+    sendButton.configuration?.showsActivityIndicator = false
+    guard isButtonVisible || !ComposeSendButtonState.isEffectivelyHidden(alpha: Double(sendButton.alpha)) else {
+      sendButton.isEnabled = false
+      sendButton.isUserInteractionEnabled = false
+      sendButton.setNeedsUpdateConfiguration()
+      return
+    }
+    isButtonVisible = false
+
+    guard animated else {
+      sendButton.layer.removeAllAnimations()
+      sendButton.layer.removeAnimation(forKey: "telegram.sendButton.blur")
+      sendButton.layer.filters = nil
+      sendButton.alpha = 0
+      sendButton.transform = .identity
+      sendButton.isEnabled = false
+      sendButton.isUserInteractionEnabled = false
+      sendButton.setNeedsUpdateConfiguration()
+      return
+    }
+
+    animateTelegramSendButtonBlur(to: telegramSendButtonBlurRadius)
+
+    UIView.animate(
+      withDuration: telegramSendButtonHideDuration,
+      delay: 0,
+      options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState]
+    ) {
+      self.sendButton.alpha = 0
+    } completion: { finished in
+      guard ComposeSendButtonState.shouldFinalizeHide(
+        finished: finished,
+        isButtonVisible: self.isButtonVisible
+      ) else { return }
+      self.sendButton.isEnabled = false
+      self.sendButton.isUserInteractionEnabled = false
+      self.sendButton.transform = .identity
+      self.sendButton.setNeedsUpdateConfiguration()
+    }
+  }
+
+  func buttonAppear() {
+    let isFullyVisible = ComposeSendButtonState.isFullyVisible(
+      isButtonVisible: isButtonVisible,
+      isEnabled: sendButton.isEnabled,
+      isUserInteractionEnabled: sendButton.isUserInteractionEnabled,
+      alpha: Double(sendButton.alpha)
+    )
+    guard !isFullyVisible else { return }
+
+    isButtonVisible = true
+    sendButton.isHidden = false
+    updateVoiceButtonVisibility(visible: false, animated: false)
+    sendButton.isEnabled = true
+    sendButton.isUserInteractionEnabled = true
+    sendButton.setNeedsUpdateConfiguration()
+
+    animateTelegramSendButtonBlur(to: 0.0)
+
+    sendButton.transform = .identity
+
+    if ComposeSendButtonState.isEffectivelyHidden(alpha: Double(sendButton.alpha)) {
+      sendButton.alpha = 0.0
+    }
+
+    UIView.animate(
+      withDuration: telegramSendButtonShowDuration,
+      delay: 0,
+      options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState]
+    ) {
+      self.sendButton.alpha = 1
+      self.sendButton.transform = .identity
+    }
+  }
+
+  private func showSendButtonImmediately() {
+    isButtonVisible = true
+    sendButton.layer.removeAllAnimations()
+    sendButton.layer.removeAnimation(forKey: "telegram.sendButton.blur")
+    sendButton.layer.filters = nil
+    sendButton.isHidden = false
+    sendButton.alpha = 1.0
+    sendButton.transform = .identity
+    sendButton.isEnabled = true
+    sendButton.isUserInteractionEnabled = true
+    updateVoiceButtonVisibility(visible: false, animated: false)
+    sendButton.configuration?.showsActivityIndicator = false
+    sendButton.setNeedsUpdateConfiguration()
+  }
+
+  private func queueSendUntilPendingVideosAreReady(sendMode: MessageSendMode?) {
+    guard pendingMediaSendState.beginWaiting() else { return }
+    queuedPendingVideoSendMode = sendMode
+    showPendingMediaSendState()
+    pendingMediaSendWatchdog.schedule { [weak self] in
+      self?.expireQueuedPendingVideoSend()
+    }
+  }
+
+  func cancelQueuedPendingVideoSend() {
+    guard pendingMediaSendState.cancel() else { return }
+    queuedPendingVideoSendMode = nil
+    pendingMediaSendWatchdog.cancel()
+    sendButton.configuration?.showsActivityIndicator = false
+    updateSendButtonVisibility()
+  }
+
+  private func sendQueuedPendingVideoMessageIfReady() {
+    guard pendingMediaSendState.consumeSendIfReady(
+      hasPendingMedia: !pendingVideoAttachments.isEmpty
+    ) else { return }
+    let queuedSendMode = queuedPendingVideoSendMode
+    queuedPendingVideoSendMode = nil
+    pendingMediaSendWatchdog.cancel()
+    sendButton.configuration?.showsActivityIndicator = false
+    sendMessage(sendMode: queuedSendMode)
+  }
+
+  private func showPendingMediaSendState() {
+    showSendButtonImmediately()
+    sendButton.configuration?.showsActivityIndicator = true
+    sendButton.isEnabled = false
+    sendButton.isUserInteractionEnabled = false
+    sendButton.setNeedsUpdateConfiguration()
+  }
+
+  private func expireQueuedPendingVideoSend() {
+    guard pendingMediaSendState.isAwaitingSend else { return }
+
+    cancelQueuedPendingVideoSend()
+    for pending in pendingVideoAttachments {
+      canceledPendingVideoAttachmentIds.insert(pending.id)
+    }
+    pendingVideoAttachments.removeAll()
+    handleAttachmentItemsChanged(animated: true)
+    dismissAttachmentPickerIfPresented(animated: true)
+
+    ToastManager.shared.showToast(
+      "Attachment processing timed out. Please try again.",
+      type: .error,
+      systemImage: "exclamationmark.triangle.fill"
+    )
+  }
+
+  private func currentTelegramSendButtonBlurRadius() -> CGFloat {
+    if let presentationRadius = sendButton.layer.presentation()?.value(forKeyPath: "filters.gaussianBlur.inputRadius") as? NSNumber {
+      return CGFloat(presentationRadius.floatValue)
+    }
+    if let layerRadius = sendButton.layer.value(forKeyPath: "filters.gaussianBlur.inputRadius") as? NSNumber {
+      return CGFloat(layerRadius.floatValue)
+    }
+    return 0.0
+  }
+
+  private func makeTelegramGaussianBlurFilter(radius: CGFloat) -> NSObject? {
+    guard let filterClass = NSClassFromString(String("retliFAC".reversed())) as? NSObject.Type else {
+      return nil
+    }
+
+    let selector = NSSelectorFromString(String(":epyThtiWretlif".reversed()))
+    guard let filter = filterClass.perform(selector, with: "gaussianBlur")?.takeUnretainedValue() as? NSObject else {
+      return nil
+    }
+
+    filter.setValue(radius, forKey: "inputRadius")
+    return filter
+  }
+
+  private func animateTelegramSendButtonBlur(to toRadius: CGFloat) {
+    sendButton.layer.removeAnimation(forKey: "telegram.sendButton.blur")
+    let fromRadius = currentTelegramSendButtonBlurRadius()
+
+    if abs(fromRadius - toRadius) < 0.01 {
+      if toRadius <= 0.0 {
+        sendButton.layer.filters = nil
+      }
+      return
+    }
+
+    guard let blurFilter = makeTelegramGaussianBlurFilter(radius: toRadius) else {
+      return
+    }
+
+    sendButton.layer.filters = [blurFilter]
+
+    let animation = CABasicAnimation(keyPath: "filters.gaussianBlur.inputRadius")
+    animation.fromValue = fromRadius as NSNumber
+    animation.toValue = toRadius as NSNumber
+    animation.duration = telegramSendButtonBlurDuration
+    animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    animation.isRemovedOnCompletion = true
+
+    CATransaction.begin()
+    CATransaction.setCompletionBlock { [weak self] in
+      guard let self else { return }
+      if toRadius <= 0.0 {
+        self.sendButton.layer.filters = nil
+      }
+    }
+    sendButton.layer.add(animation, forKey: "telegram.sendButton.blur")
+    CATransaction.commit()
+  }
+
+  @objc func sendTapped() {
+    SendMessageAnimationDiagnostics.debug(
+      "compose sendTapped canSend=\(canSend) textLen=\((textView.text ?? "").count) focused=\(textView.isFirstResponder) window=\(window != nil)"
+    )
+
+    if handleVoiceSendTapped(sendMode: nil) {
+      return
+    }
+
+    guard canSend else { return }
+
+    sendMessage()
+  }
+
+  func consumePendingSendAnimationHeightChange() -> Bool {
+    let value = pendingSendAnimationHeightChange
+    pendingSendAnimationHeightChange = false
+    return value
+  }
+
+  var isVoiceActive: Bool {
+    voiceViewModel.isActive
+  }
+
+  private var canStartVoiceRecording: Bool {
+    let normalizedText = (textView.text ?? "").replacingOccurrences(of: "\u{FFFC}", with: "")
+    let hasText = !normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let state = peerId.map { ChatState.shared.getState(peer: $0) }
+
+    return ComposeVoiceRecordingEligibility.canStart(
+      hasText: hasText,
+      hasAttachments: !attachmentItems.isEmpty,
+      hasPendingVideos: !pendingVideoAttachments.isEmpty,
+      isEditing: state?.editingMessageId != nil,
+      isForwarding: state?.forwardContext != nil,
+      hasPeer: peerId != nil,
+      hasChat: chatId != nil,
+      isVoiceActive: isVoiceActive
+    )
+  }
+
+  private var trailingControlState: ComposeTrailingControlState {
+    ComposeTrailingControlState.resolve(
+      canSend: canSend,
+      canStartVoiceRecording: canStartVoiceRecording,
+      isVoiceActive: isVoiceActive
+    )
+  }
+
+  func setupVoicePhaseObserver() {
+    voicePhaseObserver = Publishers.CombineLatest(
+      voiceViewModel.$phase.removeDuplicates(),
+      voiceViewModel.$isSending.removeDuplicates()
+    )
+      .sink { [weak self] _, _ in
+        // `@Published` emits before storing; reconcile once the phase lands,
+        // or a reset from the recorder (too short, system stop) leaves the
+        // voice controls up with nothing in them.
+        Task { @MainActor [weak self] in
+          self?.reconcileVoiceControls(animated: true)
+          self?.applyPendingVoiceHoldStop()
+        }
+      }
+  }
+
+  @objc private func handleVoiceHold(_ gesture: UILongPressGestureRecognizer) {
+    switch gesture.state {
+    case .began:
+      guard canStartVoiceRecording else { return }
+      // A first-use permission prompt steals the touch; leave that recording
+      // running as a tap recording instead of stopping it on the cancelled hold.
+      isVoiceHoldRecording = AVAudioApplication.shared.recordPermission == .granted
+      stopVoiceWhenRecordingStarts = false
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+      startVoiceRecordingTapped()
+    case .ended, .cancelled, .failed:
+      guard isVoiceHoldRecording else { return }
+      isVoiceHoldRecording = false
+      if voiceViewModel.phase == .recording {
+        stopVoiceRecording()
+      } else {
+        stopVoiceWhenRecordingStarts = true
+        applyPendingVoiceHoldStop()
+      }
+    default:
+      break
+    }
+  }
+
+  private func applyPendingVoiceHoldStop() {
+    guard stopVoiceWhenRecordingStarts else { return }
+    switch voiceViewModel.phase {
+    case .recording:
+      stopVoiceWhenRecordingStarts = false
+      stopVoiceRecording()
+    case .finishing, .review:
+      stopVoiceWhenRecordingStarts = false
+    case .idle, .starting:
+      // `.idle` here is either still preparing (permission/activation) or a failed start;
+      // a failed start leaves nothing to stop, and the next hold resets the flag.
+      break
+    }
+  }
+
+  private func reconcileVoiceControls(animated: Bool) {
+    updateVoiceAvailability(animated: animated)
+    updateSendButtonVisibility(syncVoiceAvailability: false)
+  }
+
+  func updateVoiceAvailability(animated: Bool = false) {
+    let voiceActive = voiceViewModel.isActive
+    let controlState = trailingControlState
+
+    if voiceActive {
+      dismissOverlay()
+      textView.resignFirstResponder()
+    }
+
+    voiceInputView.isHidden = !voiceActive
+    textView.isHidden = voiceActive
+    applyAgentLayout(agentLayoutIsWanted, animated: animated)
+    updateComposeWidth(showsSideButton: showsOutsidePlusButton, animated: animated)
+    updateAgentRunCircle(animated: animated)
+    updateTrailingControlVisibility(controlState, animated: animated)
+
+    if voiceActive {
+      attachmentScrollView.isHidden = true
+      attachmentContainerHeightConstraint?.constant = 0
+    } else {
+      let hasAttachments = !attachmentItems.isEmpty || !pendingVideoAttachments.isEmpty
+      attachmentScrollView.isHidden = !hasAttachments
+      attachmentContainerHeightConstraint?.constant = hasAttachments ? ComposeAttachmentPreviewItemView.stripHeight : 0
+    }
+
+    updateHeight(animated: animated)
+  }
+
+  func updateComposeWidth(showsSideButton: Bool, animated: Bool) {
+    guard let composeLeadingToPlusConstraint, let composeLeadingExpandedConstraint else {
+      plusButton.isHidden = !showsSideButton
+      plusButton.alpha = showsSideButton ? 1 : 0
+      plusButton.isUserInteractionEnabled = showsSideButton
+      return
+    }
+
+    let expanded = !showsSideButton
+    let needsConstraintUpdate = composeLeadingToPlusConstraint.isActive != showsSideButton
+      || composeLeadingExpandedConstraint.isActive != expanded
+    guard needsConstraintUpdate else {
+      plusButton.isHidden = !showsSideButton
+      plusButton.alpha = showsSideButton ? 1 : 0
+      plusButton.isUserInteractionEnabled = showsSideButton
+      return
+    }
+
+    if showsSideButton {
+      plusButton.isHidden = false
+      plusButton.alpha = 0
+    }
+
+    layoutIfNeeded()
+    composeLeadingToPlusConstraint.isActive = showsSideButton
+    composeLeadingExpandedConstraint.isActive = expanded
+    plusButton.isUserInteractionEnabled = showsSideButton
+
+    guard animated else {
+      plusButton.alpha = showsSideButton ? 1 : 0
+      plusButton.isHidden = !showsSideButton
+      plusButton.isUserInteractionEnabled = showsSideButton
+      layoutIfNeeded()
+      return
+    }
+
+    if !showsSideButton {
+      plusButton.isHidden = false
+    }
+
+    UIView.animate(
+      withDuration: 0.22,
+      delay: 0,
+      options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseInOut]
+    ) {
+      self.plusButton.alpha = showsSideButton ? 1 : 0
+      self.layoutIfNeeded()
+    } completion: { [weak self] _ in
+      guard let self else { return }
+      let showsSideButton = self.showsOutsidePlusButton
+      self.plusButton.alpha = showsSideButton ? 1 : 0
+      self.plusButton.isHidden = !showsSideButton
+      self.plusButton.isUserInteractionEnabled = showsSideButton
+    }
+  }
+
+  private func updateTrailingControlVisibility(_ state: ComposeTrailingControlState, animated: Bool) {
+    updateVoiceButtonVisibility(visible: state == .voice, animated: animated)
+    sendButton.isHidden = state != .send
+  }
+
+  private func updateVoiceButtonVisibility(visible: Bool, animated: Bool) {
+    let isVisible = !voiceButton.isHidden && voiceButton.alpha > 0.01
+    guard isVisible != visible else {
+      voiceButton.isUserInteractionEnabled = visible
+      return
+    }
+
+    voiceButton.isUserInteractionEnabled = visible
+
+    guard animated else {
+      voiceButton.layer.removeAllAnimations()
+      voiceButton.alpha = visible ? 1 : 0
+      voiceButton.isHidden = !visible
+      return
+    }
+
+    if visible {
+      voiceButton.alpha = 0
+      voiceButton.isHidden = false
+    }
+
+    UIView.animate(
+      withDuration: 0.16,
+      delay: 0,
+      options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseInOut]
+    ) {
+      self.voiceButton.alpha = visible ? 1 : 0
+    } completion: { [weak self] _ in
+      guard let self else { return }
+      let shouldShowVoiceButton = !self.voiceViewModel.isActive && self.canStartVoiceRecording
+      self.voiceButton.alpha = shouldShowVoiceButton ? 1 : 0
+      self.voiceButton.isHidden = !shouldShowVoiceButton
+    }
+  }
+
+  @objc func startVoiceRecordingTapped() {
+    guard canStartVoiceRecording, let peerId else { return }
+    dismissOverlay()
+    // A hold that released into a failed start must not stop this new recording.
+    stopVoiceWhenRecordingStarts = false
+
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      await voiceViewModel.start(peerId: peerId)
+    }
+  }
+
+  private func stopVoiceRecording() {
+    voiceViewModel.stopRecording()
+  }
+
+  private func toggleVoicePlayback() {
+    voiceViewModel.togglePlayback()
+  }
+
+  private func discardVoiceRecordingTapped() {
+    guard voiceViewModel.isActive, !voiceViewModel.isSending else { return }
+
+    let canLoseRecording = voiceViewModel.phase == .recording || voiceViewModel.phase == .review
+    if canLoseRecording, voiceViewModel.shouldConfirmCancel {
+      presentVoiceDiscardConfirmation()
+      return
+    }
+
+    cancelVoiceRecording()
+  }
+
+  private func presentVoiceDiscardConfirmation() {
+    guard let presenter = attachmentFlowPresenter() else { return }
+
+    let alert = UIAlertController(
+      title: "Discard voice message?",
+      message: nil,
+      preferredStyle: .actionSheet
+    )
+    alert.addAction(UIAlertAction(title: "Discard", style: .destructive) { [weak self] _ in
+      self?.cancelVoiceRecording()
+    })
+    alert.addAction(UIAlertAction(title: "Keep", style: .cancel))
+
+    if let popover = alert.popoverPresentationController {
+      if plusButton.isHidden {
+        popover.sourceView = presenter.view
+        popover.sourceRect = CGRect(
+          x: presenter.view.bounds.midX,
+          y: presenter.view.bounds.maxY,
+          width: 1,
+          height: 1
+        )
+      } else {
+        popover.sourceView = plusButton
+        popover.sourceRect = plusButton.bounds
+      }
+    }
+
+    presenter.present(alert, animated: true)
+  }
+
+  private func cancelVoiceRecording() {
+    voiceViewModel.cancel()
+    reconcileVoiceControls(animated: true)
+  }
+
+  private func handleVoiceSendTapped(sendMode: MessageSendMode?) -> Bool {
+    guard voiceViewModel.isActive else { return false }
+
+    voiceSendTapped(sendMode: sendMode)
+    return true
+  }
+
+  /// Sends from review directly, or finalizes an in-progress recording first.
+  private func voiceSendTapped(sendMode: MessageSendMode?) {
+    if voiceViewModel.canSend {
+      sendVoiceRecording(sendMode: sendMode)
+      return
+    }
+
+    guard voiceViewModel.phase == .recording || voiceViewModel.phase == .finishing else { return }
+    Task { @MainActor [weak self] in
+      guard let self, await voiceViewModel.finalizeRecordingForSend() else { return }
+      sendVoiceRecording(sendMode: sendMode)
+    }
+  }
+
+  private func sendVoiceRecording(sendMode: MessageSendMode?) {
+    guard let peerId, let chatId else {
+      voiceViewModel.cancel()
+      reconcileVoiceControls(animated: true)
+      return
+    }
+
+    do {
+      guard let mediaItem = try voiceViewModel.takeVoiceMediaItem() else {
+        reconcileVoiceControls(animated: true)
+        return
+      }
+      let state = ChatState.shared.getState(peer: peerId)
+      let replyToMessageId = state.replyingMessageId
+
+      Transactions.shared.mutate(
+        transaction: .sendMessage(
+          .init(
+            text: nil,
+            peerId: peerId,
+            chatId: chatId,
+            mediaItems: [mediaItem],
+            replyToMsgId: replyToMessageId,
+            isSticker: nil,
+            entities: nil,
+            sendMode: sendMode
+          )
+        )
+      )
+
+      IntentDonationCoordinator.donateOutgoing(peerId: peerId, chatId: chatId)
+
+      ChatState.shared.clearReplyingMessageId(peer: peerId)
+      resetComposeStateWithoutSendAnimation()
+      reconcileVoiceControls(animated: true)
+    } catch {
+      log.error("Failed to send voice recording", error: error)
+      ToastManager.shared.showToast(
+        error.localizedDescription,
+        type: .error,
+        systemImage: "exclamationmark.triangle.fill"
+      )
+      reconcileVoiceControls(animated: true)
+    }
+  }
+
+  func sendMessage(sendMode: MessageSendMode? = nil) {
+    textView.resetPastedLinks()
+    guard let peerId else { return }
+    let state = ChatState.shared.getState(peer: peerId)
+    let isEditing = state.editingMessageId != nil
+    let forwardContext = state.forwardContext
+    guard let chatId else { return }
+    let hasPendingVideos = !pendingVideoAttachments.isEmpty
+    let hasActiveUploads = hasActiveAttachmentUploads
+    if isEditing, !attachmentItems.isEmpty || hasPendingVideos {
+      cancelQueuedPendingVideoSend()
+      showFilesEditingFeedback(sending: true)
+      return
+    }
+
+    if ComposePendingMediaSendBehavior.shouldQueueSendUntilPendingVideosAreReady(
+      hasPendingVideos: hasPendingVideos
+    ) {
+      queueSendUntilPendingVideosAreReady(sendMode: sendMode)
+      return
+    }
+
+    let attributedText = attributedStringForSend()
+    let (rawText, extractedEntities) = ProcessEntities.fromAttributedString(
+      attributedText,
+      threadLinkSpaceId: spaceId
+    )
+    let hasText = !rawText.isEmpty
+    let attachmentItemsSnapshot = attachmentItems
+    let hasAttachmentItems = !attachmentItemsSnapshot.isEmpty
+    let hasForward = forwardContext != nil
+
+    let hasBotCommandEntity = extractedEntities.entities.contains { entity in
+      if case .botCommand = entity.entity { return true }
+      return false
+    }
+    if !isEditing,
+       !hasForward,
+       !hasAttachmentItems,
+       !hasPendingVideos,
+       !hasActiveUploads,
+       !hasBotCommandEntity,
+       let action = InlineCommandRegistry.action(forStandaloneText: rawText) {
+      performInlineCommand(action)
+      return
+    }
+
+    guard ComposeSendEligibility.canSend(
+      hasText: hasText,
+      hasAttachments: hasAttachmentItems,
+      hasForward: hasForward,
+      hasPendingVideos: hasPendingVideos,
+      hasActiveAttachmentUploads: hasActiveUploads
+    ) else { return }
+
+    let shouldSendTextOnly = ComposeSendEligibility.shouldSendTextOnly(
+      hasText: hasText,
+      hasPendingVideos: hasPendingVideos,
+      hasActiveAttachmentUploads: hasActiveUploads
+    )
+    let attachmentItemsToSend = shouldSendTextOnly ? [String: FileMediaItem]() : attachmentItemsSnapshot
+    let hasAttachments = !attachmentItemsToSend.isEmpty
+
+    // Can't send if no text, no attachments, and not forwarding
+    guard hasText || hasAttachments || forwardContext != nil else { return }
+
+    let hasEntities = !extractedEntities.entities.isEmpty
+    let entities: MessageEntities? = hasEntities ? extractedEntities : nil
+    let editEntities: MessageEntities? = hasEntities ? extractedEntities : MessageEntities()
+
+    // Make text nil if empty and we have attachments
+    let text = if rawText.isEmpty, hasAttachments {
+      nil as String?
+    } else {
+      rawText
+    }
+
+    let sendAnimationEligibility = SendMessageAnimationEligibility(
+      hasText: hasText,
+      hasAttachments: hasAttachments,
+      hasPendingVideos: hasPendingVideos,
+      hasActiveAttachmentUploads: hasActiveUploads,
+      isEditing: isEditing,
+      isForwarding: hasForward,
+      isReplying: state.replyingMessageId != nil,
+      isComposeFocused: textView.isFirstResponder,
+      hasWindow: window != nil,
+      isEmojiOnlyText: rawText.containsOnlyEmojis
+    )
+    let shouldAttemptSendAnimation = SendMessageAnimationFeatureGate.shouldAttemptTextSend(
+      sendAnimationEligibility
+    )
+    SendMessageAnimationDiagnostics.event(
+      "compose sendMessage gate should=\(shouldAttemptSendAnimation) sendMode=\(sendMode.map { String(describing: $0) } ?? "nil") rawTextLen=\(rawText.count) textLen=\(text?.count ?? 0) \(sendAnimationEligibility.diagnosticSummary)"
+    )
+
+    func makeTextSendTransaction(replyToMessageId: Int64?) -> SendMessageTransaction {
+      SendMessageTransaction(
+        text: text ?? "",
+        peerId: peerId,
+        chatId: chatId,
+        replyToMsgId: replyToMessageId,
+        isSticker: nil,
+        entities: entities,
+        sendMode: sendMode
+      )
+    }
+
+    func sendTextTransaction(_ transaction: SendMessageTransaction) async {
+      let identity = SendMessageAnimationIdentity(
+        randomId: transaction.context.randomId,
+        temporaryMessageId: transaction.context.temporaryMessageId
+      )
+
+      do {
+        try await Api.realtime.send(transaction)
+      } catch {
+        sendAnimationCoordinator?.cancel(identity: identity)
+        log.error("Send message failed", error: error)
+      }
+    }
+
+    func prepareTextSendAnimationIfNeeded(
+      transaction: SendMessageTransaction,
+      replyToMessageId: Int64?,
+      shouldCoordinateSendAnimationReset: Bool
+    ) -> Bool {
+      SendMessageAnimationDiagnostics.debug(
+        "compose prepare-check random=\(transaction.context.randomId) temp=\(transaction.context.temporaryMessageId) should=\(shouldAttemptSendAnimation) coordinateReset=\(shouldCoordinateSendAnimationReset) reply=\(replyToMessageId.map(String.init) ?? "nil") textLen=\((transaction.context.text ?? "").count) composeH=\(composeHeightConstraint.constant) focused=\(textView.isFirstResponder) window=\(window != nil)"
+      )
+      guard shouldCoordinateSendAnimationReset else { return false }
+
+      let identity = SendMessageAnimationIdentity(
+        randomId: transaction.context.randomId,
+        temporaryMessageId: transaction.context.temporaryMessageId
+      )
+
+      guard let source = makeTextSendAnimationSource(
+        identity: identity,
+        text: transaction.context.text ?? ""
+      ) else {
+        SendMessageAnimationDiagnostics.event(
+          "compose source-capture-nil random=\(identity.randomId) temp=\(identity.temporaryMessageId) coordinateReset=\(shouldCoordinateSendAnimationReset)"
+        )
+        return false
+      }
+
+      return sendAnimationCoordinator?.prepare(source: source) == true
+    }
+
+    func shouldCoordinateTextSendAnimationReset(replyToMessageId: Int64?) -> Bool {
+      let canPrepareSourceLayout = sendAnimationCoordinator?.canPrepareTextSendSource() != false
+      let shouldCoordinate = shouldAttemptSendAnimation &&
+        canPrepareSourceLayout
+      SendMessageAnimationDiagnostics.debug(
+        "compose coordinate-reset-check should=\(shouldCoordinate) attempt=\(shouldAttemptSendAnimation) reply=\(replyToMessageId.map(String.init) ?? "nil") sourceLayout=\(canPrepareSourceLayout)"
+      )
+      return shouldCoordinate
+    }
+
+    func sendTextAndAttachments(replyToMessageId: Int64?, queueOnly: Bool) async {
+      if attachmentItemsToSend.isEmpty {
+        let transaction = makeTextSendTransaction(replyToMessageId: replyToMessageId)
+        if queueOnly {
+          _ = await Api.realtime.sendQueued(transaction)
+        } else {
+          await sendTextTransaction(transaction)
+        }
+      } else {
+        for (index, (_, attachment)) in attachmentItemsToSend.enumerated() {
+          log.debug("Sending attachment: \(attachment)")
+          let isFirst = index == 0
+
+          // Verify attachment has valid local path before sending
+          guard attachment.getLocalPath() != nil else {
+            log.error("Attachment has no local path, skipping: \(attachment)")
+            continue
+          }
+
+          submitAttachmentSend(.init(
+            text: isFirst ? text : nil,
+            peerId: peerId,
+            chatId: chatId,
+            mediaItems: [attachment],
+            replyToMsgId: isFirst ? replyToMessageId : nil,
+            isSticker: nil,
+            entities: isFirst ? entities : nil,
+            sendMode: sendMode
+          ))
+        }
+      }
+    }
+
+    var didPrepareSendAnimationPreview = false
+    var shouldCoordinateSendAnimationReset = false
+
+    if isEditing {
+      mentionedParticipantsAccess.handle(entities: entities, peer: peerId, chatId: chatId)
+      Task(priority: .userInitiated) { @MainActor in
+        try await Api.realtime.send(.editMessage(
+          messageId: state.editingMessageId ?? 0,
+          text: text ?? "",
+          chatId: chatId,
+          peerId: peerId,
+          entities: editEntities
+        ))
+      }
+
+      ChatState.shared.clearEditingMessageId(peer: peerId)
+    } else if let forwardContext {
+      guard !forwardContext.messageIds.isEmpty else {
+        log.error("Forward failed: empty message ids")
+        return
+      }
+      Task(priority: .userInitiated) { @MainActor in
+        if hasText || hasAttachments {
+          await sendTextAndAttachments(replyToMessageId: nil, queueOnly: true)
+        }
+        do {
+          let result = try await Api.realtime.send(.forwardMessages(
+            fromPeerId: forwardContext.fromPeerId,
+            toPeerId: peerId,
+            messageIds: forwardContext.messageIds
+          ))
+
+          if case let .forwardMessages(response) = result, response.updates.isEmpty {
+            _ = await Api.realtime.sendQueued(.getChatHistory(peer: peerId))
+          }
+        } catch {
+          log.error("Forward failed", error: error)
+        }
+      }
+
+      ChatState.shared.clearForwarding(peer: peerId)
+      IntentDonationCoordinator.donateOutgoing(peerId: peerId, chatId: chatId)
+    } else {
+      let replyToMessageId = state.replyingMessageId
+      mentionedParticipantsAccess.handle(entities: entities, peer: peerId, chatId: chatId)
+      if attachmentItemsToSend.isEmpty {
+        let transaction = makeTextSendTransaction(replyToMessageId: replyToMessageId)
+        shouldCoordinateSendAnimationReset = shouldCoordinateTextSendAnimationReset(
+          replyToMessageId: replyToMessageId
+        )
+        didPrepareSendAnimationPreview = prepareTextSendAnimationIfNeeded(
+          transaction: transaction,
+          replyToMessageId: replyToMessageId,
+          shouldCoordinateSendAnimationReset: shouldCoordinateSendAnimationReset
+        )
+        Task(priority: .userInitiated) { @MainActor in
+          await sendTextTransaction(transaction)
+        }
+      } else {
+        Task(priority: .userInitiated) { @MainActor in
+          await sendTextAndAttachments(replyToMessageId: replyToMessageId, queueOnly: false)
+        }
+      }
+
+      ChatState.shared.clearReplyingMessageId(peer: peerId)
+      IntentDonationCoordinator.donateOutgoing(peerId: peerId, chatId: chatId)
+    }
+
+    if shouldSendTextOnly {
+      clearTextOnlyComposeAfterSend(
+        shouldCoordinateSendAnimationReset: shouldCoordinateSendAnimationReset,
+        didPrepareSendAnimationPreview: didPrepareSendAnimationPreview
+      )
+    } else {
+      // Clear everything
+      resetFullComposeStateAfterTextSend(
+        shouldCoordinateSendAnimationReset: shouldCoordinateSendAnimationReset,
+        didPrepareSendAnimationPreview: didPrepareSendAnimationPreview
+      )
+    }
+  }
+
+  func performInlineCommand(_ action: InlineCommandAction) {
+    guard inlineCommandTask == nil,
+          let executeInlineCommand,
+          let peerId
+    else { return }
+    let invocationPeerId = peerId
+    let invocationText = textView.text ?? ""
+    let invocationAttributedText = NSAttributedString(
+      attributedString: textView.attributedText ?? NSAttributedString()
+    )
+    let normalizedInvocation = invocationText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let state = ChatState.shared.getState(peer: invocationPeerId)
+    guard normalizedInvocation.hasPrefix("/"),
+          !normalizedInvocation.dropFirst().contains(where: { $0.isWhitespace }),
+          state.editingMessageId == nil,
+          state.forwardContext == nil,
+          attachmentItems.isEmpty,
+          pendingVideoAttachments.isEmpty,
+          !hasActiveAttachmentUploads,
+          !isVoiceActive
+    else { return }
+
+    autocompleteManager?.dismissCompletion()
+    inlineCommandTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { inlineCommandTask = nil }
+      do {
+        guard let execution = try await executeInlineCommand(action),
+              window != nil,
+              self.peerId == invocationPeerId
+        else { return }
+
+        let currentState = ChatState.shared.getState(peer: invocationPeerId)
+        let invocationIsUnchanged = (textView.text ?? "") == invocationText &&
+          (textView.attributedText ?? NSAttributedString()).isEqual(to: invocationAttributedText) &&
+          currentState.editingMessageId == nil &&
+          currentState.forwardContext == nil &&
+          attachmentItems.isEmpty &&
+          pendingVideoAttachments.isEmpty &&
+          !hasActiveAttachmentUploads &&
+          !isVoiceActive
+        if invocationIsUnchanged {
+          clearInlineCommandText()
+        }
+
+        if case let .openThread(result) = execution {
+          guard let threadId = result.peer.asThreadId() else {
+            assertionFailure("Local thread command returned a non-thread peer")
+            return
+          }
+          ThreadLinkNavigator.open(target: .chatId(threadId))
+          if !result.didOpenInSidebar {
+            ToastManager.shared.showToast(
+              "Thread created, but couldn’t open it in the sidebar.",
+              type: .error,
+              systemImage: "exclamationmark.triangle.fill"
+            )
+          }
+        }
+      } catch {
+        guard window != nil, self.peerId == invocationPeerId else { return }
+        log.error("Inline command failed", error: error)
+        ToastManager.shared.showToast(
+          error.localizedDescription,
+          type: .error,
+          systemImage: "exclamationmark.triangle.fill"
+        )
+      }
+    }
+  }
+
+  func clearInlineCommandText() {
+    clearDraft()
+    stopDraftSaveTimer()
+    textView.text = ""
+    resetTextViewState()
+    textView.font = .systemFont(ofSize: 17)
+    textView.typingAttributes[.font] = UIFont.systemFont(ofSize: 17)
+    textView.showPlaceholder(true)
+    updateSendButtonVisibility(syncVoiceAvailability: false)
+    updateHeight(animated: false)
+  }
+
+  private func attributedStringForSend() -> NSAttributedString {
+    let attributedString = NSMutableAttributedString(
+      attributedString: textView.attributedText ?? NSAttributedString()
+    )
+
+    removeAttachmentMarkers(from: attributedString)
+    return trimmedAttributedString(attributedString)
+  }
+
+  private func removeAttachmentMarkers(from attributedString: NSMutableAttributedString) {
+    let text = attributedString.string as NSString
+    var ranges: [NSRange] = []
+    var searchRange = NSRange(location: 0, length: text.length)
+
+    while searchRange.length > 0 {
+      let range = text.range(of: "\u{FFFC}", options: [], range: searchRange)
+      if range.location == NSNotFound {
+        break
+      }
+
+      ranges.append(range)
+      let nextLocation = NSMaxRange(range)
+      searchRange = NSRange(location: nextLocation, length: text.length - nextLocation)
+    }
+
+    for range in ranges.reversed() {
+      attributedString.deleteCharacters(in: range)
+    }
+  }
+
+  private func trimmedAttributedString(_ attributedString: NSAttributedString) -> NSAttributedString {
+    let whitespaceSet = CharacterSet.whitespacesAndNewlines
+    let text = attributedString.string as NSString
+    let startRange = text.rangeOfCharacter(from: whitespaceSet.inverted)
+    if startRange.location == NSNotFound {
+      return NSAttributedString()
+    }
+
+    let endRange = text.rangeOfCharacter(from: whitespaceSet.inverted, options: .backwards)
+    let trimmedRange = NSRange(
+      location: startRange.location,
+      length: NSMaxRange(endRange) - startRange.location
+    )
+    return attributedString.attributedSubstring(from: trimmedRange)
+  }
+
+  func updateSendButtonForEditing(_ isEditing: Bool) {
+    let imageName = isEditing ? "checkmark" : "arrow.up"
+    sendButton.configuration?.image = UIImage(systemName: imageName)?.withConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)
+    )
+  }
+
+  func setupScenePhaseObserver() {
+    sceneObserverTokens.forEach { NotificationCenter.default.removeObserver($0) }
+    sceneObserverTokens.removeAll()
+
+    let didEnterBackgroundToken = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.saveCurrentDraft()
+    }
+
+    let willTerminateToken = NotificationCenter.default.addObserver(
+      forName: UIApplication.willTerminateNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.saveCurrentDraft()
+    }
+
+    let willResignActiveToken = NotificationCenter.default.addObserver(
+      forName: UIApplication.willResignActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.saveCurrentDraft()
+    }
+
+    sceneObserverTokens = [
+      didEnterBackgroundToken,
+      willTerminateToken,
+      willResignActiveToken,
+    ]
+  }
+
+  func setupChatStateObservers() {
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleEditingStateChange),
+      name: .init("ChatStateSetEditingCalled"),
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleEditingStateChange),
+      name: .init("ChatStateClearEditingCalled"),
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleReplyStateChange),
+      name: .init("ChatStateSetReplyCalled"),
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleReplyStateChange),
+      name: .init("ChatStateClearReplyCalled"),
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleQuote(_:)),
+      name: .init("ChatStateQuoteCalled"),
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleForwardStateChange),
+      name: .init("ChatStateSetForwardCalled"),
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleForwardStateChange),
+      name: .init("ChatStateClearForwardCalled"),
+      object: nil
+    )
+  }
+
+  func setupStickerObserver() {
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleStickerDetected(_:)),
+      name: NSNotification.Name("StickerDetected"),
+      object: nil
+    )
+  }
+
+  @objc func handleEditingStateChange() {
+    guard let peerId, let chatId else { return }
+    autocompleteManager?.dismissCompletion()
+    let isEditing = ChatState.shared.getState(peer: peerId).editingMessageId != nil
+    updateSendButtonForEditing(isEditing)
+
+    if isEditing {
+      // Stop draft timer when editing a message
+      stopDraftSaveTimer()
+
+      if let messageId = ChatState.shared.getState(peer: peerId).editingMessageId,
+         let message = try? FullMessage.get(messageId: messageId, chatId: chatId)
+      {
+        // The experiment exposes Markdown syntax; otherwise keep rendered formatting.
+        if let text = message.message.text {
+          let configuration = ProcessEntities.Configuration(
+            font: .systemFont(ofSize: 17),
+            primaryColor: .label,
+            linkColor: linkColor,
+            convertMentionsToLink: false, // Keep as attributes for editing
+            renderPhoneNumbers: false
+          )
+
+          let attributedText = ExperimentalFeatureFlags.richMessageCopyEditingEnabled ? MessageMarkdown.editableText(
+            text: text,
+            entities: message.message.entities,
+            configuration: configuration
+          ) : MessageMarkdown.withQuoteSyntax(
+            ProcessEntities.toAttributedString(
+              text: text,
+              entities: message.message.entities,
+              configuration: configuration
+            ),
+            entities: message.message.entities,
+            attributes: [.font: UIFont.systemFont(ofSize: 17), .foregroundColor: UIColor.label]
+          )
+
+          textView.attributedText = attributedText
+        } else {
+          textView.text = ""
+        }
+
+        textView.selectedRange = NSRange(location: textView.attributedText.length, length: 0)
+        textView.resetTypingAttributesToDefault()
+
+        textView.showPlaceholder(false)
+        buttonAppear()
+        DispatchQueue.main.async { [weak self] in
+          self?.updateHeight()
+        }
+      }
+    } else {
+      // Resume draft timer when exiting edit mode if there's text
+      if let text = textView.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        startDraftSaveTimer()
+      }
+    }
+    updateEmbedState(animated: true)
+    updateSendButtonVisibility()
+  }
+
+  @objc private func handleReplyStateChange() {
+    removeStaleReplyQuote()
+    updateEmbedState(animated: true)
+    updateAgentReplyTarget()
+  }
+
+  /// The quote lines Quote put at the top and the message they quote, so quoting again or
+  /// dropping the reply can take them back out.
+  private var insertedReplyQuote: (markdown: String, messageId: Int64)?
+
+  /// Puts quote lines first, replacing the last quote, through the normal input path, and
+  /// leaves the cursor at the end so the reply is typed below the quote. One quote per reply,
+  /// like Telegram, so the reply shows it in its header.
+  @objc private func handleQuote(_ notification: Notification) {
+    guard let peerId, (notification.userInfo?["peer"] as? InlineKit.Peer) == peerId,
+          let markdown = notification.userInfo?["markdown"] as? String else { return }
+    let insertion = MessageMarkdown.replyQuoteInsertion(
+      markdown,
+      into: textView.text ?? "",
+      replacing: insertedReplyQuote?.markdown
+    )
+    textView.resetTypingAttributesToDefault()
+    textView.selectedRange = insertion.range
+    textView.insertText(insertion.text)
+    insertedReplyQuote = ChatState.shared.getState(peer: peerId).replyingMessageId.map { (markdown, $0) }
+    textView.selectedRange = NSRange(location: textView.attributedText.length, length: 0)
+    textView.becomeFirstResponder()
+  }
+
+  /// A reply that moved to another message, or was dropped, takes its inserted quote with it
+  /// while the lines are still untouched at the top.
+  private func removeStaleReplyQuote() {
+    guard let inserted = insertedReplyQuote, let peerId,
+          ChatState.shared.getState(peer: peerId).replyingMessageId != inserted.messageId
+    else { return }
+    insertedReplyQuote = nil
+    guard let range = MessageMarkdown.replyQuoteRemoval(inserted.markdown, from: textView.text ?? "") else { return }
+    let selection = textView.selectedRange
+    textView.selectedRange = range
+    textView.insertText("")
+    textView.selectedRange = NSRange(location: max(0, selection.location - range.length), length: 0)
+  }
+
+  @objc private func handleForwardStateChange() {
+    updateEmbedState(animated: true)
+    updateSendButtonVisibility()
+  }
+
+  func dismissEmbed(mode: ComposeEmbedViewContent.Mode) {
+    if let peerId {
+      switch mode {
+      case .reply:
+        ChatState.shared.clearReplyingMessageId(peer: peerId)
+      case .edit:
+        ChatState.shared.clearEditingMessageId(peer: peerId)
+        clearEditingComposeState()
+      case .forward:
+        ChatState.shared.clearForwarding(peer: peerId)
+      }
+    } else {
+      if mode == .edit {
+        clearEditingComposeState()
+      }
+    }
+
+    updateEmbedState(animated: true)
+  }
+
+  private func updateEmbedState(animated: Bool) {
+    guard let peerId else {
+      hideEmbedView(animated: animated)
+      return
+    }
+    guard let chatId else {
+      hideEmbedView(animated: animated)
+      return
+    }
+
+    let state = ChatState.shared.getState(peer: peerId)
+    if let editingMessageId = state.editingMessageId {
+      showEmbedView(
+        peerId: peerId,
+        messageId: editingMessageId,
+        messageChatId: chatId,
+        mode: .edit,
+        animated: animated
+      )
+      becomeFirstResponder()
+      textView.becomeFirstResponder()
+      return
+    }
+
+    if let forwardContext = state.forwardContext,
+       let previewMessageId = forwardContext.messageIds.first
+    {
+      showEmbedView(
+        peerId: peerId,
+        messageId: previewMessageId,
+        messageChatId: forwardContext.sourceChatId,
+        mode: .forward,
+        animated: animated
+      )
+      becomeFirstResponder()
+      textView.becomeFirstResponder()
+      updateSendButtonVisibility()
+      return
+    }
+
+    if let replyingMessageId = state.replyingMessageId {
+      showEmbedView(
+        peerId: peerId,
+        messageId: replyingMessageId,
+        messageChatId: chatId,
+        mode: .reply,
+        animated: animated
+      )
+      becomeFirstResponder()
+      textView.becomeFirstResponder()
+      return
+    }
+
+    hideEmbedView(animated: animated)
+  }
+
+  private func clearEditingComposeState() {
+    autocompleteManager?.dismissCompletion()
+    textView.text = ""
+    textView.showPlaceholder(true)
+    updateSendButtonVisibility(syncVoiceAvailability: false)
+    clearDraft()
+    resetTextViewState()
+    updateHeight()
+  }
+
+  private func showEmbedView(
+    peerId: InlineKit.Peer,
+    messageId: Int64,
+    messageChatId: Int64,
+    mode: ComposeEmbedViewContent.Mode,
+    animated: Bool
+  ) {
+    let needsNewView = embedView == nil ||
+      currentEmbedMessageId != messageId ||
+      currentEmbedMode != mode ||
+      currentEmbedMessageChatId != messageChatId
+    if needsNewView {
+      embedView?.removeFromSuperview()
+      let newEmbedView = ComposeEmbedView(
+        peerId: peerId,
+        messageChatId: messageChatId,
+        messageId: messageId,
+        mode: mode
+      )
+      newEmbedView.translatesAutoresizingMaskIntoConstraints = false
+      UIView.performWithoutAnimation {
+        embedContainerView.addSubview(newEmbedView)
+        NSLayoutConstraint.activate([
+          newEmbedView.leadingAnchor.constraint(equalTo: embedContainerView.leadingAnchor),
+          newEmbedView.trailingAnchor.constraint(equalTo: embedContainerView.trailingAnchor),
+          newEmbedView.topAnchor.constraint(equalTo: embedContainerView.topAnchor),
+          newEmbedView.bottomAnchor.constraint(equalTo: embedContainerView.bottomAnchor),
+          newEmbedView.heightAnchor.constraint(equalToConstant: ComposeEmbedView.height),
+        ])
+        embedContainerView.layoutIfNeeded()
+      }
+      embedView = newEmbedView
+      currentEmbedMessageId = messageId
+      currentEmbedMode = mode
+      currentEmbedMessageChatId = messageChatId
+    }
+
+    if embedContainerView.isHidden {
+      UIView.performWithoutAnimation {
+        embedContainerView.isHidden = false
+        embedContainerView.layoutIfNeeded()
+      }
+    }
+
+    let targetHeight = ComposeEmbedView.height
+    let shouldUpdateHeight = embedContainerHeightConstraint?.constant != targetHeight
+    embedContainerHeightConstraint?.constant = targetHeight
+
+    if shouldUpdateHeight {
+      updateHeight(animated: animated)
+    }
+  }
+
+  private func hideEmbedView(animated: Bool) {
+    guard embedView != nil else { return }
+
+    let shouldUpdateHeight = embedContainerHeightConstraint?.constant != 0
+    embedContainerHeightConstraint?.constant = 0
+
+    let finish: () -> Void = { [weak self] in
+      guard let self else { return }
+      self.embedView?.removeFromSuperview()
+      self.embedView = nil
+      self.currentEmbedMessageId = nil
+      self.currentEmbedMode = nil
+      self.currentEmbedMessageChatId = nil
+      self.embedContainerView.isHidden = true
+    }
+
+    if shouldUpdateHeight {
+      updateHeight(animated: animated, completion: finish)
+    } else {
+      finish()
+    }
+  }
+
+  func removeObservers() {
+    // Called from deinit: stop the model only. Layout code there would make
+    // weak references to a deallocating view, which aborts.
+    stopAgentChain()
+    voicePhaseObserver?.cancel()
+    voicePhaseObserver = nil
+    sceneObserverTokens.forEach { NotificationCenter.default.removeObserver($0) }
+    sceneObserverTokens.removeAll()
+    NotificationCenter.default.removeObserver(self)
+  }
+
+  // MARK: - Reset Methods
+
+  /// Resets text view typing attributes and related state
+  func resetTextViewState() {
+    textView.resetTypingAttributesToDefault()
+    updateAgentDraftTarget()
+
+    DispatchQueue.main.async { [weak self] in
+      self?.textView.updateTypingAttributesIfNeeded()
+    }
+  }
+
+  private enum ComposeResetHeightBehavior {
+    case normal
+    case coordinatedSendAnimation
+
+    var debugName: String {
+      switch self {
+      case .normal:
+        return "normal"
+      case .coordinatedSendAnimation:
+        return "coordinated-send-animation"
+      }
+    }
+  }
+
+  private func resetComposeStateWithoutSendAnimation() {
+    resetFullComposeState(heightBehavior: .normal)
+  }
+
+  func resetFullComposeStateAfterTextSend(
+    shouldCoordinateSendAnimationReset: Bool,
+    didPrepareSendAnimationPreview: Bool
+  ) {
+    resetFullComposeState(
+      heightBehavior: shouldCoordinateSendAnimationReset ? .coordinatedSendAnimation : .normal,
+      didPrepareSendAnimationPreview: didPrepareSendAnimationPreview
+    )
+  }
+
+  private func resetFullComposeState(
+    heightBehavior: ComposeResetHeightBehavior,
+    didPrepareSendAnimationPreview: Bool = false
+  ) {
+    autocompleteManager?.dismissCompletion()
+    let hadAttachments = !attachmentItems.isEmpty || !pendingVideoAttachments.isEmpty
+    let shouldAnimateHeightReset = ComposeResetBehavior.shouldAnimateHeightResetAfterSend(
+      hadAttachments: hadAttachments
+    )
+    let shouldHideSendButtonImmediately = ComposeResetBehavior.shouldHideSendButtonImmediatelyAfterSend(
+      hadAttachments: hadAttachments
+    )
+
+    if shouldHideSendButtonImmediately {
+      buttonDisappear(animated: false)
+    }
+
+    let heightBeforeClear = composeHeightConstraint.constant
+    let shouldDeferSendHeightReset = heightBehavior == .coordinatedSendAnimation
+      && shouldAnimateHeightReset
+      && abs(heightBeforeClear - restingHeight) > 1
+    pendingSendAnimationHeightChange = shouldDeferSendHeightReset
+    SendMessageAnimationDiagnostics.event(
+      "compose reset-full heightBehavior=\(heightBehavior.debugName) shouldCoordinateHeight=\(heightBehavior == .coordinatedSendAnimation) preview=\(didPrepareSendAnimationPreview) shouldDeferHeight=\(shouldDeferSendHeightReset) shouldAnimateHeightReset=\(shouldAnimateHeightReset) hadAttachments=\(hadAttachments) heightBefore=\(String(format: "%.1f", heightBeforeClear)) minHeight=\(String(format: "%.1f", Self.minHeight))"
+    )
+
+    clearDraft()
+    // Keep already-started uploads alive after tapping send; the transaction may still be awaiting them.
+    clearAttachments(
+      shouldUpdateSendButtonVisibility: !shouldHideSendButtonImmediately,
+      cancelRemovedUploads: false
+    )
+    stopDraftSaveTimer()
+    textView.text = ""
+
+    resetTextViewState()
+
+    // Ensure font is reset after clearing text
+    textView.font = .systemFont(ofSize: 17)
+    textView.typingAttributes[.font] = UIFont.systemFont(ofSize: 17)
+
+    resetHeight(animated: shouldAnimateHeightReset)
+    textView.showPlaceholder(true)
+    // Programmatic text changes do not call textViewDidChange. Reconcile both
+    // trailing controls after the text and attachments have finished clearing.
+    updateSendButtonVisibility(syncVoiceAvailability: false)
+    if !shouldDeferSendHeightReset {
+      pendingSendAnimationHeightChange = false
+    }
+
+    sendButton.configuration?.showsActivityIndicator = false
+  }
+
+  func clearTextOnlyComposeAfterSend(
+    shouldCoordinateSendAnimationReset: Bool,
+    didPrepareSendAnimationPreview: Bool
+  ) {
+    autocompleteManager?.dismissCompletion()
+    let heightBeforeClear = composeHeightConstraint.constant
+    let shouldAnimateHeight = shouldCoordinateSendAnimationReset && abs(heightBeforeClear - restingHeight) > 1
+    pendingSendAnimationHeightChange = shouldAnimateHeight
+    SendMessageAnimationDiagnostics.event(
+      "compose reset-text-only shouldCoordinateHeight=\(shouldCoordinateSendAnimationReset) preview=\(didPrepareSendAnimationPreview) shouldAnimateHeight=\(shouldAnimateHeight) heightBefore=\(String(format: "%.1f", heightBeforeClear)) minHeight=\(String(format: "%.1f", Self.minHeight))"
+    )
+
+    clearDraft()
+    stopDraftSaveTimer()
+    textView.text = ""
+    resetTextViewState()
+    textView.font = .systemFont(ofSize: 17)
+    textView.typingAttributes[.font] = UIFont.systemFont(ofSize: 17)
+    textView.showPlaceholder(true)
+    updateSendButtonVisibility(syncVoiceAvailability: false)
+    updateHeight(
+      animated: shouldAnimateHeight,
+      duration: SendMessageAnimationTiming.duration,
+      timingParameters: shouldAnimateHeight ? SendMessageAnimationTiming.verticalTimingParameters : nil
+    )
+    if !shouldAnimateHeight {
+      pendingSendAnimationHeightChange = false
+    }
+    sendButton.configuration?.showsActivityIndicator = false
+  }
+
+  // MARK: - Attachment Management
+
+  func removeAttachment(_ id: String) {
+    cancelQueuedPendingVideoSend()
+    // TODO: Delete from cache as well
+
+    // Update state
+    attachmentItems.removeValue(forKey: id)
+    handleAttachmentItemsChanged(animated: true)
+
+    log.debug("Removed attachment with id: \(id)")
+  }
+
+  func removeImage(_ id: String) {
+    removeAttachment(id)
+  }
+
+  func removeFile(_ id: String) {
+    removeAttachment(id)
+  }
+
+  func clearAttachments(
+    shouldUpdateSendButtonVisibility: Bool = true,
+    cancelRemovedUploads: Bool = true
+  ) {
+    cancelQueuedPendingVideoSend()
+    for pending in pendingVideoAttachments {
+      canceledPendingVideoAttachmentIds.insert(pending.id)
+    }
+    attachmentItems.removeAll()
+    pendingVideoAttachments.removeAll()
+    handleAttachmentItemsChanged(
+      animated: false,
+      shouldUpdateSendButtonVisibility: shouldUpdateSendButtonVisibility,
+      cancelRemovedUploads: cancelRemovedUploads
+    )
+    log.debug("Cleared all attachments")
+  }
+
+  @discardableResult
+  func addAttachmentItem(_ mediaItem: FileMediaItem, animated: Bool = false) -> String {
+    let uniqueId = mediaItem.getItemUniqueId()
+    attachmentItems[uniqueId] = mediaItem
+    handleAttachmentItemsChanged(animated: animated)
+    return uniqueId
+  }
+
+  func handleAttachmentItemsChanged(
+    animated: Bool = true,
+    shouldUpdateSendButtonVisibility: Bool = true,
+    cancelRemovedUploads: Bool = true
+  ) {
+    syncAttachmentUploadTracking(cancelRemovedUploads: cancelRemovedUploads)
+    UIView.performWithoutAnimation {
+      refreshAttachmentPreviews()
+      attachmentStackView.layoutIfNeeded()
+    }
+    if shouldUpdateSendButtonVisibility {
+      let shouldShowSendButtonImmediately = ComposeSendButtonState.shouldShowImmediatelyForReadyAttachments(
+        hasAttachments: !attachmentItems.isEmpty,
+        hasPendingVideos: !pendingVideoAttachments.isEmpty,
+        canSend: canSend
+      )
+
+      if shouldShowSendButtonImmediately {
+        showSendButtonImmediately()
+      } else {
+        updateSendButtonVisibility()
+      }
+    }
+
+    updateHeight(animated: animated)
+    sendQueuedPendingVideoMessageIfReady()
+  }
+
+  private func syncAttachmentUploadTracking(cancelRemovedUploads: Bool = true) {
+    guard ComposeAttachmentUploadBehavior.shouldStartUploadsInCompose() else {
+      clearAttachmentUploadTracking(cancelUploads: cancelRemovedUploads)
+      return
+    }
+
+    let currentAttachmentIds = Set(attachmentItems.keys)
+
+    for trackedId in Set(attachmentUploadProgress.keys) where !currentAttachmentIds.contains(trackedId) {
+      stopTrackingAttachmentUpload(trackedId, cancelUpload: cancelRemovedUploads)
+    }
+
+    for taskId in Set(attachmentUploadBindingTasks.keys) where !currentAttachmentIds.contains(taskId) {
+      stopTrackingAttachmentUpload(taskId, cancelUpload: cancelRemovedUploads)
+    }
+
+    for taskId in Set(attachmentUploadStartTasks.keys) where !currentAttachmentIds.contains(taskId) {
+      stopTrackingAttachmentUpload(taskId, cancelUpload: cancelRemovedUploads)
+    }
+
+    for subscriptionId in Set(attachmentUploadSubscriptions.keys) where !currentAttachmentIds.contains(subscriptionId) {
+      stopTrackingAttachmentUpload(subscriptionId, cancelUpload: cancelRemovedUploads)
+    }
+
+    for (attachmentId, mediaItem) in attachmentItems {
+      guard attachmentUploadProgress[attachmentId] == nil, attachmentUploadStartTasks[attachmentId] == nil else {
+        continue
+      }
+
+      startTrackingAttachmentUpload(attachmentId: attachmentId, mediaItem: mediaItem)
+    }
+  }
+
+  private func startTrackingAttachmentUpload(attachmentId: String, mediaItem: FileMediaItem) {
+    setAttachmentUploadProgress(.processing(id: attachmentId), for: attachmentId)
+    bindAttachmentUploadProgress(attachmentId: attachmentId, mediaItem: mediaItem)
+
+    attachmentUploadStartTasks[attachmentId] = Task { [weak self] in
+      guard let self else { return }
+
+      do {
+        try await self.startAttachmentUpload(mediaItem)
+      } catch {
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          guard self.attachmentItems[attachmentId] != nil else { return }
+          self.setAttachmentUploadProgress(.failed(id: attachmentId, error: error), for: attachmentId)
+        }
+      }
+
+      await MainActor.run { [weak self] in
+        self?.attachmentUploadStartTasks.removeValue(forKey: attachmentId)
+      }
+    }
+  }
+
+  private func bindAttachmentUploadProgress(attachmentId: String, mediaItem: FileMediaItem) {
+    attachmentUploadBindingTasks[attachmentId] = Task { @MainActor [weak self] in
+      guard let self else { return }
+
+      let publisher = await uploadProgressPublisher(for: mediaItem)
+      guard !Task.isCancelled else {
+        self.attachmentUploadBindingTasks.removeValue(forKey: attachmentId)
+        return
+      }
+
+      guard let publisher else {
+        self.attachmentUploadBindingTasks.removeValue(forKey: attachmentId)
+        return
+      }
+
+      self.attachmentUploadBindingTasks.removeValue(forKey: attachmentId)
+      self.attachmentUploadSubscriptions[attachmentId] = publisher
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] snapshot in
+          guard let self else { return }
+          guard self.attachmentItems[attachmentId] != nil else { return }
+          self.setAttachmentUploadProgress(snapshot, for: attachmentId)
+        }
+    }
+  }
+
+  private func uploadProgressPublisher(for mediaItem: FileMediaItem) async -> AnyPublisher<UploadProgressSnapshot, Never>? {
+    switch mediaItem {
+    case let .photo(photoInfo):
+      guard let localId = photoInfo.photo.id else { return nil }
+      return await FileUploader.shared.photoProgressPublisher(photoLocalId: localId)
+    case let .video(videoInfo):
+      guard let localId = videoInfo.video.id else { return nil }
+      return await FileUploader.shared.videoProgressPublisher(videoLocalId: localId)
+    case let .document(documentInfo):
+      guard let localId = documentInfo.document.id else { return nil }
+      return await FileUploader.shared.documentProgressPublisher(documentLocalId: localId)
+    case let .voice(voiceContent):
+      let localId = voiceContent.voiceID
+      guard localId != 0 else { return nil }
+      return await FileUploader.shared.voiceProgressPublisher(voiceLocalId: localId)
+    }
+  }
+
+  private func startAttachmentUpload(_ mediaItem: FileMediaItem) async throws {
+    switch mediaItem {
+    case let .photo(photoInfo):
+      _ = try await FileUploader.shared.uploadPhoto(photoInfo: photoInfo)
+    case let .video(videoInfo):
+      _ = try await FileUploader.shared.uploadVideo(videoInfo: videoInfo)
+    case let .document(documentInfo):
+      _ = try await FileUploader.shared.uploadDocument(documentInfo: documentInfo)
+    case let .voice(voiceContent):
+      _ = try await FileUploader.shared.uploadVoice(voiceContent: voiceContent)
+    }
+  }
+
+  private func setAttachmentUploadProgress(_ progress: UploadProgressSnapshot, for attachmentId: String) {
+    attachmentUploadProgress[attachmentId] = progress
+
+    if let preview = attachmentStackView.arrangedSubviews
+      .compactMap({ $0 as? ComposeAttachmentPreviewItemView })
+      .first(where: { $0.attachmentIdentifier == attachmentId })
+    {
+      preview.setUploadProgress(progress)
+    }
+
+    updateSendButtonVisibility()
+  }
+
+  private func stopTrackingAttachmentUpload(_ attachmentId: String, cancelUpload: Bool) {
+    attachmentUploadBindingTasks[attachmentId]?.cancel()
+    attachmentUploadBindingTasks.removeValue(forKey: attachmentId)
+
+    attachmentUploadStartTasks[attachmentId]?.cancel()
+    attachmentUploadStartTasks.removeValue(forKey: attachmentId)
+
+    attachmentUploadSubscriptions[attachmentId]?.cancel()
+    attachmentUploadSubscriptions.removeValue(forKey: attachmentId)
+
+    if cancelUpload,
+       let progress = attachmentUploadProgress[attachmentId],
+       (progress.stage == .processing || progress.stage == .uploading)
+    {
+      Task {
+        await FileUploader.shared.cancel(uploadId: attachmentId)
+      }
+    }
+
+    attachmentUploadProgress.removeValue(forKey: attachmentId)
+  }
+
+  private func clearAttachmentUploadTracking(cancelUploads: Bool) {
+    let trackedAttachmentIds = Set(attachmentUploadProgress.keys)
+      .union(attachmentUploadBindingTasks.keys)
+      .union(attachmentUploadStartTasks.keys)
+      .union(attachmentUploadSubscriptions.keys)
+
+    for attachmentId in trackedAttachmentIds {
+      stopTrackingAttachmentUpload(attachmentId, cancelUpload: cancelUploads)
+    }
+  }
+
+  func refreshAttachmentPreviews() {
+    attachmentStackView.arrangedSubviews.forEach { view in
+      attachmentStackView.removeArrangedSubview(view)
+      view.removeFromSuperview()
+    }
+
+    let hasAttachments = !attachmentItems.isEmpty || !pendingVideoAttachments.isEmpty
+    attachmentContainerHeightConstraint?.constant = hasAttachments ? ComposeAttachmentPreviewItemView.stripHeight : 0
+    attachmentScrollView.isHidden = !hasAttachments
+
+    guard hasAttachments else { return }
+
+    for pending in pendingVideoAttachments {
+      let preview = ComposeAttachmentPreviewItemView(
+        pendingVideoId: pending.id,
+        thumbnailImage: pending.thumbnailImage
+      ) { [weak self] pendingId in
+        self?.removePendingVideoAttachment(pendingId, userInitiated: true)
+      }
+      attachmentStackView.addArrangedSubview(preview)
+    }
+
+    for (id, mediaItem) in attachmentItems {
+      let preview = ComposeAttachmentPreviewItemView(
+        attachmentId: id,
+        mediaItem: mediaItem,
+        onPreview: { [weak self] attachmentId, sourceView in
+          self?.openAttachmentPreview(attachmentId: attachmentId, sourceView: sourceView)
+        }
+      ) { [weak self] attachmentId in
+        self?.removeAttachment(attachmentId)
+      }
+      preview.setUploadProgress(attachmentUploadProgress[id])
+      attachmentStackView.addArrangedSubview(preview)
+    }
+  }
+
+  @discardableResult
+  func addPendingVideoAttachment() -> String {
+    let pendingId = "pending_video_\(UUID().uuidString)"
+    canceledPendingVideoAttachmentIds.remove(pendingId)
+    pendingVideoAttachments.append(PendingVideoAttachment(id: pendingId, thumbnailImage: nil))
+    handleAttachmentItemsChanged(animated: false)
+    return pendingId
+  }
+
+  func updatePendingVideoAttachmentThumbnail(_ pendingId: String, image: UIImage?) {
+    guard let index = pendingVideoAttachments.firstIndex(where: { $0.id == pendingId }) else { return }
+    pendingVideoAttachments[index].thumbnailImage = image
+    refreshAttachmentPreviews()
+  }
+
+  func removePendingVideoAttachment(_ pendingId: String, animated: Bool = false, userInitiated: Bool = false) {
+    if userInitiated {
+      cancelQueuedPendingVideoSend()
+      canceledPendingVideoAttachmentIds.insert(pendingId)
+    }
+    pendingVideoAttachments.removeAll { $0.id == pendingId }
+    handleAttachmentItemsChanged(animated: animated)
+  }
+
+  private func cancelPendingAttachmentsForDestinationChange() {
+    guard !pendingVideoAttachments.isEmpty else { return }
+    cancelQueuedPendingVideoSend()
+    canceledPendingVideoAttachmentIds.formUnion(pendingVideoAttachments.map(\.id))
+    pendingVideoAttachments.removeAll()
+    handleAttachmentItemsChanged(animated: false)
+  }
+
+  func isPendingVideoAttachmentCanceled(_ pendingId: String) -> Bool {
+    canceledPendingVideoAttachmentIds.contains(pendingId)
+  }
+
+  func finishPendingVideoAttachmentProcessing(_ pendingId: String) {
+    canceledPendingVideoAttachmentIds.remove(pendingId)
+  }
+
+  func completePendingVideoAttachments(
+    _ pendingIds: [String],
+    animated: Bool = false
+  ) {
+    let pendingIds = Set(pendingIds)
+    canceledPendingVideoAttachmentIds.subtract(pendingIds)
+    pendingVideoAttachments.removeAll { pendingIds.contains($0.id) }
+    handleAttachmentItemsChanged(animated: animated)
+  }
+
+  private func openAttachmentPreview(attachmentId: String, sourceView: UIView) {
+    guard let mediaItem = attachmentItems[attachmentId] else { return }
+    guard let presenter = attachmentFlowPresenter() else { return }
+    guard presenter.presentedViewController == nil else { return }
+
+    guard let fileURL = mediaItem.localFileURL(),
+          FileManager.default.fileExists(atPath: fileURL.path)
+    else {
+      showAttachmentPreviewUnavailableAlert()
+      return
+    }
+
+    switch mediaItem {
+    case .photo:
+      let viewer = MediaGalleryViewController(
+        imageURL: fileURL,
+        sourceView: sourceView,
+        sourceCornerRadius: 16
+      )
+      presenter.present(viewer, animated: false)
+    case .video:
+      let viewer = MediaGalleryViewController(
+        videoURL: fileURL,
+        sourceView: sourceView,
+        sourceCornerRadius: 16
+      )
+      presenter.present(viewer, animated: false)
+    case .document:
+      presentDocumentPreview(fileURL: fileURL, sourceView: sourceView, presenter: presenter)
+    case .voice:
+      showAttachmentPreviewUnavailableAlert()
+    }
+  }
+
+  private func presentDocumentPreview(fileURL: URL, sourceView: UIView, presenter: UIViewController) {
+    if QLPreviewController.canPreview(fileURL as NSURL) {
+      quickLookPreviewURL = fileURL
+      let previewController = QLPreviewController()
+      previewController.dataSource = self
+      previewController.delegate = self
+      presenter.present(previewController, animated: true)
+      return
+    }
+
+    let interactionController = UIDocumentInteractionController(url: fileURL)
+    interactionController.delegate = self
+    documentInteractionController = interactionController
+
+    if !interactionController.presentPreview(animated: true) {
+      _ = interactionController.presentOptionsMenu(from: sourceView.bounds, in: sourceView, animated: true)
+    }
+  }
+
+  private func showAttachmentPreviewUnavailableAlert() {
+    guard let presenter = attachmentFlowPresenter() else { return }
+
+    let alert = UIAlertController(
+      title: "Preview Unavailable",
+      message: "This attachment can't be previewed right now.",
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "OK", style: .default))
+    presenter.present(alert, animated: true)
+  }
+
+  func updateSendButtonVisibility(syncVoiceAvailability: Bool = true) {
+    if syncVoiceAvailability {
+      updateVoiceAvailability(animated: false)
+    }
+    let controlState = trailingControlState
+    if !syncVoiceAvailability {
+      // Callers coordinating their own height reset still need the microphone
+      // and send button to reflect the current draft.
+      updateTrailingControlVisibility(controlState, animated: false)
+    }
+
+    if controlState == .voice || voiceViewModel.isActive {
+      buttonDisappear(animated: false)
+      return
+    }
+
+    if pendingMediaSendState.isAwaitingSend {
+      showPendingMediaSendState()
+      return
+    }
+
+    if controlState == .send {
+      buttonAppear()
+    } else {
+      buttonDisappear()
+    }
+  }
+}
+
+extension ComposeView: SlashCommandManagerDelegate {
+  func slashCommandManager(_ manager: SlashCommandManager, didInsertCommand text: String, for range: NSRange) {
+    sendMessage()
+  }
+
+  func slashCommandManagerDidDismiss(_ manager: SlashCommandManager) {}
+}
+
+extension ComposeView: QLPreviewControllerDataSource, QLPreviewControllerDelegate {
+  func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+    quickLookPreviewURL == nil ? 0 : 1
+  }
+
+  func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+    if let quickLookPreviewURL {
+      return quickLookPreviewURL as NSURL
+    }
+
+    return NSURL(fileURLWithPath: "/")
+  }
+
+  func previewControllerDidDismiss(_ controller: QLPreviewController) {
+    quickLookPreviewURL = nil
+  }
+}
+
+extension ComposeView: UIDocumentInteractionControllerDelegate {
+  func documentInteractionControllerViewControllerForPreview(_ controller: UIDocumentInteractionController) -> UIViewController {
+    attachmentFlowPresenter() ?? UIViewController()
+  }
+
+  func documentInteractionControllerDidEndPreview(_ controller: UIDocumentInteractionController) {
+    if documentInteractionController === controller {
+      documentInteractionController = nil
+    }
+  }
+}
+
+private final class ComposeAttachmentPreviewItemView: UIView {
+  static let stripHeight: CGFloat = 92
+
+  private enum Metrics {
+    static let tileSize: CGFloat = 84
+    static let cornerRadius: CGFloat = 16
+    static let removeButtonSize: CGFloat = 22
+    static let removeBadgeSize: CGFloat = 22
+  }
+
+  private let attachmentId: String
+  private let onPreview: ((String, UIView) -> Void)?
+  private let onRemove: (String) -> Void
+  var attachmentIdentifier: String { attachmentId }
+
+  private let tileContentView: UIView = {
+    let view = UIView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.layer.cornerRadius = Metrics.cornerRadius
+    view.layer.cornerCurve = .continuous
+    view.layer.masksToBounds = true
+    return view
+  }()
+
+  private let tinyThumbnailBackgroundView: InlineTinyThumbnailBackgroundView = {
+    let view = InlineTinyThumbnailBackgroundView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private let thumbnailView: PlatformPhotoView = {
+    let view = PlatformPhotoView()
+    view.photoContentMode = .aspectFill
+    view.showsLoadingPlaceholder = false
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private let localThumbnailImageView: UIImageView = {
+    let imageView = UIImageView()
+    imageView.translatesAutoresizingMaskIntoConstraints = false
+    imageView.contentMode = .scaleAspectFill
+    imageView.clipsToBounds = true
+    imageView.isHidden = true
+    return imageView
+  }()
+
+  private let fallbackView: UIView = {
+    let view = UIView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.backgroundColor = .tertiarySystemFill
+    return view
+  }()
+
+  private let centerIconView: UIImageView = {
+    let iconView = UIImageView()
+    iconView.translatesAutoresizingMaskIntoConstraints = false
+    iconView.contentMode = .scaleAspectFit
+    iconView.tintColor = .secondaryLabel
+    return iconView
+  }()
+
+  private let extensionBadge: UILabel = {
+    let label = UILabel()
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.font = .systemFont(ofSize: 9, weight: .semibold)
+    label.textColor = .white
+    label.textAlignment = .center
+    label.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+    label.layer.cornerRadius = 5
+    label.layer.masksToBounds = true
+    label.isHidden = true
+    return label
+  }()
+
+  private let overlayIconView: UIImageView = {
+    let iconView = UIImageView()
+    iconView.translatesAutoresizingMaskIntoConstraints = false
+    iconView.contentMode = .scaleAspectFit
+    iconView.tintColor = .white
+    iconView.layer.shadowColor = UIColor.black.cgColor
+    iconView.layer.shadowOffset = .zero
+    iconView.layer.shadowRadius = 2
+    iconView.layer.shadowOpacity = 0.6
+    iconView.isHidden = true
+    return iconView
+  }()
+
+  private lazy var removeButton: UIButton = {
+    let button = UIButton(type: .system)
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.backgroundColor = .clear
+    button.addTarget(self, action: #selector(removeTapped), for: .touchUpInside)
+    button.accessibilityLabel = "Remove attachment"
+    return button
+  }()
+
+  private let removeBadgeView: UIView = {
+    let view = UIView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.isUserInteractionEnabled = false
+    view.backgroundColor = .white
+    view.layer.cornerRadius = Metrics.removeBadgeSize / 2
+    view.layer.cornerCurve = .continuous
+    view.layer.shadowColor = UIColor.black.cgColor
+    view.layer.shadowOpacity = 0.18
+    view.layer.shadowRadius = 3
+    view.layer.shadowOffset = CGSize(width: 0, height: 1)
+    return view
+  }()
+
+  private let removeIconView: UIImageView = {
+    let view = UIImageView()
+    view.translatesAutoresizingMaskIntoConstraints = false
+    view.isUserInteractionEnabled = false
+    view.image = UIImage(systemName: "xmark")?.withConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+    )
+    view.tintColor = .black
+    return view
+  }()
+
+  init(
+    attachmentId: String,
+    mediaItem: FileMediaItem,
+    onPreview: ((String, UIView) -> Void)?,
+    onRemove: @escaping (String) -> Void
+  ) {
+    self.attachmentId = attachmentId
+    self.onPreview = onPreview
+    self.onRemove = onRemove
+    super.init(frame: .zero)
+    setupViews()
+    configure(mediaItem: mediaItem)
+  }
+
+  init(
+    pendingVideoId: String,
+    thumbnailImage: UIImage?,
+    onRemove: @escaping (String) -> Void
+  ) {
+    attachmentId = pendingVideoId
+    onPreview = nil
+    self.onRemove = onRemove
+    super.init(frame: .zero)
+    accessibilityIdentifier = pendingVideoId
+    setupViews()
+    configurePendingVideo(thumbnailImage: thumbnailImage)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  @objc private func removeTapped() {
+    onRemove(attachmentId)
+  }
+
+  @objc private func previewTapped() {
+    onPreview?(attachmentId, tileContentView)
+  }
+
+  private func setupViews() {
+    translatesAutoresizingMaskIntoConstraints = false
+    clipsToBounds = false
+
+    addSubview(tileContentView)
+    tileContentView.addSubview(fallbackView)
+    tileContentView.addSubview(tinyThumbnailBackgroundView)
+    tileContentView.addSubview(thumbnailView)
+    tileContentView.addSubview(localThumbnailImageView)
+    tileContentView.addSubview(centerIconView)
+    tileContentView.addSubview(extensionBadge)
+    tileContentView.addSubview(overlayIconView)
+    addSubview(removeButton)
+    removeButton.addSubview(removeBadgeView)
+    removeBadgeView.addSubview(removeIconView)
+
+    let tapGesture = UITapGestureRecognizer(target: self, action: #selector(previewTapped))
+    tileContentView.addGestureRecognizer(tapGesture)
+
+    NSLayoutConstraint.activate([
+      widthAnchor.constraint(equalToConstant: Metrics.tileSize),
+      heightAnchor.constraint(equalToConstant: Metrics.tileSize),
+
+      tileContentView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      tileContentView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      tileContentView.topAnchor.constraint(equalTo: topAnchor),
+      tileContentView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      fallbackView.leadingAnchor.constraint(equalTo: tileContentView.leadingAnchor),
+      fallbackView.trailingAnchor.constraint(equalTo: tileContentView.trailingAnchor),
+      fallbackView.topAnchor.constraint(equalTo: tileContentView.topAnchor),
+      fallbackView.bottomAnchor.constraint(equalTo: tileContentView.bottomAnchor),
+
+      tinyThumbnailBackgroundView.leadingAnchor.constraint(equalTo: tileContentView.leadingAnchor),
+      tinyThumbnailBackgroundView.trailingAnchor.constraint(equalTo: tileContentView.trailingAnchor),
+      tinyThumbnailBackgroundView.topAnchor.constraint(equalTo: tileContentView.topAnchor),
+      tinyThumbnailBackgroundView.bottomAnchor.constraint(equalTo: tileContentView.bottomAnchor),
+
+      thumbnailView.leadingAnchor.constraint(equalTo: tileContentView.leadingAnchor),
+      thumbnailView.trailingAnchor.constraint(equalTo: tileContentView.trailingAnchor),
+      thumbnailView.topAnchor.constraint(equalTo: tileContentView.topAnchor),
+      thumbnailView.bottomAnchor.constraint(equalTo: tileContentView.bottomAnchor),
+
+      localThumbnailImageView.leadingAnchor.constraint(equalTo: tileContentView.leadingAnchor),
+      localThumbnailImageView.trailingAnchor.constraint(equalTo: tileContentView.trailingAnchor),
+      localThumbnailImageView.topAnchor.constraint(equalTo: tileContentView.topAnchor),
+      localThumbnailImageView.bottomAnchor.constraint(equalTo: tileContentView.bottomAnchor),
+
+      centerIconView.centerXAnchor.constraint(equalTo: tileContentView.centerXAnchor),
+      centerIconView.centerYAnchor.constraint(equalTo: tileContentView.centerYAnchor),
+
+      extensionBadge.centerXAnchor.constraint(equalTo: tileContentView.centerXAnchor),
+      extensionBadge.bottomAnchor.constraint(equalTo: tileContentView.bottomAnchor, constant: -4),
+      extensionBadge.leadingAnchor.constraint(greaterThanOrEqualTo: tileContentView.leadingAnchor, constant: 4),
+      extensionBadge.trailingAnchor.constraint(lessThanOrEqualTo: tileContentView.trailingAnchor, constant: -4),
+
+      overlayIconView.centerXAnchor.constraint(equalTo: tileContentView.centerXAnchor),
+      overlayIconView.centerYAnchor.constraint(equalTo: tileContentView.centerYAnchor),
+
+      removeButton.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+      removeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+      removeButton.widthAnchor.constraint(equalToConstant: Metrics.removeButtonSize),
+      removeButton.heightAnchor.constraint(equalToConstant: Metrics.removeButtonSize),
+
+      removeBadgeView.centerXAnchor.constraint(equalTo: removeButton.centerXAnchor),
+      removeBadgeView.centerYAnchor.constraint(equalTo: removeButton.centerYAnchor),
+      removeBadgeView.widthAnchor.constraint(equalToConstant: Metrics.removeBadgeSize),
+      removeBadgeView.heightAnchor.constraint(equalToConstant: Metrics.removeBadgeSize),
+
+      removeIconView.centerXAnchor.constraint(equalTo: removeBadgeView.centerXAnchor),
+      removeIconView.centerYAnchor.constraint(equalTo: removeBadgeView.centerYAnchor),
+    ])
+  }
+
+  private func configure(mediaItem: FileMediaItem) {
+    setUploadProgress(nil)
+    localThumbnailImageView.image = nil
+    localThumbnailImageView.isHidden = true
+    centerIconView.isHidden = true
+    overlayIconView.isHidden = true
+    extensionBadge.isHidden = true
+    thumbnailView.isHidden = false
+    tinyThumbnailBackgroundView.isHidden = true
+
+    switch mediaItem {
+    case let .photo(photoInfo):
+      applyPhotoPreview(photoInfo)
+
+    case let .video(videoInfo):
+      if let thumbnail = videoInfo.thumbnail {
+        applyPhotoPreview(thumbnail)
+      } else {
+        applyFallback(iconName: "video.fill", badgeText: nil)
+      }
+
+    case let .document(documentInfo):
+      if documentInfo.thumbnail?.hasDisplayablePreview == true {
+        applyPhotoPreview(
+          documentInfo.thumbnail,
+          contentMode: .aspectFit,
+          usesInternalTinyThumbnail: true,
+          showsLoadingPlaceholder: true
+        )
+      } else {
+        applyFallback(
+          iconName: DocumentIconResolver.symbolName(
+            mimeType: documentInfo.document.mimeType,
+            fileName: documentInfo.document.fileName,
+            style: .filled
+          ),
+          badgeText: fileExtension(from: documentInfo.document.fileName)
+        )
+      }
+
+    case .voice:
+      applyFallback(iconName: "waveform", badgeText: nil)
+    }
+  }
+
+  private func configurePendingVideo(thumbnailImage: UIImage?) {
+    setUploadProgress(nil)
+    overlayIconView.isHidden = true
+    extensionBadge.isHidden = true
+    if let thumbnailImage {
+      applyPendingThumbnail(thumbnailImage)
+      return
+    }
+    applyFallback(iconName: "video.fill", badgeText: nil)
+  }
+
+  func setUploadProgress(_ progress: UploadProgressSnapshot?) {
+    _ = progress
+  }
+
+  private func applyPhotoPreview(
+    _ photoInfo: PhotoInfo?,
+    contentMode: PlatformPhotoContentMode = .aspectFill,
+    usesInternalTinyThumbnail: Bool = false,
+    showsLoadingPlaceholder: Bool = false
+  ) {
+    localThumbnailImageView.image = nil
+    localThumbnailImageView.isHidden = true
+    thumbnailView.photoContentMode = contentMode
+    thumbnailView.showsTinyThumbnailBackground = usesInternalTinyThumbnail
+    thumbnailView.showsLoadingPlaceholder = showsLoadingPlaceholder
+    tinyThumbnailBackgroundView.isHidden = usesInternalTinyThumbnail
+    tinyThumbnailBackgroundView.setPhoto(usesInternalTinyThumbnail ? nil : photoInfo)
+    thumbnailView.setPhoto(photoInfo)
+    centerIconView.isHidden = true
+  }
+
+  private func applyPendingThumbnail(_ image: UIImage) {
+    thumbnailView.photoContentMode = .aspectFill
+    thumbnailView.showsTinyThumbnailBackground = false
+    thumbnailView.showsLoadingPlaceholder = false
+    thumbnailView.setPhoto(nil)
+    thumbnailView.isHidden = true
+    tinyThumbnailBackgroundView.setPhoto(nil)
+
+    localThumbnailImageView.image = image
+    localThumbnailImageView.isHidden = false
+    centerIconView.isHidden = true
+  }
+
+  private func applyFallback(iconName: String, badgeText: String?) {
+    thumbnailView.photoContentMode = .aspectFill
+    thumbnailView.showsTinyThumbnailBackground = false
+    thumbnailView.showsLoadingPlaceholder = false
+    thumbnailView.setPhoto(nil)
+    thumbnailView.isHidden = true
+    tinyThumbnailBackgroundView.setPhoto(nil)
+    localThumbnailImageView.image = nil
+    localThumbnailImageView.isHidden = true
+
+    centerIconView.image = UIImage(systemName: iconName)?.withConfiguration(
+      UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+    )
+    centerIconView.isHidden = false
+
+    if let badgeText, !badgeText.isEmpty {
+      extensionBadge.text = " \(badgeText.uppercased()) "
+      extensionBadge.isHidden = false
+    } else {
+      extensionBadge.text = nil
+      extensionBadge.isHidden = true
+    }
+  }
+
+  private func fileExtension(from fileName: String?) -> String? {
+    guard let fileName else { return nil }
+    let ext = URL(fileURLWithPath: fileName).pathExtension
+    return ext.isEmpty ? nil : ext
+  }
+}
+
+// MARK: - Voice hold gesture
+
+extension ComposeView: UIGestureRecognizerDelegate {
+  func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+    guard gestureRecognizer === voiceHoldGesture else { return true }
+    guard !voiceButton.isHidden, voiceButton.alpha > 0.01, voiceButton.isUserInteractionEnabled else {
+      return false
+    }
+    return voiceButton.point(inside: touch.location(in: voiceButton), with: nil)
+  }
+}

@@ -1,0 +1,1623 @@
+import {
+  InputPeer,
+  MessageActions,
+  MessageAttachment,
+  MessageEntities,
+  MessageSendMode,
+  Update,
+  type AgentThreadContext,
+  type BlockContent,
+} from "@inline-chat/protocol/core"
+import { ChatModel } from "@in/server/db/models/chats"
+import { FileModel, type DbFullPhoto, type DbFullVideo } from "@in/server/db/models/files"
+import type { DbFullDocument, DbFullPlainFile, DbFullVoice } from "@in/server/db/models/files"
+import { MessageModel } from "@in/server/db/models/messages"
+import { UsersModel } from "@in/server/db/models/users"
+import { db } from "@in/server/db"
+import { chats, messageAttachments, messages, type DbChat, type DbMessage } from "@in/server/db/schema"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { getCachedUserName, UserNamesCache, type UserName } from "@in/server/modules/cache/userNames"
+import { encryptMessage, encryptMessageEntities } from "@in/server/modules/encryption/encryptMessage"
+import { prependReplyQuote } from "@in/server/modules/message/replyQuote"
+import { Notifications } from "@in/server/modules/notifications/notifications"
+import { getUpdateGroupFromInputPeer, type UpdateGroup } from "@in/server/modules/updates"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { encodePeerFromChat } from "@in/server/realtime/encoders/encodePeer"
+import { encodeMessageAttachmentUpdate } from "@in/server/realtime/encoders/encodeMessageAttachment"
+import { RealtimeUpdates } from "@in/server/realtime/message"
+import { Log } from "@in/server/utils/log"
+import { getCachedUserSettings } from "@in/server/modules/cache/userSettings"
+import { enforceBotSendPacing } from "@in/server/modules/pacing/botSendPacing"
+import { encryptBinary } from "@in/server/modules/encryption/encryption"
+import { getMentionedUserIds, isUserMentioned } from "@in/server/modules/message/helpers"
+import { detectHasLink } from "@in/server/modules/message/linkDetection"
+import { decideNotification } from "@in/server/modules/notifications/decision"
+import {
+  decodeDialogNotificationSettings,
+  resolveEffectiveNotificationMode,
+} from "@in/server/modules/notifications/dialogNotificationSettings"
+import { normalizeGlobalNotificationMode } from "@in/server/modules/notifications/notificationSettingsCompat"
+import { getInheritedDialogNotificationSettings } from "@in/server/modules/notifications/inheritedDialogNotificationSettings"
+import type { UpdateSeqAndDate } from "@in/server/db/models/updates"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { connectionManager, ConnVersion } from "@in/server/ws/connections"
+import { getEffectiveChatAccessUserIds } from "@in/server/modules/authorization/chatAccessProjection"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import { getCachedUserProfilePhoto } from "@in/server/modules/cache/userPhotos"
+import { processAttachments } from "@in/server/db/models/messages"
+import { and, eq, inArray } from "drizzle-orm"
+import { unarchiveIfNeeded } from "@in/server/modules/message/unarchiveIfNeeded"
+import { desktopPushSuppressionTracker, recordChatParticipation } from "@in/server/modules/notifications/desktopPushSuppression"
+import { publishDurableReference } from "@in/server/modules/internalMessaging/durable"
+import {
+  maxNotificationNameBytes,
+  messageNotificationBody,
+  notificationText,
+} from "@in/server/modules/notifications/messagePreview"
+import { notificationPhotoUrl } from "@in/server/modules/notifications/notificationPhoto"
+import { processOutgoingText } from "@in/server/modules/message/processOutgoingText"
+import { prepareBlockContent, type PreparedBlockContent } from "@in/server/modules/message/blockContentStorage"
+import { validateBotBlockContent } from "@in/server/modules/message/botBlockContent"
+import { getPreviewRoutesFromMessage, processUrlPreviews } from "@in/server/modules/urlPreview/processUrlPreview"
+import { normalizeAndValidateMessageActions } from "@in/server/modules/message/messageActions"
+import {
+  emitChatListOpenUpdates,
+  emitMessageSubthreadUpdateIfNeeded,
+  getReplyThreadAnchorSenderId,
+  isReplyThread,
+  isLinkedSubthread,
+  queueSubthreadParentUpdate,
+  showAndOpenLinkedSubthreadDialogs,
+  getChatById,
+} from "@in/server/modules/subthreads"
+import { queueFirstMessageExperience } from "@in/server/modules/subthreadParentMaterialization"
+import { setDialogOpenForUsers } from "@in/server/modules/dialogOpen"
+import {
+  documentTitleContext,
+  getMessageAttachmentTitleContext,
+  maybeScheduleThreadTitleGeneration,
+  type ThreadTitleAttachmentContext,
+} from "@in/server/modules/threadTitles"
+import { encodeMessageAttachment } from "@in/server/realtime/encoders/encodeMessageAttachment"
+import { VoiceTranscriptionModule } from "@in/server/modules/voiceTranscription"
+import { applicationBackgroundWork } from "@in/server/lifecycle/backgroundWork"
+import {
+  DIALOG_FOLLOWING,
+  getFollowingDialogUserIds,
+  getUnfollowedDialogUserIds,
+  setDialogFollowModeForUsers,
+} from "@in/server/modules/dialogFollow"
+import { queueMessageThreadLinkMaterialization } from "@in/server/modules/threadGraph"
+import { resolveThreadTitleLinks } from "@in/server/modules/message/resolveThreadTitleLinks"
+import { resolveGroupMentions } from "@in/server/modules/message/resolveGroupMentions"
+import { getAddressedUserIds, resolveThreadAutoFollowUserIds } from "@in/server/modules/threadAutoFollow"
+import { resolveBotCommandTargets } from "@in/server/modules/message/resolveBotCommandTargets"
+import { BotUpdateProjector } from "@in/server/modules/botUpdates/projector"
+import { ModelError } from "@in/server/db/models/_errors"
+import {
+  encodeAgentThreadContext,
+  chatAgentContext,
+  normalizeAgentThreadContext,
+  validateAgentThreadContext,
+} from "@in/server/modules/agentConfiguration"
+import { getBotUserIdsForChatScope } from "@in/server/functions/bot.peerDiscovery"
+import { InlineError } from "@in/server/types/errors"
+import { logReplacedSendDate, resolveMessageDate } from "@in/server/modules/message/clientSendDate"
+
+type Input = {
+  peerId: InputPeer
+  message?: string
+  replyToMessageId?: bigint
+  /** Quote sent apart from `message` by older builds; folded back into the text as a blockquote. */
+  replyQuote?: string
+  randomId?: bigint
+  photoId?: bigint
+  videoId?: bigint
+  documentId?: bigint
+  voiceId?: bigint
+  nudge?: boolean
+  sendDate?: number
+  isSticker?: boolean
+  entities?: MessageEntities
+  actions?: MessageActions
+  sendMode?: MessageSendMode
+  forwardHeader?: {
+    fromPeerId: InputPeer
+    fromId: number
+    fromMessageId: number
+  }
+  messageAttachments?: { externalTaskId?: bigint; urlPreviewId?: bigint }[]
+
+  /** Canonical structural projection supplied by trusted internal callers such as forwarding. */
+  blockContent?: BlockContent
+
+  /** Bot-supplied structural content over the unparsed `message` text; validated strictly. */
+  botBlockContent?: BlockContent
+
+  /** whether to process markdown string */
+  parseMarkdown?: boolean
+
+  /**
+   * Charges a bot sender's pacing budget. Set by client entry points only, so
+   * internal fan-out such as forwarding is never paced mid-operation.
+   */
+  paceBotSender?: { isBot?: boolean }
+
+  /** skip processing links into attachments */
+  skipLinkProcessing?: boolean
+
+  /** Set-once binding for an existing unbound Chat's first Agent-directed message. */
+  initialAgentContext?: AgentThreadContext
+
+  /** Trusted Bot API provenance for an explicit same-bot cross-Chat handoff. */
+  sourceChatId?: number
+}
+
+type Output = {
+  updates: Update[]
+}
+
+const log = new Log("functions.sendMessage")
+const URGENT_NUDGE_TEXT = "🚨"
+
+export const shouldPublishSendMessageToCurrentSession = ({
+  isRealtimeV3Session,
+  currentUserLayer,
+  hasAttachments,
+}: {
+  isRealtimeV3Session: boolean
+  currentUserLayer: number
+  hasAttachments: boolean
+}): boolean => !isRealtimeV3Session && (currentUserLayer < 2 || hasAttachments)
+
+const photoFiles = (photo: DbFullPhoto | null | undefined): DbFullPlainFile[] =>
+  photo?.photoSizes?.map((size) => size.file) ?? []
+
+/**
+ * Media ids are sequential, so only the sender's own uploads can be attached by id.
+ * Forwarding clones source media into the forwarder's ownership first. Missing and
+ * foreign ids fail alike so ids can't be probed.
+ */
+const loadOwnedMedia = async <Media>(
+  pending: Promise<Media | undefined>,
+  files: (media: Media) => DbFullPlainFile[],
+  userId: number,
+): Promise<Media> => {
+  const media = await pending.catch((error: unknown) => {
+    if (error instanceof ModelError) return undefined
+    throw error
+  })
+  const mediaFiles = media === undefined ? [] : files(media)
+  if (media === undefined || mediaFiles.length === 0 || mediaFiles.some((file) => file.userId !== userId)) {
+    throw new InlineError(InlineError.ApiError.MEDIA_NOT_OWNED)
+  }
+  return media
+}
+
+export const sendMessage = async (input: Input, context: FunctionContext): Promise<Output> => {
+  // input data
+  const receivedAt = Date.now()
+  const messageDate = resolveMessageDate(input.sendDate, receivedAt)
+  const date = messageDate.date
+  const fromId = context.currentUserId
+  const currentUserId = context.currentUserId
+  let senderIsBotLookup: Promise<boolean> | undefined
+  const senderIsBot = () =>
+    (senderIsBotLookup ??=
+      context.isBot !== undefined
+        ? Promise.resolve(context.isBot)
+        : UsersModel.getUserById(currentUserId).then((user) => user?.bot === true))
+  let chat = await ChatModel.getChatFromInputPeerUnchecked(input.peerId, context)
+  await AccessGuards.ensureChatAccess(chat, currentUserId)
+  await ensurePrivatePeerCanReceiveMessages(chat, currentUserId)
+  const inputPeer = Encoders.peerFromChat(chat, { currentUserId })
+  const chatId = chat.id
+  if (input.paceBotSender) {
+    const committed = await paceBotSend({
+      chatId, currentUserId, randomId: input.randomId, isBot: input.paceBotSender.isBot,
+    })
+    if (committed) return { updates: committed }
+  }
+  if (input.sourceChatId !== undefined) {
+    const sourceChatId = Number(input.sourceChatId)
+    if (!Number.isSafeInteger(sourceChatId) || sourceChatId <= 0 || sourceChatId === chatId) {
+      throw RealtimeRpcError.BadRequest()
+    }
+    const sourceChat = await getChatById(sourceChatId)
+    if (!(await senderIsBot()) || !sourceChat) throw RealtimeRpcError.BadRequest()
+    await AccessGuards.ensureChatAccess(sourceChat, currentUserId)
+    const sourceContext = chatAgentContext(sourceChat)
+    const destinationContext = chatAgentContext(chat)
+    if (Number(sourceContext?.botUserId) !== currentUserId || destinationContext === undefined) {
+      throw RealtimeRpcError.BadRequest()
+    }
+  }
+  if (input.initialAgentContext && input.randomId) {
+    const normalizedRetryContext = normalizeAgentThreadContext(input.initialAgentContext)
+    const recovered = await recoverInitialAgentMessageRetry({
+      chatId,
+      currentUserId,
+      randomId: input.randomId,
+      expectedContext: normalizedRetryContext,
+    })
+    if (recovered) return { updates: recovered }
+  }
+  const replyToMsgIdNumber = input.replyToMessageId ? Number(input.replyToMessageId) : null
+  const currentSessionConnections = connectionManager
+    .getUserConnections(currentUserId)
+    .filter(({ sessionId }) => sessionId === context.currentSessionId)
+  const currentUserLayer = currentSessionConnections.reduce(
+    (layer, connection) => Math.max(layer, connection.layer ?? 0),
+    0,
+  )
+  const isRealtimeV3Session = currentSessionConnections.some(({ version }) => version === ConnVersion.REALTIME_V3)
+  if (messageDate.replaced && input.sendDate !== undefined) {
+    logReplacedSendDate({
+      userId: currentUserId,
+      chatId,
+      sendDate: input.sendDate,
+      receivedAt,
+      clientType: currentSessionConnections.find((connection) => connection.clientType)?.clientType,
+      layer: currentUserLayer,
+    })
+  }
+
+  // Quotes live in the text as blockquotes. A quote sent apart, by builds that briefly split it
+  // out of a reply, goes back in front of the text. Sent blocks index the text as sent, so a
+  // send carrying them is left alone.
+  const replyQuote =
+    replyToMsgIdNumber !== null &&
+    !input.parseMarkdown &&
+    !input.blockContent &&
+    !input.botBlockContent &&
+    input.replyQuote?.trim()
+      ? prependReplyQuote(input.replyQuote, input.message, input.entities)
+      : undefined
+  const inputText = replyQuote?.text ?? input.message
+  const outgoingText = inputText
+    ? await processOutgoingText({
+        text: inputText,
+        entities: replyQuote?.entities ?? input.entities,
+        parseMarkdown: input.parseMarkdown,
+      })
+    : undefined
+  let text = outgoingText?.text
+  let entities: MessageEntities | undefined
+  try {
+    entities = await resolveThreadTitleLinks({
+      entities: outgoingText?.entities,
+      context,
+    })
+    if (text) {
+      entities = await resolveBotCommandTargets({
+        text,
+        entities,
+        chat,
+        currentUserId,
+        replyToMessageId: replyToMsgIdNumber ?? undefined,
+      })
+    }
+  } catch (error) {
+    log.error("sendMessage failed to resolve outgoing entities", { chatId, currentUserId, error })
+    if (RealtimeRpcError.is(error)) {
+      throw error
+    }
+    throw RealtimeRpcError.InternalError()
+  }
+
+  await ensureUrgentNudgeHasPriorTwoWayChat({
+    chat,
+    currentUserId,
+    isUrgentNudge: input.nudge === true && text?.trim() === URGENT_NUDGE_TEXT,
+  })
+
+  const groupMentions = await resolveGroupMentions({
+    text: text ?? "",
+    entities,
+    chat,
+    currentUserId,
+  })
+  entities = groupMentions.entities
+  const destinationAgentContext = chatAgentContext(chat)
+  const selfMentionsExactBoundAgent =
+    Number(destinationAgentContext?.botUserId) === currentUserId &&
+    (entities?.entities ?? []).some((entity) => {
+      if (entity.entity.oneofKind !== "mention") return false
+      const mention = entity.entity.mention
+      return Number(mention.userId) === currentUserId && mention.agentId === destinationAgentContext?.agentId
+    })
+  if (selfMentionsExactBoundAgent && input.sourceChatId === undefined) {
+    throw RealtimeRpcError.BadRequest()
+  }
+  const mentionedUserIds = new Set<number>([...getMentionedUserIds(entities), ...groupMentions.mentionedUserIds])
+
+  let preparedBlockContent: PreparedBlockContent | undefined
+  let botBlockContent: BlockContent | undefined
+  if (input.botBlockContent) {
+    const sender = await UsersModel.getUserById(currentUserId)
+    if (!sender?.bot || input.parseMarkdown || input.blockContent) throw RealtimeRpcError.BadRequest()
+    botBlockContent = validateBotBlockContent(text, input.botBlockContent)
+  }
+  const trustedBlockContent = input.blockContent ?? botBlockContent
+  const parsedBlockContent = trustedBlockContent
+    ? { blockContent: trustedBlockContent, imageSources: [] }
+    : outgoingText?.blockContent
+    ? {
+        blockContent: outgoingText.blockContent,
+        imageSources: outgoingText.blockImageSources ?? [],
+      }
+    : undefined
+  if (text && parsedBlockContent) {
+    try {
+      preparedBlockContent = prepareBlockContent({
+        text,
+        entities,
+        parsed: parsedBlockContent,
+      })
+    } catch (error) {
+      log.error("rich content preparation failed; sending the plain projection", {
+        chatId,
+        currentUserId,
+        errorType: error instanceof Error ? error.name : "UnknownError",
+      })
+    }
+  }
+
+  const hasInputUrlPreview = input.messageAttachments?.some((attachment) => attachment.urlPreviewId != null) ?? false
+  const previewRoutes =
+    text && !input.skipLinkProcessing && !hasInputUrlPreview
+      ? getPreviewRoutesFromMessage(text, entities, parsedBlockContent?.blockContent)
+      : []
+  const hasLink = detectHasLink({ entities }) || hasInputUrlPreview || previewRoutes.length > 0
+
+  // Encrypt
+  const encryptedMessage = text ? encryptMessage(text) : undefined
+  const normalizedActions = normalizeAndValidateMessageActions(input.actions, botBlockContent)
+  if (normalizedActions !== undefined && !(await senderIsBot())) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  // photo, video, document, voice ids
+  let dbFullPhoto: DbFullPhoto | undefined
+  let dbFullVideo: DbFullVideo | undefined
+  let dbFullDocument: DbFullDocument | undefined
+  let dbFullVoice: DbFullVoice | undefined
+  let mediaType: "photo" | "video" | "document" | "nudge" | "voice" | null = null
+
+  if (input.nudge) {
+    mediaType = "nudge"
+  } else if (input.photoId) {
+    dbFullPhoto = await loadOwnedMedia(FileModel.getPhotoById(input.photoId), photoFiles, currentUserId)
+    mediaType = "photo"
+  } else if (input.videoId) {
+    dbFullVideo = await loadOwnedMedia(
+      FileModel.getVideoById(input.videoId),
+      (video) => [video.file, ...photoFiles(video.photo)],
+      currentUserId,
+    )
+    mediaType = "video"
+  } else if (input.documentId) {
+    dbFullDocument = await loadOwnedMedia(
+      FileModel.getDocumentById(input.documentId),
+      (document) => [document.file, ...photoFiles(document.photo)],
+      currentUserId,
+    )
+    mediaType = "document"
+  } else if (input.voiceId) {
+    dbFullVoice = await loadOwnedMedia(FileModel.getVoiceById(input.voiceId), (voice) => [voice.file], currentUserId)
+    mediaType = "voice"
+  }
+
+  let initialAgentContext: AgentThreadContext | undefined
+  let encodedInitialAgentContext: Buffer | undefined
+  if (input.initialAgentContext) {
+    initialAgentContext = await validateAgentThreadContext(input.initialAgentContext, {
+      bindingActorUserId: currentUserId,
+      operation: "initial_message",
+    })
+    const botUserId = Number(initialAgentContext.botUserId)
+    encodedInitialAgentContext = encodeAgentThreadContext(initialAgentContext)
+    if (chat.agentContext !== null) {
+      if (!input.randomId || !Buffer.from(chat.agentContext).equals(encodedInitialAgentContext)) {
+        throw RealtimeRpcError.BadRequest()
+      }
+      try {
+        const existing = await MessageModel.getMessageByRandomId(input.randomId, currentUserId)
+        if (existing.chatId !== chatId) throw RealtimeRpcError.BadRequest()
+        return { updates: await selfUpdatesFromExistingMessage(input.randomId, currentUserId) }
+      } catch (error) {
+        if (error instanceof RealtimeRpcError) throw error
+        throw RealtimeRpcError.BadRequest()
+      }
+    }
+
+    const visibleBotIds = await getBotUserIdsForChatScope(chat, currentUserId)
+    if (!visibleBotIds.includes(botUserId)) throw RealtimeRpcError.UserIdInvalid()
+
+    const hasConsumableInput =
+      Boolean(text?.trim()) ||
+      mediaType === "photo" ||
+      mediaType === "video" ||
+      mediaType === "document" ||
+      mediaType === "voice"
+    if (!hasConsumableInput) throw RealtimeRpcError.BadRequest()
+  }
+
+  // encrypt entities
+  const binaryEntities = entities ? MessageEntities.toBinary(entities) : undefined
+  const encryptedEntities =
+    binaryEntities && binaryEntities.length > 0 ? encryptMessageEntities(binaryEntities) : undefined
+  const binaryActions = normalizedActions ? MessageActions.toBinary(normalizedActions) : undefined
+  const encryptedActions = binaryActions && binaryActions.length > 0 ? encryptBinary(binaryActions) : undefined
+
+  let fwdFromPeerUserId: number | null = null
+  let fwdFromPeerChatId: number | null = null
+  let fwdFromMessageId: number | null = null
+  let fwdFromSenderId: number | null = null
+
+  if (input.forwardHeader) {
+    const forwardPeer = input.forwardHeader.fromPeerId.type
+    switch (forwardPeer.oneofKind) {
+      case "user":
+        fwdFromPeerUserId = Number(forwardPeer.user.userId)
+        break
+      case "chat":
+        fwdFromPeerChatId = Number(forwardPeer.chat.chatId)
+        break
+      case "self":
+        fwdFromPeerUserId = currentUserId
+        break
+      default:
+        break
+    }
+
+    fwdFromMessageId = Number(input.forwardHeader.fromMessageId)
+    fwdFromSenderId = Number(input.forwardHeader.fromId)
+  }
+
+  let newMessage: DbMessage & { blockContent?: BlockContent | null }
+  let update: UpdateSeqAndDate
+  let agentContextUpdate: UpdateSeqAndDate | undefined
+  try {
+    // The first history snapshot must see the message and its initial attachments together.
+    ;({
+      chat,
+      message: newMessage,
+      update,
+      agentContextUpdate,
+    } = await db.transaction(async (tx) => {
+      const inserted = await MessageModel.insertMessage(
+        {
+          chatId: chatId,
+          fromId: fromId,
+          textEncrypted: encryptedMessage?.encrypted ?? null,
+          textIv: encryptedMessage?.iv ?? null,
+          textTag: encryptedMessage?.authTag ?? null,
+          replyToMsgId: replyToMsgIdNumber,
+          fwdFromPeerUserId: fwdFromPeerUserId,
+          fwdFromPeerChatId: fwdFromPeerChatId,
+          fwdFromMessageId: fwdFromMessageId,
+          fwdFromSenderId: fwdFromSenderId,
+          randomId: input.randomId,
+          date: date,
+          mediaType: mediaType,
+          photoId: dbFullPhoto?.id ?? null,
+          videoId: dbFullVideo?.id ?? null,
+          documentId: dbFullDocument?.id ?? null,
+          voiceId: dbFullVoice?.id ?? null,
+          isSticker: input.isSticker ?? false,
+          hasLink: hasLink,
+          entitiesEncrypted: encryptedEntities?.encrypted ?? null,
+          entitiesIv: encryptedEntities?.iv ?? null,
+          entitiesTag: encryptedEntities?.authTag ?? null,
+          actionsEncrypted: encryptedActions?.encrypted ?? null,
+          actionsIv: encryptedActions?.iv ?? null,
+          actionsTag: encryptedActions?.authTag ?? null,
+        },
+        preparedBlockContent,
+        tx,
+        initialAgentContext && encodedInitialAgentContext
+          ? { value: initialAgentContext, encoded: encodedInitialAgentContext }
+          : undefined,
+      )
+      if (input.messageAttachments && input.messageAttachments.length > 0) {
+        const attachmentRows = input.messageAttachments
+          .map((attachment) => ({
+            messageId: inserted.message.globalId,
+            externalTaskId: attachment.externalTaskId ?? null,
+            urlPreviewId: attachment.urlPreviewId ?? null,
+          }))
+          .filter((attachment) => attachment.externalTaskId !== null || attachment.urlPreviewId !== null)
+
+        if (attachmentRows.length > 0) {
+          await tx.insert(messageAttachments).values(attachmentRows)
+        }
+      }
+      return inserted
+    }))
+  } catch (error) {
+    if (error instanceof ModelError && error.code === ModelError.Codes.AGENT_CONTEXT_ALREADY_SET) {
+      if (input.randomId && encodedInitialAgentContext && initialAgentContext) {
+        const recovered = await recoverInitialAgentMessageRetry({
+          chatId,
+          currentUserId,
+          randomId: input.randomId,
+          expectedContext: initialAgentContext,
+        })
+        if (recovered) return { updates: recovered }
+      }
+      throw RealtimeRpcError.BadRequest()
+    }
+    if (error instanceof Error && error.message.includes("random_id_per_sender_unique") && input.randomId) {
+      log.debug("duplicate random id recovered from existing message", { currentUserId })
+
+      // Just fetch the message from the database
+      return { updates: await selfUpdatesFromExistingMessage(input.randomId, currentUserId) }
+    } else {
+      log.error("error inserting message", error)
+      throw RealtimeRpcError.InternalError()
+    }
+  }
+
+  queueMessageThreadLinkMaterialization({
+    sourceChat: chat,
+    sourceChatId: chat.id,
+    sourceMessageGlobalId: newMessage.globalId,
+    sourceMessageId: newMessage.messageId,
+    sourceMessageFromId: newMessage.fromId,
+    sourceMessageRevision: newMessage.rev,
+    entities,
+  })
+
+  const titleAttachments = documentTitleContext(dbFullDocument)
+
+  const recordDesktopChatActivityPromise = recordChatParticipation(context, chatId)
+
+  // encode message info
+  const messageInfo: MessageInfo = {
+    message: newMessage,
+    photo: dbFullPhoto,
+    video: dbFullVideo,
+    document: dbFullDocument,
+    voice: dbFullVoice,
+    sendMode: input.sendMode,
+    mentionedUserIds,
+  }
+
+  //await debugDelay(5000)
+
+  const hasAttachments =
+    messageInfo.photo !== undefined ||
+    messageInfo.video !== undefined ||
+    messageInfo.document !== undefined ||
+    messageInfo.voice !== undefined
+
+  // send new updates
+  // TODO: need to create the update, use the sequence number
+  // we probably need to create the update and message in one transaction
+  // to avoid multiple times locking the chat row for last message and pts.
+  // we can also separate the sequence caching. this will speed up and
+  // remove the need to lock the chat row. then we should deliver the update
+  // with sequence number so we can ensure gap-free delivery.
+  const updateGroup = await getUpdateGroupFromInputPeer(inputPeer, { currentUserId })
+  let initialAgentContextRealtimeUpdate: Update | undefined
+  if (initialAgentContext && agentContextUpdate) {
+    initialAgentContextRealtimeUpdate = {
+      update: {
+        oneofKind: "chatInfo",
+        chatInfo: { chatId: BigInt(chat.id), agentContext: initialAgentContext },
+      },
+      seq: agentContextUpdate.seq,
+      date: encodeDateStrict(agentContextUpdate.date),
+    }
+    updateGroup.userIds.forEach((userId) => {
+      RealtimeUpdates.pushToUser(userId, [initialAgentContextRealtimeUpdate!], {
+        skipSessionId: userId === currentUserId ? context.currentSessionId : undefined,
+      })
+    })
+  }
+  await autoFollowThreadMessage({
+    chat,
+    currentUserId,
+    updateGroup,
+    newMessageId: newMessage.messageId,
+    addressedUserIds: getAddressedUserIds(text, entities),
+    senderIsBot: context.isBot,
+  })
+
+  const sidebarOpenUserIds = await getSidebarOpenUserIds({
+    chat,
+    currentUserId,
+    replyToMessageId: replyToMsgIdNumber ?? undefined,
+    mentionedUserIds,
+    updateGroup,
+  })
+  if (sidebarOpenUserIds.length > 0) {
+    const { changedDialogs } = isLinkedSubthread(chat)
+      ? await showAndOpenLinkedSubthreadDialogs({
+          chat,
+          userIds: sidebarOpenUserIds,
+        })
+      : await setDialogOpenForUsers({
+          chat,
+          userIds: sidebarOpenUserIds,
+          open: true,
+          showInChatList: true,
+        })
+
+    await emitChatListOpenUpdates({
+      chat,
+      dialogs: changedDialogs,
+    })
+  }
+  const { updates: unarchiveUpdates } = await unarchiveIfNeeded({
+    chat,
+    updateGroup,
+    senderUserId: currentUserId,
+    userIds: isReplyThread(chat) ? sidebarOpenUserIds : undefined,
+  })
+
+  unarchiveUpdates.forEach(({ userId, update }) => {
+    RealtimeUpdates.pushToUser(userId, [update])
+  })
+
+  await recordDesktopChatActivityPromise
+
+  const publishToSelfSession = shouldPublishSendMessageToCurrentSession({
+    isRealtimeV3Session,
+    currentUserLayer,
+    hasAttachments,
+  })
+  let { selfUpdates } = await pushUpdates({
+    inputPeer,
+    messageInfo,
+    currentUserId,
+    update,
+    currentSessionId: context.currentSessionId,
+    publishToSelfSession,
+    updateGroup,
+  })
+  publishDurableReference({
+    bucket: { kind: "chat", chatId },
+    frontier: update.seq,
+    senderUserId: currentUserId,
+    ...(!publishToSelfSession ? { excludeSessionId: context.currentSessionId } : {}),
+  })
+  if (initialAgentContextRealtimeUpdate) selfUpdates.unshift(initialAgentContextRealtimeUpdate)
+
+  BotUpdateProjector.messageCreated({
+    chat,
+    messageId: newMessage.messageId,
+    updateGroup,
+    sourceChatId: input.sourceChatId,
+  })
+
+  // Start after the new-message update is pushed so attachment updates cannot race ahead of the message.
+  if (previewRoutes.length > 0) {
+    const previewWork = processUrlPreviews({
+      message: newMessage,
+      previewRoutes,
+      chatId,
+      spaceId: chat.spaceId,
+      currentUserId,
+      inputPeer,
+      chat,
+      messageText: text,
+      messageEntities: entities,
+      titleAttachments,
+    }).catch((error) => {
+      log.error("Failed to process message URL previews", {
+        error,
+        chatId,
+        messageId: newMessage.messageId,
+      })
+    })
+    applicationBackgroundWork.track(previewWork)
+  }
+
+  if (dbFullVoice && !text) {
+    VoiceTranscriptionModule.schedule({
+      message: newMessage,
+      voice: dbFullVoice,
+      inputPeer,
+      context,
+    })
+  }
+
+  // send notification
+  const notificationWork = sendNotifications({
+    updateGroup,
+    messageInfo,
+    currentUserId,
+    chat,
+    unencryptedEntities: entities,
+    mentionedUserIds,
+    unencryptedText: text,
+    inputPeer,
+    sendMode: input.sendMode,
+  }).catch((error) => {
+    log.error("Failed to send message notifications", {
+      error,
+      chatId,
+      messageId: newMessage.messageId,
+      currentUserId,
+    })
+  })
+  applicationBackgroundWork.track(notificationWork)
+
+  if (previewRoutes.length === 0) {
+    if (input.messageAttachments && input.messageAttachments.length > 0) {
+      const titleContextWork = scheduleThreadTitleGenerationWithMessageAttachments({
+        chat,
+        message: newMessage,
+        text,
+        entities,
+        attachments: titleAttachments,
+        currentUserId,
+      }).catch((error) => {
+        log.error("Failed to schedule message thread title generation", {
+          error,
+          chatId,
+          messageId: newMessage.messageId,
+        })
+      })
+      applicationBackgroundWork.track(titleContextWork)
+    } else {
+      maybeScheduleThreadTitleGeneration({
+        chat,
+        message: newMessage,
+        text,
+        entities,
+        attachments: titleAttachments,
+        currentUserId,
+      })
+    }
+  }
+
+  queueFirstMessageExperience({
+    chat,
+    message: newMessage,
+    text,
+    entities,
+    attachments: titleAttachments,
+    currentUserId,
+  })
+
+  if (input.messageAttachments && input.messageAttachments.length > 0) {
+    try {
+      const attachmentUpdates = await buildAttachmentUpdates({
+        message: newMessage,
+        chatId,
+        inputPeer,
+        currentUserId,
+        updateGroup,
+      })
+      if (attachmentUpdates.length > 0) {
+        selfUpdates.push(...attachmentUpdates)
+      }
+    } catch (error) {
+      log.error("Failed to push message attachment updates", {
+        error,
+        chatId,
+        messageId: newMessage.messageId,
+      })
+    }
+  }
+
+  if (isReplyThread(chat)) {
+    await emitMessageSubthreadUpdateIfNeeded({ chatId: chat.id, currentUserId })
+  } else if (isLinkedSubthread(chat)) {
+    queueSubthreadParentUpdate({
+      chatId: chat.id,
+      currentUserId,
+      reason: "message send",
+    })
+  }
+
+  // return new updates
+  return { updates: selfUpdates }
+}
+
+async function ensurePrivatePeerCanReceiveMessages(chat: DbChat, currentUserId: number): Promise<void> {
+  if (chat.type !== "private" || chat.minUserId == null || chat.maxUserId == null) {
+    return
+  }
+
+  const peerUserId = chat.minUserId === currentUserId ? chat.maxUserId : chat.minUserId
+  if (peerUserId === currentUserId) {
+    return
+  }
+
+  const peerUser = await UsersModel.getUserById(peerUserId)
+  if (!peerUser || UsersModel.isDeleted(peerUser)) {
+    throw RealtimeRpcError.PeerIdInvalid()
+  }
+}
+
+async function ensureUrgentNudgeHasPriorTwoWayChat({
+  chat,
+  currentUserId,
+  isUrgentNudge,
+}: {
+  chat: DbChat
+  currentUserId: number
+  isUrgentNudge: boolean
+}): Promise<void> {
+  if (!isUrgentNudge) {
+    return
+  }
+
+  if (chat.type !== "private" || chat.minUserId == null || chat.maxUserId == null) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  const peerUserId = chat.minUserId === currentUserId ? chat.maxUserId : chat.minUserId
+  if (peerUserId === currentUserId) {
+    return
+  }
+
+  const priorAuthors = await db
+    .selectDistinct({ fromId: messages.fromId })
+    .from(messages)
+    .where(and(eq(messages.chatId, chat.id), inArray(messages.fromId, [currentUserId, peerUserId])))
+    .limit(2)
+
+  const priorAuthorIds = new Set(priorAuthors.map(({ fromId }) => fromId))
+  if (!priorAuthorIds.has(currentUserId) || !priorAuthorIds.has(peerUserId)) {
+    throw RealtimeRpcError.BadRequest()
+  }
+}
+
+async function scheduleThreadTitleGenerationWithMessageAttachments(input: {
+  chat: DbChat
+  message: DbMessage
+  text: string | undefined
+  entities: MessageEntities | undefined
+  attachments: ThreadTitleAttachmentContext[]
+  currentUserId: number
+}): Promise<void> {
+  let attachments = input.attachments
+  try {
+    attachments = [...attachments, ...(await getMessageAttachmentTitleContext(input.message.globalId))]
+  } catch (error) {
+    log.warn("Failed to load message attachment context for thread title generation", {
+      error,
+      chatId: input.chat.id,
+      messageId: input.message.messageId,
+    })
+  }
+
+  maybeScheduleThreadTitleGeneration({
+    chat: input.chat,
+    message: input.message,
+    text: input.text,
+    entities: input.entities,
+    attachments,
+    currentUserId: input.currentUserId,
+  })
+}
+
+const getSidebarOpenUserIds = async ({
+  chat,
+  currentUserId,
+  replyToMessageId,
+  mentionedUserIds,
+  updateGroup,
+}: {
+  chat: DbChat
+  currentUserId: number
+  replyToMessageId: number | undefined
+  mentionedUserIds: ReadonlySet<number>
+  updateGroup: UpdateGroup
+}): Promise<number[]> => {
+  const eligibleUserIds = new Set(updateGroup.userIds.filter((userId) => userId !== currentUserId))
+  const openUserIds = new Set<number>()
+
+  if (updateGroup.type === "dmUsers") {
+    for (const userId of eligibleUserIds) {
+      openUserIds.add(userId)
+    }
+  }
+
+  for (const mentionedUserId of mentionedUserIds) {
+    if (eligibleUserIds.has(mentionedUserId)) {
+      openUserIds.add(mentionedUserId)
+    }
+  }
+
+  if (replyToMessageId !== undefined) {
+    try {
+      const repliedToMessage = await MessageModel.getMessage(replyToMessageId, chat.id)
+      if (eligibleUserIds.has(repliedToMessage.fromId)) {
+        openUserIds.add(repliedToMessage.fromId)
+      }
+    } catch {
+      // Keep send semantics unchanged if reply target is missing or inaccessible.
+    }
+  }
+
+  if (chat.type === "thread") {
+    const followingUserIds = await getFollowingDialogUserIds({
+      chatId: chat.id,
+      userIds: Array.from(eligibleUserIds),
+    })
+
+    followingUserIds.forEach((userId) => openUserIds.add(userId))
+  }
+
+  return Array.from(openUserIds)
+}
+
+const autoFollowThreadMessage = async ({
+  chat,
+  currentUserId,
+  updateGroup,
+  newMessageId,
+  addressedUserIds,
+  senderIsBot,
+}: {
+  chat: DbChat
+  currentUserId: number
+  updateGroup: UpdateGroup
+  newMessageId: number
+  addressedUserIds: ReadonlySet<number>
+  senderIsBot: boolean | undefined
+}) => {
+  const eligibleUserIds = new Set(updateGroup.userIds)
+  const candidateUserIds = await resolveThreadAutoFollowUserIds({
+    chat,
+    currentUserId,
+    eligibleUserIds,
+    newMessageId,
+    addressedUserIds,
+    senderIsBot,
+  })
+  if (candidateUserIds.length === 0) {
+    return
+  }
+
+  const unfollowedUserIds = new Set(
+    await getUnfollowedDialogUserIds({
+      chatId: chat.id,
+      userIds: candidateUserIds,
+    }),
+  )
+  const followUserIds = candidateUserIds.filter((userId) => !unfollowedUserIds.has(userId))
+  if (followUserIds.length === 0) {
+    return
+  }
+
+  const { changedDialogs, unhiddenDialogs } = await setDialogFollowModeForUsers({
+    chat,
+    userIds: followUserIds,
+    followMode: DIALOG_FOLLOWING,
+    showInChatList: true,
+  })
+
+  const unhiddenUserIds = new Set(unhiddenDialogs.map((dialog) => dialog.userId))
+  await emitChatListOpenUpdates({
+    chat,
+    dialogs: changedDialogs.filter((dialog) => {
+      if (dialog.userId === currentUserId) {
+        return true
+      }
+
+      return (
+        unhiddenUserIds.has(dialog.userId) && dialog.open === true && dialog.order != null && dialog.archived !== true
+      )
+    }),
+  })
+}
+
+type EncodeMessageInput = Parameters<typeof Encoders.message>[0]
+type MessageInfo = Omit<EncodeMessageInput, "encodingForUserId" | "encodingForPeer">
+
+// ------------------------------------------------------------
+// Message Encoding
+// ------------------------------------------------------------
+
+/** Encode a message for a specific user based on update group context */
+const encodeMessageForUser = ({
+  messageInfo,
+  updateGroup,
+  inputPeer,
+  currentUserId,
+  targetUserId,
+}: {
+  messageInfo: MessageInfo
+  updateGroup: UpdateGroup
+  inputPeer: InputPeer
+  currentUserId: number
+  targetUserId: number
+}) => {
+  let encodingForInputPeer: InputPeer
+
+  if (updateGroup.type === "dmUsers") {
+    // In DMs, encoding peer depends on whether we're encoding for current user or other user
+    encodingForInputPeer =
+      targetUserId === currentUserId
+        ? inputPeer
+        : { type: { oneofKind: "user", user: { userId: BigInt(currentUserId) } } }
+  } else {
+    // In threads, always use the same input peer
+    encodingForInputPeer = inputPeer
+  }
+
+  return Encoders.message({
+    ...messageInfo,
+    encodingForPeer: { inputPeer: encodingForInputPeer },
+    encodingForUserId: targetUserId,
+  })
+}
+
+// ------------------------------------------------------------
+// Updates
+// ------------------------------------------------------------
+
+/** Push updates for send messages */
+const pushUpdates = async ({
+  inputPeer,
+  messageInfo,
+  currentUserId,
+  update,
+  publishToSelfSession,
+  currentSessionId,
+  updateGroup,
+}: {
+  inputPeer: InputPeer
+  messageInfo: MessageInfo
+  currentUserId: number
+  update: UpdateSeqAndDate
+  currentSessionId: number
+  publishToSelfSession: boolean
+  updateGroup?: UpdateGroup
+}): Promise<{ selfUpdates: Update[]; updateGroup: UpdateGroup }> => {
+  const resolvedUpdateGroup = updateGroup ?? (await getUpdateGroupFromInputPeer(inputPeer, { currentUserId }))
+  const skipSessionId = publishToSelfSession ? undefined : currentSessionId
+
+  let messageIdUpdate: Update = {
+    update: {
+      oneofKind: "updateMessageId",
+      updateMessageId: {
+        messageId: BigInt(messageInfo.message.messageId),
+        randomId: messageInfo.message.randomId ?? 0n,
+      },
+    },
+  }
+
+  const messageUpdateForUser = (targetUserId: number): Update => ({
+    update: {
+      oneofKind: "newMessage",
+      newMessage: {
+        message: encodeMessageForUser({
+          messageInfo,
+          updateGroup: resolvedUpdateGroup,
+          inputPeer,
+          currentUserId,
+          targetUserId,
+        }),
+      },
+    },
+    seq: update.seq,
+    date: encodeDateStrict(update.date),
+  })
+  // The successful mutation's receipt is independent of a later recipient
+  // projection, which may already exclude a concurrently removed sender.
+  const selfUpdates = [messageIdUpdate, messageUpdateForUser(currentUserId)]
+  const sends = resolvedUpdateGroup.userIds.map((userId) =>
+    RealtimeUpdates.pushToUser(
+      userId,
+      userId === currentUserId ? selfUpdates : [messageUpdateForUser(userId)],
+      userId === currentUserId ? { skipSessionId } : undefined,
+    ),
+  )
+
+  await Promise.all(sends)
+  return { selfUpdates, updateGroup: resolvedUpdateGroup }
+}
+
+const buildAttachmentUpdates = async ({
+  message,
+  chatId,
+  inputPeer,
+  currentUserId,
+  updateGroup,
+}: {
+  message: DbMessage
+  chatId: number
+  inputPeer: InputPeer
+  currentUserId: number
+  updateGroup: UpdateGroup
+}): Promise<Update[]> => {
+  const attachments = await db._query.messageAttachments.findMany({
+    where: eq(messageAttachments.messageId, message.globalId),
+    with: {
+      externalTask: true,
+      linkEmbed: {
+        with: {
+          photo: {
+            with: {
+              photoSizes: {
+                with: {
+                  file: true,
+                },
+              },
+            },
+          },
+          video: {
+            with: {
+              file: true,
+              photo: {
+                with: {
+                  photoSizes: {
+                    with: {
+                      file: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          document: {
+            with: {
+              file: true,
+              photo: {
+                with: {
+                  photoSizes: {
+                    with: {
+                      file: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+
+  if (attachments.length === 0) {
+    return []
+  }
+
+  const processed = processAttachments(attachments)
+  const selfUpdates: Update[] = []
+
+  const updateForUser = (userId: number, attachment: MessageAttachment): Update => {
+    const encodingForInputPeer: InputPeer =
+      updateGroup.type === "dmUsers" && userId !== currentUserId
+        ? { type: { oneofKind: "user", user: { userId: BigInt(currentUserId) } } }
+        : inputPeer
+
+    return encodeMessageAttachmentUpdate({
+      messageId: BigInt(message.messageId),
+      chatId: BigInt(chatId),
+      encodingForUserId: userId,
+      encodingForPeer: { inputPeer: encodingForInputPeer },
+      attachment,
+    })
+  }
+
+  const attachmentUpdates = processed
+    .map((attachment) => encodeMessageAttachment(attachment))
+    .filter((attachment): attachment is MessageAttachment => attachment !== null)
+
+  if (attachmentUpdates.length === 0) {
+    return []
+  }
+
+  const publishUpdate = (userId: number, update: Update) => {
+    if (userId === currentUserId) {
+      selfUpdates.push(update)
+    } else {
+      RealtimeUpdates.pushToUser(userId, [update])
+    }
+  }
+
+  if (updateGroup.type === "dmUsers") {
+    updateGroup.userIds.forEach((userId) => {
+      attachmentUpdates.forEach((attachment) => {
+        publishUpdate(userId, updateForUser(userId, attachment))
+      })
+    })
+  } else if (updateGroup.type === "threadUsers") {
+    updateGroup.userIds.forEach((userId) => {
+      attachmentUpdates.forEach((attachment) => {
+        publishUpdate(userId, updateForUser(userId, attachment))
+      })
+    })
+  } else if (updateGroup.type === "spaceUsers") {
+    const userIds = connectionManager.getSpaceUserIds(updateGroup.spaceId)
+    userIds.forEach((userId) => {
+      attachmentUpdates.forEach((attachment) => {
+        publishUpdate(userId, updateForUser(userId, attachment))
+      })
+    })
+  }
+
+  return selfUpdates
+}
+
+/**
+ * Before any write: a flooding bot gets RATE_LIMIT with a retry-after instead
+ * of fanning more updates out to every recipient. A resend of a message that
+ * already committed is not a new send, so it returns the original result.
+ */
+async function paceBotSend(input: {
+  chatId: number
+  currentUserId: number
+  randomId: bigint | undefined
+  isBot: boolean | undefined
+}): Promise<Update[] | undefined> {
+  try {
+    await enforceBotSendPacing({ senderUserId: input.currentUserId, chatId: input.chatId, isBot: input.isBot })
+    return undefined
+  } catch (error) {
+    if (input.randomId && RealtimeRpcError.is(error, RealtimeRpcError.Code.RATE_LIMIT)) {
+      const existing = await committedRetryUpdates(input.randomId, input.currentUserId, input.chatId)
+      if (existing) return existing
+    }
+    throw error
+  }
+}
+
+async function committedRetryUpdates(randomId: bigint, currentUserId: number, chatId: number): Promise<Update[] | undefined> {
+  let message: DbMessage
+  try {
+    message = await MessageModel.getMessageByRandomId(randomId, currentUserId)
+  } catch (error) {
+    if (error instanceof ModelError && error.code === ModelError.Codes.MESSAGE_INVALID) return undefined
+    throw error
+  }
+  return message.chatId === chatId ? selfUpdatesFromExistingMessage(randomId, currentUserId) : undefined
+}
+
+async function selfUpdatesFromExistingMessage(randomId: bigint, currentUserId: number): Promise<Update[]> {
+  const message = await MessageModel.getMessageByRandomId(randomId, currentUserId)
+  return [
+    {
+      update: {
+        oneofKind: "updateMessageId",
+        updateMessageId: { messageId: BigInt(message.messageId), randomId: randomId },
+      },
+    },
+
+    // Note(@mo): No need for this, this will be fetched by the sync engine once it detects missing PTS
+    // Moreover we don't have access to the exact update caused by this message
+    // so we can't send it to the user.
+    // {
+    //   update: {
+    //     oneofKind: "newMessage",
+  ]
+}
+
+async function recoverInitialAgentMessageRetry(input: {
+  chatId: number
+  currentUserId: number
+  randomId: bigint
+  expectedContext: AgentThreadContext
+}): Promise<Update[] | undefined> {
+  let message: DbMessage
+  try {
+    message = await MessageModel.getMessageByRandomId(input.randomId, input.currentUserId)
+  } catch (error) {
+    if (error instanceof ModelError && error.code === ModelError.Codes.MESSAGE_INVALID) {
+      return undefined
+    }
+    throw error
+  }
+  const persistedChat = await db._query.chats.findFirst({ where: eq(chats.id, input.chatId) })
+  const persistedContext = persistedChat ? chatAgentContext(persistedChat) : undefined
+  // The committed message already owns its optional Agent/configuration. Retry
+  // identity is anchored by sender, random ID, Chat, and the required bot target.
+  if (message.chatId !== input.chatId || persistedContext?.botUserId !== input.expectedContext.botUserId) {
+    throw RealtimeRpcError.BadRequest()
+  }
+  return selfUpdatesFromExistingMessage(input.randomId, input.currentUserId)
+}
+
+// ------------------------------------------------------------
+// Push notifications
+// ------------------------------------------------------------
+
+const isNudgeMessage = ({ messageInfo }: { messageInfo: MessageInfo }): boolean =>
+  messageInfo.message.mediaType === "nudge"
+
+type SendPushForMsgInput = {
+  updateGroup: UpdateGroup
+  messageInfo: MessageInfo
+  currentUserId: number
+  chat: DbChat
+  unencryptedText: string | undefined
+  unencryptedEntities: MessageEntities | undefined
+  mentionedUserIds: ReadonlySet<number>
+  inputPeer: InputPeer
+  sendMode?: MessageSendMode
+}
+
+/** Send push notifications for this message */
+async function sendNotifications(input: SendPushForMsgInput) {
+  if (input.sendMode === MessageSendMode.MODE_SILENT) {
+    return
+  }
+
+  const { updateGroup, messageInfo, currentUserId, chat, unencryptedText, inputPeer, mentionedUserIds } = input
+  const isNudge = isNudgeMessage({ messageInfo })
+  const trimmedText = unencryptedText?.trim()
+  const isUrgentNudge = isNudge && trimmedText === URGENT_NUDGE_TEXT
+
+  // A direct reply (replyToMsgId) targets a concrete message in this chat.
+  const repliedToSenderId = messageInfo.message.replyToMsgId
+    ? await MessageModel.getSenderIdForMessage({
+        chatId: messageInfo.message.chatId,
+        messageId: messageInfo.message.replyToMsgId,
+      })
+    : undefined
+
+  // In linked reply threads (anchored by parentMessageId), each child message is
+  // semantically a reply to the anchor message. We treat the anchor author as a
+  // reply target so users in "any message to you" mode don't miss thread activity.
+  // "Only mentions" ignores reply targets (see decideNotification).
+  const replyThreadAnchorSenderId = await getReplyThreadAnchorSenderId(chat)
+  const replyMentionUserIds = new Set<number>(
+    [repliedToSenderId, replyThreadAnchorSenderId].filter(
+      (userId): userId is number => userId != null && Number.isSafeInteger(userId) && userId > 0,
+    ),
+  )
+
+  // decrypt message text
+  let messageText = input.unencryptedText
+  let messageEntities = input.unencryptedEntities
+
+  const senderNameInfo = await getCachedUserName(messageInfo.message.fromId)
+  const senderPhoto = await getCachedUserProfilePhoto(messageInfo.message.fromId)
+
+  const recipientUserIds = updateGroup.userIds.filter((userId) => userId !== currentUserId)
+  const dialogNotificationSettingsByUserId = await getInheritedDialogNotificationSettings(chat.id, recipientUserIds)
+
+  // Resolve policy/provider preparation first, then take one current authority
+  // snapshot immediately before submitting the eligible notification audience.
+  const prepared = await Promise.all(
+    recipientUserIds.map(async (userId) => {
+      try {
+        const send = await prepareNotificationForUser({
+          userId,
+          messageInfo,
+          messageText,
+          messageEntities,
+          mentionedUserIds,
+          replyMentionUserIds,
+          chat,
+          isNudge,
+          isUrgentNudge,
+          updateGroup,
+          inputPeer,
+          currentUserId,
+          senderNameInfo,
+          senderProfilePhotoUrl: senderPhoto?.cdnUrl,
+          senderHasProfilePhoto: senderPhoto?.hasPhoto,
+          dialogNotificationSettings: dialogNotificationSettingsByUserId.get(userId),
+        })
+        return send ? { userId, send } : undefined
+      } catch (error) {
+        log.error("Failed to prepare message notification", { error, userId, chatId: chat.id })
+        return undefined
+      }
+    }),
+  )
+  const notifications = prepared.filter((value) => value !== undefined)
+  const access = await getEffectiveChatAccessUserIds(db, [chat.id], {
+    userIds: notifications.map((value) => value.userId),
+    source: "messages.send",
+  })
+  await Promise.all(
+    notifications
+      .filter((value) => access.get(chat.id)?.has(value.userId))
+      .map(async (value) => {
+        try {
+          await value.send()
+        } catch (error) {
+          log.error("Failed to send message notification", { error, userId: value.userId, chatId: chat.id })
+        }
+      }),
+  )
+}
+
+/**
+ * Reuse the ordinary notification policy for a newly committed live agent
+ * projection without reusing the ordinary send path (which would activate
+ * bots, title work, previews, and dialog mutations).
+ */
+export async function sendProjectedMessageNotification(input: {
+  chat: DbChat
+  message: DbMessage
+  text: string | undefined
+  entities: MessageEntities | undefined
+}): Promise<void> {
+  const inputPeer = encodePeerFromChat(input.chat, { currentUserId: input.message.fromId })
+  const updateGroup = await getUpdateGroupFromInputPeer(inputPeer, {
+    currentUserId: input.message.fromId,
+  })
+  await sendNotifications({
+    updateGroup,
+    messageInfo: { message: input.message },
+    currentUserId: input.message.fromId,
+    chat: input.chat,
+    unencryptedText: input.text,
+    unencryptedEntities: input.entities,
+    mentionedUserIds: new Set(getMentionedUserIds(input.entities)),
+    inputPeer,
+  })
+}
+
+/** Send push notifications for this message */
+async function prepareNotificationForUser({
+  userId,
+  messageInfo,
+  messageText,
+  messageEntities,
+  mentionedUserIds,
+  replyMentionUserIds,
+  chat,
+  isNudge,
+  isUrgentNudge,
+  updateGroup,
+  inputPeer,
+  currentUserId,
+  senderNameInfo,
+  senderProfilePhotoUrl,
+  senderHasProfilePhoto,
+  dialogNotificationSettings,
+}: {
+  userId: number
+  messageInfo: MessageInfo
+  messageText: string | undefined
+  messageEntities: MessageEntities | undefined
+  mentionedUserIds: ReadonlySet<number>
+  replyMentionUserIds: Set<number>
+  chat?: DbChat
+  isNudge: boolean
+  isUrgentNudge: boolean
+  // For explicit mac notification
+  updateGroup: UpdateGroup
+  inputPeer: InputPeer
+  currentUserId: number
+  senderNameInfo?: UserName
+  senderProfilePhotoUrl?: string
+  senderHasProfilePhoto?: boolean
+  dialogNotificationSettings?: ReturnType<typeof decodeDialogNotificationSettings>
+}) {
+  // FIRST, check if we should notify this user or not ---------------------------------
+  const userSettings = await getCachedUserSettings(userId)
+  const globalMode = normalizeGlobalNotificationMode(userSettings)
+  const effectiveMode = resolveEffectiveNotificationMode({
+    globalMode,
+    dialogNotificationSettings,
+  })
+
+  const isDM = inputPeer.type.oneofKind === "user"
+  const isReplyToUser = replyMentionUserIds.has(userId)
+  const isExplicitlyMentioned =
+    mentionedUserIds.has(userId) ||
+    (messageEntities ? isUserMentioned(messageEntities, userId, mentionedUserIds) : false)
+
+  const decision = decideNotification({
+    mode: effectiveMode,
+    isUrgentNudge,
+    isNudge,
+    isDM,
+    isReplyToUser,
+    isExplicitlyMentioned,
+  })
+
+  if (!decision.shouldNotify) {
+    return
+  }
+
+  const needsExplicitMacNotification = decision.needsExplicitMacNotification
+  const reason = decision.reason
+
+  // THEN, send notification ------------------------------------------------------------
+
+  const senderUserName = senderNameInfo ?? (await getCachedUserName(messageInfo.message.fromId))
+
+  if (!senderUserName) {
+    Log.shared.warn("No user name found for sender", { senderUserId: messageInfo.message.fromId })
+    return
+  }
+
+  let title = "Message"
+  let body = messageNotificationBody({
+    messageText,
+    mediaType: messageInfo.message.mediaType,
+    isSticker: messageInfo.message.isSticker,
+    documentFileName: messageInfo.document?.fileName,
+    isAnimated: messageInfo.video?.isAnimated,
+    voiceDuration: messageInfo.voice?.duration,
+  })
+
+  let includeSenderNameInMessage = false
+  const senderName = notificationText(UserNamesCache.getDisplayName(senderUserName), maxNotificationNameBytes)
+  // Only provide chat title for threads not DMs
+  const chatTitle = chat?.type === "thread" ? chat.title ?? undefined : undefined
+
+  if (chatTitle) {
+    // If thread
+    title = chatTitle
+    if (senderName) {
+      includeSenderNameInMessage = true
+    }
+  } else if (senderName) {
+    // If DM
+    title = senderName
+  } else {
+    // If no sender name, use default
+    title = "Message"
+  }
+
+  if (includeSenderNameInMessage) {
+    body = `${senderName}: ${body}`
+  }
+
+  const suppressionDecision = await desktopPushSuppressionTracker.shouldSuppressIOSSendMessagePush({
+    userId,
+    chatId: messageInfo.message.chatId,
+    isUrgentNudge,
+  })
+
+  const pushSubmission = !suppressionDecision.suppress
+    ? await Notifications.prepareSendToUser({
+        userId,
+        payload: {
+          kind: "send_message",
+          senderUserId: messageInfo.message.fromId,
+          threadId: `chat_${messageInfo.message.chatId}`,
+          isThread: chat?.type == "thread",
+          isReplyThread: chat != null ? isReplyThread(chat) : false,
+          messageId: String(messageInfo.message.messageId),
+          title,
+          body,
+          isUrgentNudge: isUrgentNudge,
+          senderDisplayName: senderName ?? undefined,
+          senderProfilePhotoUrl,
+          senderHasProfilePhoto,
+          threadEmoji: chat?.emoji ?? undefined,
+          photoUrl: messageInfo.message.isSticker ? undefined : notificationPhotoUrl(messageInfo.photo),
+        },
+      })
+    : undefined
+
+  return async () => {
+    await pushSubmission?.()
+
+    if (suppressionDecision.suppress) {
+      log.debug("Suppressing iOS send_message push due to active desktop chat", {
+        userId,
+        chatId: messageInfo.message.chatId,
+        reason: suppressionDecision.reason,
+      })
+    }
+
+    if (needsExplicitMacNotification) {
+      RealtimeUpdates.pushToUser(userId, [
+        {
+          update: {
+            oneofKind: "newMessageNotification",
+            newMessageNotification: {
+              message: encodeMessageForUser({
+                messageInfo,
+                updateGroup,
+                inputPeer,
+                currentUserId,
+                targetUserId: userId,
+              }),
+              reason: reason,
+            },
+          },
+        },
+      ])
+    }
+  }
+}

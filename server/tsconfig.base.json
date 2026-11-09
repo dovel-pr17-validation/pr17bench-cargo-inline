@@ -1,0 +1,48 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "strictNullChecks": true,
+    "esModuleInterop": true,
+    "exactOptionalPropertyTypes": false, // had to disable this because of annoying issues
+    "target": "ESNext",
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    // Monorepo
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+
+    // Bundler mode
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "jsx": "react-jsx",
+
+    "moduleDetection": "force",
+
+    // Best practices
+    "noFallthroughCasesInSwitch": true,
+
+    // Some stricter flags
+    "noPropertyAccessFromIndexSignature": true,
+    "noUncheckedIndexedAccess": true,
+
+    "paths": {
+      "@inline-chat/protocol/trust-roots/inline-protocol-production.json": ["../packages/protocol/trust-roots/inline-protocol-production.json"],
+      "@in/server": ["./src"],
+      "@in/server/*": ["./src/*"],
+      "@in/protocol": ["../packages/protocol/src"],
+      "@in/protocol/*": ["../packages/protocol/src/*"],
+      "@inline-chat/protocol": ["../packages/protocol/src"],
+      "@inline-chat/protocol/*": ["../packages/protocol/src/*"],
+      "@inline-chat/bot-api-types": ["../packages/bot-api-types/src/index.ts"],
+      "@inline-chat/bot-api-types/*": ["../packages/bot-api-types/src/*"],
+      "@inline-chat/oauth-core": ["../packages/oauth-core/src/index.ts"],
+      "@inline-chat/oauth-core/*": ["../packages/oauth-core/src/*"],
+      "@inline-chat/url-preview": ["./packages/url-preview/src/index.ts"],
+      "@inline-chat/url-preview/*": ["./packages/url-preview/src/*"]
+    }
+  }
+}

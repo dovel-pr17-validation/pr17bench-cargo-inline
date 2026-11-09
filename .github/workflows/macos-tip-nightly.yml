@@ -1,0 +1,197 @@
+name: macOS Tip
+
+# Every Apple Validation or CodeQL completion on main re-runs the gate, which
+# releases the newest green commit when it changes the Mac app and the last tip
+# is over an hour old. Server, CLI and integration workflows do not gate Apple
+# releases. The concurrency group keeps one release running and only the newest
+# run waiting. The 3-hourly sweep catches anything the interval deferred. The
+# summary job states whether the run published, was already current, deferred,
+# blocked or failed.
+on:
+  workflow_run:
+    workflows: [Apple Validation, CodeQL]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      channel:
+        type: string
+        default: tip
+
+permissions:
+  contents: read
+
+env:
+  MACOS_RELEASE_CHANNEL: ${{ inputs.channel || 'tip' }}
+
+concurrency:
+  group: macos-${{ inputs.channel || 'tip' }}-release
+  cancel-in-progress: false
+
+jobs:
+  select:
+    name: Select newest green main
+    if: github.repository == 'inline-chat/inline' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    outputs:
+      sha: ${{ steps.gate.outputs.sha }}
+      should_release: ${{ steps.gate.outputs.should_release }}
+      create_new_appcast: ${{ steps.gate.outputs.create_new_appcast }}
+      outcome: ${{ steps.gate.outputs.outcome }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Select newest green main commit for the channel
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/nightly-tip-gate.py select
+
+  release:
+    name: Build, sign, notarize, and publish
+    needs: select
+    if: needs.select.outputs.should_release == 'true'
+    runs-on: xcode-27
+    timeout-minutes: 120
+    environment: apple
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+    env:
+      EXPECTED_SHA: ${{ needs.select.outputs.sha }}
+      INLINE_NIGHTLY_MAIN_SHA: ${{ needs.select.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      SCHEME: ${{ vars.MACOS_DIRECT_SCHEME }}
+      MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+      MACOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.MACOS_PROVISIONING_PROFILE_BASE64 }}
+      MACOS_SPARKLE_PUBLIC_KEY: ${{ secrets.MACOS_SPARKLE_PUBLIC_KEY }}
+      MACOS_SPARKLE_PRIVATE_KEY: ${{ secrets.MACOS_SPARKLE_PRIVATE_KEY }}
+      APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+      APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      PUBLIC_RELEASES_R2_ACCESS_KEY_ID: ${{ secrets.PUBLIC_RELEASES_R2_ACCESS_KEY_ID }}
+      PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY: ${{ secrets.PUBLIC_RELEASES_R2_SECRET_ACCESS_KEY }}
+      PUBLIC_RELEASES_R2_BUCKET: ${{ secrets.PUBLIC_RELEASES_R2_BUCKET }}
+      PUBLIC_RELEASES_R2_ENDPOINT: ${{ secrets.PUBLIC_RELEASES_R2_ENDPOINT }}
+      PUBLIC_RELEASES_R2_PUBLIC_BASE_URL: ${{ secrets.PUBLIC_RELEASES_R2_PUBLIC_BASE_URL }}
+      PUBLIC_RELEASES_R2_PREFIX: ${{ secrets.PUBLIC_RELEASES_R2_PREFIX }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.4'
+      - name: Verify checkout is still a green main commit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          # Older publishers cannot safely qualify Beta at each public mutation.
+          # Wait for this slice to be green before publishing from that channel.
+          mode=qualify-tip
+          if [[ "$MACOS_RELEASE_CHANNEL" == beta ]]; then mode=qualify-macos; fi
+          python3 scripts/ci/nightly-tip-gate.py "$mode"
+          test "$(sw_vers -productVersion | cut -d. -f1)" -ge 27
+          xcodebuild -version
+      - name: Install release tools
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          npm install --global create-dmg@8.1.0
+          create-dmg --version
+      - name: Resolve release dependencies
+        run: |
+          bash scripts/apple/resolve-ci-packages.sh \
+            apple/Inline.xcodeproj "${SCHEME:-Inline (macOS)}" \
+            "$GITHUB_WORKSPACE/build/InlineMacDirect/reusable" \
+            "$RUNNER_TEMP/macos-package-resolution.log"
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_CI_KEYCHAIN_PWD: ${{ secrets.MACOS_CI_KEYCHAIN_PWD }}
+        run: |
+          set -euo pipefail
+          test -n "$MACOS_CERTIFICATE"
+          test -n "$MACOS_CERTIFICATE_PWD"
+          test -n "$MACOS_CI_KEYCHAIN_PWD"
+          certificate_path="$RUNNER_TEMP/inline-macos-signing.p12"
+          keychain_path="$RUNNER_TEMP/inline-macos-signing.keychain-db"
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$MACOS_CI_KEYCHAIN_PWD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_CI_KEYCHAIN_PWD" "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CI_KEYCHAIN_PWD" "$keychain_path"
+      - name: Publish the frozen channel release
+        env:
+          CREATE_NEW_APPCAST: ${{ needs.select.outputs.create_new_appcast }}
+        run: |
+          set -euo pipefail
+          args=(--channel "$MACOS_RELEASE_CHANNEL" --source-commit "$EXPECTED_SHA")
+          if [[ "$CREATE_NEW_APPCAST" == 'true' ]]; then
+            args+=(--create-new-appcast)
+          fi
+          if [[ -z "${SENTRY_AUTH_TOKEN:-}" ]]; then
+            args+=(--skip upload-sentry-dsyms)
+          fi
+          bun --no-env-file scripts/macos/release-app.ts "${args[@]}"
+      - name: Verify published GitHub and Sparkle state
+        run: python3 scripts/ci/nightly-tip-gate.py verify
+
+  summary:
+    name: Release outcome
+    needs: [select, release]
+    if: always() && github.repository == 'inline-chat/inline' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - name: Report published, already current, deferred, blocked or failed
+        env:
+          SELECT_RESULT: ${{ needs.select.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          SHOULD_RELEASE: ${{ needs.select.outputs.should_release }}
+          OUTCOME: ${{ needs.select.outputs.outcome }}
+          REASON: ${{ needs.select.outputs.reason }}
+          SHA: ${{ needs.select.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$SELECT_RESULT" != success ]]; then
+            OUTCOME=failed REASON="candidate selection $SELECT_RESULT"
+          elif [[ "$SHOULD_RELEASE" == true ]]; then
+            if [[ "$RELEASE_RESULT" == success ]]; then
+              OUTCOME=published REASON="signed, notarized and verified on the ${MACOS_RELEASE_CHANNEL:-tip} feed"
+            else
+              OUTCOME=failed REASON="release job $RELEASE_RESULT; rerun or resume from the logs"
+            fi
+          fi
+          bash scripts/ci/release-summary.sh "macOS ${MACOS_RELEASE_CHANNEL:-tip}" "$OUTCOME" "$REASON" "$SHA"

@@ -1,0 +1,413 @@
+import {
+  Method,
+  RealtimeV3Request,
+  RealtimeV3Response,
+  RealtimeV3Update,
+  RpcError_Code,
+  type AuthBeginRequest,
+  type AuthBeginResult,
+  type AuthBeginBrowserRequest,
+  type AuthBeginBrowserResult,
+  type AuthBrowserStatusRequest,
+  type AuthBrowserStatusResult,
+  type AuthCompleteRequest,
+  type AuthCompleteResult,
+  type AuthUpgradeSessionRequest,
+  type AuthUpgradeSessionResult,
+  type InputPeer,
+  type RpcCall,
+  type ServerProtocolMessage,
+} from "@inline-chat/protocol/core"
+import {
+  InlineProtocolApplicationOutputOverloaded,
+  type ServerApplicationAuthorization,
+  type ServerApplicationDispatcher,
+  type ServerAuthorizationKeyRepository,
+} from "@inline-chat/protocol/server"
+/*
+ * The output-capacity error crosses the application adapter unchanged so the
+ * secure-session owner can classify an already-started mutation as uncertain.
+ */
+import { handleRpcCall } from "@in/server/realtime/handlers/_rpc"
+import { toRealtimeRpcError } from "@in/server/realtime/rpcErrorBoundary"
+import type { RealtimeRequestMetadata } from "@in/server/realtime/types"
+import { Log, LogLevel } from "@in/server/utils/log"
+import { InlineError } from "@in/server/types/errors"
+import { connectionManager } from "@in/server/ws/connections"
+import { upgradedSessionTransportPreference } from "@in/server/modules/serverConfig/transportPreference"
+import { TRANSFER_RPC_METHODS } from "@inline-chat/protocol/transfers"
+
+const log = new Log("InlineProtocol.V3.Application", LogLevel.INFO)
+
+/** A transfer-only socket may execute only these besides pings. */
+export const inlineProtocolTransferSocketAllows = (method: Method): boolean =>
+  TRANSFER_RPC_METHODS.has(method) || method === Method.GET_ME
+
+export type InlineProtocolAuthorizationOptions = {
+  /** The socket declared itself a dedicated transfer connection in connection_init. */
+  transferOnly: boolean
+}
+
+export type InlineProtocolApplicationContext = {
+  authorization: ServerApplicationAuthorization
+  metadata?: RealtimeRequestMetadata
+  signal?: AbortSignal
+}
+
+export interface InlineProtocolApplicationOperations {
+  authBegin(input: AuthBeginRequest, context: InlineProtocolApplicationContext): Promise<AuthBeginResult>
+  authComplete(input: AuthCompleteRequest, context: InlineProtocolApplicationContext): Promise<AuthCompleteResult>
+  authBeginBrowser(input: AuthBeginBrowserRequest, context: InlineProtocolApplicationContext): Promise<AuthBeginBrowserResult>
+  authBrowserStatus(input: AuthBrowserStatusRequest, context: InlineProtocolApplicationContext): Promise<AuthBrowserStatusResult>
+  authUpgradeSession(input: AuthUpgradeSessionRequest, context: InlineProtocolApplicationContext): Promise<AuthUpgradeSessionResult>
+}
+
+const unauthorizedResponse = (): Uint8Array => RealtimeV3Response.toBinary({
+  body: {
+    oneofKind: "rpcError",
+    rpcError: {
+      reqMsgId: 0n,
+      errorCode: RpcError_Code.UNAUTHENTICATED,
+      message: "Unauthenticated",
+      code: 401,
+      retryAfterSeconds: 0,
+    },
+  },
+})
+
+const errorResponse = (error: unknown): Uint8Array => {
+  const rpc = toRealtimeRpcError(error)
+  if (rpc.codeNumber >= 500) {
+    log.error("Inline Protocol application request failed", error)
+  }
+  return RealtimeV3Response.toBinary({
+    body: {
+      oneofKind: "rpcError",
+      rpcError: {
+        reqMsgId: 0n,
+        errorCode: rpc.code,
+        message: rpc.message,
+        code: rpc.codeNumber,
+        retryAfterSeconds: rpc.retryAfterSeconds ?? 0,
+      },
+    },
+  })
+}
+
+const freshRequestIdRequiredResponse = (method: string): Uint8Array => RealtimeV3Response.toBinary({
+  body: {
+    oneofKind: "rpcError",
+    rpcError: {
+      reqMsgId: 0n,
+      errorCode: RpcError_Code.RATE_LIMIT,
+      message: `Retry ${method} with a fresh request ID`,
+      code: 429,
+      retryAfterSeconds: 0,
+    },
+  },
+})
+
+const sendV3Update = (
+  message: ServerProtocolMessage,
+  sendUpdate: (payload: Uint8Array) => void,
+): void => {
+  if (message.body.oneofKind !== "message") return
+  sendUpdate(RealtimeV3Update.toBinary({ message: message.body.message }))
+}
+
+const peerLane = (peer: InputPeer | undefined): string | undefined => {
+  switch (peer?.type.oneofKind) {
+    case "chat": return `chat:${peer.type.chat.chatId}`
+    case "user": return `user:${peer.type.user.userId}`
+    default: return undefined
+  }
+}
+
+export const inlineProtocolRpcExecutionLane = (rpc: RpcCall): string | undefined => {
+  switch (rpc.input.oneofKind) {
+    case "sendMessage": return peerLane(rpc.input.sendMessage.peerId)
+    case "editMessage": return peerLane(rpc.input.editMessage.peerId)
+    case "deleteMessages": return peerLane(rpc.input.deleteMessages.peerId)
+    case "deleteMessageAttachment": return peerLane(rpc.input.deleteMessageAttachment.peerId)
+    case "forwardMessages": return peerLane(rpc.input.forwardMessages.toPeerId)
+    case "addReaction": return peerLane(rpc.input.addReaction.peerId)
+    case "deleteReaction": return peerLane(rpc.input.deleteReaction.peerId)
+    case "pinMessage": return peerLane(rpc.input.pinMessage.peerId)
+    case "unpinAllMessages": return peerLane(rpc.input.unpinAllMessages.peerId)
+    case "deleteChat": return peerLane(rpc.input.deleteChat.peerId)
+    case "markAsUnread": return peerLane(rpc.input.markAsUnread.peerId)
+    case "acknowledgeMessages": return peerLane(rpc.input.acknowledgeMessages.peerId)
+    case "readMessages": return peerLane(rpc.input.readMessages.peerId)
+    case "updateDialogNotificationSettings": {
+      return peerLane(rpc.input.updateDialogNotificationSettings.peerId)
+    }
+    case "updateDialogFollowMode": return peerLane(rpc.input.updateDialogFollowMode.peerId)
+    case "updateDialogTranslation": return peerLane(rpc.input.updateDialogTranslation.peerId)
+    case "showInChatList": return peerLane(rpc.input.showInChatList.peerId)
+    case "updateDialogOpen": return peerLane(rpc.input.updateDialogOpen.peerId)
+    case "updateDialogOrder": return peerLane(rpc.input.updateDialogOrder.peerId)
+    case "updateDialogArchived": return peerLane(rpc.input.updateDialogArchived.peerId)
+    case "collapseHistory": return peerLane(rpc.input.collapseHistory.peerId)
+    case "connectAgentSession": return peerLane(rpc.input.connectAgentSession.peerId)
+    case "syncAgentSessionMessages": {
+      return `agent-session:${rpc.input.syncAgentSessionMessages.agentSessionId}`
+    }
+    case "clearChatHistory": {
+      const target = rpc.input.clearChatHistory.target
+      if (target.oneofKind === "peerId") return peerLane(target.peerId)
+      if (target.oneofKind === "spaceId") return `space:${target.spaceId}`
+      return undefined
+    }
+    case "addChatParticipant": return `chat:${rpc.input.addChatParticipant.chatId}`
+    case "removeChatParticipant": return `chat:${rpc.input.removeChatParticipant.chatId}`
+    case "updateChatVisibility": return `chat:${rpc.input.updateChatVisibility.chatId}`
+    case "updateChatInfo": return `chat:${rpc.input.updateChatInfo.chatId}`
+    case "moveThread": return `chat:${rpc.input.moveThread.chatId}`
+    case "createSubthread": return `chat:${rpc.input.createSubthread.parentChatId}`
+    case "deleteMember": return `space:${rpc.input.deleteMember.spaceId}`
+    case "updateMemberAccess": return `space:${rpc.input.updateMemberAccess.spaceId}`
+    case "setSpacePhoto": return `space:${rpc.input.setSpacePhoto.spaceId}`
+    case "toggleSpaceGrid": return `space:${rpc.input.toggleSpaceGrid.spaceId}`
+    case "updateUserSettings": return "account:settings"
+    default: return undefined
+  }
+}
+
+export class InlineProtocolApplicationLanes {
+  readonly #tails = new Map<string, Promise<void>>()
+
+  async run<T>(key: string | undefined, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    if (!key) return await operation()
+    const previous = this.#tails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => { release = resolve })
+    const tail = previous.catch(() => {}).then(() => current)
+    this.#tails.set(key, tail)
+    try {
+      await waitForLane(previous, signal)
+      return await operation()
+    } finally {
+      release()
+      // An aborted waiter must leave its placeholder in the chain until the
+      // previous owner has actually finished. Deleting it immediately would
+      // let a later same-key operation bypass the still-running owner.
+      void tail.then(() => {
+        if (this.#tails.get(key) === tail) this.#tails.delete(key)
+      })
+    }
+  }
+}
+
+const waitForLane = async (previous: Promise<void>, signal: AbortSignal): Promise<void> => {
+  if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError")
+  let onAbort!: () => void
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"))
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+  try {
+    await Promise.race([previous.catch(() => {}), aborted])
+  } finally {
+    signal.removeEventListener("abort", onAbort)
+  }
+}
+
+export const makeInlineProtocolApplicationDispatcher = (input: {
+  operations: InlineProtocolApplicationOperations
+  authorizationKeys: Pick<ServerAuthorizationKeyRepository, "load"> & {
+    /** Drops cached permanent authority for an account session this connection logged out. */
+    invalidateAccountSession?: (userId: number, accountSessionId: number) => void
+  }
+  connectionId: string
+  metadata?: RealtimeRequestMetadata
+  /**
+   * Registers the authenticated connection with the realtime authority fence.
+   * Returning false means a revocation won the auth-to-execution race, so this
+   * request must not cross the application execution boundary.
+   */
+  onAuthorized?: (
+    authorization: ServerApplicationAuthorization,
+    options: InlineProtocolAuthorizationOptions,
+  ) => boolean
+}): ServerApplicationDispatcher => {
+  const lanes = new InlineProtocolApplicationLanes()
+  let recordedProtocolUse = false
+  // Fixed by the first successful connection_init; a socket never changes role.
+  let transferOnly = false
+  return {
+    dispatch: async ({ payload, authorization, signal, markExecutionStarted, sendUpdate }) => {
+      let request
+      try {
+        request = RealtimeV3Request.fromBinary(payload)
+      } catch (error) {
+        if (error instanceof InlineProtocolApplicationOutputOverloaded) throw error
+        // The secure-session owner classifies an aborted application as either
+        // rejected-before-execution or commit-unknown. Turning the abort into a
+        // normal RPC error here would make the timed-out result replayable as a
+        // definitive application failure even though execution may have begun.
+        if (signal.aborted) throw signal.reason ?? error
+        return { kind: "result", payload: errorResponse(error) }
+      }
+      const context = { authorization, metadata: input.metadata, signal }
+      try {
+        // A successful upgrade authorizes the permanent key. Its subsequent
+        // recovery requests must still reach the exact-key operation.
+        if (authorization.permanent && request.body.oneofKind === "authUpgradeSession") {
+          markExecutionStarted()
+          const result = await input.operations.authUpgradeSession(request.body.authUpgradeSession, context)
+          return {
+            kind: "result",
+            payload: RealtimeV3Response.toBinary({
+              body: { oneofKind: "authUpgradeSession", authUpgradeSession: result },
+            }),
+          }
+        }
+        if (authorization.permanent && request.body.oneofKind === "authBrowserStatus") {
+          const result = await input.operations.authBrowserStatus(request.body.authBrowserStatus, context)
+          return {
+            kind: "result",
+            payload: RealtimeV3Response.toBinary({
+              body: { oneofKind: "authBrowserStatus", authBrowserStatus: result },
+            }),
+          }
+        }
+        if (authorization.permanent && authorization.userId === undefined) {
+          if (request.body.oneofKind === "authBegin") {
+            markExecutionStarted()
+            const result = await input.operations.authBegin(request.body.authBegin, context)
+            return {
+              kind: "result",
+              payload: RealtimeV3Response.toBinary({
+                body: { oneofKind: "authBegin", authBegin: result },
+              }),
+            }
+          }
+          if (request.body.oneofKind === "authComplete") {
+            markExecutionStarted()
+            const result = await input.operations.authComplete(request.body.authComplete, context)
+            return {
+              kind: "result",
+              payload: RealtimeV3Response.toBinary({
+                body: { oneofKind: "authComplete", authComplete: result },
+              }),
+            }
+          }
+          if (request.body.oneofKind === "authBeginBrowser") {
+            markExecutionStarted()
+            const result = await input.operations.authBeginBrowser(request.body.authBeginBrowser, context)
+            return {
+              kind: "result",
+              payload: RealtimeV3Response.toBinary({
+                body: { oneofKind: "authBeginBrowser", authBeginBrowser: result },
+              }),
+            }
+          }
+          return { kind: "result", payload: unauthorizedResponse() }
+        }
+
+        if (!authorization.temporaryBound || authorization.userId === undefined ||
+            authorization.accountSessionId === undefined) {
+          return { kind: "result", payload: unauthorizedResponse() }
+        }
+        if (request.body.oneofKind === "connectionInit") {
+          // V3 init advertises presentation capabilities; the bound key, never
+          // the legacy token in this payload, owns the authenticated identity.
+          const current = await input.authorizationKeys.load(authorization.authKeyId)
+          if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError")
+          const requestsTransferOnly = request.body.connectionInit.transferOnly === true
+          if (!current?.temporary || !current.binding || !authorization.permanentAuthKeyId ||
+              current.binding.userId !== authorization.userId ||
+              current.binding.accountSessionId !== authorization.accountSessionId ||
+              !Buffer.from(current.binding.permanentAuthKeyId).equals(authorization.permanentAuthKeyId) ||
+              (input.onAuthorized &&
+                !input.onAuthorized(authorization, { transferOnly: transferOnly || requestsTransferOnly }))) {
+            throw new InlineError(InlineError.ApiError.UNAUTHORIZED)
+          }
+          markExecutionStarted()
+          if (requestsTransferOnly) transferOnly = true
+          // A transfer socket has no presentation; its capabilities stay with the main socket.
+          if (!transferOnly) {
+            connectionManager.setSupportsWorking(
+              input.connectionId, authorization.userId, authorization.accountSessionId,
+              request.body.connectionInit.supportsWorking === true,
+            )
+          }
+          const upgradedSessionTransport = upgradedSessionTransportPreference()
+          return { kind: "result", payload: RealtimeV3Response.toBinary({ body: {
+            oneofKind: "connectionOpen", connectionOpen: { upgradedSessionTransport },
+          } }) }
+        }
+        if (request.body.oneofKind === "rpc") {
+          const rpc = request.body.rpc
+          if (transferOnly && !inlineProtocolTransferSocketAllows(rpc.method)) {
+            throw new InlineError(InlineError.ApiError.UNAUTHORIZED)
+          }
+          const result = await lanes.run(inlineProtocolRpcExecutionLane(rpc), signal, async () => {
+            // Admission may precede a long resource-lane wait. Revalidate the
+            // same binding before entering application-owned execution.
+            const current = await input.authorizationKeys.load(authorization.authKeyId)
+            if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError")
+            if (!current?.temporary || !current.binding || !authorization.permanentAuthKeyId ||
+                current.binding.userId !== authorization.userId ||
+                current.binding.accountSessionId !== authorization.accountSessionId ||
+                !Buffer.from(current.binding.permanentAuthKeyId).equals(authorization.permanentAuthKeyId)) {
+              throw new InlineError(InlineError.ApiError.UNAUTHORIZED)
+            }
+            if (input.onAuthorized && !input.onAuthorized(authorization, { transferOnly })) {
+              throw new InlineError(InlineError.ApiError.UNAUTHORIZED)
+            }
+            markExecutionStarted()
+            return await handleRpcCall(rpc, {
+              userId: authorization.userId!,
+              sessionId: authorization.accountSessionId!,
+              connectionId: input.connectionId,
+              signal,
+              sendRaw: (message) => sendV3Update(message, sendUpdate),
+              sendRpcReply: () => {},
+              inlineProtocol: authorization.permanentAuthKeyId
+                ? { permanentAuthKeyId: authorization.permanentAuthKeyId }
+                : undefined,
+            })
+          })
+          if (rpc.method === Method.LOG_OUT) {
+            input.authorizationKeys.invalidateAccountSession?.(authorization.userId, authorization.accountSessionId)
+          }
+          if (!recordedProtocolUse && !signal.aborted && rpc.method !== Method.GET_ME) {
+            recordedProtocolUse = true
+            try {
+              // Preparation only calls getMe. A completed ordinary RPC proves
+              // actual application use, once per carrier, with IDs for cohort
+              // joins. This is not a claim of sustained connection health.
+              log.info("realtime_protocol_used", {
+                protocol: "v3", outcome: "rpc_succeeded",
+                userId: authorization.userId, sessionId: authorization.accountSessionId,
+              })
+            } catch {
+              // Telemetry is never part of the RPC result contract.
+            }
+          }
+          return {
+            kind: "result",
+            terminateAuthorization: rpc.method === Method.LOG_OUT,
+            // File parts use session-tier replay and never reach a durable row. A
+            // transcription result is not retained in one either.
+            replayPayload: rpc.method === Method.TRANSCRIBE_VOICE_DRAFT
+              ? freshRequestIdRequiredResponse("transcribeVoiceDraft")
+              : undefined,
+            payload: RealtimeV3Response.toBinary({
+              body: {
+                oneofKind: "rpcResult",
+                rpcResult: { reqMsgId: 0n, result },
+              },
+            }),
+          }
+        }
+        return { kind: "result", payload: unauthorizedResponse() }
+      } catch (error) {
+        if (error instanceof InlineProtocolApplicationOutputOverloaded) throw error
+        if (signal.aborted) throw signal.reason ?? error
+        return { kind: "result", payload: errorResponse(error) }
+      }
+    },
+  }
+}

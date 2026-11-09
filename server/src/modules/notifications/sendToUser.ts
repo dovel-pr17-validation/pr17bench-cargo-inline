@@ -1,0 +1,724 @@
+import { SessionsModel, type PushSession } from "@in/server/db/models/sessions"
+import { getApnProvider } from "@in/server/libs/apn"
+import { isSuppressedApnFailure, summarizeApnFailure } from "@in/server/libs/apnFailures"
+import {
+  getExpoPushClient,
+  isExpoPushToken,
+  type ExpoPushMessage,
+  type ExpoPushTicket,
+} from "@in/server/libs/expoPush"
+import { getCachedUserSettings } from "@in/server/modules/cache/userSettings"
+import { Log } from "@in/server/utils/log"
+import { Notification } from "apn"
+import { applicationBackgroundWork } from "@in/server/lifecycle/backgroundWork"
+import { configureAlertNotification, configureBackgroundNotification, iOSTopic } from "./utils"
+import { notificationSyncOpsTracker, type NotificationSyncOps } from "./notificationSyncOps"
+import { maxNotificationNameBytes, notificationBodyText, notificationText } from "./messagePreview"
+import {
+  encryptSendMessagePushContent,
+  PUSH_CONTENT_ALGORITHM,
+  PUSH_CONTENT_VERSION,
+} from "@in/server/modules/notifications/pushContentEncryption"
+
+type AlertPushPayload = {
+  kind: "alert"
+  senderUserId: number
+  threadId: string
+  title: string
+  body: string
+  subtitle?: string
+  isThread?: boolean
+  isReplyThread?: boolean
+  threadEmoji?: string
+}
+
+type SendMessagePushPayload = {
+  kind: "send_message"
+  senderUserId: number
+  threadId: string
+  title: string
+  body: string
+  subtitle?: string
+  isThread?: boolean
+  isReplyThread?: boolean
+  messageId: string
+  isUrgentNudge?: boolean
+  senderDisplayName?: string
+  senderProfilePhotoUrl?: string
+  senderHasProfilePhoto?: boolean
+  threadEmoji?: string
+  /** Capability carried only inside encrypted Apple push content. */
+  photoUrl?: string
+}
+
+type MessageDeletedPushPayload = {
+  kind: "message_deleted"
+  threadId: string
+  messageIds: string[]
+}
+
+type MessagesReadUpToPushPayload = {
+  kind: "messages_read"
+  threadId: string
+  readUpToMessageId: string
+}
+
+export type PushToUserPayload =
+  | AlertPushPayload
+  | SendMessagePushPayload
+  | MessageDeletedPushPayload
+  | MessagesReadUpToPushPayload
+
+type SendPushToUserInput = {
+  userId: number
+  payload: PushToUserPayload
+}
+
+const log = new Log("notifications.sendToUser")
+
+type ApsOverrides = {
+  ["interruption-level"]?: "time-sensitive"
+}
+
+const configureTimeSensitive = (notification: Notification) => {
+  const aps = notification.aps as unknown as ApsOverrides
+  aps["interruption-level"] = "time-sensitive"
+  notification.priority = 10
+}
+
+export const shouldPlayNotificationSound = ({
+  silent,
+  isUrgentNudge,
+}: {
+  silent: boolean
+  isUrgentNudge?: boolean
+}) => {
+  return isUrgentNudge || !silent
+}
+
+const configureSound = ({
+  notification,
+  silent,
+  isUrgentNudge,
+}: {
+  notification: Notification
+  silent: boolean
+  isUrgentNudge?: boolean
+}) => {
+  if (shouldPlayNotificationSound({ silent, isUrgentNudge })) {
+    notification.sound = "default"
+  }
+}
+
+const configureGenericSendMessageNotification = ({
+  notification,
+  payload,
+  silent,
+}: {
+  notification: Notification
+  payload: SendMessagePushPayload
+  silent: boolean
+}) => {
+  const senderPayload: Record<string, unknown> = { id: payload.senderUserId }
+
+  const apsPayload: Record<string, unknown> = {
+    userId: payload.senderUserId,
+    threadId: payload.threadId,
+    isThread: payload.isThread ?? false,
+    isReplyThread: payload.isReplyThread ?? false,
+    sender: senderPayload,
+    messageId: payload.messageId,
+  }
+
+  notification.payload = apsPayload
+  notification.contentAvailable = true
+  notification.mutableContent = true
+  configureAlertNotification(notification)
+
+  configureSound({ notification, silent, isUrgentNudge: payload.isUrgentNudge })
+  if (payload.isUrgentNudge) {
+    configureTimeSensitive(notification)
+  }
+  notification.alert = {
+    title: genericEncryptedAlertTitle,
+    body: genericEncryptedAlertBody,
+  }
+}
+
+const genericEncryptedAlertTitle = "New message"
+const genericEncryptedAlertBody = "Open Inline to read it."
+
+const optionalNotificationText = (value: string | undefined, maxBytes: number): string | undefined => {
+  const projected = value ? notificationText(value, maxBytes) : ""
+  return projected || undefined
+}
+
+const normalizeNotificationPayload = (payload: PushToUserPayload): PushToUserPayload => {
+  if (payload.kind === "send_message") {
+    return {
+      ...payload,
+      title: notificationText(payload.title, maxNotificationNameBytes) || genericEncryptedAlertTitle,
+      body: notificationBodyText(payload.body),
+      subtitle: optionalNotificationText(payload.subtitle, maxNotificationNameBytes),
+      threadEmoji: optionalNotificationText(payload.threadEmoji, 64),
+      senderDisplayName: optionalNotificationText(payload.senderDisplayName, maxNotificationNameBytes),
+    }
+  }
+  if (payload.kind === "alert") {
+    return {
+      ...payload,
+      title: notificationText(payload.title, maxNotificationNameBytes) || "Inline",
+      body: notificationBodyText(payload.body),
+      subtitle: optionalNotificationText(payload.subtitle, maxNotificationNameBytes),
+      threadEmoji: optionalNotificationText(payload.threadEmoji, 64),
+    }
+  }
+  return payload
+}
+
+type PushContentSession = Pick<
+  PushSession,
+  | "pushContentKeyPublic"
+  | "pushContentKeyId"
+  | "pushContentVersion"
+  | "pushContentKeyAlgorithm"
+> &
+  Partial<Pick<PushSession, "pushFilteredSyncPushes">>
+
+const sessionSupportsEncryptedPushContent = (
+  session: PushContentSession,
+): session is PushContentSession & {
+  pushContentKeyPublic: Uint8Array
+  pushContentVersion: number
+  pushContentKeyAlgorithm: string
+} => {
+  if (!session.pushContentKeyPublic || session.pushContentKeyPublic.length === 0) return false
+  if (!session.pushContentVersion || session.pushContentVersion < PUSH_CONTENT_VERSION) return false
+  return session.pushContentKeyAlgorithm === PUSH_CONTENT_ALGORITHM
+}
+
+const filteredSyncAlertTitle = "Inline"
+const filteredSyncAlertBody = "Conversation updated."
+
+/**
+ * Read/delete sync pushes clear delivered notifications. Background pushes are
+ * throttled and dropped by iOS, so sessions whose notification service extension
+ * can filter (hide) a push get a mutable alert the extension consumes instead.
+ */
+const configureSyncNotification = ({
+  notification,
+  session,
+  expirySeconds,
+  collapseId,
+}: {
+  notification: Notification
+  session: PushContentSession
+  expirySeconds: number
+  collapseId?: string
+}) => {
+  if (session.pushFilteredSyncPushes !== true) {
+    configureBackgroundNotification({ notification, expirySeconds, collapseId })
+    return
+  }
+  configureAlertNotification(notification)
+  notification.mutableContent = true
+  notification.priority = 10
+  notification.expiry = expirySeconds
+  if (collapseId) notification.collapseId = collapseId
+  // Only visible if the extension fails to filter; never carries content.
+  notification.alert = { title: filteredSyncAlertTitle, body: filteredSyncAlertBody }
+}
+
+export const buildApnNotification = ({
+  session,
+  recipientUserId,
+  payload,
+  silent,
+  topic,
+  nowSeconds,
+  encrypt = encryptSendMessagePushContent,
+  onEncryptionError,
+  onPayloadTooLarge,
+  syncOps,
+}: {
+  session: PushContentSession
+  recipientUserId: number
+  payload: PushToUserPayload
+  silent: boolean
+  topic: string
+  nowSeconds: number
+  /** Recent read/delete state carried inside encrypted message content. */
+  syncOps?: NotificationSyncOps
+  encrypt?: typeof encryptSendMessagePushContent
+  onEncryptionError?: (error: unknown) => void
+  onPayloadTooLarge?: (bytes: number) => void
+}): Notification | undefined => {
+  payload = normalizeNotificationPayload(payload)
+  const notification = new Notification()
+  notification.topic = topic
+  notification.threadId = payload.threadId
+
+  const finalize = (): Notification | undefined => {
+    notification.payload = { ...notification.payload, recipientUserId: String(recipientUserId) }
+    // apn.length() caches compilation permanently; measure before any fallback mutation.
+    const bytes = Buffer.byteLength(JSON.stringify(notification), "utf8")
+    if (bytes <= 4_096) return notification
+    onPayloadTooLarge?.(bytes)
+    if (payload.kind !== "send_message") return undefined
+    // Never send an oversized envelope or expose encrypted content as plaintext.
+    // Existing chat/message identity still lets the app open the original message.
+    notification.payload = {
+      kind: "send_message_encrypted",
+      recipientUserId: String(recipientUserId),
+      threadId: payload.threadId,
+      messageId: payload.messageId,
+    }
+    notification.alert = { title: genericEncryptedAlertTitle, body: genericEncryptedAlertBody }
+    return Buffer.byteLength(JSON.stringify(notification), "utf8") <= 4_096 ? notification : undefined
+  }
+
+  if (payload.kind === "send_message") {
+    let encryptedContent: ReturnType<typeof encryptSendMessagePushContent> | undefined
+    if (sessionSupportsEncryptedPushContent(session)) {
+      try {
+        encryptedContent = encrypt({
+          recipientPublicKey: session.pushContentKeyPublic,
+          recipientKeyId: session.pushContentKeyId ?? undefined,
+          content: {
+            kind: "send_message",
+            sender: {
+              id: payload.senderUserId,
+              displayName: payload.senderDisplayName,
+              profilePhotoUrl: payload.senderProfilePhotoUrl,
+              hasProfilePhoto: payload.senderHasProfilePhoto,
+            },
+            title: payload.title,
+            body: payload.body,
+            subtitle: payload.subtitle,
+            threadId: payload.threadId,
+            messageId: payload.messageId,
+            isThread: payload.isThread ?? false,
+            isReplyThread: payload.isReplyThread ?? false,
+            threadEmoji: payload.threadEmoji,
+            photoUrl: payload.photoUrl,
+            ...(syncOps ? { sync: syncOps } : {}),
+          },
+        })
+      } catch (error) {
+        onEncryptionError?.(error)
+      }
+    }
+
+    if (sessionSupportsEncryptedPushContent(session)) {
+      notification.payload = {
+        kind: "send_message_encrypted",
+        threadId: payload.threadId,
+        messageId: payload.messageId,
+        ...(encryptedContent ? { encryptedContent } : {}),
+      }
+      notification.contentAvailable = true
+      notification.mutableContent = true
+      configureAlertNotification(notification)
+      configureSound({ notification, silent, isUrgentNudge: payload.isUrgentNudge })
+      if (payload.isUrgentNudge) {
+        configureTimeSensitive(notification)
+      }
+      notification.alert = {
+        title: genericEncryptedAlertTitle,
+        body: genericEncryptedAlertBody,
+      }
+      notification.payload = { ...notification.payload, recipientUserId: String(recipientUserId) }
+      if (syncOps && encryptedContent && Buffer.byteLength(JSON.stringify(notification), "utf8") > 4_096) {
+        // Sync ops are best-effort cleanup. Drop them before any message content.
+        return buildApnNotification({
+          session, recipientUserId, payload,
+          silent, topic, nowSeconds, encrypt, onEncryptionError, onPayloadTooLarge,
+        })
+      }
+      if (payload.photoUrl && encryptedContent && Buffer.byteLength(JSON.stringify(notification), "utf8") > 4_096) {
+        // The image is optional. Preserve the encrypted caption before using the generic fallback.
+        return buildApnNotification({
+          session, recipientUserId, payload: { ...payload, photoUrl: undefined },
+          silent, topic, nowSeconds, encrypt, onEncryptionError, onPayloadTooLarge,
+        })
+      }
+    } else {
+      configureGenericSendMessageNotification({ notification, payload, silent })
+    }
+    return finalize()
+  }
+
+  if (payload.kind === "alert") {
+    notification.payload = {
+      kind: "alert",
+      userId: payload.senderUserId,
+      threadId: payload.threadId,
+      isThread: payload.isThread ?? false,
+      isReplyThread: payload.isReplyThread ?? false,
+    }
+    notification.contentAvailable = true
+    notification.mutableContent = false
+    configureAlertNotification(notification)
+    configureSound({ notification, silent })
+    notification.alert = {
+      title: "Inline",
+      body: "Open Inline to see the update.",
+    }
+    return finalize()
+  }
+
+  if (payload.kind === "message_deleted") {
+    if (!payload.messageIds.length) return undefined
+    configureSyncNotification({
+      notification,
+      session,
+      expirySeconds: nowSeconds + 60 * 60,
+    })
+    notification.payload = {
+      kind: "message_deleted",
+      threadId: payload.threadId,
+      messageIds: payload.messageIds,
+    }
+    return finalize()
+  }
+
+  if (!payload.readUpToMessageId) return undefined
+  configureSyncNotification({
+    notification,
+    session,
+    expirySeconds: nowSeconds + 60 * 10,
+    collapseId: `messages_read:${payload.threadId}`,
+  })
+  notification.payload = {
+    kind: "messages_read",
+    threadId: payload.threadId,
+    readUpToMessageId: payload.readUpToMessageId,
+  }
+  return finalize()
+}
+
+export type PreparedPushSubmission = () => Promise<void>
+
+/** Resolve devices and build payloads before the caller's final content-access check. */
+export const preparePushNotificationToUser = async (
+  { userId, payload }: SendPushToUserInput,
+): Promise<PreparedPushSubmission | undefined> => {
+  try {
+    // Get all sessions for the user
+    const userSessions = await SessionsModel.getValidPushSessionsByUserId(userId)
+
+    if (!userSessions.length) {
+      return
+    }
+
+    let silent = false
+    if (payload.kind === "send_message" || payload.kind === "alert") {
+      try {
+        silent = (await getCachedUserSettings(userId))?.notifications.silent ?? false
+      } catch (error) {
+        log.error("Failed to load notification sound settings", {
+          error,
+          userId,
+        })
+      }
+    }
+
+    const hasApnsSession = userSessions.some((session) => session.pushNotificationProvider !== "expo_android")
+    let syncOps: NotificationSyncOps | undefined
+    if (hasApnsSession) {
+      try {
+        if (payload.kind === "messages_read") {
+          await notificationSyncOpsTracker.recordRead(userId, payload.threadId, payload.readUpToMessageId)
+        } else if (payload.kind === "message_deleted") {
+          await notificationSyncOpsTracker.recordDeleted(userId, payload.threadId, payload.messageIds)
+        } else if (payload.kind === "send_message" && userSessions.some(sessionSupportsEncryptedPushContent)) {
+          syncOps = await notificationSyncOpsTracker.recent(userId)
+        }
+      } catch (error) {
+        log.warn("Notification sync ops unavailable", { error, userId })
+      }
+    }
+
+    const submissions: PreparedPushSubmission[] = []
+    for (const session of userSessions) {
+      if (session.pushNotificationProvider === "expo_android") {
+        submissions.push(...prepareExpoPush({ session, payload, silent, userId }))
+        continue
+      }
+
+      const apnProvider = getApnProvider()
+      if (!apnProvider) {
+        Log.shared.error("APN provider not found", { userId, sessionId: session.id })
+        continue
+      }
+
+      const topic = iOSTopic
+      if (!topic) continue
+
+      const notification = buildApnNotification({
+        session,
+        recipientUserId: userId,
+        payload,
+        silent,
+        topic,
+        nowSeconds: Math.floor(Date.now() / 1_000),
+        syncOps,
+        onEncryptionError: (error) => {
+          log.error("Failed to encrypt push content", {
+            error,
+            userId,
+            sessionId: session.id,
+            threadId: payload.threadId,
+          })
+        },
+        onPayloadTooLarge: (bytes) => {
+          log.warn("Notification payload exceeded APNs byte budget", { bytes, userId, sessionId: session.id })
+        },
+      })
+      if (!notification) continue
+
+      const sendPush = async () => {
+        if (!session.applePushToken) return
+        try {
+          const result = await apnProvider.send(notification, session.applePushToken)
+          if (result.failed.length > 0) {
+            const summaries = result.failed.map((failure) => summarizeApnFailure(failure))
+            const suppressed = summaries.filter((s) => isSuppressedApnFailure(s))
+            const important = summaries.filter((s) => !isSuppressedApnFailure(s))
+
+            if (!shouldClearApplePushTokenForFailures(result.failed)) {
+              log.warn("Failed to send push notification", {
+                failures: important,
+                suppressedFailureCount: suppressed.length,
+                userId,
+                sessionId: session.id,
+                threadId: payload.threadId,
+              })
+            } else {
+              log.debug("Failed to send push notification (expected)", {
+                failures: suppressed,
+                userId,
+                sessionId: session.id,
+                threadId: payload.threadId,
+              })
+              await SessionsModel.clearApplePushToken(session.id)
+            }
+
+          } else {
+            log.debug("Push notification sent successfully", {
+              userId,
+              threadId: payload.threadId,
+            })
+          }
+        } catch (error) {
+          log.error("Error sending push notification", {
+            error,
+            userId,
+            threadId: payload.threadId,
+          })
+        }
+      }
+
+      submissions.push(() => {
+        // APNs completion stays detached from the caller as before. Register
+        // it so shutdown and test teardown still join the provider result.
+        applicationBackgroundWork.track(sendPush())
+        return Promise.resolve()
+      })
+    }
+
+    if (submissions.length === 0) return undefined
+    // Calling the closure starts every prepared provider submission before
+    // awaiting any result. No asynchronous preparation follows admission.
+    return () => Promise.all(submissions.map((submit) => submit())).then(() => undefined)
+  } catch (error) {
+    log.error("Error sending push notification", {
+      error,
+      userId,
+      threadId: payload.threadId,
+    })
+  }
+}
+
+export const sendPushNotificationToUser = async (input: SendPushToUserInput): Promise<void> => {
+  const submit = await preparePushNotificationToUser(input)
+  await submit?.()
+}
+
+export function shouldClearApplePushTokenForFailures(failures: readonly unknown[]): boolean {
+  return failures.length > 0 && failures.every((failure) => isSuppressedApnFailure(summarizeApnFailure(failure)))
+}
+
+function prepareExpoPush({
+  session,
+  payload,
+  silent,
+  userId,
+}: {
+  session: PushSession
+  payload: PushToUserPayload
+  silent: boolean
+  userId: number
+}): PreparedPushSubmission[] {
+  if (!session.applePushToken || !isExpoPushToken(session.applePushToken)) {
+    log.warn("Invalid Expo push token", {
+      userId,
+      sessionId: session.id,
+      threadId: payload.threadId,
+    })
+    return []
+  }
+
+  const message = buildExpoPushMessage({
+    to: session.applePushToken,
+    payload,
+    silent,
+  })
+  if (!message) return []
+
+  const expo = getExpoPushClient()
+  const chunks = expo.chunkPushNotifications([message])
+
+  return chunks.map((chunk) => async () => {
+    try {
+      const tickets = await expo.sendPushNotificationsAsync(chunk)
+      await handleExpoTickets({ tickets, session, payload, userId })
+    } catch (error) {
+      log.error("Error sending Expo push notification", {
+        error,
+        userId,
+        sessionId: session.id,
+        threadId: payload.threadId,
+      })
+    }
+  })
+}
+
+export function buildExpoPushMessage({
+  to,
+  payload,
+  silent,
+}: {
+  to: string
+  payload: PushToUserPayload
+  silent: boolean
+}): ExpoPushMessage | undefined {
+  payload = normalizeNotificationPayload(payload)
+  const baseData = expoDataForPayload(payload)
+  const shouldSound =
+    payload.kind === "send_message"
+      ? shouldPlayNotificationSound({ silent, isUrgentNudge: payload.isUrgentNudge })
+      : payload.kind === "alert"
+        ? shouldPlayNotificationSound({ silent })
+        : false
+
+  if (payload.kind === "send_message") {
+    const message: ExpoPushMessage = {
+      to,
+      title: genericEncryptedAlertTitle,
+      body: genericEncryptedAlertBody,
+      data: baseData,
+      sound: shouldSound ? "default" : undefined,
+      priority: payload.isUrgentNudge ? "high" : "default",
+      channelId: payload.isUrgentNudge ? "urgent" : silent ? "messages_silent" : "messages",
+    }
+    return message
+  }
+
+  if (payload.kind === "alert") {
+    return {
+      to,
+      title: "Inline",
+      body: "Open Inline to see the update.",
+      data: baseData,
+      sound: shouldSound ? "default" : undefined,
+      priority: "default",
+      channelId: silent ? "messages_silent" : "messages",
+    }
+  }
+
+  if (payload.kind === "message_deleted" || payload.kind === "messages_read") {
+    return {
+      to,
+      data: baseData,
+      priority: "normal",
+    }
+  }
+
+  return undefined
+}
+
+function expoDataForPayload(payload: PushToUserPayload): Record<string, unknown> {
+  if (payload.kind === "send_message") {
+    return {
+      kind: "send_message",
+      userId: payload.senderUserId,
+      senderUserId: payload.senderUserId,
+      threadId: payload.threadId,
+      isThread: payload.isThread ?? false,
+      isReplyThread: payload.isReplyThread ?? false,
+      messageId: payload.messageId,
+      isUrgentNudge: payload.isUrgentNudge ?? false,
+    }
+  }
+
+  if (payload.kind === "alert") {
+    return {
+      kind: "alert",
+      userId: payload.senderUserId,
+      threadId: payload.threadId,
+      isThread: payload.isThread ?? false,
+      isReplyThread: payload.isReplyThread ?? false,
+    }
+  }
+
+  if (payload.kind === "message_deleted") {
+    return {
+      kind: "message_deleted",
+      threadId: payload.threadId,
+      messageIds: payload.messageIds,
+    }
+  }
+
+  return {
+    kind: "messages_read",
+    threadId: payload.threadId,
+    readUpToMessageId: payload.readUpToMessageId,
+  }
+}
+
+async function handleExpoTickets({
+  tickets,
+  session,
+  payload,
+  userId,
+}: {
+  tickets: ExpoPushTicket[]
+  session: PushSession
+  payload: PushToUserPayload
+  userId: number
+}) {
+  for (const ticket of tickets) {
+    if (ticket.status === "ok") {
+      log.debug("Expo push notification queued", {
+        userId,
+        sessionId: session.id,
+        threadId: payload.threadId,
+        ticketId: ticket.id,
+      })
+      continue
+    }
+
+    log.warn("Expo push notification failed", {
+      userId,
+      sessionId: session.id,
+      threadId: payload.threadId,
+      message: ticket.message,
+      details: ticket.details,
+    })
+
+    if (ticket.details?.error === "DeviceNotRegistered") {
+      await SessionsModel.clearApplePushToken(session.id)
+    }
+  }
+}

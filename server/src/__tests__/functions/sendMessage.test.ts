@@ -1,0 +1,1397 @@
+import { afterAll, describe, test, expect, beforeAll, mock, spyOn } from "bun:test"
+import {
+  DialogNotificationSettings,
+  DialogNotificationSettings_Mode,
+  InputPeer,
+  Message,
+  MessageEntities,
+  MessageEntity_Type,
+  SendMessageResult,
+} from "@inline-chat/protocol/core"
+import { setupTestDatabase, teardownTestDatabase, testUtils } from "../setup"
+import { sendMessage } from "@in/server/functions/messages.sendMessage"
+import type { DbChat, DbUser } from "@in/server/db/schema"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { db } from "@in/server/db"
+import { chats, dialogs, files, members, messages, users, voices } from "@in/server/db/schema"
+import { and, eq } from "drizzle-orm"
+import { UpdateBucket } from "@in/server/db/schema/updates"
+import { UpdatesModel } from "@in/server/db/models/updates"
+import { desktopPushSuppressionTracker } from "@in/server/modules/notifications/desktopPushSuppression"
+import { getMessages } from "@in/server/functions/messages.getMessages"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { getReplyThreadAnchorSenderId } from "@in/server/modules/subthreads"
+import { createUserGroup } from "@in/server/modules/userGroups"
+import { addChatParticipant } from "@in/server/functions/messages.addChatParticipant"
+import { internalMessaging } from "@in/server/modules/internalMessaging/service"
+import { outboundPublications } from "@in/server/modules/internalMessaging/outbound"
+import { RealtimeUpdates } from "@in/server/realtime/message"
+
+// Test state
+let currentUser: DbUser
+let privateChat: DbChat
+let privateChatPeerId: InputPeer
+let context: FunctionContext
+let userIndex = 0
+
+const runId = Date.now()
+const nextEmail = (label: string) => `${label}-${runId}-${userIndex++}@example.com`
+
+// Helpers
+function extractMessage(result: SendMessageResult): Message | null {
+  const update = result.updates[1]
+  if (update?.update.oneofKind !== "newMessage") {
+    return null
+  }
+  return update.update.newMessage?.message ?? null
+}
+
+async function createVoiceForUser(userId: number) {
+  const [file] = await db
+    .insert(files)
+    .values({
+      fileUniqueId: `INV-${runId}-${userIndex++}`,
+      userId,
+      fileType: "voice",
+      mimeType: "audio/ogg",
+      fileSize: 321,
+    })
+    .returning()
+
+  if (!file) {
+    throw new Error("Failed to create test voice file")
+  }
+
+  const [voice] = await db
+    .insert(voices)
+    .values({
+      fileId: file.id,
+      duration: 12,
+      waveform: Buffer.from([1, 2, 3, 4]),
+    })
+    .returning()
+
+  if (!voice) {
+    throw new Error("Failed to create test voice")
+  }
+
+  return voice
+}
+
+describe("sendMessage", () => {
+  beforeAll(async () => {
+    await setupTestDatabase()
+    currentUser = (await testUtils.createUser(nextEmail("test-user")))!
+    privateChat = (await testUtils.createPrivateChat(currentUser, currentUser))!
+    privateChatPeerId = {
+      type: { oneofKind: "chat" as const, chat: { chatId: BigInt(privateChat.id) } },
+    }
+    context = testUtils.functionContext({ userId: currentUser.id, sessionId: 1 })
+  })
+  afterAll(teardownTestDatabase)
+
+  test("preserves markdown syntax for normal user RPC when parseMarkdown is omitted", async () => {
+    const text = "hello **world** and `code`"
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: text,
+      },
+      context,
+    )
+
+    const message = extractMessage(result)
+    expect(message?.message).toBe(text)
+    expect(message?.entities).toBeUndefined()
+  })
+
+  test("returns only after local delivery and without waiting for a stalled durable broker hint", async () => {
+    await outboundPublications.drain()
+    outboundPublications.start()
+    const releasePublication = Promise.withResolvers<void>()
+    const publicationStarted = Promise.withResolvers<void>()
+    let localDeliveryCompleted = false
+    let localDeliveryAtPublication = false
+    const localDelivery = spyOn(RealtimeUpdates, "pushToUser").mockImplementation(async () => {
+      await Promise.resolve()
+      localDeliveryCompleted = true
+    })
+    const publish = spyOn(internalMessaging, "publish").mockImplementation(async () => {
+      localDeliveryAtPublication = localDeliveryCompleted
+      publicationStarted.resolve()
+      await releasePublication.promise
+      return { status: "published", subscribers: 1 }
+    })
+
+    try {
+      const result = sendMessage({ peerId: privateChatPeerId, message: "broker-free response" }, context)
+      await publicationStarted.promise
+
+      let settled = false
+      void result.then(() => { settled = true })
+      for (let attempt = 0; attempt < 8 && !settled; attempt += 1) await Promise.resolve()
+      expect(settled).toBe(true)
+      expect(localDeliveryAtPublication).toBe(true)
+
+      releasePublication.resolve()
+      await outboundPublications.drain()
+      await result
+    } finally {
+      releasePublication.resolve()
+      await outboundPublications.drain()
+      publish.mockRestore()
+      localDelivery.mockRestore()
+    }
+  })
+
+  test("sends one 90k rich progress message through the realtime function", async () => {
+    const source = [
+      "<details open>",
+      "<summary kind=\"progress\">Working</summary>",
+      "",
+      "<details>",
+      "<summary>Ran commands</summary>",
+      "",
+      "x".repeat(90_000),
+      "</details>",
+      "</details>",
+    ].join("\n")
+
+    const result = await sendMessage({
+      peerId: privateChatPeerId,
+      message: source,
+      parseMarkdown: true,
+    }, context)
+    const message = extractMessage(result)
+    expect(message?.message?.length).toBeGreaterThan(90_000)
+    expect(message?.blockContent?.blocks).toHaveLength(1)
+  })
+
+  test("records desktop chat activity from successful sends", async () => {
+    const mockRecordChatActivity = mock().mockResolvedValue(undefined)
+    const originalRecordChatActivity = desktopPushSuppressionTracker.recordChatActivity
+    desktopPushSuppressionTracker.recordChatActivity = mockRecordChatActivity
+
+    try {
+      await sendMessage(
+        {
+          peerId: privateChatPeerId,
+          message: "activity ping",
+        },
+        context,
+      )
+    } finally {
+      desktopPushSuppressionTracker.recordChatActivity = originalRecordChatActivity
+    }
+
+    expect(mockRecordChatActivity).toHaveBeenCalledTimes(1)
+    expect(mockRecordChatActivity).toHaveBeenCalledWith({
+      userId: currentUser.id,
+      sessionId: context.currentSessionId,
+      chatId: privateChat.id,
+    })
+  })
+
+  test("resolves reply-thread parent author for notification mention context", async () => {
+    const owner = await testUtils.createUser(nextEmail("reply-thread-owner"))
+    const parentAuthor = await testUtils.createUser(nextEmail("reply-thread-parent-author"))
+
+    const parentChat = await testUtils.createChat(null, "Parent Thread", "thread", false, owner.id)
+    if (!parentChat) throw new Error("Parent chat not created")
+
+    await testUtils.addParticipant(parentChat.id, owner.id)
+    await testUtils.addParticipant(parentChat.id, parentAuthor.id)
+
+    await db.insert(messages).values({
+      chatId: parentChat.id,
+      messageId: 1,
+      fromId: parentAuthor.id,
+      text: "anchor",
+    })
+
+    const [childChat] = await db
+      .insert(chats)
+      .values({
+        type: "thread",
+        title: "Re: anchor",
+        publicThread: false,
+        createdBy: owner.id,
+        parentChatId: parentChat.id,
+        parentMessageId: 1,
+      })
+      .returning()
+
+    if (!childChat) throw new Error("Child chat not created")
+
+    await expect(getReplyThreadAnchorSenderId(childChat)).resolves.toBe(parentAuthor.id)
+  })
+
+  test("should create a text message", async () => {
+    let result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "test",
+      },
+      context,
+    )
+
+    expect(result.updates).toHaveLength(2)
+    expect(result.updates[1]?.update.oneofKind).toBe("newMessage")
+
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message?.message).toBe("test")
+  })
+
+  test("should return one update if message has duplicate random id", async () => {
+    let _ = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "test",
+        randomId: 1n,
+      },
+      context,
+    )
+    let result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "test",
+        randomId: 1n,
+      },
+      context,
+    )
+
+    expect(result.updates).toHaveLength(1)
+    expect(result.updates[0]?.update.oneofKind).toBe("updateMessageId")
+  })
+
+  test("should create a text message with empty entities", async () => {
+    let result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "test",
+        entities: { entities: [] },
+      },
+      context,
+    )
+
+    expect(result.updates).toHaveLength(2)
+    const message = extractMessage(result)
+    expect(message!.message).toBe("test")
+  })
+
+  test("should create a text message with entities", async () => {
+    let result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "@mo",
+        entities: testUtils.mentionEntities(0, 3),
+      },
+      context,
+    )
+
+    expect(result.updates).toHaveLength(2)
+    const message = extractMessage(result)
+    expect(message!.message).toBe("@mo")
+    expect(message!.entities).toBeTruthy()
+    expect(message!.entities!.entities).toHaveLength(1)
+    expect(message!.entities!.entities[0]!.type).toBe(MessageEntity_Type.MENTION)
+    expect(message!.entities!.entities[0]!.offset).toBe(0n)
+    expect(message!.entities!.entities[0]!.length).toBe(3n)
+  })
+
+  test("should create a voice message", async () => {
+    const voice = await createVoiceForUser(currentUser.id)
+
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        voiceId: BigInt(voice.id),
+      },
+      context,
+    )
+
+    expect(result.updates).toHaveLength(2)
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message?.media?.media.oneofKind).toBe("voice")
+    if (message?.media?.media.oneofKind !== "voice") {
+      throw new Error("Expected voice media")
+    }
+    const encodedVoice = message.media.media.voice.voice
+    expect(encodedVoice).toBeTruthy()
+    expect(encodedVoice?.duration).toBe(12)
+    expect(encodedVoice?.waveform).toEqual(new Uint8Array([1, 2, 3, 4]))
+  })
+
+  test("parses @username mention from text when client does not provide mention entity", async () => {
+    const mentionedUser = await testUtils.createUser(nextEmail("mentioned-user"))
+    await db.update(users).set({ username: "mentioneduser" }).where(eq(users.id, mentionedUser.id)).execute()
+
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "hello @mentioneduser",
+      },
+      context,
+    )
+
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message!.entities).toBeTruthy()
+    expect(message!.entities!.entities).toHaveLength(1)
+
+    const mentionEntity = message!.entities!.entities[0]!
+    expect(mentionEntity.type).toBe(MessageEntity_Type.MENTION)
+    expect(mentionEntity.offset).toBe(6n)
+    expect(mentionEntity.length).toBe(14n)
+    expect(mentionEntity.entity.oneofKind).toBe("mention")
+    if (mentionEntity.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(mentionEntity.entity.mention.userId).toBe(BigInt(mentionedUser.id))
+  })
+
+  test("does not parse deleted users as @username mentions", async () => {
+    const mentionedUser = await testUtils.createUser(nextEmail("deleted-mentioned-user"))
+    await db
+      .update(users)
+      .set({ username: "deletedmention", deleted: true })
+      .where(eq(users.id, mentionedUser.id))
+      .execute()
+
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "hello @deletedmention",
+      },
+      context,
+    )
+
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message!.entities?.entities ?? []).toHaveLength(0)
+  })
+
+  test("rejects sending to an existing DM whose peer user is deleted", async () => {
+    const sender = await testUtils.createUser(nextEmail("deleted-dm-sender"))
+    const peer = await testUtils.createUser(nextEmail("deleted-dm-peer"))
+    const chat = await testUtils.createPrivateChat(sender, peer)
+    if (!chat) throw new Error("Chat not created")
+
+    await db.update(users).set({ deleted: true }).where(eq(users.id, peer.id)).execute()
+
+    await expect(
+      sendMessage(
+        {
+          peerId: { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } },
+          message: "hello",
+        },
+        testUtils.functionContext({ userId: sender.id, sessionId: 1 }),
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.PEER_ID_INVALID })
+  })
+
+  test("requires prior messages from both DM participants before sending an urgent Nudge", async () => {
+    const sender = await testUtils.createUser(nextEmail("urgent-nudge-sender"))
+    const recipient = await testUtils.createUser(nextEmail("urgent-nudge-recipient"))
+    const chat = await testUtils.createPrivateChat(sender, recipient)
+    if (!chat) throw new Error("Chat not created")
+
+    const peerId: InputPeer = {
+      type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+    }
+    const senderContext = testUtils.functionContext({ userId: sender.id, sessionId: 1 })
+    const recipientContext = testUtils.functionContext({ userId: recipient.id, sessionId: 2 })
+
+    await expect(
+      sendMessage({ peerId, message: "🚨", nudge: true }, senderContext),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+
+    await sendMessage({ peerId, message: "👋", nudge: true }, senderContext)
+
+    await expect(
+      sendMessage({ peerId, message: "🚨", nudge: true }, senderContext),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+
+    await sendMessage({ peerId, message: "hello", nudge: false }, recipientContext)
+    await sendMessage({ peerId, message: "🚨", nudge: true }, senderContext)
+
+    const storedMessages = await db.query.messages.findMany({
+      where: { chatId: chat.id },
+    })
+    expect(storedMessages).toHaveLength(3)
+    expect(storedMessages.filter(({ mediaType }) => mediaType === "nudge")).toHaveLength(2)
+  })
+
+  test("does not duplicate mention node when client already provides mention entity", async () => {
+    const mentionedUser = await testUtils.createUser(nextEmail("provided-mentioned-user"))
+    await db.update(users).set({ username: "providedmention" }).where(eq(users.id, mentionedUser.id)).execute()
+
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "hello @providedmention",
+        entities: {
+          entities: [
+            {
+              type: MessageEntity_Type.MENTION,
+              offset: 6n,
+              length: 16n,
+              entity: {
+                oneofKind: "mention",
+                mention: {
+                  userId: BigInt(mentionedUser.id),
+                },
+              },
+            },
+          ],
+        },
+      },
+      context,
+    )
+
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message!.entities).toBeTruthy()
+    expect(message!.entities!.entities).toHaveLength(1)
+    expect(message!.entities!.entities[0]!.offset).toBe(6n)
+    expect(message!.entities!.entities[0]!.length).toBe(16n)
+    expect(message!.entities!.entities[0]!.entity.oneofKind).toBe("mention")
+    if (message!.entities!.entities[0]!.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(message!.entities!.entities[0]!.entity.mention.userId).toBe(BigInt(mentionedUser.id))
+  })
+
+  test("parses only missing @username mentions and keeps provided mention entities", async () => {
+    const providedUser = await testUtils.createUser(nextEmail("provided-user"))
+    const missingUser = await testUtils.createUser(nextEmail("missing-user"))
+    await db.update(users).set({ username: "providednode" }).where(eq(users.id, providedUser.id)).execute()
+    await db.update(users).set({ username: "missingnode" }).where(eq(users.id, missingUser.id)).execute()
+
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "@providednode and @missingnode",
+        entities: {
+          entities: [
+            {
+              type: MessageEntity_Type.MENTION,
+              offset: 0n,
+              length: 13n,
+              entity: {
+                oneofKind: "mention",
+                mention: {
+                  userId: BigInt(providedUser.id),
+                },
+              },
+            },
+          ],
+        },
+      },
+      context,
+    )
+
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message!.entities).toBeTruthy()
+    expect(message!.entities!.entities).toHaveLength(2)
+
+    const [providedMention, missingMention] = message!.entities!.entities
+    expect(providedMention!.entity.oneofKind).toBe("mention")
+    if (providedMention!.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(providedMention!.entity.mention.userId).toBe(BigInt(providedUser.id))
+    expect(providedMention!.offset).toBe(0n)
+    expect(providedMention!.length).toBe(13n)
+
+    expect(missingMention!.entity.oneofKind).toBe("mention")
+    if (missingMention!.entity.oneofKind !== "mention") {
+      throw new Error("Expected mention entity")
+    }
+    expect(missingMention!.entity.mention.userId).toBe(BigInt(missingUser.id))
+    expect(missingMention!.offset).toBe(18n)
+    expect(missingMention!.length).toBe(12n)
+  })
+
+  test("does not parse @username when mention range is partly covered by a client entity", async () => {
+    const mentionedUser = await testUtils.createUser(nextEmail("partial-overlap-user"))
+    await db.update(users).set({ username: "partialoverlap" }).where(eq(users.id, mentionedUser.id)).execute()
+
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "hello @partialoverlap world",
+        entities: {
+          entities: [
+            {
+              type: MessageEntity_Type.BOLD,
+              offset: 9n,
+              length: 4n,
+              entity: {
+                oneofKind: undefined,
+              },
+            },
+          ],
+        },
+      },
+      context,
+    )
+
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message!.entities).toBeTruthy()
+    expect(message!.entities!.entities).toHaveLength(1)
+    expect(message!.entities!.entities[0]!.type).toBe(MessageEntity_Type.BOLD)
+    expect(message!.entities!.entities.some((entity) => entity!.type === MessageEntity_Type.MENTION)).toBe(false)
+  })
+
+  test("does not parse @username when overlap with client entity is a single character", async () => {
+    const mentionedUser = await testUtils.createUser(nextEmail("single-char-overlap-user"))
+    await db.update(users).set({ username: "singlecharoverlap" }).where(eq(users.id, mentionedUser.id)).execute()
+
+    const result = await sendMessage(
+      {
+        peerId: privateChatPeerId,
+        message: "hello @singlecharoverlap",
+        entities: {
+          entities: [
+            {
+              type: MessageEntity_Type.ITALIC,
+              offset: 6n,
+              length: 1n,
+              entity: {
+                oneofKind: undefined,
+              },
+            },
+          ],
+        },
+      },
+      context,
+    )
+
+    const message = extractMessage(result)
+    expect(message).toBeTruthy()
+    expect(message!.entities).toBeTruthy()
+    expect(message!.entities!.entities).toHaveLength(1)
+    expect(message!.entities!.entities[0]!.type).toBe(MessageEntity_Type.ITALIC)
+    expect(message!.entities!.entities.some((entity) => entity!.type === MessageEntity_Type.MENTION)).toBe(false)
+  })
+
+  test("marks recipient dialog explicitly open on incoming DM", async () => {
+    const sender = (await testUtils.createUser(nextEmail("sender")))!
+    const recipient = (await testUtils.createUser(nextEmail("recipient")))!
+    const { chat } = await testUtils.createPrivateChatWithOptionalDialog({
+      userA: sender,
+      userB: recipient,
+      createDialogForUserA: true,
+      createDialogForUserB: true,
+    })
+
+    await db
+      .update(dialogs)
+      .set({ archived: true, chatListHidden: true, open: null, openedDate: null })
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, recipient.id)))
+      .execute()
+
+    const peerId: InputPeer = {
+      type: { oneofKind: "chat" as const, chat: { chatId: BigInt(chat.id) } },
+    }
+    const senderContext = testUtils.functionContext({ userId: sender.id, sessionId: 1 })
+
+    await sendMessage({ peerId, message: "hello" }, senderContext)
+
+    const [updatedDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, recipient.id)))
+      .limit(1)
+
+    expect(updatedDialog?.archived).toBe(false)
+    expect(updatedDialog?.chatListHidden).toBeNull()
+    expect(updatedDialog?.open).toBe(true)
+    expect(updatedDialog?.order).toBeTruthy()
+
+    const userUpdates = await db.query.updates.findMany({
+      where: {
+        bucket: UpdateBucket.User,
+        entityId: recipient.id,
+      },
+    })
+
+    const hasChatOpenUpdate = userUpdates
+      .map((update) => UpdatesModel.decrypt(update))
+      .some(
+        (update) =>
+          update.payload.update.oneofKind === "userChatOpen" &&
+          update.payload.update.userChatOpen.dialog?.open === true &&
+          update.payload.update.userChatOpen.dialog?.archived === false,
+      )
+
+    expect(hasChatOpenUpdate).toBe(true)
+  })
+
+  test("opens mentioned users' reply-thread dialogs for the sidebar inbox", async () => {
+    const owner = await testUtils.createUser(nextEmail("thread-owner"))
+    const mentioned = await testUtils.createUser(nextEmail("thread-mentioned"))
+    await db.update(users).set({ username: "replythreadmentioned" }).where(eq(users.id, mentioned.id)).execute()
+
+    const parentChat = await testUtils.createChat(null, "Parent Thread", "thread", false, owner.id)
+    if (!parentChat) throw new Error("Parent chat not created")
+
+    await testUtils.addParticipant(parentChat.id, owner.id)
+    await testUtils.addParticipant(parentChat.id, mentioned.id)
+
+    await db.insert(messages).values({
+      chatId: parentChat.id,
+      messageId: 1,
+      fromId: owner.id,
+      text: "anchor",
+    })
+
+    const [childChat] = await db
+      .insert(chats)
+      .values({
+        type: "thread",
+        title: "Re: anchor",
+        publicThread: false,
+        createdBy: owner.id,
+        parentChatId: parentChat.id,
+        parentMessageId: 1,
+      })
+      .returning()
+
+    if (!childChat) throw new Error("Child chat not created")
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(childChat.id) } },
+        },
+        message: "hello @replythreadmentioned",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [recipientDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, mentioned.id)))
+      .limit(1)
+
+    expect(recipientDialog?.chatListHidden).toBeNull()
+    expect(recipientDialog?.open).toBe(true)
+    expect(recipientDialog?.order).toBeTruthy()
+    expect(recipientDialog?.followMode).toBeNull()
+
+    const userUpdates = await db.query.updates.findMany({
+      where: {
+        bucket: UpdateBucket.User,
+        entityId: mentioned.id,
+      },
+    })
+
+    const hasChatOpenUpdate = userUpdates
+      .map((update) => UpdatesModel.decrypt(update))
+      .some((update) => update.payload.update.oneofKind === "userChatOpen")
+
+    expect(hasChatOpenUpdate).toBe(true)
+  })
+
+  test("opens group-mentioned users' dialogs and keeps the group mention entity", async () => {
+    const owner = await testUtils.createUser(nextEmail("group-mention-owner"))
+    const groupMember = await testUtils.createUser(nextEmail("group-mention-member"))
+    const bystander = await testUtils.createUser(nextEmail("group-mention-bystander"))
+    const space = await testUtils.createSpace("Group Mention Space")
+    if (!space) throw new Error("Space not created")
+
+    await db.insert(members).values([
+      { spaceId: space.id, userId: owner.id, role: "owner" },
+      { spaceId: space.id, userId: groupMember.id, role: "member" },
+      { spaceId: space.id, userId: bystander.id, role: "member" },
+    ])
+
+    const { group } = await createUserGroup(
+      {
+        spaceId: space.id,
+        name: "Eng",
+        userIds: [groupMember.id],
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+    const groupId = Number(group.id)
+
+    const chat = await testUtils.createChat(space.id, "Group Mention Thread", "thread", false, owner.id)
+    if (!chat) throw new Error("Chat not created")
+    await testUtils.addParticipant(chat.id, owner.id)
+    await addChatParticipant(
+      { chatId: chat.id, groupId },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const result = await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+        },
+        message: "@eng hello",
+        entities: MessageEntities.create({
+          entities: [
+            {
+              type: MessageEntity_Type.GROUP_MENTION,
+              offset: 0n,
+              length: 4n,
+              entity: {
+                oneofKind: "groupMention",
+                groupMention: {
+                  groupId: BigInt(groupId),
+                },
+              },
+            },
+          ],
+        }),
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const sentMessage = extractMessage(result)
+    expect(sentMessage?.mentioned).toBe(false)
+    const entity = sentMessage?.entities?.entities[0]
+    expect(entity?.entity.oneofKind).toBe("groupMention")
+    if (entity?.entity.oneofKind !== "groupMention") {
+      throw new Error("Expected group mention entity")
+    }
+    expect(entity.entity.groupMention.groupId).toBe(BigInt(groupId))
+
+    const [memberDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, groupMember.id)))
+      .limit(1)
+
+    expect(memberDialog?.chatListHidden).toBeNull()
+    expect(memberDialog?.open).toBe(true)
+    expect(memberDialog?.order).toBeTruthy()
+
+    const [bystanderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, bystander.id)))
+      .limit(1)
+
+    expect(bystanderDialog).toBeUndefined()
+  })
+
+  test("does not open explicit all-notification dialogs for plain thread messages", async () => {
+    const owner = await testUtils.createUser(nextEmail("thread-all-owner"))
+    const recipient = await testUtils.createUser(nextEmail("thread-all-recipient"))
+
+    const chat = await testUtils.createChat(null, "All Notifications Thread", "thread", false, owner.id)
+    if (!chat) throw new Error("Thread chat not created")
+
+    await testUtils.addParticipant(chat.id, owner.id)
+    await testUtils.addParticipant(chat.id, recipient.id)
+    await db.insert(dialogs).values({
+      chatId: chat.id,
+      userId: recipient.id,
+      open: false,
+      chatListHidden: true,
+      notificationSettings: Buffer.from(
+        DialogNotificationSettings.toBinary({
+          mode: DialogNotificationSettings_Mode.ALL,
+        }),
+      ),
+    })
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+        },
+        message: "plain message",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [recipientDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, recipient.id)))
+      .limit(1)
+
+    expect(recipientDialog?.chatListHidden).toBe(true)
+    expect(recipientDialog?.open).toBe(false)
+    expect(recipientDialog?.order).toBeNull()
+    expect(recipientDialog?.followMode).toBeNull()
+  })
+
+  test("opens reply-thread anchor authors' dialogs for the sidebar inbox", async () => {
+    const owner = await testUtils.createUser(nextEmail("thread-anchor-owner"))
+    const anchorAuthor = await testUtils.createUser(nextEmail("thread-anchor-author"))
+
+    const parentChat = await testUtils.createChat(null, "Parent Thread", "thread", false, owner.id)
+    if (!parentChat) throw new Error("Parent chat not created")
+
+    await testUtils.addParticipant(parentChat.id, owner.id)
+    await testUtils.addParticipant(parentChat.id, anchorAuthor.id)
+
+    await db.insert(messages).values({
+      chatId: parentChat.id,
+      messageId: 1,
+      fromId: anchorAuthor.id,
+      text: "anchor",
+    })
+
+    const [childChat] = await db
+      .insert(chats)
+      .values({
+        type: "thread",
+        title: null,
+        publicThread: false,
+        createdBy: owner.id,
+        parentChatId: parentChat.id,
+        parentMessageId: 1,
+      })
+      .returning()
+
+    if (!childChat) throw new Error("Child chat not created")
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(childChat.id) } },
+        },
+        message: "starting a reply thread",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [anchorAuthorDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, anchorAuthor.id)))
+      .limit(1)
+
+    expect(anchorAuthorDialog?.chatListHidden).toBeNull()
+    expect(anchorAuthorDialog?.open).toBe(true)
+    expect(anchorAuthorDialog?.order).toBeTruthy()
+    expect(anchorAuthorDialog?.followMode).toBe("following")
+
+    const [senderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, owner.id)))
+      .limit(1)
+
+    expect(senderDialog?.chatListHidden).toBeNull()
+    expect(senderDialog?.open).toBeNull()
+    expect(senderDialog?.order).toBeNull()
+    expect(senderDialog?.followMode).toBe("following")
+
+    const userUpdates = await db.query.updates.findMany({
+      where: {
+        bucket: UpdateBucket.User,
+        entityId: anchorAuthor.id,
+      },
+    })
+
+    const chatOpenUpdates = userUpdates
+      .map((update) => UpdatesModel.decrypt(update))
+      .filter((update) => update.payload.update.oneofKind === "userChatOpen")
+
+    expect(chatOpenUpdates).toHaveLength(1)
+
+    const senderUserUpdates = await db.query.updates.findMany({
+      where: {
+        bucket: UpdateBucket.User,
+        entityId: owner.id,
+      },
+    })
+
+    const senderChatListUpdates = senderUserUpdates
+      .map((update) => UpdatesModel.decrypt(update))
+      .filter((update) => update.payload.update.oneofKind === "userChatOpen")
+
+    expect(senderChatListUpdates).toHaveLength(1)
+  })
+
+  test("emits chat-list update when auto-follow unhides an already-open reply-thread anchor dialog", async () => {
+    const owner = await testUtils.createUser(nextEmail("thread-open-hidden-owner"))
+    const anchorAuthor = await testUtils.createUser(nextEmail("thread-open-hidden-anchor"))
+
+    const parentChat = await testUtils.createChat(null, "Parent Thread", "thread", false, owner.id)
+    if (!parentChat) throw new Error("Parent chat not created")
+
+    await testUtils.addParticipant(parentChat.id, owner.id)
+    await testUtils.addParticipant(parentChat.id, anchorAuthor.id)
+
+    await db.insert(messages).values({
+      chatId: parentChat.id,
+      messageId: 1,
+      fromId: anchorAuthor.id,
+      text: "anchor",
+    })
+
+    const [childChat] = await db
+      .insert(chats)
+      .values({
+        type: "thread",
+        title: null,
+        publicThread: false,
+        createdBy: owner.id,
+        parentChatId: parentChat.id,
+        parentMessageId: 1,
+      })
+      .returning()
+
+    if (!childChat) throw new Error("Child chat not created")
+
+    await db.insert(dialogs).values({
+      chatId: childChat.id,
+      userId: anchorAuthor.id,
+      chatListHidden: true,
+      open: true,
+      order: "a",
+    })
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(childChat.id) } },
+        },
+        message: "reply after parent-opened anchor",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [anchorAuthorDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, anchorAuthor.id)))
+      .limit(1)
+
+    expect(anchorAuthorDialog?.followMode).toBe("following")
+    expect(anchorAuthorDialog?.chatListHidden).toBeNull()
+    expect(anchorAuthorDialog?.open).toBe(true)
+    expect(anchorAuthorDialog?.order).toBe("a")
+
+    const userUpdates = await db.query.updates.findMany({
+      where: {
+        bucket: UpdateBucket.User,
+        entityId: anchorAuthor.id,
+      },
+    })
+
+    const chatOpenUpdates = userUpdates
+      .map((update) => UpdatesModel.decrypt(update))
+      .filter((update) => update.payload.update.oneofKind === "userChatOpen")
+
+    expect(chatOpenUpdates).toHaveLength(1)
+  })
+
+  test("opens replied-to authors' reply-thread dialogs for the sidebar inbox", async () => {
+    const owner = await testUtils.createUser(nextEmail("thread-reply-owner"))
+    const repliedUser = await testUtils.createUser(nextEmail("thread-replied-user"))
+
+    const parentChat = await testUtils.createChat(null, "Parent Thread", "thread", false, owner.id)
+    if (!parentChat) throw new Error("Parent chat not created")
+
+    await testUtils.addParticipant(parentChat.id, owner.id)
+    await testUtils.addParticipant(parentChat.id, repliedUser.id)
+
+    await db.insert(messages).values({
+      chatId: parentChat.id,
+      messageId: 1,
+      fromId: owner.id,
+      text: "anchor",
+    })
+
+    const [childChat] = await db
+      .insert(chats)
+      .values({
+        type: "thread",
+        title: "Re: anchor",
+        publicThread: false,
+        createdBy: owner.id,
+        parentChatId: parentChat.id,
+        parentMessageId: 1,
+      })
+      .returning()
+
+    if (!childChat) throw new Error("Child chat not created")
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(childChat.id) } },
+        },
+        message: "first",
+      },
+      testUtils.functionContext({ userId: repliedUser.id, sessionId: 1 }),
+    )
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(childChat.id) } },
+        },
+        message: "replying",
+        replyToMessageId: 1n,
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [recipientDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, repliedUser.id)))
+      .limit(1)
+
+    expect(recipientDialog?.chatListHidden).toBeNull()
+    expect(recipientDialog?.open).toBe(true)
+    expect(recipientDialog?.order).toBeTruthy()
+
+    const parentMessages = await getMessages(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(parentChat.id) } },
+        },
+        messageIds: [1n],
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    expect(parentMessages.messages[0]?.replies?.replyCount).toBe(2)
+    expect(parentMessages.messages[0]?.replies?.recentReplierUserIds).toEqual([
+      BigInt(owner.id),
+      BigInt(repliedUser.id),
+    ])
+  })
+
+  test("shows the sender's hidden reply-thread dialog on outbound auto-follow", async () => {
+    const owner = await testUtils.createUser(nextEmail("thread-hidden-owner"))
+    const participant = await testUtils.createUser(nextEmail("thread-hidden-participant"))
+
+    const parentChat = await testUtils.createChat(null, "Parent Thread", "thread", false, owner.id)
+    if (!parentChat) throw new Error("Parent chat not created")
+
+    await testUtils.addParticipant(parentChat.id, owner.id)
+    await testUtils.addParticipant(parentChat.id, participant.id)
+
+    await db.insert(messages).values({
+      chatId: parentChat.id,
+      messageId: 1,
+      fromId: owner.id,
+      text: "anchor",
+    })
+
+    const [childChat] = await db
+      .insert(chats)
+      .values({
+        type: "thread",
+        title: "Re: anchor",
+        publicThread: false,
+        createdBy: owner.id,
+        parentChatId: parentChat.id,
+        parentMessageId: 1,
+      })
+      .returning()
+
+    if (!childChat) throw new Error("Child chat not created")
+
+    await db.insert(dialogs).values({
+      chatId: childChat.id,
+      userId: owner.id,
+      chatListHidden: true,
+    })
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(childChat.id) } },
+        },
+        message: "still hidden",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [senderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, owner.id)))
+      .limit(1)
+
+    expect(senderDialog?.chatListHidden).toBeNull()
+    expect(senderDialog?.open).toBeNull()
+    expect(senderDialog?.order).toBeNull()
+    expect(senderDialog?.followMode).toBe("following")
+  })
+
+  test("opens followed normal thread dialogs for the sidebar inbox", async () => {
+    const owner = await testUtils.createUser(nextEmail("normal-follow-owner"))
+    const follower = await testUtils.createUser(nextEmail("normal-follow-follower"))
+
+    const chat = await testUtils.createChat(null, "Normal Follow Thread", "thread", false, owner.id)
+    if (!chat) throw new Error("Thread chat not created")
+
+    await testUtils.addParticipant(chat.id, owner.id)
+    await testUtils.addParticipant(chat.id, follower.id)
+
+    await db.insert(dialogs).values({
+      chatId: chat.id,
+      userId: follower.id,
+      followMode: "following",
+      open: false,
+      order: null,
+      chatListHidden: true,
+    })
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+        },
+        message: "normal followed activity",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [followerDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, follower.id)))
+      .limit(1)
+
+    expect(followerDialog?.followMode).toBe("following")
+    expect(followerDialog?.chatListHidden).toBeNull()
+    expect(followerDialog?.open).toBe(true)
+    expect(followerDialog?.order).toBeTruthy()
+    expect(followerDialog?.archived).toBe(false)
+  })
+
+  test("auto-follows senders in fresh normal threads", async () => {
+    const owner = await testUtils.createUser(nextEmail("fresh-normal-owner"))
+
+    const chat = await testUtils.createChat(null, "Fresh Normal Thread", "thread", false, owner.id)
+    if (!chat) throw new Error("Thread chat not created")
+
+    await testUtils.addParticipant(chat.id, owner.id)
+    await db.insert(dialogs).values({
+      chatId: chat.id,
+      userId: owner.id,
+      chatListHidden: true,
+      open: null,
+      order: null,
+    })
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+        },
+        message: "fresh normal start",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [senderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, owner.id)))
+      .limit(1)
+
+    expect(senderDialog?.followMode).toBe("following")
+    expect(senderDialog?.chatListHidden).toBeNull()
+    expect(senderDialog?.open).toBeNull()
+
+    const userUpdates = await db.query.updates.findMany({
+      where: {
+        bucket: UpdateBucket.User,
+        entityId: owner.id,
+      },
+    })
+
+    const hasChatListUpdate = userUpdates
+      .map((update) => UpdatesModel.decrypt(update))
+      .some((update) => update.payload.update.oneofKind === "userChatOpen")
+
+    expect(hasChatListUpdate).toBe(true)
+  })
+
+  test("auto-follows senders through message 15 in normal threads", async () => {
+    const owner = await testUtils.createUser(nextEmail("fifteen-normal-owner"))
+
+    const chat = await testUtils.createChat(null, "Fifteen Normal Thread", "thread", false, owner.id)
+    if (!chat) throw new Error("Thread chat not created")
+
+    await testUtils.addParticipant(chat.id, owner.id)
+    await db.insert(messages).values(
+      Array.from({ length: 14 }, (_, index) => ({
+        chatId: chat.id,
+        messageId: index + 1,
+        fromId: owner.id,
+        text: `existing ${index + 1}`,
+      })),
+    )
+    await db.update(chats).set({ lastMsgId: 14 }).where(eq(chats.id, chat.id))
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+        },
+        message: "message fifteen",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [senderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, owner.id)))
+      .limit(1)
+
+    expect(senderDialog?.followMode).toBe("following")
+    expect(senderDialog?.chatListHidden).toBeNull()
+  })
+
+  test("does not auto-follow senders at message 16 in normal threads", async () => {
+    const owner = await testUtils.createUser(nextEmail("large-normal-owner"))
+
+    const chat = await testUtils.createChat(null, "Large Normal Thread", "thread", false, owner.id)
+    if (!chat) throw new Error("Thread chat not created")
+
+    await testUtils.addParticipant(chat.id, owner.id)
+    await db.insert(messages).values(
+      Array.from({ length: 15 }, (_, index) => ({
+        chatId: chat.id,
+        messageId: index + 1,
+        fromId: owner.id,
+        text: `existing ${index + 1}`,
+      })),
+    )
+    await db.update(chats).set({ lastMsgId: 15 }).where(eq(chats.id, chat.id))
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+        },
+        message: "large normal continuation",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [senderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, owner.id)))
+      .limit(1)
+
+    expect(senderDialog?.followMode ?? null).toBeNull()
+  })
+
+  test("does not auto-follow normal-thread senders who explicitly unfollowed", async () => {
+    const owner = await testUtils.createUser(nextEmail("unfollowed-normal-owner"))
+
+    const chat = await testUtils.createChat(null, "Unfollowed Normal Thread", "thread", false, owner.id)
+    if (!chat) throw new Error("Thread chat not created")
+
+    await testUtils.addParticipant(chat.id, owner.id)
+    await db.insert(dialogs).values({
+      chatId: chat.id,
+      userId: owner.id,
+      followMode: "unfollowed",
+      chatListHidden: true,
+      open: null,
+      order: null,
+    })
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } },
+        },
+        message: "fresh normal opt out",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [senderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, chat.id), eq(dialogs.userId, owner.id)))
+      .limit(1)
+
+    expect(senderDialog?.followMode).toBe("unfollowed")
+    expect(senderDialog?.chatListHidden).toBe(true)
+  })
+
+  test("does not auto-follow reply-thread anchor authors who explicitly unfollowed", async () => {
+    const owner = await testUtils.createUser(nextEmail("unfollowed-reply-owner"))
+    const anchorAuthor = await testUtils.createUser(nextEmail("unfollowed-anchor-author"))
+
+    const parentChat = await testUtils.createChat(null, "Parent Thread", "thread", false, owner.id)
+    if (!parentChat) throw new Error("Parent chat not created")
+
+    await testUtils.addParticipant(parentChat.id, owner.id)
+    await testUtils.addParticipant(parentChat.id, anchorAuthor.id)
+
+    await db.insert(messages).values({
+      chatId: parentChat.id,
+      messageId: 1,
+      fromId: anchorAuthor.id,
+      text: "anchor",
+    })
+
+    const [childChat] = await db
+      .insert(chats)
+      .values({
+        type: "thread",
+        title: null,
+        publicThread: false,
+        createdBy: owner.id,
+        parentChatId: parentChat.id,
+        parentMessageId: 1,
+      })
+      .returning()
+
+    if (!childChat) throw new Error("Child chat not created")
+
+    await db.insert(dialogs).values({
+      chatId: childChat.id,
+      userId: anchorAuthor.id,
+      followMode: "unfollowed",
+      chatListHidden: true,
+    })
+
+    await sendMessage(
+      {
+        peerId: {
+          type: { oneofKind: "chat", chat: { chatId: BigInt(childChat.id) } },
+        },
+        message: "starting reply thread after anchor opt out",
+      },
+      testUtils.functionContext({ userId: owner.id, sessionId: 1 }),
+    )
+
+    const [anchorAuthorDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, anchorAuthor.id)))
+      .limit(1)
+
+    expect(anchorAuthorDialog?.followMode).toBe("unfollowed")
+    expect(anchorAuthorDialog?.chatListHidden).toBe(true)
+
+    const [senderDialog] = await db
+      .select()
+      .from(dialogs)
+      .where(and(eq(dialogs.chatId, childChat.id), eq(dialogs.userId, owner.id)))
+      .limit(1)
+
+    expect(senderDialog?.followMode).toBe("following")
+  })
+})

@@ -1,0 +1,200 @@
+import { Log } from "@in/server/utils/log"
+import { REQUIRED_PRODUCTION_VARIABLES } from "@in/server/envRequirements"
+
+export const NODE_ENV = process.env.NODE_ENV ?? "development"
+export const isProd = NODE_ENV === "production"
+export const isDev = NODE_ENV === "development"
+export const isTest = NODE_ENV === "test"
+
+export const PORT = Number(process.env["PORT"] ?? 8000)
+export const API_BASE_URL = isProd ? "https://api.inline.chat" : `http://localhost:${PORT}`
+
+export const EMAIL_PROVIDER: "SES" | "RESEND" = process.env["EMAIL_PROVIDER"] === "SES" ? "SES" : "RESEND"
+export const SEND_EMAIL = process.env["SEND_EMAIL"]
+/** @deprecated Signup admission belongs to the async serverConfig resolver. */
+export const isInviteCodesRequired = () => {
+  const value = process.env["INVITE_CODES_REQUIRED"]?.trim().toLowerCase()
+  return value === "true" || value === "1"
+}
+
+const rawDatabaseUrl = process.env["DATABASE_URL"]
+const rawTestDatabaseUrl = process.env["TEST_DATABASE_URL"]
+
+const ensureLocalDatabaseUrl = (databaseUrl: string): string => {
+  let parsed: URL
+  try {
+    parsed = new URL(databaseUrl)
+  } catch {
+    throw new Error("Database URL must be a valid URL.")
+  }
+
+  const host = parsed.hostname
+  if (host !== "localhost" && host !== "127.0.0.1") {
+    throw new Error(`Refusing to use database URL with non-local host '${host}'.`)
+  }
+
+  return databaseUrl
+}
+
+export const DATABASE_URL = (() => {
+  if (isProd) {
+    return rawDatabaseUrl
+  }
+
+  if (isTest) {
+    // Tests must never run against remote DBs. Prefer TEST_DATABASE_URL when present,
+    // otherwise fall back to DATABASE_URL (so local dev doesn't need extra env for tests).
+    const baseUrl = rawTestDatabaseUrl ?? rawDatabaseUrl
+    if (!baseUrl) {
+      throw new Error("DATABASE_URL (or TEST_DATABASE_URL) is required when NODE_ENV=test.")
+    }
+    return ensureLocalDatabaseUrl(baseUrl)
+  }
+
+  // Non-test environments should never accidentally use TEST_DATABASE_URL.
+  if (!rawDatabaseUrl) {
+    throw new Error("DATABASE_URL is required when NODE_ENV is not test/production.")
+  }
+  return rawDatabaseUrl
+})() as string
+
+const ENCRYPTION_KEY = process.env["ENCRYPTION_KEY"]
+const ENCRYPTION_KEY_HEX_RE = /^[a-fA-F0-9]{64}$/
+
+// REQUIRED FOR PROD
+export const AMAZON_ACCESS_KEY = process.env["AMAZON_ACCESS_KEY"] as string
+export const AMAZON_SECRET_ACCESS_KEY = process.env["AMAZON_SECRET_ACCESS_KEY"] as string
+export const SES_ACCESS_KEY_ID = process.env["SES_ACCESS_KEY_ID"] as string
+export const SES_SECRET_ACCESS_KEY = process.env["SES_SECRET_ACCESS_KEY"] as string
+export const SES_REGION = process.env["SES_REGION"] ?? "eu-central-1"
+export const TWILIO_AUTH_TOKEN = process.env["TWILIO_AUTH_TOKEN"] as string
+export const TWILIO_SID = process.env["TWILIO_SID"] as string
+export const TWILIO_VERIFY_SERVICE_SID = process.env["TWILIO_VERIFY_SERVICE_SID"] as string
+export const SENTRY_DSN = process.env["SENTRY_DSN"] as string
+export const RESEND_API_KEY = process.env["RESEND_API_KEY"] as string
+
+export const APN_KEY = process.env["APN_KEY"] as string
+export const APN_KEY_ID = process.env["APN_KEY_ID"] as string
+export const APN_TEAM_ID = process.env["APN_TEAM_ID"] as string
+
+export const R2_ACCESS_KEY_ID = process.env["R2_ACCESS_KEY_ID"] as string
+export const R2_SECRET_ACCESS_KEY = process.env["R2_SECRET_ACCESS_KEY"] as string
+export const R2_BUCKET = process.env["R2_BUCKET"] as string
+export const R2_ENDPOINT = process.env["R2_ENDPOINT"] as string
+export const FILES_PROXY_SIGNING_KEY = process.env["FILES_PROXY_SIGNING_KEY"]
+
+export const PRELUDE_API_TOKEN = process.env["PRELUDE_API_TOKEN"] as string
+
+// OPTIONAL
+export const IPINFO_TOKEN = process.env["IPINFO_TOKEN"]
+export const OPENAI_API_KEY = process.env["OPENAI_API_KEY"]
+export const ANTHROPIC_API_KEY = process.env["ANTHROPIC_API_KEY"]
+export const INLINE_ALERTS_BOT_TOKEN = process.env["INLINE_ALERTS_BOT_TOKEN"]
+export const INLINE_ALERTS_CHAT_ID = process.env["INLINE_ALERTS_CHAT_ID"]
+export const ADMIN_PUBLIC_API_ORIGIN = process.env["ADMIN_PUBLIC_API_ORIGIN"]
+export const DEMO_EMAIL = process.env["DEMO_EMAIL"]
+export const DEMO_CODE = process.env["DEMO_CODE"]
+export const DEMO_EMAIL2 = process.env["DEMO_EMAIL2"]
+export const DEMO_CODE2 = process.env["DEMO_CODE2"]
+
+export const LINEAR_CLIENT_ID = process.env["LINEAR_CLIENT_ID"]
+export const LINEAR_CLIENT_SECRET = process.env["LINEAR_CLIENT_SECRET"]
+export const LINEAR_CLIENT_ID_DEV = process.env["LINEAR_CLIENT_ID_DEV"]
+export const LINEAR_CLIENT_SECRET_DEV = process.env["LINEAR_CLIENT_SECRET_DEV"]
+export const HARDCODED_TRANSLATION_CONTEXT = process.env["HARDCODED_TRANSLATION_CONTEXT"]
+
+export const NOTION_CLIENT_ID = process.env["NOTION_CLIENT_ID"]
+export const NOTION_CLIENT_SECRET = process.env["NOTION_CLIENT_SECRET"]
+
+export const NOTION_CLIENT_ID_DEV = process.env["NOTION_CLIENT_ID_DEV"]
+export const NOTION_CLIENT_SECRET_DEV = process.env["NOTION_CLIENT_SECRET_DEV"]
+
+export const LIVEKIT_URL = process.env["LIVEKIT_URL"]
+export const LIVEKIT_API_KEY = process.env["LIVEKIT_API_KEY"]
+export const LIVEKIT_API_SECRET = process.env["LIVEKIT_API_SECRET"]
+export const LIVEKIT_PROVIDER = process.env["LIVEKIT_PROVIDER"] ?? "self_hosted"
+// Coordinate activation across the server fleet and upgraded Apple clients.
+// Do not turn this off with live transferred calls: doing so restores legacy
+// unfenced behavior. Production process environment remains immutable.
+export const isGridCallTransferEnabled = () => {
+  const value = process.env["GRID_CALL_TRANSFER_ENABLED"]?.trim().toLowerCase()
+  return value === "true" || value === "1"
+}
+export const LIVEKIT_CLOUD_URL = process.env["LIVEKIT_CLOUD_URL"]
+export const LIVEKIT_CLOUD_API_KEY = process.env["LIVEKIT_CLOUD_API_KEY"]
+export const LIVEKIT_CLOUD_API_SECRET = process.env["LIVEKIT_CLOUD_API_SECRET"]
+export const LIVEKIT_SELF_HOSTED_URL = process.env["LIVEKIT_SELF_HOSTED_URL"]
+export const LIVEKIT_SELF_HOSTED_API_KEY = process.env["LIVEKIT_SELF_HOSTED_API_KEY"]
+export const LIVEKIT_SELF_HOSTED_API_SECRET = process.env["LIVEKIT_SELF_HOSTED_API_SECRET"]
+
+// Check required variables
+for (const variable of REQUIRED_PRODUCTION_VARIABLES) {
+  if (!process.env[variable]) {
+    if (isProd) {
+      throw new Error(`Required production variable ${variable} is not defined.`)
+    } else if (!isTest) {
+      Log.shared.warn(`Env variable ${variable} is not defined.`)
+    }
+  }
+}
+
+if (ENCRYPTION_KEY) {
+  if (!ENCRYPTION_KEY_HEX_RE.test(ENCRYPTION_KEY)) {
+    if (isProd) {
+      throw new Error("ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes).")
+    } else if (!isTest) {
+      Log.shared.warn("ENCRYPTION_KEY should be exactly 64 hex characters (32 bytes).")
+    }
+  }
+}
+
+// Check optional variables
+const optionalVariables = [
+  "TWILIO_AUTH_TOKEN",
+  "TWILIO_SID",
+  "TWILIO_VERIFY_SERVICE_SID",
+  "SENTRY_DSN",
+  "IPINFO_TOKEN",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "INLINE_ALERTS_BOT_TOKEN",
+  "INLINE_ALERTS_CHAT_ID",
+  "LINEAR_CLIENT_ID",
+  "LINEAR_CLIENT_SECRET",
+  "HARDCODED_TRANSLATION_CONTEXT",
+  "NOTION_CLIENT_ID",
+  "NOTION_CLIENT_SECRET",
+  "FILES_PROXY_SIGNING_KEY",
+]
+
+optionalVariables.forEach((variable) => {
+  if (!process.env[variable] && isProd) {
+    Log.shared.warn(`${variable} env variable is not defined.`)
+  }
+})
+
+const liveKitProvider = LIVEKIT_PROVIDER.trim().toLowerCase() || "self_hosted"
+const legacyLiveKitVariables = ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"]
+const selectedLiveKitVariables = liveKitProvider === "cloud"
+  ? ["LIVEKIT_CLOUD_URL", "LIVEKIT_CLOUD_API_KEY", "LIVEKIT_CLOUD_API_SECRET"]
+  : liveKitProvider === "self_hosted"
+    ? ["LIVEKIT_SELF_HOSTED_URL", "LIVEKIT_SELF_HOSTED_API_KEY", "LIVEKIT_SELF_HOSTED_API_SECRET"]
+    : []
+const selectedLiveKitConfigured = selectedLiveKitVariables.length > 0
+  && selectedLiveKitVariables.every((variable) => !!process.env[variable]?.trim())
+const legacyLiveKitConfigured = legacyLiveKitVariables.every((variable) => !!process.env[variable]?.trim())
+
+if (!isTest && selectedLiveKitVariables.length === 0) {
+  Log.shared.warn("LIVEKIT_PROVIDER must be either 'cloud' or 'self_hosted'.")
+}
+if (!isTest && selectedLiveKitVariables.length > 0 && !selectedLiveKitConfigured && legacyLiveKitConfigured) {
+  Log.shared.warn(
+    `LiveKit ${liveKitProvider} variables are incomplete; falling back to legacy LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET.`,
+  )
+} else if (isProd && !selectedLiveKitConfigured) {
+  for (const variable of selectedLiveKitVariables) {
+    if (!process.env[variable]?.trim()) {
+      Log.shared.warn(`${variable} selected by LIVEKIT_PROVIDER is not defined.`)
+    }
+  }
+}

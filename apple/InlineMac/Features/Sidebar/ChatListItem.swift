@@ -1,0 +1,190 @@
+import Foundation
+import InlineKit
+import Translation
+
+/// Common presentation model for sidebar chat- and contact-like rows.
+struct ChatListItem: Hashable, Identifiable {
+  enum Kind: String, Hashable, Sendable {
+    case thread
+    case contact
+  }
+
+  enum BadgeState: Hashable {
+    case none
+    case unread
+    case pinned
+  }
+
+  struct Identifier: Hashable, Sendable {
+    let kind: Kind
+    let rawValue: Int64
+  }
+
+  let kind: Kind
+  let dialog: Dialog?
+  let chat: Chat?
+  let user: UserInfo?
+  let member: Member?
+  let lastMessage: EmbeddedMessage?
+  let spaceId: Int64?
+  let titleOverride: String?
+  let parentTitle: String?
+
+  var id: Identifier
+
+  var peerId: Peer? {
+    if let dialog {
+      return dialog.peerId
+    }
+    if let member {
+      return .user(id: member.userId)
+    }
+    if let user {
+      return .user(id: user.id)
+    }
+    return nil
+  }
+
+  var displayTitle: String {
+    user?.user.firstName ??
+      user?.user.lastName ??
+      user?.user.username ??
+      titleOverride ??
+      chat?.humanReadableTitle ??
+      "Chat"
+  }
+
+  var hasUnread: Bool {
+    guard let dialog else { return false }
+    return (dialog.unreadCount ?? 0) > 0 || (dialog.unreadMark == true)
+  }
+
+  var isSpaceScoped: Bool {
+    spaceId != nil || dialog?.spaceId != nil || chat?.spaceId != nil
+  }
+
+  var badgeState: BadgeState {
+    if hasUnread {
+      return .unread
+    }
+    if dialog?.pinned == true {
+      return .pinned
+    }
+    return .none
+  }
+
+  init(chatItem: HomeChatItem, titleOverride: String? = nil, parentTitle: String? = nil) {
+    kind = .thread
+    dialog = chatItem.dialog
+    chat = chatItem.chat
+    user = chatItem.user
+    member = nil
+    lastMessage = chatItem.lastMessage
+    spaceId = chatItem.dialog.spaceId ?? chatItem.chat?.spaceId ?? chatItem.space?.id
+    self.titleOverride = titleOverride
+    self.parentTitle = parentTitle
+    id = Identifier(kind: .thread, rawValue: chatItem.id)
+  }
+
+  init(member: Member, user: UserInfo?, dialog: Dialog? = nil) {
+    kind = .contact
+    self.dialog = dialog
+    chat = nil
+    self.user = user
+    self.member = member
+    lastMessage = nil
+    spaceId = member.spaceId
+    titleOverride = nil
+    parentTitle = nil
+    id = Identifier(kind: .contact, rawValue: member.id)
+  }
+
+  init(spaceContactItem: SpaceChatItem, titleOverride: String? = nil, parentTitle: String? = nil) {
+    kind = .contact
+    dialog = spaceContactItem.dialog
+    chat = spaceContactItem.chat
+    user = spaceContactItem.userInfo
+    member = nil
+    if let message = spaceContactItem.message {
+      lastMessage = EmbeddedMessage(
+        message: message,
+        senderInfo: spaceContactItem.from,
+        translations: spaceContactItem.translations,
+        photoInfo: spaceContactItem.photoInfo,
+        videoInfo: nil,
+        document: spaceContactItem.document
+      )
+    } else {
+      lastMessage = nil
+    }
+    spaceId = spaceContactItem.dialog.spaceId
+    self.titleOverride = titleOverride
+    self.parentTitle = parentTitle
+    id = Identifier(kind: .contact, rawValue: spaceContactItem.id)
+  }
+
+  init(spaceChatItem: SpaceChatItem, titleOverride: String? = nil, parentTitle: String? = nil) {
+    kind = .thread
+    dialog = spaceChatItem.dialog
+    chat = spaceChatItem.chat
+    user = spaceChatItem.userInfo
+    member = nil
+    if let message = spaceChatItem.message {
+      lastMessage = EmbeddedMessage(
+        message: message,
+        senderInfo: spaceChatItem.from,
+        translations: spaceChatItem.translations,
+        photoInfo: spaceChatItem.photoInfo,
+        videoInfo: nil,
+        document: spaceChatItem.document
+      )
+    } else {
+      lastMessage = nil
+    }
+    spaceId = spaceChatItem.dialog.spaceId
+    self.titleOverride = titleOverride
+    self.parentTitle = parentTitle
+    id = Identifier(kind: .thread, rawValue: spaceChatItem.id)
+  }
+}
+
+extension ChatListItem {
+  var draftPreviewText: String? {
+    guard let peerId else { return nil }
+    guard let draftText = Drafts2.shared.cached(peer: peerId)?.text ?? dialog?.draftMessage?.text else { return nil }
+    let normalizedText = draftText
+      .components(separatedBy: .newlines)
+      .joined(separator: " ")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard normalizedText.isEmpty == false else { return nil }
+    return "Draft: \(normalizedText)"
+  }
+
+  var sidebarLastMessagePreviewText: String {
+    guard let lastMessage else { return "" }
+    let messageText = lastMessage.displayTextForLastMessage
+      ?? lastMessage.documentPreviewText
+      ?? lastMessage.message.stringRepresentationPlain
+    guard kind == .thread, chat?.type == .thread else { return messageText }
+    guard let sender = lastMessage.senderInfo?.user.shortDisplayName, sender.isEmpty == false else {
+      return messageText
+    }
+    return "\(sender): \(messageText)"
+  }
+
+  var sidebarBasePreviewText: String {
+    draftPreviewText ?? sidebarLastMessagePreviewText
+  }
+}
+
+private extension EmbeddedMessage {
+  var documentPreviewText: String? {
+    guard message.documentId != nil else { return nil }
+    guard let fileName = document?.fileName?.trimmingCharacters(in: .whitespacesAndNewlines),
+          fileName.isEmpty == false
+    else {
+      return nil
+    }
+    return fileName.replacingOccurrences(of: "\n", with: " ")
+  }
+}

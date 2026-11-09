@@ -1,0 +1,575 @@
+import Foundation
+import TextProcessing
+import Testing
+
+@testable import InlineUI
+
+@Suite("ComposeInteractionState")
+struct ComposeInteractionStateTests {
+  @Test("plain text paste replaces the selected range and advances the cursor")
+  func plainTextPasteReplacesSelection() async throws {
+    let result = ComposePlainTextPaste.apply(
+      currentText: "reply old text",
+      selectedRange: NSRange(location: 6, length: 3),
+      pastedText: "new"
+    )
+
+    #expect(result.text == "reply new text")
+    #expect(result.selectedRange == NSRange(location: 9, length: 0))
+  }
+
+  @Test("plain text paste clamps invalid ranges before applying")
+  func plainTextPasteClampsOutOfBoundsRange() async throws {
+    let result = ComposePlainTextPaste.apply(
+      currentText: "hello",
+      selectedRange: NSRange(location: 99, length: 4),
+      pastedText: " world"
+    )
+
+    #expect(result.text == "hello world")
+    #expect(result.selectedRange == NSRange(location: 11, length: 0))
+  }
+
+  @Test("plain text paste uses UTF-16 cursor math for emoji content")
+  func plainTextPasteHandlesEmojiSelection() async throws {
+    let nsText = "Hi 👋"
+    let result = ComposePlainTextPaste.apply(
+      currentText: nsText,
+      selectedRange: NSRange(location: 3, length: 2),
+      pastedText: "🙂"
+    )
+
+    #expect(result.text == "Hi 🙂")
+    #expect(result.selectedRange == NSRange(location: 5, length: 0))
+  }
+
+  @Test("link paste accepts a full URL")
+  func linkPasteAcceptsFullURL() async throws {
+    let urlString = ComposeLinkPaste.normalizedURLString(from: " https://inline.chat/docs?tab=api ")
+
+    #expect(urlString == "https://inline.chat/docs?tab=api")
+  }
+
+  @Test("link paste moves the cursor after the linked selection")
+  func linkPasteMovesCursorAfterLinkedSelection() async throws {
+    let selection = ComposeLinkPaste.selectionAfterApplyingLink(to: NSRange(location: 17, length: 2))
+
+    #expect(selection == NSRange(location: 19, length: 0))
+  }
+
+  @Test("link paste normalizes a bare domain")
+  func linkPasteNormalizesBareDomain() async throws {
+    let urlString = ComposeLinkPaste.normalizedURLString(from: "inline.chat/docs")
+
+    #expect(urlString == "https://inline.chat/docs")
+  }
+
+  @Test("link paste accepts app deep links")
+  func linkPasteAcceptsAppDeepLinks() async throws {
+    let urlString = ComposeLinkPaste.normalizedURLString(from: "omnifocus:///task/psa9Li_Hd3r")
+
+    #expect(urlString == "omnifocus:///task/psa9Li_Hd3r")
+  }
+
+  @Test("link paste rejects surrounding prose")
+  func linkPasteRejectsSurroundingProse() async throws {
+    let urlString = ComposeLinkPaste.normalizedURLString(from: "go to https://inline.chat")
+
+    #expect(urlString == nil)
+  }
+
+  @Test("link paste rejects non-web URLs")
+  func linkPasteRejectsNonWebURLs() async throws {
+    let urlString = ComposeLinkPaste.normalizedURLString(from: "file:///tmp/test.png")
+
+    #expect(urlString == nil)
+  }
+
+  @Test("visible but disabled send button is not treated as fully visible")
+  func sendButtonVisibleButDisabledNeedsRecovery() async throws {
+    let isFullyVisible = ComposeSendButtonState.isFullyVisible(
+      isButtonVisible: true,
+      isEnabled: false,
+      isUserInteractionEnabled: false,
+      alpha: 1.0
+    )
+
+    #expect(isFullyVisible == false)
+  }
+
+  @Test("fully interactive send button is treated as fully visible")
+  func sendButtonFullyVisibleWhenInteractive() async throws {
+    let isFullyVisible = ComposeSendButtonState.isFullyVisible(
+      isButtonVisible: true,
+      isEnabled: true,
+      isUserInteractionEnabled: true,
+      alpha: 1.0
+    )
+
+    #expect(isFullyVisible == true)
+  }
+
+  @Test("hide completion is ignored after a newer show wins")
+  func sendButtonHideCompletionSkipsVisibleButton() async throws {
+    let shouldFinalize = ComposeSendButtonState.shouldFinalizeHide(
+      finished: true,
+      isButtonVisible: true
+    )
+
+    #expect(shouldFinalize == false)
+  }
+
+  @Test("hide completion disables when the button stayed hidden")
+  func sendButtonHideCompletionFinalizesWhenStillHidden() async throws {
+    let shouldFinalize = ComposeSendButtonState.shouldFinalizeHide(
+      finished: true,
+      isButtonVisible: false
+    )
+
+    #expect(shouldFinalize == true)
+  }
+
+  @Test("hide completion only disables when the hide animation really finished")
+  func sendButtonHideCompletionRequiresFinishedAnimation() async throws {
+    let shouldFinalize = ComposeSendButtonState.shouldFinalizeHide(
+      finished: false,
+      isButtonVisible: false
+    )
+
+    #expect(shouldFinalize == false)
+  }
+
+  @Test("ready attachments force the send button visible immediately")
+  func sendButtonShowsImmediatelyForReadyAttachments() async throws {
+    let shouldShowImmediately = ComposeSendButtonState.shouldShowImmediatelyForReadyAttachments(
+      hasAttachments: true,
+      hasPendingVideos: false,
+      canSend: true
+    )
+
+    #expect(shouldShowImmediately == true)
+  }
+
+  @Test("pending videos do not force immediate send button visibility")
+  func sendButtonDoesNotShowImmediatelyForPendingVideos() async throws {
+    let shouldShowImmediately = ComposeSendButtonState.shouldShowImmediatelyForReadyAttachments(
+      hasAttachments: true,
+      hasPendingVideos: true,
+      canSend: false
+    )
+
+    #expect(shouldShowImmediately == false)
+  }
+
+  @Test("attachment sends are blocked while uploads are already in flight")
+  func sendEligibilityBlocksAttachmentSendDuringUpload() async throws {
+    let canSend = ComposeSendEligibility.canSend(
+      hasText: true,
+      hasAttachments: true,
+      hasForward: false,
+      hasPendingVideos: false,
+      hasActiveAttachmentUploads: true
+    )
+
+    #expect(canSend == false)
+  }
+
+  @Test("attachment-only send is allowed while pending video preprocessing is in progress")
+  func sendEligibilityAllowsAttachmentOnlyDuringPendingMedia() async throws {
+    let canSend = ComposeSendEligibility.canSend(
+      hasText: false,
+      hasAttachments: false,
+      hasForward: false,
+      hasPendingVideos: true,
+      hasActiveAttachmentUploads: false
+    )
+
+    #expect(canSend == true)
+  }
+
+  @Test("attachment-only send is blocked while uploads are already in flight")
+  func sendEligibilityBlocksAttachmentOnlyDuringUpload() async throws {
+    let canSend = ComposeSendEligibility.canSend(
+      hasText: false,
+      hasAttachments: true,
+      hasForward: false,
+      hasPendingVideos: false,
+      hasActiveAttachmentUploads: true
+    )
+
+    #expect(canSend == false)
+  }
+
+  @Test("compose does not prestart attachment uploads")
+  func attachmentUploadsDoNotStartInCompose() async throws {
+    let shouldStartUploads = ComposeAttachmentUploadBehavior.shouldStartUploadsInCompose()
+
+    #expect(shouldStartUploads == false)
+  }
+
+  @Test("pending video only can be sent")
+  func sendEligibilityAllowsPendingVideoOnly() async throws {
+    let canSend = ComposeSendEligibility.canSend(
+      hasText: false,
+      hasAttachments: false,
+      hasForward: false,
+      hasPendingVideos: true,
+      hasActiveAttachmentUploads: false
+    )
+
+    #expect(canSend == true)
+  }
+
+  @Test("pending video sends do not fall back to text only")
+  func sendEligibilityDoesNotUseTextOnlyModeWhenPendingMediaIsNotReady() async throws {
+    let shouldSendTextOnly = ComposeSendEligibility.shouldSendTextOnly(
+      hasText: true,
+      hasPendingVideos: true,
+      hasActiveAttachmentUploads: false
+    )
+
+    #expect(shouldSendTextOnly == false)
+  }
+
+  @Test("text only mode is not used when uploads are already in flight")
+  func sendEligibilityDoesNotUseTextOnlyModeDuringUpload() async throws {
+    let shouldSendTextOnly = ComposeSendEligibility.shouldSendTextOnly(
+      hasText: true,
+      hasPendingVideos: false,
+      hasActiveAttachmentUploads: true
+    )
+
+    #expect(shouldSendTextOnly == false)
+  }
+
+  @Test("text only mode is not used when media is ready")
+  func sendEligibilityDoesNotUseTextOnlyModeWhenMediaReady() async throws {
+    let shouldSendTextOnly = ComposeSendEligibility.shouldSendTextOnly(
+      hasText: true,
+      hasPendingVideos: false,
+      hasActiveAttachmentUploads: false
+    )
+
+    #expect(shouldSendTextOnly == false)
+  }
+
+  @Test("voice recording can start only from an idle empty composer")
+  func voiceRecordingCanStartFromIdleEmptyComposer() async throws {
+    let canStart = ComposeVoiceRecordingEligibility.canStart(
+      hasText: false,
+      hasAttachments: false,
+      hasPendingVideos: false,
+      isEditing: false,
+      isForwarding: false,
+      hasPeer: true,
+      hasChat: true,
+      isVoiceActive: false
+    )
+
+    #expect(canStart == true)
+  }
+
+  @Test("voice recording is hidden when regular compose content exists")
+  func voiceRecordingCannotStartWithRegularComposeContent() async throws {
+    #expect(ComposeVoiceRecordingEligibility.canStart(
+      hasText: true,
+      hasAttachments: false,
+      hasPendingVideos: false,
+      isEditing: false,
+      isForwarding: false,
+      hasPeer: true,
+      hasChat: true,
+      isVoiceActive: false
+    ) == false)
+
+    #expect(ComposeVoiceRecordingEligibility.canStart(
+      hasText: false,
+      hasAttachments: true,
+      hasPendingVideos: false,
+      isEditing: false,
+      isForwarding: false,
+      hasPeer: true,
+      hasChat: true,
+      isVoiceActive: false
+    ) == false)
+
+    #expect(ComposeVoiceRecordingEligibility.canStart(
+      hasText: false,
+      hasAttachments: false,
+      hasPendingVideos: true,
+      isEditing: false,
+      isForwarding: false,
+      hasPeer: true,
+      hasChat: true,
+      isVoiceActive: false
+    ) == false)
+  }
+
+  @Test("voice recording is blocked by mode state")
+  func voiceRecordingCannotStartWhenModeDisallowsIt() async throws {
+    #expect(ComposeVoiceRecordingEligibility.canStart(
+      hasText: false,
+      hasAttachments: false,
+      hasPendingVideos: false,
+      isEditing: true,
+      isForwarding: false,
+      hasPeer: true,
+      hasChat: true,
+      isVoiceActive: false
+    ) == false)
+
+    #expect(ComposeVoiceRecordingEligibility.canStart(
+      hasText: false,
+      hasAttachments: false,
+      hasPendingVideos: false,
+      isEditing: false,
+      isForwarding: true,
+      hasPeer: true,
+      hasChat: true,
+      isVoiceActive: false
+    ) == false)
+
+    #expect(ComposeVoiceRecordingEligibility.canStart(
+      hasText: false,
+      hasAttachments: false,
+      hasPendingVideos: false,
+      isEditing: false,
+      isForwarding: false,
+      hasPeer: false,
+      hasChat: true,
+      isVoiceActive: false
+    ) == false)
+
+    #expect(ComposeVoiceRecordingEligibility.canStart(
+      hasText: false,
+      hasAttachments: false,
+      hasPendingVideos: false,
+      isEditing: false,
+      isForwarding: false,
+      hasPeer: true,
+      hasChat: true,
+      isVoiceActive: true
+    ) == false)
+  }
+
+  @Test("trailing control prefers send over voice when compose can send")
+  func trailingControlPrefersSendOverVoice() async throws {
+    let state = ComposeTrailingControlState.resolve(
+      canSend: true,
+      canStartVoiceRecording: true,
+      isVoiceActive: false
+    )
+
+    #expect(state == .send)
+  }
+
+  @Test("trailing control shows voice only when send is unavailable")
+  func trailingControlShowsVoiceOnlyWhenSendUnavailable() async throws {
+    let state = ComposeTrailingControlState.resolve(
+      canSend: false,
+      canStartVoiceRecording: true,
+      isVoiceActive: false
+    )
+
+    #expect(state == .voice)
+  }
+
+  @Test("trailing control hides regular controls while voice is active")
+  func trailingControlHidesRegularControlsWhileVoiceActive() async throws {
+    let state = ComposeTrailingControlState.resolve(
+      canSend: true,
+      canStartVoiceRecording: true,
+      isVoiceActive: true
+    )
+
+    #expect(state == .none)
+  }
+
+  @Test("sending staged attachments resets compose without animation")
+  func sendResetDoesNotAnimateAfterSendingAttachments() async throws {
+    let shouldAnimateReset = ComposeResetBehavior.shouldAnimateHeightResetAfterSend(
+      hadAttachments: true
+    )
+
+    #expect(shouldAnimateReset == false)
+  }
+
+  @Test("text-only reset keeps the existing height animation behavior")
+  func sendResetCanAnimateWithoutAttachments() async throws {
+    let shouldAnimateReset = ComposeResetBehavior.shouldAnimateHeightResetAfterSend(
+      hadAttachments: false
+    )
+
+    #expect(shouldAnimateReset == true)
+  }
+
+  @Test("sending staged attachments hides the send button immediately")
+  func sendResetHidesButtonImmediatelyAfterSendingAttachments() async throws {
+    let shouldHideImmediately = ComposeResetBehavior.shouldHideSendButtonImmediatelyAfterSend(
+      hadAttachments: true
+    )
+
+    #expect(shouldHideImmediately == true)
+  }
+
+  @Test("pending video send is queued until preprocessing completes")
+  func pendingMediaSendQueuesWhileVideosArePending() async throws {
+    let shouldQueue = ComposePendingMediaSendBehavior.shouldQueueSendUntilPendingVideosAreReady(
+      hasPendingVideos: true
+    )
+
+    #expect(shouldQueue == true)
+  }
+
+  @Test("ready media sends immediately without queuing")
+  func pendingMediaSendDoesNotQueueWithoutPendingVideos() async throws {
+    let shouldQueue = ComposePendingMediaSendBehavior.shouldQueueSendUntilPendingVideosAreReady(
+      hasPendingVideos: false
+    )
+
+    #expect(shouldQueue == false)
+  }
+
+  @Test("pending media state sends exactly once when ready")
+  func pendingMediaStateSendsExactlyOnceWhenReady() {
+    var state = ComposePendingMediaSendState()
+
+    let didBeginWaiting = state.beginWaiting()
+    let didSendWhilePending = state.consumeSendIfReady(hasPendingMedia: true)
+    let didSendWhenReady = state.consumeSendIfReady(hasPendingMedia: false)
+    let didSendTwice = state.consumeSendIfReady(hasPendingMedia: false)
+
+    #expect(didBeginWaiting)
+    #expect(!didSendWhilePending)
+    #expect(didSendWhenReady)
+    #expect(!didSendTwice)
+  }
+
+  @Test("cancelled pending media state cannot auto-send")
+  func cancelledPendingMediaStateCannotAutoSend() {
+    var state = ComposePendingMediaSendState()
+
+    let didBeginWaiting = state.beginWaiting()
+    let didCancel = state.cancel()
+    let didSendAfterCancellation = state.consumeSendIfReady(hasPendingMedia: false)
+
+    #expect(didBeginWaiting)
+    #expect(didCancel)
+    #expect(!didSendAfterCancellation)
+  }
+
+  @Test("repeated pending media send tap does not create another wait")
+  func repeatedPendingMediaSendTapDoesNotCreateAnotherWait() {
+    var state = ComposePendingMediaSendState()
+
+    let didBeginWaiting = state.beginWaiting()
+    let didBeginWaitingAgain = state.beginWaiting()
+
+    #expect(didBeginWaiting)
+    #expect(!didBeginWaitingAgain)
+    #expect(state.isAwaitingSend)
+  }
+
+  @Test("pending media watchdog reaches timeout", .timeLimit(.minutes(1)))
+  @MainActor
+  func pendingMediaWatchdogReachesTimeout() async {
+    let probe = PendingMediaWatchdogProbe()
+    let sleeper = ManualWatchdogSleeper()
+    let watchdog = ComposePendingMediaSendWatchdog(
+      timeout: .milliseconds(5),
+      sleep: { try await sleeper.sleep($0) }
+    )
+
+    watchdog.schedule {
+      probe.recordFire()
+    }
+    let requestedTimeout = await sleeper.started.next()
+
+    #expect(requestedTimeout == .milliseconds(5))
+    #expect(probe.fireCount == 0)
+
+    sleeper.elapse()
+    await probe.fired.next()
+    // Give a duplicate fire the chance to show up before asserting "exactly once".
+    for _ in 0..<5 { await Task.yield() }
+
+    #expect(probe.fireCount == 1)
+  }
+
+  @Test("cancelled pending media watchdog does not fire", .timeLimit(.minutes(1)))
+  @MainActor
+  func cancelledPendingMediaWatchdogDoesNotFire() async {
+    let probe = PendingMediaWatchdogProbe()
+    let sleeper = ManualWatchdogSleeper()
+    let watchdog = ComposePendingMediaSendWatchdog(
+      timeout: .milliseconds(5),
+      sleep: { try await sleeper.sleep($0) }
+    )
+
+    watchdog.schedule {
+      probe.recordFire()
+    }
+    await sleeper.started.next()
+    watchdog.cancel()
+    // The cancelled sleep throws, which ends the watchdog task without reaching the callback.
+    await sleeper.cancelled.next()
+    for _ in 0..<5 { await Task.yield() }
+
+    #expect(probe.fireCount == 0)
+  }
+}
+
+@MainActor
+private final class PendingMediaWatchdogProbe {
+  private(set) var fireCount = 0
+  let fired = TestSignal<Void>()
+
+  func recordFire() {
+    fireCount += 1
+    fired.send(())
+  }
+}
+
+/// Stands in for `Task.sleep` so a test decides when the watchdog timeout "elapses" instead of
+/// racing the real clock. Like `Task.sleep`, it throws when the sleeping task is cancelled.
+private final class ManualWatchdogSleeper: Sendable {
+  let started = TestSignal<Duration>()
+  let cancelled = TestSignal<Void>()
+  private let elapsed = TestSignal<Void>()
+
+  func sleep(_ duration: Duration) async throws {
+    started.send(duration)
+    await elapsed.next()
+    if Task.isCancelled {
+      cancelled.send(())
+      throw CancellationError()
+    }
+  }
+
+  func elapse() {
+    elapsed.send(())
+  }
+}
+
+/// A one-shot signal: `send` may happen before or after `next`. Wakes with nil if the waiting
+/// task is cancelled. Each signal supports a single `next()`.
+private struct TestSignal<Value: Sendable>: Sendable {
+  private let stream: AsyncStream<Value>
+  private let continuation: AsyncStream<Value>.Continuation
+
+  init() {
+    (stream, continuation) = AsyncStream.makeStream()
+  }
+
+  func send(_ value: Value) {
+    continuation.yield(value)
+  }
+
+  @discardableResult
+  func next() async -> Value? {
+    for await value in stream {
+      return value
+    }
+    return nil
+  }
+}

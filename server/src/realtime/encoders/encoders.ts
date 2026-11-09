@@ -1,0 +1,43 @@
+import { encodeFullMessage, encodeMessage } from "@in/server/realtime/encoders/encodeMessage"
+import { encodePhoto, encodePhotoLegacy } from "@in/server/realtime/encoders/encodePhoto"
+import { encodeOutputPeerFromChat, encodePeer, encodePeerFromInputPeer } from "@in/server/realtime/encoders/encodePeer"
+import { encodeUser } from "@in/server/realtime/encoders/encodeUser"
+import {
+  encodeChat,
+  encodeChatForUser,
+  encodeChatForUsers,
+  encodeChatsForUser,
+} from "@in/server/realtime/encoders/encodeChat"
+import { encodeMember } from "@in/server/realtime/encoders/encodeMember"
+import { encodeSpace } from "@in/server/realtime/encoders/encodeSpace"
+import { encodeDialog } from "@in/server/realtime/encoders/encodeDialog"
+import { encodeTranslation, encodeUnencryptedTranslation } from "@in/server/realtime/encoders/encodeTranslation"
+import { encodeChatParticipant } from "./encodeChatParticipant"
+import { encodeUserSettings } from "./encodeUserSettings"
+import { encodeVoice } from "./encodeVoice"
+import { encodeBotAvatar } from "./encodeBotAvatar"
+import { encodeDialogFolder } from "./encodeDialogFolder"
+export const Encoders = {
+  photoLegacy: encodePhotoLegacy,
+  message: encodeMessage,
+  fullMessage: encodeFullMessage,
+  peer: encodePeer,
+  peerFromInputPeer: encodePeerFromInputPeer,
+  peerFromChat: encodeOutputPeerFromChat,
+  user: encodeUser,
+  chat: encodeChat,
+  chatForUser: encodeChatForUser,
+  chatForUsers: encodeChatForUsers,
+  chatsForUser: encodeChatsForUser,
+  photo: encodePhoto,
+  voice: encodeVoice,
+  member: encodeMember,
+  space: encodeSpace,
+  dialog: encodeDialog,
+  translation: encodeTranslation,
+  unencryptedTranslation: encodeUnencryptedTranslation,
+  chatParticipant: encodeChatParticipant,
+  userSettings: encodeUserSettings,
+  botAvatar: encodeBotAvatar,
+  dialogFolder: encodeDialogFolder,
+}

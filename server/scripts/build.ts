@@ -1,0 +1,67 @@
+import { $ } from "bun"
+import { resolve } from "path"
+import { version } from "../package.json"
+import {
+  FORBIDDEN_PRODUCTION_RUNTIME_IMPORT_PATTERN,
+} from "./runtimeImportPolicy"
+import { verifyForgeBundle, verifyForgeSource } from "./forge-runtime-proof"
+
+// https://coolify.io/docs/knowledge-base/environment-variables/
+const sourceCommit = process.env["SOURCE_COMMIT"] || (await $`git rev-parse HEAD`.quiet()).text().trim() || "N/A"
+const commitHash = sourceCommit === "N/A" ? "N/A" : sourceCommit.slice(0, 7)
+
+console.info("🚧 Building...")
+console.info("Reviewed Forge source:", JSON.stringify(verifyForgeSource()))
+
+const result = await Bun.build({
+  entrypoints: [
+    resolve(__dirname, "../src/index.ts"),
+    ...["core-production-smoke", "encrypt-content", "migrate", "verify-migrations", "livekit-cutover-preflight", "realtime-cross-origin-smoke"].map(
+      (name) => resolve(__dirname, `./${name}.ts`),
+    ),
+  ],
+  naming: "[name].[ext]",
+  outdir: resolve(__dirname, "../dist"),
+  target: "bun",
+  external: ["@aws-sdk/*", "sharp"],
+  sourcemap: "external",
+  plugins: [
+    {
+      name: "reject-retired-http-runtime",
+      setup(build) {
+        build.onResolve(
+          {
+            filter: new RegExp(
+              FORBIDDEN_PRODUCTION_RUNTIME_IMPORT_PATTERN,
+            ),
+          },
+          ({ importer, path }) => {
+            throw new Error(
+              `Production entry imported retired HTTP runtime package "${path}" from "${importer}".`,
+            )
+          },
+        )
+      },
+    },
+  ],
+  define: {
+    "process.env.NODE_ENV": JSON.stringify("production"),
+    "process.env.BUILD_DATE": JSON.stringify(new Date().toISOString()),
+    "process.env.GIT_COMMIT_HASH": JSON.stringify(commitHash),
+    "process.env.GIT_COMMIT_SHA": JSON.stringify(sourceCommit),
+    "process.env.VERSION": JSON.stringify(version),
+  },
+})
+
+if (!result.success) {
+  for (const log of result.logs) {
+    console.error(log)
+  }
+  throw new Error(
+    "Production server build failed.",
+  )
+}
+
+verifyForgeBundle(await Bun.file(resolve(__dirname, "../dist/index.js")).text())
+
+console.info("✅ Build complete")

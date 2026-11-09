@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>INLINE_USER_PROFILE</key>
+	<string>$(INLINE_USER_PROFILE)</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeIconFiles</key>
+			<array/>
+			<key>CFBundleTypeName</key>
+			<string>Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.item</string>
+				<string>public.content</string>
+				<string>public.data</string>
+				<string>public.archive</string>
+				<string>public.disk-image</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleDisplayName</key>
+	<string>$(DISPLAY_NAME)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>chat.inline.inlineIOS</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(INLINE_URL_SCHEME)</string>
+				<string>$(INLINE_URL_SCHEME_ALIAS)</string>
+			</array>
+		</dict>
+		<dict/>
+	</array>
+	<key>InlineURLScheme</key>
+	<string>$(INLINE_URL_SCHEME)</string>
+	<key>DEV_HOST</key>
+	<string>$(DEV_HOST)</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Inline needs access to your camera to take and share photos in your conversations.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Inline uses your contacts on this device to help you find people to invite. Your address book is not uploaded.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Inline needs access to documents to share files in your conversations.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Inline needs access to your microphone to speak in Grid and record audio messages and videos.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Inline needs access to your photo library to share photos and videos in your conversations.</string>
+	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
+	<true/>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>remote-notification</string>
+	</array>
+	<key>UIAppFonts</key>
+	<array/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>UISupportsDocumentBrowser</key>
+	<true/>
+	<key>USE_PRODUCTION_API</key>
+	<string>$(USE_PRODUCTION_API)</string>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Document</string>
+			<key>UTTypeIdentifier</key>
+			<string>public.item</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>*</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

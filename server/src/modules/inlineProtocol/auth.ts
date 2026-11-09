@@ -1,0 +1,478 @@
+import { assertOtpDeliveryAllowed } from "@in/server/modules/auth/otpDeliveryBudget"
+import {
+  AuthBeginResult_Delivery,
+  type AuthBeginRequest,
+  type AuthBeginResult,
+  type AuthBeginBrowserRequest,
+  type AuthBeginBrowserResult,
+  type AuthBrowserStatusRequest,
+  type AuthBrowserStatusResult,
+  type AuthCompleteRequest,
+  type AuthCompleteResult,
+  type AuthUpgradeSessionRequest,
+  type AuthUpgradeSessionResult,
+} from "@inline-chat/protocol/core"
+import { and, count, eq, gte, inArray, isNull, lt, or, sql } from "drizzle-orm"
+import { randomBytes, timingSafeEqual } from "node:crypto"
+import { db } from "@in/server/db"
+import {
+  inlineProtocolAuthChallenges,
+} from "@in/server/db/schema"
+import { encodeUser } from "@in/server/realtime/encoders/encodeUser"
+import { getOrCreateUserByEmailForSignup } from "@in/server/modules/auth/signupInvites"
+import { getOrCreateUserByPhoneForSignup } from "@in/server/modules/auth/signupInvites"
+import { lockGridMutations } from "@in/server/modules/grid/roomLifecycle"
+import { normalizeEmail } from "@in/server/utils/normalize"
+import { sendEmail } from "@in/server/utils/email"
+import { prelude } from "@in/server/libs/prelude"
+import { getServerConfig, type PhoneCodeMode } from "@in/server/modules/serverConfig"
+import parsePhoneNumber from "libphonenumber-js"
+import { isValidEmail } from "@in/server/utils/validate"
+import { InlineError } from "@in/server/types/errors"
+import { Log } from "@in/server/utils/log"
+import type { InlineProtocolApplicationContext } from "./application"
+import {
+  inlineProtocolAuthCodeMac,
+  inlineProtocolKeyedHash,
+  randomInlineProtocolAuthCode,
+} from "./authCode"
+import type { InlineProtocolSecretKeyRing } from "./keyCipher"
+import { InlineProtocolChallengeCipher } from "./challengeCipher"
+import { DEMO_CODE, DEMO_CODE2, DEMO_EMAIL, DEMO_EMAIL2 } from "@in/server/env"
+import { authorizeInlineProtocolKey, finishInlineProtocolSessionReplacement } from "./authorizeKey"
+import { upgradeInlineProtocolSession } from "./upgradeSession"
+import {
+  beginInlineProtocolBrowserLogin,
+  inlineProtocolBrowserLoginStatus,
+  networkFingerprint,
+} from "@in/server/modules/auth/hostedLogin/service"
+
+const CHALLENGE_TTL_MS = 10 * 60 * 1_000
+const RATE_WINDOW_MS = 10 * 60 * 1_000
+const MAX_CHALLENGES_PER_WINDOW = 5
+const MAX_ATTEMPTS = 5
+const RETRY_AFTER_SECONDS = 60
+const MAX_EMAIL_BYTES = 320
+const MAX_PHONE_BYTES = 64
+const MAX_DEVICE_ID_BYTES = 128
+const MAX_CLIENT_TYPE_BYTES = 32
+const MAX_VERSION_BYTES = 64
+const MAX_DEVICE_NAME_BYTES = 256
+const MAX_INVITE_CODE_BYTES = 256
+const MAX_TIME_ZONE_BYTES = 64
+const log = new Log("InlineProtocol.Auth")
+
+const configuredDemoCode = (email: string): string | undefined => {
+  if (email === DEMO_EMAIL && DEMO_CODE && /^\d{6}$/.test(DEMO_CODE)) return DEMO_CODE
+  if (email === DEMO_EMAIL2 && DEMO_CODE2 && /^\d{6}$/.test(DEMO_CODE2)) return DEMO_CODE2
+  return undefined
+}
+
+const boundedString = (value: string | undefined, maximumBytes: number): string | undefined => {
+  if (value === undefined) return undefined
+  if (value.includes("\0") || Buffer.byteLength(value, "utf8") > maximumBytes) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  return value
+}
+
+const clientRecord = (request: AuthBeginRequest): Record<string, string> => {
+  const client = request.client
+  if (!client) return {}
+  return Object.fromEntries(Object.entries({
+    deviceId: boundedString(client.deviceId, MAX_DEVICE_ID_BYTES),
+    clientType: boundedString(client.clientType, MAX_CLIENT_TYPE_BYTES),
+    clientVersion: boundedString(client.clientVersion, MAX_VERSION_BYTES),
+    osVersion: boundedString(client.osVersion, MAX_VERSION_BYTES),
+    deviceName: boundedString(client.deviceName, MAX_DEVICE_NAME_BYTES),
+  }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0))
+}
+
+const requirePermanentKey = (context: InlineProtocolApplicationContext): Uint8Array => {
+  if (!context.authorization.permanent || context.authorization.authKeyId.length !== 8) {
+    throw new InlineError(InlineError.ApiError.UNAUTHORIZED)
+  }
+  return context.authorization.authKeyId
+}
+
+const requirePermanentUnauthorised = (context: InlineProtocolApplicationContext): Uint8Array => {
+  if (context.authorization.userId !== undefined) {
+    throw new InlineError(InlineError.ApiError.UNAUTHORIZED)
+  }
+  return requirePermanentKey(context)
+}
+
+type NormalizedIdentifier = {
+  value: string
+  delivery: "email" | "sms"
+}
+
+type StoredChallengeDelivery = "email" | "sms" | "sms_custom" | "sms_prelude" | "sms_verified"
+
+const storedChallengeDelivery = (
+  delivery: NormalizedIdentifier["delivery"],
+  phoneCodeMode: PhoneCodeMode | undefined,
+): StoredChallengeDelivery => {
+  if (delivery === "email") return "email"
+  return phoneCodeMode === "custom" ? "sms_custom" : "sms_prelude"
+}
+
+const isStoredChallengeDelivery = (delivery: string): delivery is StoredChallengeDelivery =>
+  delivery === "email" || delivery === "sms" || delivery === "sms_custom" ||
+  delivery === "sms_prelude" || delivery === "sms_verified"
+
+const isSmsChallenge = (delivery: StoredChallengeDelivery): boolean => delivery !== "email"
+const usesLocalCodeProof = (delivery: StoredChallengeDelivery): boolean => delivery !== "sms_prelude"
+const usesPreludeCodeProof = (delivery: StoredChallengeDelivery): boolean =>
+  delivery === "sms" || delivery === "sms_custom" || delivery === "sms_prelude"
+
+const normalizeIdentifier = (request: AuthBeginRequest): NormalizedIdentifier => {
+  if (request.identifier.oneofKind === "email" &&
+      boundedString(request.identifier.email, MAX_EMAIL_BYTES) !== undefined) {
+    const email = normalizeEmail(request.identifier.email)
+    if (isValidEmail(email)) return { value: email, delivery: "email" }
+  }
+  if (request.identifier.oneofKind === "phoneNumber") {
+    boundedString(request.identifier.phoneNumber, MAX_PHONE_BYTES)
+    const parsed = parsePhoneNumber(request.identifier.phoneNumber)
+    if (parsed?.isValid()) return { value: parsed.number, delivery: "sms" }
+    throw new InlineError(InlineError.ApiError.PHONE_INVALID)
+  }
+  throw new InlineError(InlineError.ApiError.EMAIL_INVALID)
+}
+
+export class InlineProtocolAuthOperations {
+  private readonly challengeCipher: InlineProtocolChallengeCipher
+
+  constructor(private readonly pepperRing: InlineProtocolSecretKeyRing) {
+    this.challengeCipher = new InlineProtocolChallengeCipher(pepperRing)
+  }
+
+  private activePepper(): Uint8Array {
+    const pepper = this.pepperRing.keys.get(this.pepperRing.activeId)
+    if (!pepper) throw new RangeError("Inline Protocol active auth pepper is absent")
+    return pepper
+  }
+
+  upgradeSession(
+    request: AuthUpgradeSessionRequest,
+    context: InlineProtocolApplicationContext,
+  ): Promise<AuthUpgradeSessionResult> {
+    return upgradeInlineProtocolSession(request, context)
+  }
+
+  async beginBrowser(
+    request: AuthBeginBrowserRequest,
+    context: InlineProtocolApplicationContext,
+  ): Promise<AuthBeginBrowserResult> {
+    const authKeyId = requirePermanentUnauthorised(context)
+    const client = request.client
+      ? Object.fromEntries(Object.entries({
+        deviceId: boundedString(request.client.deviceId, MAX_DEVICE_ID_BYTES),
+        clientType: boundedString(request.client.clientType, MAX_CLIENT_TYPE_BYTES),
+        clientVersion: boundedString(request.client.clientVersion, MAX_VERSION_BYTES),
+        osVersion: boundedString(request.client.osVersion, MAX_VERSION_BYTES),
+        deviceName: boundedString(request.client.deviceName, MAX_DEVICE_NAME_BYTES),
+      }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0))
+      : {}
+    const requestNetwork = networkFingerprint(context.metadata?.ip)
+    const result = await beginInlineProtocolBrowserLogin({
+      authKeyId,
+      client: requestNetwork ? { ...client, requestNetwork } : client,
+    })
+    return {
+      loginTransactionId: result.loginTransactionId,
+      browserUrl: result.browserUrl,
+      verificationCode: result.verificationCode,
+      expiresAt: BigInt(Math.floor(result.expiresAt.getTime() / 1_000)),
+    }
+  }
+
+  async browserStatus(
+    request: AuthBrowserStatusRequest,
+    context: InlineProtocolApplicationContext,
+  ): Promise<AuthBrowserStatusResult> {
+    // Authorization can commit between two polls. The transaction lookup is
+    // still exact-key scoped, so the newly authenticated permanent key must be
+    // allowed to collect its own terminal result.
+    const authKeyId = requirePermanentKey(context)
+    const status = await inlineProtocolBrowserLoginStatus({
+      transactionId: request.loginTransactionId,
+      authKeyId,
+    })
+    if (status.kind === "pending") return { state: { oneofKind: "pending", pending: {} } }
+    if (status.kind === "cancelled") return { state: { oneofKind: "cancelled", cancelled: {} } }
+    return {
+      state: {
+        oneofKind: "authorized",
+        authorized: {
+          user: encodeUser({ user: status.user, viewerUserId: status.user.id }),
+          accountSessionId: BigInt(status.accountSessionId),
+        },
+      },
+    }
+  }
+
+  async begin(request: AuthBeginRequest, context: InlineProtocolApplicationContext): Promise<AuthBeginResult> {
+    const authKeyId = requirePermanentUnauthorised(context)
+    const identifier = normalizeIdentifier(request)
+    const phoneCodeConfig = identifier.delivery === "sms"
+      ? await getServerConfig("auth.phone_code_mode")
+      : undefined
+    const phoneCodeMode = phoneCodeConfig?.value
+    const delivery = storedChallengeDelivery(identifier.delivery, phoneCodeMode)
+    const client = clientRecord(request)
+    const challengeId = randomBytes(32)
+    const code = identifier.delivery === "email"
+      ? configuredDemoCode(identifier.value) ?? randomInlineProtocolAuthCode()
+      : randomInlineProtocolAuthCode()
+    const pepper = this.activePepper()
+    const identifierHash = inlineProtocolKeyedHash(pepper, "identifier", identifier.value)
+    const identifierHashes = [...this.pepperRing.keys.values()]
+      .map((key) => inlineProtocolKeyedHash(key, "identifier", identifier.value))
+    const networkHash = context.metadata?.ip
+      ? inlineProtocolKeyedHash(pepper, "network", context.metadata.ip)
+      : undefined
+    const networkHashes = context.metadata?.ip
+      ? [...this.pepperRing.keys.values()].map((key) => inlineProtocolKeyedHash(key, "network", context.metadata!.ip!))
+      : []
+    const deviceId = client["deviceId"]?.trim()
+    const deviceHash = deviceId ? inlineProtocolKeyedHash(pepper, "device", deviceId) : undefined
+    const deviceHashes = deviceId
+      ? [...this.pepperRing.keys.values()].map((key) => inlineProtocolKeyedHash(key, "device", deviceId))
+      : []
+    const now = new Date()
+    const rateStart = new Date(now.getTime() - RATE_WINDOW_MS)
+    const expiresAt = new Date(now.getTime() + CHALLENGE_TTL_MS)
+    await assertOtpDeliveryAllowed({ channel: identifier.delivery, contact: identifier.value, ip: context.metadata?.ip })
+    const encryptedIdentifier = this.challengeCipher.encrypt(challengeId, identifier.value)
+    await db.transaction(async (tx) => {
+      // Serialize overlapping quota dimensions across connections/processes.
+      // Stable ordering prevents deadlocks when two requests share only some
+      // dimensions; the locks contain hashes, never contact or network data.
+      const quotaLocks = [
+        `key:${Buffer.from(authKeyId).toString("hex")}`,
+        ...identifierHashes.map((hash) => `identifier:${hash.toString("hex")}`),
+        ...networkHashes.map((hash) => `network:${hash.toString("hex")}`),
+        ...deviceHashes.map((hash) => `device:${hash.toString("hex")}`),
+      ].sort()
+      for (const lock of quotaLocks) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`auth-begin:${lock}`}, 0))`)
+      }
+      const [{ value: recent = 0 } = { value: 0 }] = await tx.select({ value: count() })
+        .from(inlineProtocolAuthChallenges)
+        .where(and(
+          gte(inlineProtocolAuthChallenges.createdAt, rateStart),
+          or(
+            eq(inlineProtocolAuthChallenges.authKeyId, Buffer.from(authKeyId)),
+            inArray(inlineProtocolAuthChallenges.identifierHash, identifierHashes),
+            ...(networkHashes.length > 0 ? [inArray(inlineProtocolAuthChallenges.networkHash, networkHashes)] : []),
+            ...(deviceHashes.length > 0 ? [inArray(inlineProtocolAuthChallenges.deviceHash, deviceHashes)] : []),
+          ),
+        ))
+      if (recent >= MAX_CHALLENGES_PER_WINDOW) throw new InlineError(InlineError.ApiError.FLOOD)
+
+      await tx.update(inlineProtocolAuthChallenges).set({ consumedAt: now }).where(and(
+        eq(inlineProtocolAuthChallenges.authKeyId, Buffer.from(authKeyId)),
+        eq(inlineProtocolAuthChallenges.identifierHash, identifierHash),
+        isNull(inlineProtocolAuthChallenges.consumedAt),
+      ))
+      await tx.insert(inlineProtocolAuthChallenges).values({
+        challengeId,
+        authKeyId: Buffer.from(authKeyId),
+        identifierEncrypted: encryptedIdentifier.encrypted,
+        identifierHash,
+        codeMac: inlineProtocolAuthCodeMac(pepper, challengeId, identifier.value, code),
+        pepperKeyId: encryptedIdentifier.keyId,
+        delivery,
+        client,
+        networkHash,
+        deviceHash,
+        expiresAt,
+      })
+    })
+    let providerStatus: "success" | "retry" | "blocked" | undefined
+    try {
+      if (identifier.delivery === "email") {
+        await sendEmail({
+          to: identifier.value,
+          content: {
+            template: "code",
+            variables: { code, firstName: undefined, isExistingUser: true },
+          },
+        })
+      } else if (phoneCodeMode === "custom") {
+        providerStatus = (await prelude.sendCustomCode(identifier.value, code)).status
+      } else {
+        providerStatus = (await prelude.sendCode(identifier.value)).status
+      }
+      if (providerStatus === "blocked") {
+        throw new Error("Phone verification provider blocked code delivery")
+      }
+    } catch (error) {
+      if (identifier.delivery === "sms") {
+        log.warn("Phone verification provider request failed", {
+          provider: "prelude",
+          operation: "create",
+          codeMode: phoneCodeMode,
+          configSource: phoneCodeConfig?.source,
+          providerStatus: providerStatus ?? "request_error",
+          error,
+        })
+      }
+      await db.update(inlineProtocolAuthChallenges).set({ consumedAt: new Date() })
+        .where(eq(inlineProtocolAuthChallenges.challengeId, challengeId))
+      throw error
+    }
+    return {
+      challengeId: Uint8Array.from(challengeId),
+      delivery: identifier.delivery === "email"
+        ? AuthBeginResult_Delivery.EMAIL
+        : AuthBeginResult_Delivery.SMS,
+      expiresAt: BigInt(Math.floor(expiresAt.getTime() / 1000)),
+      retryAfterSeconds: RETRY_AFTER_SECONDS,
+    }
+  }
+
+  async complete(request: AuthCompleteRequest, context: InlineProtocolApplicationContext): Promise<AuthCompleteResult> {
+    const authKeyId = requirePermanentUnauthorised(context)
+    boundedString(request.inviteCode, MAX_INVITE_CODE_BYTES)
+    boundedString(request.timeZone, MAX_TIME_ZONE_BYTES)
+    if (request.challengeId.length !== 32 || !/^\d{6}$/.test(request.code)) {
+      throw new InlineError(InlineError.ApiError.EMAIL_CODE_INVALID)
+    }
+    const now = new Date()
+    // Claim the attempt atomically before checking its proof. Concurrent guesses
+    // must share the same finite budget.
+    const challenge = (await db.update(inlineProtocolAuthChallenges)
+      .set({ attempts: sql`${inlineProtocolAuthChallenges.attempts} + 1` }).where(and(
+      eq(inlineProtocolAuthChallenges.challengeId, Buffer.from(request.challengeId)),
+      eq(inlineProtocolAuthChallenges.authKeyId, Buffer.from(authKeyId)),
+      isNull(inlineProtocolAuthChallenges.consumedAt),
+      gte(inlineProtocolAuthChallenges.expiresAt, now),
+      lt(inlineProtocolAuthChallenges.attempts, MAX_ATTEMPTS),
+    )).returning())[0]
+    if (!challenge) {
+      throw new InlineError(InlineError.ApiError.EMAIL_CODE_INVALID)
+    }
+    if (!isStoredChallengeDelivery(challenge.delivery)) {
+      throw new InlineError(InlineError.ApiError.INTERNAL)
+    }
+    const challengeDelivery = challenge.delivery
+    const identifier = this.challengeCipher.decrypt(
+      request.challengeId,
+      challenge.pepperKeyId,
+      challenge.identifierEncrypted,
+    )
+    const pepper = this.pepperRing.keys.get(challenge.pepperKeyId)
+    if (!pepper) throw new InlineError(InlineError.ApiError.EMAIL_CODE_INVALID)
+    const expected = inlineProtocolAuthCodeMac(pepper, request.challengeId, identifier, request.code)
+    const invalidCode = () => new InlineError(
+      isSmsChallenge(challengeDelivery)
+        ? InlineError.ApiError.SMS_CODE_INVALID
+        : InlineError.ApiError.EMAIL_CODE_INVALID,
+    )
+    const localCodeMatches = challenge.codeMac.length === expected.length &&
+      timingSafeEqual(challenge.codeMac, expected)
+    const requiresPreludeProof = usesPreludeCodeProof(challengeDelivery)
+    if (requiresPreludeProof) {
+      let providerStatus: "success" | "failure" | "expired_or_not_found"
+      try {
+        providerStatus = (await prelude.checkCode(identifier, request.code)).status
+      } catch (error) {
+        log.warn("Phone verification provider request failed", {
+          provider: "prelude",
+          operation: "check",
+          codeMode: challengeDelivery === "sms_prelude" ? "prelude" : "custom",
+          providerStatus: "request_error",
+          error,
+        })
+        await db.update(inlineProtocolAuthChallenges)
+          .set({ attempts: sql`greatest(${inlineProtocolAuthChallenges.attempts} - 1, 0)` })
+          .where(and(
+            eq(inlineProtocolAuthChallenges.challengeId, Buffer.from(request.challengeId)),
+            isNull(inlineProtocolAuthChallenges.consumedAt),
+          ))
+        throw error
+      }
+      if (providerStatus === "expired_or_not_found") {
+        log.warn("Phone verification provider could not find the challenge", {
+          provider: "prelude",
+          operation: "check",
+          codeMode: challengeDelivery === "sms_prelude" ? "prelude" : "custom",
+          providerStatus,
+        })
+      }
+      if (providerStatus !== "success") throw invalidCode()
+    }
+    if (usesLocalCodeProof(challengeDelivery) && !localCodeMatches) {
+      throw invalidCode()
+    }
+    if (requiresPreludeProof) {
+      // Prelude verification may be one-shot, while a valid contact proof must
+      // survive invite-code retries. Freeze the verified code locally before
+      // continuing so later attempts no longer depend on the provider.
+      await db.update(inlineProtocolAuthChallenges)
+        .set({ codeMac: expected, delivery: "sms_verified" })
+        .where(and(
+          eq(inlineProtocolAuthChallenges.challengeId, Buffer.from(request.challengeId)),
+          isNull(inlineProtocolAuthChallenges.consumedAt),
+        ))
+    }
+
+    // A valid proof may be retried while entering an invite code. Only wrong
+    // guesses consume the budget, including when signup later rolls back.
+    await db.update(inlineProtocolAuthChallenges)
+      .set({ attempts: sql`${inlineProtocolAuthChallenges.attempts} - 1` })
+      .where(and(
+        eq(inlineProtocolAuthChallenges.challengeId, Buffer.from(request.challengeId)),
+        isNull(inlineProtocolAuthChallenges.consumedAt),
+      ))
+
+    const client = challenge.client
+    let completed
+    try {
+      completed = await db.transaction(async (tx) => {
+        // Session replacement also takes this lock. Match Grid's lock order
+        // before signup can lock a user row.
+        await lockGridMutations(tx)
+        const consumed = await tx.update(inlineProtocolAuthChallenges).set({ consumedAt: now }).where(and(
+          eq(inlineProtocolAuthChallenges.challengeId, Buffer.from(request.challengeId)),
+          gte(inlineProtocolAuthChallenges.expiresAt, new Date()),
+          isNull(inlineProtocolAuthChallenges.consumedAt),
+        )).returning({ challengeId: inlineProtocolAuthChallenges.challengeId })
+        if (consumed.length !== 1) throw new InlineError(InlineError.ApiError.EMAIL_CODE_INVALID)
+
+        const user = isSmsChallenge(challengeDelivery)
+          ? (await getOrCreateUserByPhoneForSignup(identifier, request.inviteCode, tx)).user
+          : (await getOrCreateUserByEmailForSignup(identifier, request.inviteCode, tx)).user
+        const { accountSessionId, replacement } = await authorizeInlineProtocolKey({
+          tx,
+          authKeyId,
+          userId: user.id,
+          client,
+          ip: context.metadata?.ip,
+          timeZone: request.timeZone,
+          now,
+        })
+        const accountSession = { id: accountSessionId }
+        return { user, accountSession, replacement }
+      })
+    } catch (error) {
+      if (error instanceof InlineError && error.type === "INVITE_CODE_REQUIRED") {
+        return { state: { oneofKind: "inviteRequired", inviteRequired: {} } }
+      }
+      throw error
+    }
+    await finishInlineProtocolSessionReplacement(completed.replacement)
+    return {
+      state: {
+        oneofKind: "authorized",
+        authorized: {
+          user: encodeUser({ user: completed.user, viewerUserId: completed.user.id }),
+          accountSessionId: BigInt(completed.accountSession.id),
+        },
+      },
+    }
+  }
+}

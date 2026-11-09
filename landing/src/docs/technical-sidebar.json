@@ -1,0 +1,45 @@
+{
+  "$schema": "./sidebar.schema.json",
+  "groups": [
+    {
+      "title": "Start Here",
+      "pages": [
+        { "slug": "technical/index", "label": "Overview" },
+        "technical/schema"
+      ]
+    },
+    {
+      "title": "Connection and Security",
+      "pages": [
+        "technical/protocol",
+        "technical/realtime",
+        "technical/authentication",
+        "technical/realtime-v2",
+        "technical/security"
+      ]
+    },
+    {
+      "title": "State and Operations",
+      "pages": [
+        "technical/rpc",
+        "technical/sync",
+        "technical/sync-recovery",
+        "technical/files",
+        "technical/uploads"
+      ]
+    },
+    {
+      "title": "Integration Reference",
+      "pages": [
+        "technical/api-schema",
+        "technical/protocol-schema",
+        "technical/deep-links",
+        "technical/local-agents"
+      ]
+    },
+    {
+      "title": "Inline Docs",
+      "pages": [{ "label": "Back to Docs", "href": "/docs" }]
+    }
+  ]
+}

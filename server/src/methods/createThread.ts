@@ -1,0 +1,81 @@
+import { syncChatAccess } from "@in/server/modules/authorization/chatAccessSync"
+import { chatTitleFields } from "@in/server/modules/encryption/chatTitleStorage"
+import { db } from "@in/server/db"
+import { chats } from "@in/server/db/schema"
+import { encodeChatInfo, TChatInfo } from "@in/server/api-types"
+import { InlineError } from "@in/server/types/errors"
+import { Log } from "@in/server/utils/log"
+import type { Static } from "elysia"
+import { Type } from "@sinclair/typebox"
+import type { HandlerContext } from "@in/server/controllers/helpers"
+import { TInputId } from "@in/server/types/methods"
+import { ensureCanCreateSpaceThread } from "@in/server/modules/authorization/spaceThreadGuards"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { allocateThreadNumber } from "@in/server/modules/threadNumbers"
+
+export const Input = Type.Object({
+  title: Type.String(),
+  spaceId: TInputId,
+  emoji: Type.Optional(Type.String()),
+})
+
+export const Response = Type.Object({
+  chat: TChatInfo,
+})
+
+export const handler = async (
+  input: Static<typeof Input>,
+  context: HandlerContext,
+): Promise<Static<typeof Response>> => {
+  try {
+    const spaceId = Number(input.spaceId)
+    if (isNaN(spaceId)) {
+      throw new InlineError(InlineError.ApiError.SPACE_INVALID)
+    }
+
+    try {
+      await ensureCanCreateSpaceThread({
+        spaceId,
+        userId: context.currentUserId,
+        isPublic: true,
+      })
+    } catch (error) {
+      if (error instanceof RealtimeRpcError) {
+        throw new InlineError(InlineError.ApiError.SPACE_INVALID)
+      }
+      throw error
+    }
+
+    const chat = await db.transaction(async (tx) => {
+      const threadNumber = await allocateThreadNumber(tx, { type: "space", id: spaceId })
+
+      const created = await tx
+        .insert(chats)
+        .values({
+          type: "thread",
+          spaceId: spaceId,
+          ...chatTitleFields(input.title, { spaceId, createdBy: context.currentUserId }),
+          publicThread: true,
+          date: new Date(),
+          threadNumber: threadNumber,
+          emoji: input.emoji ?? null,
+          createdBy: context.currentUserId,
+        })
+        .returning()
+      if (created[0]) await syncChatAccess(tx, { kind: "chats", chatIds: [created[0].id] })
+      return created
+    })
+
+    if (!chat[0]) {
+      throw new InlineError(InlineError.ApiError.INTERNAL)
+    }
+
+    return { chat: encodeChatInfo(chat[0], { currentUserId: context.currentUserId }) }
+  } catch (error) {
+    if (error instanceof InlineError) {
+      throw error
+    }
+    Log.shared.error("Failed to create thread", error)
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+}

@@ -1,0 +1,546 @@
+import {
+  GetUpdatesResult as GetUpdatesResultMessage,
+  GetUpdatesResult_ResultType,
+  type GetUpdatesInput,
+  type GetUpdatesResult,
+  type InputPeer,
+  type Peer,
+} from "@inline-chat/protocol/core"
+import { ChatModel } from "@in/server/db/models/chats"
+import type { UpdateBoxInput } from "@in/server/db/models/updates"
+import type { DbChat } from "@in/server/db/schema"
+import { UpdateBucket as DbUpdateBucket } from "@in/server/db/schema"
+import type { FunctionContext } from "@in/server/functions/_types"
+import { Sync, type ReplayAccessCache } from "@in/server/modules/updates/sync"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { RealtimeRpcError, retryAfterSecondsFromMs } from "@in/server/realtime/errors"
+import { ModelError } from "@in/server/db/models/_errors"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import { getSpacePrivacyContext } from "@in/server/modules/privacy/spacePrivacy"
+import { Log } from "@in/server/utils/log"
+import { databaseDiagnostics, replayProgress } from "@in/server/db/databaseDiagnostics"
+import { connectionManager } from "@in/server/ws/connections"
+import { replayLoopGuard } from "@in/server/modules/updates/replayLoopGuard"
+
+const PAGE_LIMIT = 100
+const REPLAY_LIMIT = 10_000
+const MAX_DATABASE_SEQUENCE = 2_147_483_647
+// Released Apple clients use Foundation's 1 MiB WebSocket receive default. Target
+// normal multi-record results below 1,000,000 bytes so realtime envelopes,
+// encryption padding, and abridged framing retain more than 48 KiB of headroom.
+export const GET_UPDATES_COMPATIBILITY_PAGE_TARGET_BYTES = 1_000_000
+const log = new Log("updates.getUpdates")
+
+export const replayRequiresAuthoritativeRepair = (startSeq: number, latestSeq: number): boolean =>
+  latestSeq - startSeq > REPLAY_LIMIT
+
+type BucketDescriptor =
+  | {
+      scope: "user"
+      box: UpdateBoxInput
+    }
+  | {
+      scope: "space"
+      spaceId: number
+      sanitizeUsers: boolean
+      box: UpdateBoxInput
+    }
+  | {
+      scope: "chat"
+      chatId: number
+      peer: Peer
+      box: UpdateBoxInput
+    }
+
+export const getUpdates = async (input: GetUpdatesInput, context: FunctionContext): Promise<GetUpdatesResult> => {
+  const startedAt = performance.now()
+  const resolveStartedAt = performance.now()
+  const descriptor = await resolveBucket(input.bucket, context)
+  const resolveMs = elapsedMs(resolveStartedAt)
+  // A caller past its deadline has abandoned this page. Stop before the next
+  // database stage; the guard is untouched, so a retry starts clean.
+  context.signal?.throwIfAborted()
+
+  const seqStartBigInt = input.startSeq ?? 0n
+  if (seqStartBigInt < 0n) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  const seqStart = Number(seqStartBigInt)
+  if (!Number.isSafeInteger(seqStart) || seqStart > MAX_DATABASE_SEQUENCE) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  let seqEnd: number | undefined
+  // proto3 scalar defaults to 0 when omitted; treat 0 as unset.
+  const seqEndBigInt = input.seqEnd ?? 0n
+  if (seqEndBigInt !== 0n) {
+    if (seqEndBigInt < 0n) {
+      throw RealtimeRpcError.BadRequest()
+    }
+    const seqEndNumber = Number(seqEndBigInt)
+    if (!Number.isSafeInteger(seqEndNumber) || seqEndNumber > MAX_DATABASE_SEQUENCE) {
+      throw RealtimeRpcError.BadRequest()
+    }
+    if (seqEndNumber < seqStart) {
+      throw RealtimeRpcError.BadRequest()
+    }
+    seqEnd = seqEndNumber
+  }
+
+  const rawPageLimit = input.limit ?? 0
+  if (!Number.isSafeInteger(rawPageLimit) || rawPageLimit < 0) {
+    throw RealtimeRpcError.BadRequest()
+  }
+  const requestedPageLimit = rawPageLimit > 0 ? rawPageLimit : PAGE_LIMIT
+  const pageLimit = Math.min(requestedPageLimit, PAGE_LIMIT)
+  // Keyed by session, not socket: a client that reconnects between identical
+  // failed catch-up passes must not start with a fresh allowance.
+  const replayIdentity = descriptor.scope === "user" && context.currentConnectionId
+    ? `${context.currentUserId}:${context.currentSessionId}`
+    : undefined
+  if (replayIdentity !== undefined && !replayLoopGuard.allow(replayIdentity, seqStart)) {
+    databaseDiagnostics.record("replay.user.throttled", 0)
+    const retryAfterMs = replayLoopGuard.retryAfterMs(replayIdentity)
+    throw RealtimeRpcError.RateLimit(retryAfterMs > 0 ? retryAfterSecondsFromMs(retryAfterMs) : undefined)
+  }
+  const connection = context.currentConnectionId
+    ? connectionManager.getConnection(context.currentConnectionId)
+    : connectionManager.getConnectionBySession(context.currentUserId, context.currentSessionId)
+  const entityId = descriptor.scope === "user" ? context.currentUserId
+    : descriptor.scope === "chat" ? descriptor.chatId : descriptor.spaceId
+  const recordProgress = replayProgress.start(
+    `${context.currentUserId}:${context.currentSessionId}:${context.currentConnectionId ?? "session"}:${descriptor.scope}:${entityId}`,
+    descriptor.scope, connection?.clientType, seqStart,
+  )
+  const logTiming = (timing: GetUpdatesTiming) => {
+    recordProgress(timing.dbUpdates)
+    logGetUpdatesTiming(timing)
+  }
+
+  const fetchTiming = await timed(async () =>
+    Sync.getUpdates({
+      bucket: descriptor.box,
+      seqStart,
+      seqEnd,
+      limit: pageLimit,
+    })
+  )
+  const {
+    updates: dbUpdates,
+    latestSeq,
+    latestDate,
+  } = fetchTiming.value
+  const fetchMs = fetchTiming.ms
+  // An abandoned page was never delivered, so it must not count as served.
+  context.signal?.throwIfAborted()
+  if (replayIdentity !== undefined) replayLoopGuard.served(replayIdentity, seqStart, dbUpdates.length)
+
+  const seqDifference = latestSeq - seqStart
+  if (replayRequiresAuthoritativeRepair(seqStart, latestSeq)) {
+    log.warn("Sync replay exceeded the retained repair window; requesting authoritative repair", {
+      scope: descriptor.scope,
+      startSeq: seqStart,
+      latestSeq,
+      seqDifference,
+      replayLimit: REPLAY_LIMIT,
+      repairReason: "replay_limit",
+    })
+    logTiming({
+      scope: descriptor.scope,
+      result: "too_long",
+      repairReason: "replay_limit",
+      totalMs: elapsedMs(startedAt),
+      resolveMs,
+      fetchMs,
+      inflateMs: 0,
+      sidecarsMs: 0,
+      dbUpdates: dbUpdates.length,
+      updates: 0,
+      pageLimit,
+      replayLimit: REPLAY_LIMIT,
+      seqDifference,
+    })
+    return authoritativeRepairResult(latestSeq, latestDate)
+  }
+
+  const pageGap = findDatabasePageGap(dbUpdates, seqStart, latestSeq, pageLimit)
+  if (pageGap) {
+    log.warn("Non-contiguous durable sync page; requesting authoritative repair", {
+      scope: descriptor.scope,
+      startSeq: seqStart,
+      expectedSeq: pageGap.expectedSeq,
+      actualSeq: pageGap.actualSeq,
+      latestSeq,
+      seqDifference,
+      replayLimit: REPLAY_LIMIT,
+      repairReason: "journal_gap",
+      dbUpdates: dbUpdates.length,
+    })
+    logTiming({
+      scope: descriptor.scope,
+      result: "too_long",
+      repairReason: "journal_gap",
+      totalMs: elapsedMs(startedAt),
+      resolveMs,
+      fetchMs,
+      inflateMs: 0,
+      sidecarsMs: 0,
+      dbUpdates: dbUpdates.length,
+      updates: 0,
+      pageLimit,
+      replayLimit: REPLAY_LIMIT,
+      seqDifference,
+    })
+    return authoritativeRepairResult(latestSeq, latestDate)
+  }
+
+  let inflatedUpdates: GetUpdatesResult["updates"] = []
+  let skippedSequences: GetUpdatesResult["skippedSequences"] = []
+  const inflateStartedAt = performance.now()
+  // One access projection per chat per request, shared by replay filtering
+  // and every sidecar hydration pass of the byte-limited candidate loop.
+  const accessCache: ReplayAccessCache = new Map()
+
+  switch (descriptor.scope) {
+    case "chat": {
+      const result = await Sync.processChatUpdates({
+        chatId: descriptor.chatId,
+        peerId: descriptor.peer,
+        updates: dbUpdates,
+        userId: context.currentUserId,
+      })
+      inflatedUpdates = result.updates
+      break
+    }
+
+    case "space": {
+      const page = Sync.inflateSpaceUpdatesPage(dbUpdates, { sanitizeUsers: descriptor.sanitizeUsers })
+      inflatedUpdates = page.updates
+      skippedSequences = page.skippedSequences
+      break
+    }
+
+    case "user": {
+      const page = await Sync.prepareUserUpdatesPage(dbUpdates, context.currentUserId, accessCache)
+      inflatedUpdates = page.updates
+      skippedSequences = page.skippedSequences
+      break
+    }
+  }
+  const inflateMs = elapsedMs(inflateStartedAt)
+
+  assertPageSequenceAccounting(dbUpdates, inflatedUpdates, skippedSequences)
+  const sidecarsStartedAt = performance.now()
+  const buildCandidate = async (databaseUpdateCount: number) => {
+    // Each candidate repeats database-backed sidecar hydration.
+    context.signal?.throwIfAborted()
+    const candidateDatabaseUpdates = dbUpdates.slice(0, databaseUpdateCount)
+    const includedSequences = new Set(candidateDatabaseUpdates.map((update) => update.seq))
+    const updates = inflatedUpdates.filter((update) => includedSequences.has(Number(update.seq ?? 0)))
+    const candidateSkippedSequences = skippedSequences.filter((skipped) =>
+      includedSequences.has(Number(skipped.seq))
+    )
+    assertPageSequenceAccounting(candidateDatabaseUpdates, updates, candidateSkippedSequences)
+
+    const lastRecord = candidateDatabaseUpdates.at(-1)
+    const pageSeq = lastRecord?.seq ?? seqStart
+    const result: GetUpdatesResult = {
+      updates,
+      seq: BigInt(pageSeq),
+      date: encodeOptionalDate(lastRecord?.date),
+      final: latestSeq <= pageSeq,
+      resultType: updates.length === 0 ? GetUpdatesResult_ResultType.EMPTY : GetUpdatesResult_ResultType.SLICE,
+      skippedSequences: candidateSkippedSequences,
+    }
+    // Sidecars can only add encoded bytes. Discard an already oversized
+    // multi-record prefix before repeating database-backed hydration for it.
+    // A single indivisible record must still receive its complete sidecars.
+    const minimumResponseBytes = GetUpdatesResultMessage.toBinary(result).length
+    if (databaseUpdateCount > 1 && minimumResponseBytes > GET_UPDATES_COMPATIBILITY_PAGE_TARGET_BYTES) {
+      return { databaseUpdateCount, responseBytes: minimumResponseBytes, result }
+    }
+    const sidecars =
+      descriptor.scope === "chat"
+        ? await Sync.buildChatSidecarsForUpdates({
+            chatId: descriptor.chatId,
+            updates,
+            userId: context.currentUserId,
+            accessCache,
+          })
+        : descriptor.scope === "user"
+          ? await Sync.buildUserSidecarsForUpdates({
+              updates,
+              userId: context.currentUserId,
+              accessCache,
+            })
+          : await Sync.buildSpaceSidecarsForUpdates({
+              spaceId: descriptor.spaceId,
+              updates,
+              userId: context.currentUserId,
+            })
+    result.sidecars = updates.length > 0 && hasSidecars(sidecars) ? sidecars : undefined
+    return {
+      databaseUpdateCount,
+      responseBytes: GetUpdatesResultMessage.toBinary(result).length,
+      result,
+    }
+  }
+
+  let candidate = await buildCandidate(dbUpdates.length)
+  while (
+    candidate.responseBytes > GET_UPDATES_COMPATIBILITY_PAGE_TARGET_BYTES &&
+    candidate.databaseUpdateCount > 1
+  ) {
+    candidate = await buildCandidate(Math.max(1, Math.floor(candidate.databaseUpdateCount / 2)))
+  }
+  const sidecarsMs = elapsedMs(sidecarsStartedAt)
+
+  // A single logical update is indivisible in the released protocol. Return it
+  // intact so clients with the protocol-aligned transport budget can advance;
+  // TOO_LONG would divert them to an equally large authoritative snapshot.
+  const singleRecordExceedsCompatibilityTarget =
+    candidate.databaseUpdateCount === 1 &&
+    candidate.responseBytes > GET_UPDATES_COMPATIBILITY_PAGE_TARGET_BYTES
+
+  logTiming({
+    scope: descriptor.scope,
+    result: candidate.result.updates.length === 0 ? "empty" : "slice",
+    totalMs: elapsedMs(startedAt),
+    resolveMs,
+    fetchMs,
+    inflateMs,
+    sidecarsMs,
+    dbUpdates: dbUpdates.length,
+    returnedDbUpdates: candidate.databaseUpdateCount,
+    updates: candidate.result.updates.length,
+    pageLimit,
+    replayLimit: REPLAY_LIMIT,
+    seqDifference,
+    responseBytes: candidate.responseBytes,
+    compatibilityTargetBytes: GET_UPDATES_COMPATIBILITY_PAGE_TARGET_BYTES,
+    byteLimited: candidate.databaseUpdateCount < dbUpdates.length,
+    singleRecordExceedsCompatibilityTarget,
+  })
+
+  return candidate.result
+}
+
+const findDatabasePageGap = (
+  dbUpdates: Awaited<ReturnType<typeof Sync.getUpdates>>["updates"],
+  seqStart: number,
+  latestSeq: number,
+  pageLimit: number,
+): { expectedSeq: number; actualSeq?: number } | undefined => {
+  for (let index = 0; index < dbUpdates.length; index += 1) {
+    const expectedSeq = seqStart + index + 1
+    const actualSeq = dbUpdates[index]!.seq
+    if (actualSeq !== expectedSeq) {
+      return { expectedSeq, actualSeq }
+    }
+  }
+  // A short/empty retained page is not caught-up when its owning entity still
+  // advertises a later sequence. Never let retention become silent data loss.
+  if (dbUpdates.length < pageLimit && seqStart + dbUpdates.length < latestSeq) {
+    return { expectedSeq: seqStart + dbUpdates.length + 1 }
+  }
+}
+
+const authoritativeRepairResult = (
+  latestSeq: number,
+  latestDate: Date | null,
+): GetUpdatesResult => ({
+  updates: [],
+  seq: BigInt(latestSeq),
+  date: encodeOptionalDate(latestDate),
+  final: false,
+  resultType: GetUpdatesResult_ResultType.TOO_LONG,
+  skippedSequences: [],
+})
+
+const assertPageSequenceAccounting = (
+  dbUpdates: Awaited<ReturnType<typeof Sync.getUpdates>>["updates"],
+  updates: GetUpdatesResult["updates"],
+  skippedSequences: GetUpdatesResult["skippedSequences"],
+): void => {
+  const accounted = new Set<number>()
+  for (const update of updates) {
+    const seq = Number(update.seq ?? 0)
+    if (!Number.isSafeInteger(seq) || seq <= 0 || accounted.has(seq)) {
+      throw new Error(`Invalid or duplicate delivered sync sequence: ${seq}`)
+    }
+    accounted.add(seq)
+  }
+  for (const skipped of skippedSequences) {
+    const seq = Number(skipped.seq)
+    if (!Number.isSafeInteger(seq) || seq <= 0 || accounted.has(seq)) {
+      throw new Error(`Invalid or duplicate skipped sync sequence: ${seq}`)
+    }
+    accounted.add(seq)
+  }
+  for (const update of dbUpdates) {
+    if (!accounted.has(update.seq)) {
+      throw new Error(`Unclassified lossless sync sequence: ${update.seq}`)
+    }
+  }
+  if (accounted.size !== dbUpdates.length) {
+    throw new Error("Sync page accounting contains a sequence outside the database page")
+  }
+}
+
+const elapsedMs = (startedAt: number): number =>
+  Math.round((performance.now() - startedAt) * 10) / 10
+
+const timed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms: number }> => {
+  const startedAt = performance.now()
+  const value = await fn()
+  return {
+    value,
+    ms: elapsedMs(startedAt),
+  }
+}
+
+type GetUpdatesTiming = {
+  scope: BucketDescriptor["scope"]
+  result: "too_long" | "empty" | "slice"
+  repairReason?: "replay_limit" | "journal_gap"
+  totalMs: number
+  resolveMs: number
+  fetchMs: number
+  inflateMs: number
+  sidecarsMs: number
+  dbUpdates: number
+  returnedDbUpdates?: number
+  updates: number
+  pageLimit: number
+  replayLimit: number
+  seqDifference: number
+  responseBytes?: number
+  compatibilityTargetBytes?: number
+  byteLimited?: boolean
+  singleRecordExceedsCompatibilityTarget?: boolean
+}
+
+const logGetUpdatesTiming = (timing: GetUpdatesTiming): void => {
+  // Fast, frequent pages otherwise disappear at the production WARN log level.
+  // Aggregate all completions without recording user IDs, cursors or payloads.
+  databaseDiagnostics.record(`replay.${timing.scope}.total`, timing.totalMs, timing.dbUpdates)
+  databaseDiagnostics.record(`replay.${timing.scope}.resolve`, timing.resolveMs)
+  databaseDiagnostics.record(`replay.${timing.scope}.fetch`, timing.fetchMs)
+  databaseDiagnostics.record(`replay.${timing.scope}.inflate`, timing.inflateMs)
+  databaseDiagnostics.record(`replay.${timing.scope}.sidecars`, timing.sidecarsMs)
+  const message = "getUpdates timing"
+  if (timing.totalMs >= 500 || timing.singleRecordExceedsCompatibilityTarget) {
+    log.warn(message, timing)
+  } else if (timing.byteLimited) {
+    // Production drops debug logs. Preserve rare compatibility pagination in
+    // Sentry Logs without promoting an expected recovery page to an issue.
+    log.info(message, timing)
+  } else {
+    log.debug(message, timing)
+  }
+}
+
+const encodeOptionalDate = (date: Date | null | undefined): bigint => {
+  if (!date) {
+    return 0n
+  }
+  return encodeDateStrict(date)
+}
+
+const hasSidecars = (sidecars: GetUpdatesResult["sidecars"]): boolean => {
+  if (!sidecars) {
+    return false
+  }
+
+  return (
+    sidecars.users.length > 0 ||
+    sidecars.chats.length > 0 ||
+    sidecars.dialogs.length > 0 ||
+    sidecars.spaces.length > 0 ||
+    sidecars.userGroups.length > 0
+  )
+}
+
+const resolveBucket = async (
+  bucket: GetUpdatesInput["bucket"],
+  context: FunctionContext,
+): Promise<BucketDescriptor> => {
+  if (!bucket || bucket.type.oneofKind === undefined) {
+    throw RealtimeRpcError.BadRequest()
+  }
+
+  switch (bucket.type.oneofKind) {
+    case "user": {
+      return {
+        scope: "user",
+        box: {
+          type: DbUpdateBucket.User,
+          userId: context.currentUserId,
+        },
+      }
+    }
+
+    case "space": {
+      const spaceId = Number(bucket.type.space.spaceId)
+      if (!Number.isSafeInteger(spaceId) || spaceId <= 0) {
+        throw RealtimeRpcError.SpaceIdInvalid()
+      }
+
+      const privacy = await getSpacePrivacyContext(spaceId, context.currentUserId)
+
+      return {
+        scope: "space",
+        spaceId,
+        sanitizeUsers: privacy.isPublicSpace && !privacy.canManageMembers,
+        box: {
+          type: DbUpdateBucket.Space,
+          spaceId,
+        },
+      }
+    }
+
+    case "chat": {
+      const inputPeer = bucket.type.chat.peerId
+      if (!inputPeer) {
+        throw RealtimeRpcError.PeerIdInvalid()
+      }
+
+      const chat = await getChatOrThrow(inputPeer, context)
+      await AccessGuards.ensureChatAccess(chat, context.currentUserId)
+
+      // Always replay a canonical output peer. A DM bucket may be addressed by
+      // chat ID, but message/update identity on clients is the other user's peer.
+      const peer = Encoders.peerFromChat(chat, {
+        currentUserId: context.currentUserId,
+      })
+
+      return {
+        scope: "chat",
+        chatId: chat.id,
+        peer,
+        box: {
+          type: DbUpdateBucket.Chat,
+          chatId: chat.id,
+        },
+      }
+    }
+  }
+}
+
+const getChatOrThrow = async (inputPeer: InputPeer, context: FunctionContext): Promise<DbChat> => {
+  try {
+    return await ChatModel.getChatFromInputPeerUnchecked(inputPeer, {
+      currentUserId: context.currentUserId,
+    })
+  } catch (error) {
+    if (
+      error === ModelError.ChatInvalid ||
+      (error instanceof ModelError && error.code === ModelError.Codes.CHAT_INVALID)
+    ) {
+      throw RealtimeRpcError.PeerIdInvalid()
+    }
+    throw error
+  }
+}

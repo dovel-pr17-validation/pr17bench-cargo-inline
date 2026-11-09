@@ -1,0 +1,46 @@
+name: Proto Drift (TypeScript)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "proto/**"
+      - "scripts/**"
+      - "packages/protocol/**"
+      - "server/src/protocol/**"
+      - "package.json"
+      - "bun.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proto-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure public workspaces
+        run: bash scripts/ci/ensure-public-workspaces.sh
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Generate protos (drift check)
+        env:
+          SKIP_SWIFT_PROTO: "1"
+        run: |
+          bun run generate:proto
+          git diff --exit-code
+          test -z "$(git status --porcelain)"

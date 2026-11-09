@@ -1,0 +1,61 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "jsPlugins": [
+    {
+      "name": "inline-effect",
+      "specifier": "./server/scripts/lint/oxlint-plugin-inline-effect.js"
+    },
+    {
+      "name": "inline-tests",
+      "specifier": "./server/scripts/lint/oxlint-plugin-inline-tests.js"
+    }
+  ],
+  "categories": {
+    "correctness": "warn"
+  },
+  "rules": {
+    "import/no-duplicates": "error",
+    "no-debugger": "error",
+    "no-dupe-class-members": "error",
+    "no-dupe-keys": "error"
+  },
+  "overrides": [
+    {
+      "files": [
+        "web/src/**/*.{ts,tsx}",
+        "landing/packages/client/src/**/*.{ts,tsx}"
+      ],
+      "excludeFiles": [
+        "web/src/testing/**",
+        "**/*.{test,spec}.{ts,tsx}"
+      ],
+      "rules": {
+        "no-console": "error"
+      }
+    },
+    {
+      "files": [
+        "server/src/core/**/*.{ts,tsx}",
+        "server/src/modules/effect/**/*.{ts,tsx}",
+        "server/src/**/*.effect.{ts,tsx}",
+        "server/src/**/*.effect.{test,spec}.{ts,tsx}",
+        "server/src/db/models/members/deleteMember.ts",
+        "server/scripts/lint/fixtures/**/*.{ts,tsx}"
+      ],
+      "rules": {
+        "inline-effect/no-effect-escape-hatch": "error",
+        "inline-effect/require-suppression-reason": "error"
+      }
+    },
+    {
+      "files": [
+        "server/**/*.{test,spec}.{ts,tsx}",
+        "server/scripts/lint/fixtures/*focused-tests.ts",
+        "server/scripts/lint/fixtures/valid-test-focus-text.ts"
+      ],
+      "rules": {
+        "inline-tests/no-focused-tests": "error"
+      }
+    }
+  ]
+}

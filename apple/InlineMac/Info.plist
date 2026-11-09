@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSAppleScriptEnabled</key>
+	<true/>
+	<key>OSAScriptingDefinition</key>
+	<string>Inline.sdef</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.inline.mac.url</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(INLINE_URL_SCHEME)</string>
+				<string>$(INLINE_URL_SCHEME_ALIAS)</string>
+			</array>
+		</dict>
+	</array>
+	<key>InlineURLScheme</key>
+	<string>$(INLINE_URL_SCHEME)</string>
+	<key>DEV_HOST</key>
+	<string>$(DEV_HOST)</string>
+	<key>INLINE_USER_PROFILE</key>
+	<string>$(INLINE_USER_PROFILE)</string>
+	<key>InlineCLIAuthProtocolVersion</key>
+	<integer>1</integer>
+	<key>NSContactsUsageDescription</key>
+	<string>Inline uses your contacts on this Mac to help you find people to invite. Your address book is not uploaded.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Inline needs access to your microphone to record voice messages.</string>
+	<key>NSObservationTrackingEnabled</key>
+	<true/>
+	<key>USE_PRODUCTION_API</key>
+	<string>$(USE_PRODUCTION_API)</string>
+</dict>
+</plist>

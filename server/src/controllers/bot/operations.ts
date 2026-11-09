@@ -1,0 +1,2085 @@
+import type {
+  BotAgent,
+  BotChat,
+  BotChatLastMessage,
+  BotCommand,
+  BotSkill,
+  BotMessage,
+  BotPeer,
+  BotPeerId,
+  BotTargetInput,
+  BotUser,
+  CreateReplyThreadParams,
+  CreateThreadParams,
+  CreateAgentParams,
+  DeleteAgentParams,
+  AnswerMessageActionParams,
+  DeleteReactionParams,
+  DeleteWebhookParams,
+  DeleteMessageParams,
+  DeleteMessagesParams,
+  EditMessageActionsParams,
+  EditMessageTextParams,
+  GetChatHistoryParams,
+  GetChatParticipantCountParams,
+  GetChatParticipantParams,
+  AddThreadParticipantParams,
+  RemoveThreadParticipantParams,
+  GetChatParams,
+  GetAgentParams,
+  GetFileParams,
+  GetMessagesParams,
+  GetUpdatesParams,
+  ForwardMessageParams,
+  ForwardMessagesParams,
+  GetSpaceParams,
+  PinMessageParams,
+  SendChatActionParams,
+  SendMessageParams,
+  BotGrantRequirement,
+  SendReactionParams,
+  SetThreadTitleParams,
+  SearchMessagesParams,
+  SetWebhookParams,
+  SetMyCommandsParams,
+  SetMySkillsParams,
+  UnpinMessageParams,
+  UploadFileResult,
+  UpdateAgentParams,
+} from "@inline-chat/bot-api-types"
+import {
+  AgentGrantRequirement,
+  InputPeer,
+  MessageAction_Style,
+  MessageAction,
+  MessageActionCallback,
+  MessageActionCopyText,
+  MessageActionResponseUi,
+  MessageActionRow,
+  MessageActions,
+  MessageActionToast,
+  MessageEntities,
+  MessageSendMode,
+  Member_Role,
+  Peer,
+  SearchMessagesFilter,
+  UpdateComposeAction_ComposeAction,
+} from "@inline-chat/protocol/core"
+import { db } from "@in/server/db"
+import { ChatModel } from "@in/server/db/models/chats"
+import { BotCommandsModel } from "@in/server/db/models/botCommands"
+import { BotSkillsModel } from "@in/server/db/models/botSkills"
+import { MembersModel } from "@in/server/db/models/members"
+import { MessageModel, type DbFullMessage } from "@in/server/db/models/messages"
+import { FileModel } from "@in/server/db/models/files"
+import { BotUpdatesModel } from "@in/server/db/models/botUpdates"
+import { UsersModel } from "@in/server/db/models/users"
+import { addReaction as addReactionFn } from "@in/server/functions/messages.addReaction"
+import { deleteReaction as deleteReactionFn } from "@in/server/functions/messages.deleteReaction"
+import { answerMessageAction as answerMessageActionFn } from "@in/server/functions/messages.answerMessageAction"
+import { sendComposeAction as sendComposeActionFn } from "@in/server/functions/messages.sendComposeAction"
+import { deleteMessage as deleteMessageFn } from "@in/server/functions/messages.deleteMessage"
+import { editMessage as editMessageFn } from "@in/server/functions/messages.editMessage"
+import { getChat as getChatFn } from "@in/server/functions/messages.getChat"
+import { getChatHistory as getChatHistoryFn } from "@in/server/functions/messages.getChatHistory"
+import { getMessages as getMessagesFn, MAX_GET_MESSAGES_IDS } from "@in/server/functions/messages.getMessages"
+import { searchMessages as searchMessagesFn } from "@in/server/functions/messages.searchMessages"
+import { createChat as createChatFn } from "@in/server/functions/messages.createChat"
+import { createSubthread as createSubthreadFn } from "@in/server/functions/messages.createSubthread"
+import { sendMessage as sendMessageFn } from "@in/server/functions/messages.sendMessage"
+import { forwardMessages as forwardMessagesFn } from "@in/server/functions/messages.forwardMessages"
+import { pinMessage as pinMessageFn } from "@in/server/functions/messages.pinMessage"
+import { getChatParticipants as getChatParticipantsFn } from "@in/server/functions/messages.getChatParticipants"
+import { addChatParticipant as addChatParticipantFn } from "@in/server/functions/messages.addChatParticipant"
+import { removeChatParticipant as removeChatParticipantFn } from "@in/server/functions/messages.removeChatParticipant"
+import { updateChatInfo as updateChatInfoFn } from "@in/server/functions/messages.updateChatInfo"
+import { uploadFileOperation, type UploadFileOperationInput } from "@in/server/methods/uploadFileOperation"
+import { handler as getMeHandler } from "@in/server/methods/getMe"
+import { getSpace as getSpaceFn } from "@in/server/functions/space.getSpace"
+import {
+  createBotAgent,
+  deleteBotAgent,
+  getBotAgent,
+  listBotAgents,
+  updateBotAgent,
+} from "@in/server/functions/bot.agents"
+import { AccessGuards } from "@in/server/modules/authorization/accessGuards"
+import { InlineError } from "@in/server/types/errors"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { chats, documents, photoSizes, videos, voices } from "@in/server/db/schema"
+import { eq, inArray, sql } from "drizzle-orm"
+import { getSignedMediaFileProxyUrl } from "@in/server/modules/files/path"
+import { resolveDownloadFile } from "@in/server/modules/files/downloadAccess"
+import { createFloodGuardedLog } from "@in/server/utils/floodGuardedLog"
+import { Log } from "@in/server/utils/log"
+import { validateWebhookUrl } from "@in/server/modules/botUpdates/webhookSecurity"
+import { BotUpdateProjector, encodeBotActions, encodeBotMedia } from "@in/server/modules/botUpdates/projector"
+import { decodeAgentThreadContext } from "@in/server/modules/agentConfiguration"
+import {
+  encodeBotEntities,
+  type BotUserJson,
+} from "./entityCodec"
+import {
+  encodeBotRichMessage,
+  encodeBotRichMessageFromStored,
+} from "./richContent"
+import {
+  type BotOperationContext,
+  type BotOperationHandlers,
+} from "./operations.effect"
+
+type BotUserSource = {
+  readonly id: number | bigint
+  readonly bot?: boolean | null | undefined
+  readonly username?: string | null | undefined
+  readonly firstName?: string | null | undefined
+  readonly lastName?: string | null | undefined
+}
+
+type BotChatSource = {
+  readonly id: number | bigint
+  readonly type?: "private" | "thread" | null | undefined
+  readonly title?: string | null | undefined
+  readonly spaceId?: number | bigint | null | undefined
+  readonly isPublic?: boolean | null | undefined
+  readonly parentChatId?: number | bigint | null | undefined
+  readonly parentMessageId?: number | bigint | null | undefined
+  readonly peerId?: { readonly type?: { readonly oneofKind?: string } } | null | undefined
+  readonly lastMsgId?: number | bigint | null | undefined
+  readonly number?: number | null | undefined
+  readonly threadNumber?: number | null | undefined
+  readonly emoji?: string | null | undefined
+  readonly agentContext?: import("@inline-chat/protocol/core").AgentThreadContext | Uint8Array | null | undefined
+}
+
+type BotMessageSource = {
+  readonly messageId: number | bigint
+  readonly chatId: number | bigint
+  readonly fromId: number | bigint
+  readonly date: number | Date
+  readonly editDate?: number | Date | null | undefined
+  readonly text?: string | null | undefined
+  readonly entities?: MessageEntities | null | undefined
+  readonly blockContent?: DbFullMessage["blockContent"]
+  readonly blockContentPhotos?: DbFullMessage["blockContentPhotos"]
+  readonly replyToMsgId?: number | bigint | null | undefined
+} & Partial<Pick<DbFullMessage, "photo" | "video" | "document" | "voice" | "mediaType" | "actions">>
+
+type BotMessageReference = Omit<BotMessage, "chat" | "reply_to_message">
+
+const toBotUser = (
+  user: BotUserSource,
+  options?: { readonly isBot?: boolean | undefined },
+): BotUser => ({
+    id: Number(user.id),
+  is_bot:
+    typeof user.bot === "boolean"
+      ? user.bot
+      : (options?.isBot ?? false),
+  username: user.username ?? undefined,
+  first_name: user.firstName ?? undefined,
+  last_name: user.lastName ?? undefined,
+})
+
+const BOT_COMMAND_RE = /^[a-z0-9_]+$/
+const BOT_COMMAND_LIMIT = 100
+const BOT_SKILL_LIMIT = 250
+
+const toBotCommand = (row: {
+  readonly command: string
+  readonly description: string
+  readonly sortOrder?: number | null | undefined
+}): BotCommand => ({
+  command: row.command,
+  description: row.description,
+  sort_order: row.sortOrder ?? undefined,
+})
+
+const toBotSkill = (row: {
+  readonly key: string
+  readonly name: string
+  readonly description?: string | null | undefined
+  readonly sortOrder?: number | null | undefined
+}): BotSkill => ({
+  key: row.key,
+  name: row.name,
+  description: row.description ?? undefined,
+  sort_order: row.sortOrder ?? undefined,
+})
+
+const toBotAgent = (agent: import("@inline-chat/protocol/core").BotAgent): BotAgent => ({
+  id: Number(agent.id),
+  bot_user_id: Number(agent.botUserId),
+  name: agent.name,
+  handle: agent.handle,
+  emoji: agent.emoji,
+  description: agent.description,
+  skill_key: agent.skillKey,
+  instructions: agent.instructions,
+})
+
+const createAgent = async (input: CreateAgentParams, context: BotOperationContext) => {
+  const result = await createBotAgent({
+    botUserId: BigInt(context.currentUserId),
+    name: input.name,
+    handle: input.handle,
+    emoji: input.emoji,
+    description: input.description,
+    skillKey: input.skill_key,
+    instructions: input.instructions,
+  }, context)
+  if (!result.agent) throw RealtimeRpcError.InternalError()
+  return { agent: toBotAgent(result.agent) }
+}
+
+const getAgent = async (input: GetAgentParams, context: BotOperationContext) => {
+  const agentId = normalizeInputId(input.agent_id)
+  if (!agentId || agentId <= 0) throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  const result = await getBotAgent({ agentId: BigInt(agentId) }, context)
+  if (!result.bot || !result.agent) throw RealtimeRpcError.InternalError()
+  return { bot: toBotUser(result.bot, { isBot: true }), agent: toBotAgent(result.agent) }
+}
+
+const getMyAgents = async (context: BotOperationContext) => {
+  const result = await listBotAgents({ botUserId: BigInt(context.currentUserId) }, context)
+  return { agents: result.agents.map(toBotAgent) }
+}
+
+const updateAgent = async (input: UpdateAgentParams, context: BotOperationContext) => {
+  const agentId = normalizeInputId(input.agent_id)
+  if (!agentId || agentId <= 0) throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  const result = await updateBotAgent({
+    agentId: BigInt(agentId),
+    name: input.name,
+    handle: input.handle,
+    emoji: input.emoji,
+    description: input.description,
+    skillKey: input.skill_key,
+    instructions: input.instructions,
+  }, context)
+  if (!result.agent) throw RealtimeRpcError.InternalError()
+  return { agent: toBotAgent(result.agent) }
+}
+
+const deleteAgent = async (input: DeleteAgentParams, context: BotOperationContext) => {
+  const agentId = normalizeInputId(input.agent_id)
+  if (!agentId || agentId <= 0) throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  const result = await deleteBotAgent({ agentId: BigInt(agentId) }, context)
+  return { agent_id: Number(result.agentId) }
+}
+
+const isRecord = (
+  value: unknown,
+): value is Record<string, unknown> =>
+  typeof value === "object" &&
+  value !== null &&
+  !Array.isArray(value)
+
+const parseMaybeJsonValue = (value: unknown): unknown => {
+  if (typeof value !== "string") return value
+  const trimmed = value.trim()
+  if (
+    !trimmed.startsWith("{") &&
+    !trimmed.startsWith("[")
+  ) {
+    return value
+  }
+
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+}
+
+const normalizeInputId = (
+  value: unknown,
+): number | undefined => {
+  if (value === undefined) return undefined
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) ? value : undefined
+  }
+  if (typeof value !== "string") return undefined
+
+  const trimmed = value.trim()
+  if (!trimmed || !/^[+-]?\d+$/.test(trimmed)) {
+    return undefined
+  }
+
+  const parsed = Number(trimmed)
+  return Number.isSafeInteger(parsed) ? parsed : undefined
+}
+
+const normalizeBotCommandsInput = (
+  value: unknown,
+): Array<{
+  command: string
+  description: string
+  sortOrder: number
+}> => {
+  const parsed = parseMaybeJsonValue(value)
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length > BOT_COMMAND_LIMIT
+  ) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const seenCommands = new Set<string>()
+  return parsed.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+
+    const rawCommand = item["command"]
+    const rawDescription = item["description"]
+    const rawSortOrder = item["sort_order"]
+    if (
+      typeof rawCommand !== "string" ||
+      typeof rawDescription !== "string"
+    ) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+
+    const command = rawCommand.trim()
+    const description = rawDescription.trim()
+    if (
+      command.length < 1 ||
+      command.length > 32 ||
+      !BOT_COMMAND_RE.test(command) ||
+      description.length < 1 ||
+      description.length > 256 ||
+      seenCommands.has(command)
+    ) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+    seenCommands.add(command)
+
+    let sortOrder = index
+    if (
+      typeof rawSortOrder === "number" &&
+      Number.isFinite(rawSortOrder)
+    ) {
+      sortOrder = rawSortOrder
+    } else if (
+      typeof rawSortOrder === "string" &&
+      rawSortOrder.trim() !== ""
+    ) {
+      const parsedSortOrder = Number(rawSortOrder)
+      if (!Number.isFinite(parsedSortOrder)) {
+        throw new InlineError(
+          InlineError.ApiError.BAD_REQUEST,
+        )
+      }
+      sortOrder = parsedSortOrder
+    }
+
+    return { command, description, sortOrder }
+  })
+}
+
+const normalizeBotSkillsInput = (
+  value: unknown,
+): Array<{
+  key: string
+  name: string
+  description?: string
+  sortOrder: number
+}> => {
+  const parsed = parseMaybeJsonValue(value)
+  if (!Array.isArray(parsed) || parsed.length > BOT_SKILL_LIMIT) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const seenKeys = new Set<string>()
+  return parsed.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+
+    const rawKey = item["key"]
+    const rawName = item["name"]
+    const rawDescription = item["description"]
+    const rawSortOrder = item["sort_order"]
+    if (
+      typeof rawKey !== "string" ||
+      typeof rawName !== "string" ||
+      (rawDescription !== undefined && typeof rawDescription !== "string")
+    ) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+
+    const key = rawKey.trim()
+    const name = rawName.trim()
+    const description = rawDescription?.trim() || undefined
+    let sortOrder = index
+    if (rawSortOrder !== undefined) {
+      const parsedSortOrder = typeof rawSortOrder === "string"
+        ? Number(rawSortOrder)
+        : typeof rawSortOrder === "number"
+          ? rawSortOrder
+          : Number.NaN
+      if (
+        !Number.isInteger(parsedSortOrder) ||
+        parsedSortOrder < -2_147_483_648 ||
+        parsedSortOrder > 2_147_483_647
+      ) {
+        throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+      }
+      sortOrder = parsedSortOrder
+    }
+
+    if (
+      key.length < 1 ||
+      key.length > 256 ||
+      name.length < 1 ||
+      name.length > 256 ||
+      (description?.length ?? 0) > 4_000 ||
+      seenKeys.has(key)
+    ) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+    seenKeys.add(key)
+    return { key, name, description, sortOrder }
+  })
+}
+
+const toBotPeer = (peer: unknown): BotPeer => {
+  if (!peer) return {}
+
+  if (isRecord(peer)) {
+    if (typeof peer["userId"] === "number") {
+      return { user_id: peer["userId"] }
+    }
+    if (typeof peer["threadId"] === "number") {
+      return { thread_id: peer["threadId"] }
+    }
+  }
+
+  const type = (peer as Peer).type
+  if (!type) return {}
+  if (type.oneofKind === "user") {
+    return { user_id: Number(type.user.userId) }
+  }
+  if (type.oneofKind === "chat") {
+    return { thread_id: Number(type.chat.chatId) }
+  }
+  return {}
+}
+
+const toBotPeerId = (peer: unknown): BotPeerId => {
+  if (isRecord(peer)) {
+    if (typeof peer["userId"] === "number") {
+      return { user_id: peer["userId"] }
+    }
+    if (typeof peer["chatId"] === "number") {
+      return { chat_id: peer["chatId"] }
+    }
+  }
+
+  const type = (peer as Peer | undefined)?.type
+  if (type?.oneofKind === "user") {
+    return { user_id: Number(type.user.userId) }
+  }
+  if (type?.oneofKind === "chat") {
+    return { chat_id: Number(type.chat.chatId) }
+  }
+  throw new InlineError(InlineError.ApiError.INTERNAL)
+}
+
+const minimalUnknownUser = (id: number): BotUser => ({
+  id,
+  is_bot: false,
+})
+
+const makeInputPeer = (
+  userId: number | undefined,
+  chatId: number | undefined,
+): InputPeer => {
+  if ((userId ? 1 : 0) + (chatId ? 1 : 0) !== 1) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  if (userId) {
+    return {
+      type: {
+        oneofKind: "user",
+        user: { userId: BigInt(userId) },
+      },
+    }
+  }
+
+  return {
+    type: {
+      oneofKind: "chat",
+      chat: { chatId: BigInt(chatId!) },
+    },
+  }
+}
+
+const parseBotTarget = (
+  input: BotTargetInput,
+): { userId?: number; chatId?: number } => {
+  const userId = normalizeInputId(input.user_id)
+  const userIdAlias = normalizeInputId(input.peer_user_id)
+  if (
+    userId !== undefined &&
+    userIdAlias !== undefined &&
+    userId !== userIdAlias
+  ) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const chatId = normalizeInputId(input.chat_id)
+  const chatIdAlias = normalizeInputId(
+    input.peer_thread_id,
+  )
+  if (
+    chatId !== undefined &&
+    chatIdAlias !== undefined &&
+    chatId !== chatIdAlias
+  ) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const resolvedUserId = userId ?? userIdAlias
+  const resolvedChatId = chatId ?? chatIdAlias
+  if (
+    (resolvedUserId ? 1 : 0) +
+      (resolvedChatId ? 1 : 0) !==
+    1
+  ) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  return {
+    userId: resolvedUserId,
+    chatId: resolvedChatId,
+  }
+}
+
+const makeInputPeerFromBotTarget = async (
+  input: BotTargetInput,
+  currentUserId: number,
+): Promise<InputPeer> => {
+  const target = parseBotTarget(input)
+  if (target.userId) {
+    return makeInputPeer(target.userId, undefined)
+  }
+
+  const chatId = target.chatId
+  if (!chatId) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const chatPeer: InputPeer = {
+    type: {
+      oneofKind: "chat",
+      chat: { chatId: BigInt(chatId) },
+    },
+  }
+
+  let chat
+  try {
+    chat = await ChatModel.getChatFromInputPeerUnchecked(chatPeer, {
+      currentUserId,
+    })
+  } catch {
+    throw new InlineError(
+      InlineError.ApiError.CHAT_ID_INVALID,
+    )
+  }
+
+  if (chat.type !== "private") return chatPeer
+  if (!chat.minUserId || !chat.maxUserId) {
+    throw new InlineError(
+      InlineError.ApiError.CHAT_ID_INVALID,
+    )
+  }
+
+  const peerUserId =
+    chat.minUserId === currentUserId
+      ? chat.maxUserId
+      : chat.minUserId
+  return makeInputPeer(peerUserId, undefined)
+}
+
+const toBotChat = (chat: BotChatSource): BotChat => {
+  const agentContext = chat.agentContext instanceof Uint8Array
+    ? decodeAgentThreadContext(chat.agentContext)
+    : chat.agentContext
+  const type =
+    chat.type === "private"
+      ? "user"
+      : chat.type === "thread"
+        ? "thread"
+        : chat.peerId?.type?.oneofKind === "user"
+          ? "user"
+          : chat.peerId?.type?.oneofKind === "chat"
+            ? "thread"
+            : undefined
+  if (!type) throw new InlineError(InlineError.ApiError.INTERNAL)
+  return {
+    chat_id: Number(chat.id),
+    type,
+    title: chat.title ? String(chat.title) : undefined,
+    space_id: chat.spaceId
+      ? Number(chat.spaceId)
+      : undefined,
+    is_public:
+      typeof chat.isPublic === "boolean"
+        ? chat.isPublic
+        : undefined,
+    parent_chat_id: chat.parentChatId
+      ? Number(chat.parentChatId)
+      : undefined,
+    last_message_id: chat.lastMsgId
+      ? Number(chat.lastMsgId)
+      : undefined,
+    number: chat.number ?? chat.threadNumber ?? undefined,
+    emoji: chat.emoji ?? undefined,
+    agent_context: agentContext
+      ? {
+          bot_user_id: Number(agentContext.botUserId),
+          agent_id: agentContext.agentId === undefined ? undefined : Number(agentContext.agentId),
+          configuration: agentContext.configuration
+            ? {
+                project_id: agentContext.configuration.projectId,
+                model_id: agentContext.configuration.modelId,
+                reasoning_effort_id: agentContext.configuration.reasoningEffortId,
+              }
+            : undefined,
+        }
+      : undefined,
+  }
+}
+
+const dateSeconds = (date: number | Date): number =>
+  date instanceof Date
+    ? Math.floor(date.getTime() / 1_000)
+    : Number(date)
+
+const toBotChatLastMessageFromDb = (
+  message: BotMessageSource,
+  usersById?: Map<number, BotUserJson>,
+): BotChatLastMessage => {
+  const fromId = Number(message.fromId)
+  const richMessage = encodeBotRichMessageFromStored({
+    text: message.text,
+    blockContent: message.blockContent,
+    blockContentPhotos: message.blockContentPhotos,
+    entities: message.entities,
+    usersById,
+  })
+  return {
+    message_id: Number(message.messageId),
+    from_id: fromId,
+    from:
+      usersById?.get(fromId) ??
+      minimalUnknownUser(fromId),
+    date: dateSeconds(message.date),
+    text: message.text ?? undefined,
+    entities: richMessage ? undefined : encodeBotEntities(message.entities, { usersById }),
+    rich_message: richMessage,
+  }
+}
+
+const loadBotMessageSummary = async (
+  messageId: number,
+  chatId: number,
+  context: BotOperationContext,
+): Promise<BotMessageReference | undefined> => {
+  const parentChat = await getChatFn(
+    { peerId: makeInputPeer(undefined, chatId) },
+    context,
+  ).catch(() => null)
+  if (!parentChat) return undefined
+  const message = await MessageModel.getMessage(messageId, chatId).catch(() => null)
+  if (!message) return undefined
+  const usersById = await loadUsersByIds([
+    ...mentionUserIdsFromEntities(message.entities),
+    Number(message.fromId),
+  ])
+  return toBotMessageLiteFromDb(
+    message,
+    makeInputPeer(undefined, chatId),
+    usersById,
+  )
+}
+
+const parseBotBoolean = (
+  value: unknown,
+): boolean | undefined => {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return undefined
+  }
+  if (typeof value === "boolean") return value
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase()
+    if (normalized === "true" || normalized === "1") {
+      return true
+    }
+    if (normalized === "false" || normalized === "0") {
+      return false
+    }
+  }
+  throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+}
+
+const parseBotParseMarkdown = (
+  input: Record<string, unknown>,
+): boolean | undefined =>
+  parseBotBoolean(
+    input["parse_markdown"] ?? input["parseMarkdown"],
+  )
+
+const mentionUserIdsFromEntities = (
+  entities: MessageEntities | null | undefined,
+): number[] => {
+  if (!entities?.entities) return []
+  const ids: number[] = []
+  for (const entity of entities.entities) {
+    if (entity.entity.oneofKind === "mention") {
+      ids.push(Number(entity.entity.mention.userId))
+    }
+  }
+  return ids
+}
+
+const loadUsersByIds = async (
+  userIds: number[],
+): Promise<Map<number, BotUserJson>> => {
+  const unique = Array.from(
+    new Set(
+      userIds.filter(
+        (id) => Number.isFinite(id) && id > 0,
+      ),
+    ),
+  )
+  if (unique.length === 0) return new Map()
+
+  const rows = await UsersModel.getUsersWithPhotos(unique)
+  const map = new Map<number, BotUserJson>()
+  for (const row of rows) {
+    map.set(row.user.id, toBotUser(row.user))
+  }
+  return map
+}
+
+const toBotMessageLiteFromProto = (
+  message: {
+    readonly id: number | bigint
+    readonly chatId: number | bigint
+    readonly fromId: number | bigint
+    readonly date: number | bigint
+    readonly editDate?: number | bigint | undefined
+    readonly message?: string | undefined
+    readonly entities?: MessageEntities | undefined
+    readonly blockContent?: DbFullMessage["blockContent"] | undefined
+    readonly peerId?: Peer | undefined
+    readonly replyToMsgId?: number | bigint | undefined
+  },
+  inputPeer: InputPeer,
+  usersById?: Map<number, BotUserJson>,
+): BotMessageReference => {
+  const fromId = Number(message.fromId)
+  const richMessage = encodeBotRichMessage({
+    text: message.message,
+    blockContent: message.blockContent,
+    entities: message.entities,
+    usersById,
+  })
+  return {
+    message_id: Number(message.id),
+    peer_id: toBotPeerId(message.peerId ?? { type: inputPeer.type }),
+    chat_id: Number(message.chatId),
+    peer: toBotPeer(message.peerId),
+    from_id: fromId,
+    from:
+      usersById?.get(fromId) ??
+      minimalUnknownUser(fromId),
+    date: Number(message.date),
+    edit_date: message.editDate
+      ? Number(message.editDate)
+      : undefined,
+    text: message.message ?? undefined,
+    entities: richMessage ? undefined : encodeBotEntities(message.entities, { usersById }),
+    rich_message: richMessage,
+  }
+}
+
+const toBotMessageLiteFromDb = (
+  message: BotMessageSource,
+  inputPeer: InputPeer,
+  usersById?: Map<number, BotUserJson>,
+): BotMessageReference => {
+  const fromId = Number(message.fromId)
+  const richMessage = encodeBotRichMessageFromStored({
+    text: message.text,
+    blockContent: message.blockContent,
+    blockContentPhotos: message.blockContentPhotos,
+    entities: message.entities,
+    usersById,
+  })
+  return {
+    message_id: Number(message.messageId),
+    peer_id: toBotPeerId({ type: inputPeer.type }),
+    chat_id: Number(message.chatId),
+    peer: toBotPeer({ type: inputPeer.type }),
+    from_id: fromId,
+    from:
+      usersById?.get(fromId) ??
+      minimalUnknownUser(fromId),
+    date: dateSeconds(message.date),
+    edit_date: message.editDate
+      ? dateSeconds(message.editDate)
+      : undefined,
+    text: message.text ?? undefined,
+    entities: richMessage ? undefined : encodeBotEntities(message.entities, { usersById }),
+    rich_message: richMessage,
+    media:
+      "mediaType" in message
+        ? encodeBotMedia(message as DbFullMessage)
+        : undefined,
+    actions: encodeBotActions(message.actions),
+  }
+}
+
+const toBotMessageFromDb = (
+  message: BotMessageSource,
+  inputPeer: InputPeer,
+  botChat: BotChat,
+  options?: {
+    readonly usersById?: Map<number, BotUserJson>
+    readonly replyMessage?: BotMessageSource | null | undefined
+  },
+): BotMessage => ({
+  ...toBotMessageLiteFromDb(
+    message,
+    inputPeer,
+    options?.usersById,
+  ),
+  chat: botChat,
+  reply_to_message: options?.replyMessage
+    ? toBotMessageLiteFromDb(
+        options.replyMessage,
+        inputPeer,
+        options.usersById,
+      )
+    : undefined,
+})
+
+type BotProtoMessageSource = Parameters<
+  typeof toBotMessageLiteFromProto
+>[0]
+
+const encodeBotMessagesFromProto = async (
+  messages: ReadonlyArray<BotProtoMessageSource>,
+  peerId: InputPeer,
+  botChat: BotChat,
+): Promise<BotMessage[]> => {
+  const chatId = botChat.chat_id
+  const replyIds = messages
+    .map((message) =>
+      message.replyToMsgId !== undefined
+        ? Number(message.replyToMsgId)
+        : undefined,
+    )
+    .filter(
+      (id): id is number =>
+        typeof id === "number" && Number.isFinite(id) && id > 0,
+    )
+  const replyRows = await MessageModel.getMessagesByIds(
+    chatId,
+    Array.from(new Set(replyIds)).map((id) => BigInt(id)),
+  )
+  const replyById = new Map<number, BotMessageSource>(
+    replyRows.map((message) => [Number(message.messageId), message]),
+  )
+  const userIds: number[] = []
+  for (const message of messages) {
+    userIds.push(
+      Number(message.fromId),
+      ...mentionUserIdsFromEntities(message.entities),
+    )
+    const replyId = message.replyToMsgId
+      ? Number(message.replyToMsgId)
+      : undefined
+    const reply = replyId ? replyById.get(replyId) : undefined
+    if (reply) {
+      userIds.push(
+        Number(reply.fromId),
+        ...mentionUserIdsFromEntities(reply.entities),
+      )
+    }
+  }
+  const usersById = await loadUsersByIds(userIds)
+
+  return messages.map((message) => {
+    const replyId = message.replyToMsgId
+      ? Number(message.replyToMsgId)
+      : undefined
+    const reply = replyId ? replyById.get(replyId) : undefined
+    return {
+      ...toBotMessageLiteFromProto(message, peerId, usersById),
+      reply_to_message: reply
+        ? toBotMessageLiteFromDb(reply, peerId, usersById)
+        : undefined,
+    }
+  })
+}
+
+const randomId64 = (): bigint => {
+  const buffer = crypto.getRandomValues(new Uint8Array(8))
+  buffer[0] = buffer[0]! & 0x7f
+  let hexadecimal = ""
+  for (const byte of buffer) {
+    hexadecimal += byte.toString(16).padStart(2, "0")
+  }
+  const id = BigInt(`0x${hexadecimal}`)
+  return id === 0n ? 1n : id
+}
+
+const grantRequirements: Record<BotGrantRequirement, AgentGrantRequirement> = {
+  access: AgentGrantRequirement.ACCESS,
+  invoke: AgentGrantRequirement.INVOKE,
+  steer: AgentGrantRequirement.STEER,
+  approve: AgentGrantRequirement.APPROVE,
+  configure: AgentGrantRequirement.CONFIGURE,
+  owner: AgentGrantRequirement.OWNER,
+}
+const protocolGrantRequirement = (value: BotGrantRequirement | undefined): AgentGrantRequirement =>
+  value === undefined ? AgentGrantRequirement.NONE : grantRequirements[value]
+
+const toProtocolActions = (
+  actions:
+    | SendMessageParams["actions"]
+    | EditMessageTextParams["actions"]
+    | EditMessageActionsParams["actions"],
+): MessageActions | undefined => {
+  if (actions === undefined) return undefined
+  return MessageActions.create({
+    rows: actions.map((row) =>
+      MessageActionRow.create({
+        actions: row.map((action) => {
+          const options = {
+            actionId: action.action_id,
+            text: action.text,
+            style: action.style === "primary"
+              ? MessageAction_Style.PRIMARY
+              : action.style === "destructive" ? MessageAction_Style.DESTRUCTIVE : MessageAction_Style.DEFAULT,
+            confirm: action.confirm
+              ? { title: action.confirm.title, text: action.confirm.text, confirmText: action.confirm.confirm_text }
+              : undefined,
+            requiredGrant: protocolGrantRequirement(action.required_grant),
+          }
+          switch (action.type) {
+            case "copy_text":
+              return MessageAction.create({
+                ...options,
+                action: { oneofKind: "copyText", copyText: MessageActionCopyText.create({ text: action.copy_text }) },
+              })
+            case "open_url":
+              return MessageAction.create({ ...options, action: { oneofKind: "openUrl", openUrl: { url: action.url } } })
+            case "open_link":
+              return MessageAction.create({
+                ...options,
+                action: {
+                  oneofKind: "openLink",
+                  openLink: {
+                    peerId: action.chat_id !== undefined
+                      ? { type: { oneofKind: "chat", chat: { chatId: BigInt(action.chat_id) } } }
+                      : action.user_id !== undefined
+                        ? { type: { oneofKind: "user", user: { userId: BigInt(action.user_id) } } }
+                        : undefined,
+                    messageId: action.message_id === undefined ? undefined : BigInt(action.message_id),
+                  },
+                },
+              })
+            case "callback": {
+              const data = action.callback_data_base64 !== undefined
+                ? Buffer.from(action.callback_data_base64, "base64")
+                : Buffer.from(action.callback_data ?? "", "utf8")
+              return MessageAction.create({
+                ...options,
+                action: { oneofKind: "callback", callback: MessageActionCallback.create({ data }) },
+              })
+            }
+          }
+        }),
+      }),
+    ),
+  })
+}
+
+export const ensureBotFileAccess = async (
+  file: NonNullable<Awaited<ReturnType<typeof FileModel.getFileByUniqueId>>>,
+  botUserId: number,
+): Promise<void> => {
+  if (file.userId === botUserId) return
+  const candidates = await db.execute<{ chatId: number }>(sql`
+    select distinct candidate.chat_id as "chatId"
+    from (
+      select message.chat_id
+      from messages message
+      left join photo_sizes direct_photo on direct_photo.photo_id = message.photo_id
+      left join documents document on document.id = message.document_id
+      left join photo_sizes document_thumbnail on document_thumbnail.photo_id = document.photo_id
+      left join videos video on video.id = message.video_id
+      left join photo_sizes video_thumbnail on video_thumbnail.photo_id = video.photo_id
+      left join voices voice on voice.id = message.voice_id
+      where message.file_id = ${file.id}
+        or direct_photo.file_id = ${file.id}
+        or document.file_id = ${file.id}
+        or document_thumbnail.file_id = ${file.id}
+        or video.file_id = ${file.id}
+        or video_thumbnail.file_id = ${file.id}
+        or voice.file_id = ${file.id}
+      union
+      select message.chat_id
+      from messages message
+      join block_content_image_jobs block_image
+        on block_image.content_id = message.block_content_id
+      join photo_sizes block_photo on block_photo.photo_id = block_image.photo_id
+      where block_photo.file_id = ${file.id}
+    ) candidate
+    limit 1000
+  `)
+  if (candidates.length > 0) {
+    const chatRows = await db
+      .select()
+      .from(chats)
+      .where(inArray(chats.id, candidates.map((candidate) => candidate.chatId)))
+    for (const chat of chatRows) {
+      try {
+        await AccessGuards.ensureChatAccess(chat, botUserId)
+        return
+      } catch {
+        // Continue until one message containing the file is currently accessible.
+      }
+    }
+  }
+  throw new InlineError(InlineError.ApiError.FILE_NOT_FOUND)
+}
+
+const resolveBotMedia = async (
+  media: SendMessageParams["media"],
+  botUserId: number,
+): Promise<{
+  photoId?: bigint
+  videoId?: bigint
+  documentId?: bigint
+  voiceId?: bigint
+  nudge?: boolean
+}> => {
+  if (!media) return {}
+  if (media.type === "nudge") return { nudge: true }
+  // Bots resend their own uploads by file_id; other media goes through forwardMessage with copy.
+  const file = await FileModel.getFileByUniqueId(media.file_id)
+  if (!file || file.userId !== botUserId) {
+    throw new InlineError(InlineError.ApiError.MEDIA_NOT_OWNED)
+  }
+  switch (media.type) {
+    case "photo": {
+      const [row] = await db.select({ id: photoSizes.photoId }).from(photoSizes).where(eq(photoSizes.fileId, file.id)).limit(1)
+      if (!row?.id) throw new InlineError(InlineError.ApiError.FILE_UNIQUE_ID_INVALID)
+      return { photoId: BigInt(row.id) }
+    }
+    case "video": {
+      const [row] = await db.select({ id: videos.id }).from(videos).where(eq(videos.fileId, file.id)).limit(1)
+      if (!row) throw new InlineError(InlineError.ApiError.FILE_UNIQUE_ID_INVALID)
+      return { videoId: BigInt(row.id) }
+    }
+    case "document": {
+      const [row] = await db.select({ id: documents.id }).from(documents).where(eq(documents.fileId, file.id)).limit(1)
+      if (!row) throw new InlineError(InlineError.ApiError.FILE_UNIQUE_ID_INVALID)
+      return { documentId: BigInt(row.id) }
+    }
+    case "voice": {
+      const [row] = await db.select({ id: voices.id }).from(voices).where(eq(voices.fileId, file.id)).limit(1)
+      if (!row) throw new InlineError(InlineError.ApiError.FILE_UNIQUE_ID_INVALID)
+      return { voiceId: BigInt(row.id) }
+    }
+  }
+}
+
+const encodeStoredBotMessage = async (input: {
+  messageId: number
+  chatId: number
+  peerId: InputPeer
+  botChat: BotChat
+}) => {
+  const full = await MessageModel.getMessage(input.messageId, input.chatId)
+  const reply = full.replyToMsgId && Number.isFinite(full.replyToMsgId)
+    ? await MessageModel.getMessage(full.replyToMsgId, input.chatId).catch(() => null)
+    : null
+  const usersById = await loadUsersByIds([
+    ...mentionUserIdsFromEntities(full.entities),
+    ...mentionUserIdsFromEntities(reply?.entities),
+    Number(full.fromId),
+    ...(reply ? [Number(reply.fromId)] : []),
+  ])
+  return toBotMessageFromDb(full, input.peerId, input.botChat, { usersById, replyMessage: reply })
+}
+
+const inputRecord = (
+  input:
+    | SendMessageParams
+    | EditMessageTextParams
+    | EditMessageActionsParams
+    | SetMyCommandsParams
+    | SetMySkillsParams,
+): Record<string, unknown> =>
+  input as Record<string, unknown>
+
+const getMe = async (context: BotOperationContext) => {
+  const result = await getMeHandler(
+    {},
+    { currentUserId: context.currentUserId },
+  )
+  return {
+    user: toBotUser(result.user, { isBot: true }),
+  }
+}
+
+const getSpace = async (
+  input: GetSpaceParams,
+  context: BotOperationContext,
+) => {
+  const spaceId = normalizeInputId(input.space_id)
+  if (!spaceId || spaceId <= 0) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const result = await getSpaceFn(
+    { spaceId: BigInt(spaceId) },
+    context,
+  )
+  if (!result.space || !result.membership) {
+    throw new InlineError(InlineError.ApiError.INTERNAL)
+  }
+  const role = result.membership.role === Member_Role.OWNER
+    ? "owner" as const
+    : result.membership.role === Member_Role.ADMIN
+      ? "admin" as const
+      : result.membership.role === Member_Role.MEMBER
+        ? "member" as const
+        : undefined
+  return {
+    space: {
+      id: Number(result.space.id),
+      name: result.space.name,
+      is_public: result.space.isPublic,
+      handle: result.space.handle,
+    },
+    membership: {
+      id: Number(result.membership.id),
+      space_id: Number(result.membership.spaceId),
+      user_id: Number(result.membership.userId),
+      role,
+      date: Number(result.membership.date),
+      can_access_public_chats: result.membership.canAccessPublicChats,
+    },
+    settings: { grid_enabled: result.settings?.gridEnabled ?? false },
+  }
+}
+
+const sendMessage = async (
+  input: SendMessageParams,
+  context: BotOperationContext,
+) => {
+  const raw = inputRecord(input)
+  if (raw["entities"] !== undefined) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  if (raw["text"] !== undefined && typeof raw["text"] !== "string") {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const media = await resolveBotMedia(input.media, context.currentUserId)
+  if ((typeof raw["text"] !== "string" || raw["text"].length === 0) && Object.keys(media).length === 0) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const replyToMessageId = normalizeInputId(
+    raw["reply_to_message_id"],
+  )
+  const sourceChatId = normalizeInputId(raw["source_chat_id"])
+  if (raw["source_chat_id"] !== undefined && !sourceChatId) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const parseMarkdown = parseBotParseMarkdown(raw)
+  const inputPeer = await makeInputPeerFromBotTarget(
+    input,
+    context.currentUserId,
+  )
+  const chatResult = await getChatFn(
+    { peerId: inputPeer },
+    context,
+  )
+  const chatId = Number(chatResult.chat.id)
+  const botChat = toBotChat(chatResult.chat)
+  const randomId = randomId64()
+
+  await sendMessageFn({
+    peerId: inputPeer,
+    message: typeof raw["text"] === "string" ? raw["text"] : undefined,
+    replyToMessageId: replyToMessageId
+      ? BigInt(replyToMessageId)
+      : undefined,
+    parseMarkdown: parseMarkdown ?? true,
+    randomId,
+    ...media,
+    actions: toProtocolActions(input.actions),
+    sendMode: input.silent ? MessageSendMode.MODE_SILENT : undefined,
+    sourceChatId,
+    paceBotSender: { isBot: true },
+  }, { ...context, isBot: true })
+
+  const sent = await MessageModel.getMessageByRandomId(
+    randomId,
+    context.currentUserId,
+  )
+  return {
+    message: await encodeStoredBotMessage({ messageId: sent.messageId, chatId, peerId: inputPeer, botChat }),
+  }
+}
+
+const getChat = async (
+  input: GetChatParams,
+  context: BotOperationContext,
+) => {
+  const peerId = await makeInputPeerFromBotTarget(
+    input,
+    context.currentUserId,
+  )
+  const result = await getChatFn({ peerId }, context)
+  const chat = toBotChat(result.chat)
+  const chatId = Number(result.chat.id)
+  const parentMessage =
+    result.chat.parentChatId && result.chat.parentMessageId
+      ? await loadBotMessageSummary(
+          Number(result.chat.parentMessageId),
+          Number(result.chat.parentChatId),
+          context,
+        )
+      : undefined
+  const chatWithParent = parentMessage
+    ? { ...chat, parent_message: parentMessage }
+    : chat
+  const lastMessageId =
+    result.chat.lastMsgId !== undefined &&
+    result.chat.lastMsgId !== null
+      ? Number(result.chat.lastMsgId)
+      : undefined
+
+  if (
+    lastMessageId &&
+    Number.isFinite(lastMessageId) &&
+    lastMessageId > 0
+  ) {
+    const last = await MessageModel.getMessage(
+      lastMessageId,
+      chatId,
+    ).catch(() => null)
+    if (last) {
+      const usersById = await loadUsersByIds([
+        ...mentionUserIdsFromEntities(last.entities),
+        Number(last.fromId),
+      ])
+      return {
+        chat: {
+          ...chatWithParent,
+          last_message: toBotChatLastMessageFromDb(
+            last,
+            usersById,
+          ),
+        },
+      }
+    }
+  }
+
+  return { chat: chatWithParent }
+}
+
+const getChatHistory = async (
+  input: GetChatHistoryParams,
+  context: BotOperationContext,
+) => {
+  const peerId = await makeInputPeerFromBotTarget(
+    input,
+    context.currentUserId,
+  )
+  const offsetMessageId = normalizeInputId(
+    input.offset_message_id,
+  )
+  const limit =
+    typeof input.limit === "number" &&
+    Number.isFinite(input.limit)
+      ? input.limit
+      : undefined
+  const result = await getChatHistoryFn(
+    {
+      peerId,
+      offsetId: offsetMessageId
+        ? BigInt(offsetMessageId)
+        : undefined,
+      limit,
+    },
+    context,
+  )
+  const chatResult = await getChatFn(
+    { peerId },
+    context,
+  )
+  const botChat = toBotChat(chatResult.chat)
+  return {
+    messages: await encodeBotMessagesFromProto(
+      result.messages,
+      peerId,
+      botChat,
+    ),
+  }
+}
+
+const normalizeOrderedInputIds = (values: ReadonlyArray<unknown>): number[] => {
+  const ids = values.map(normalizeInputId)
+  if (ids.some((id) => id === undefined)) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  return ids as number[]
+}
+
+const normalizeInputIds = (values: ReadonlyArray<unknown>): number[] =>
+  Array.from(new Set(normalizeOrderedInputIds(values)))
+
+const getMessages = async (
+  input: GetMessagesParams,
+  context: BotOperationContext,
+) => {
+  if (input.message_ids.length > MAX_GET_MESSAGES_IDS) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const peerId = await makeInputPeerFromBotTarget(input, context.currentUserId)
+  const messageIds = normalizeInputIds(input.message_ids)
+  const [result, chatResult] = await Promise.all([
+    getMessagesFn(
+      { peerId, messageIds: messageIds.map((id) => BigInt(id)) },
+      context,
+    ),
+    getChatFn({ peerId }, context),
+  ])
+  const botChat = toBotChat(chatResult.chat)
+  return {
+    messages: await encodeBotMessagesFromProto(result.messages, peerId, botChat),
+  }
+}
+
+const toSearchFilter = (
+  filter: SearchMessagesParams["filter"],
+): SearchMessagesFilter | undefined => {
+  switch (filter) {
+    case "photo":
+      return SearchMessagesFilter.FILTER_PHOTOS
+    case "video":
+      return SearchMessagesFilter.FILTER_VIDEOS
+    case "photo_video":
+      return SearchMessagesFilter.FILTER_PHOTO_VIDEO
+    case "document":
+      return SearchMessagesFilter.FILTER_DOCUMENTS
+    case "link":
+      return SearchMessagesFilter.FILTER_LINKS
+    case "voice":
+      return SearchMessagesFilter.FILTER_VOICE_MEMOS
+    case undefined:
+      return undefined
+  }
+}
+
+const searchMessages = async (
+  input: SearchMessagesParams,
+  context: BotOperationContext,
+) => {
+  const peerId = await makeInputPeerFromBotTarget(input, context.currentUserId)
+  const offsetId = normalizeInputId(input.offset_message_id)
+  const [result, chatResult] = await Promise.all([
+    searchMessagesFn(
+      {
+        peerId,
+        queries: [input.query],
+        limit: input.limit,
+        offsetId: offsetId ? BigInt(offsetId) : undefined,
+        filter: toSearchFilter(input.filter),
+      },
+      context,
+    ),
+    getChatFn({ peerId }, context),
+  ])
+  const botChat = toBotChat(chatResult.chat)
+  return {
+    messages: await encodeBotMessagesFromProto(result.messages, peerId, botChat),
+  }
+}
+
+const createThread = async (
+  input: CreateThreadParams,
+  context: BotOperationContext,
+) => {
+  const spaceId = normalizeInputId(input.space_id)
+  const isPublic = input.is_public ?? spaceId !== undefined
+  if (isPublic && (input.participants?.length ?? 0) > 0) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const participantIds = isPublic
+    ? []
+    : normalizeInputIds([
+        ...(input.participants ?? []),
+        context.currentUserId,
+      ])
+  const result = await createChatFn(
+    {
+      title: input.title,
+      emoji: input.emoji,
+      spaceId: spaceId ? BigInt(spaceId) : undefined,
+      isPublic,
+      participants: participantIds.map((userId) => ({ userId: BigInt(userId) })),
+    },
+    context,
+  )
+  const createdChat = await ChatModel.getChatFromInputPeerUnchecked(
+    { type: { oneofKind: "chat", chat: { chatId: BigInt(result.chat.id) } } },
+    context,
+  )
+  BotUpdateProjector.participationChanged({
+    botUserId: context.currentUserId,
+    chat: createdChat,
+    actorUserId: context.currentUserId,
+    added: true,
+  })
+  return { chat: toBotChat(result.chat) }
+}
+
+const createReplyThread = async (
+  input: CreateReplyThreadParams,
+  context: BotOperationContext,
+) => {
+  const chatId = normalizeInputId(input.chat_id)
+  const messageId = normalizeInputId(input.message_id)
+  if (!chatId || !messageId) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const participantIds = normalizeInputIds(input.participants ?? [])
+  const result = await createSubthreadFn(
+    {
+      parentChatId: BigInt(chatId),
+      parentMessageId: BigInt(messageId),
+      title: input.title,
+      emoji: input.emoji,
+      participants: participantIds.map((userId) => ({ userId: BigInt(userId) })),
+    },
+    context,
+  )
+  const parentMessage = await loadBotMessageSummary(messageId, chatId, context)
+  return {
+    chat: {
+      ...toBotChat(result.chat),
+      parent_message: parentMessage,
+    },
+  }
+}
+
+const editMessageText = async (
+  input: EditMessageTextParams,
+  context: BotOperationContext,
+) => {
+  const raw = inputRecord(input)
+  if (raw["entities"] !== undefined) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const peerId = await makeInputPeerFromBotTarget(
+    input,
+    context.currentUserId,
+  )
+  const parseMarkdown = parseBotParseMarkdown(raw)
+  const messageId = normalizeInputId(raw["message_id"])
+  if (!messageId) {
+    throw new InlineError(
+      InlineError.ApiError.MSG_ID_INVALID,
+    )
+  }
+  if (typeof raw["text"] !== "string") {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const chat = await ChatModel.getChatFromInputPeerUnchecked(peerId, {
+    currentUserId: context.currentUserId,
+  })
+  await AccessGuards.ensureChatAccess(
+    chat,
+    context.currentUserId,
+  )
+  const botChat = toBotChat(chat)
+  await editMessageFn(
+    {
+      messageId: BigInt(messageId),
+      peer: peerId,
+      text: raw["text"],
+      parseMarkdown: parseMarkdown ?? true,
+      actions: toProtocolActions(input.actions),
+    },
+    { ...context, isBot: true },
+  )
+
+  const updated = await MessageModel.getMessage(
+    messageId,
+    chat.id,
+  )
+  const reply =
+    updated.replyToMsgId &&
+    Number.isFinite(updated.replyToMsgId)
+      ? await MessageModel.getMessage(
+          updated.replyToMsgId,
+          chat.id,
+        ).catch(() => null)
+      : null
+  const usersById = await loadUsersByIds([
+    ...mentionUserIdsFromEntities(updated.entities),
+    ...mentionUserIdsFromEntities(reply?.entities),
+    Number(updated.fromId),
+    ...(reply ? [Number(reply.fromId)] : []),
+  ])
+  return {
+    message: toBotMessageFromDb(
+      updated,
+      peerId,
+      botChat,
+      { usersById, replyMessage: reply },
+    ),
+  }
+}
+
+const editMessageActions = async (
+  input: EditMessageActionsParams,
+  context: BotOperationContext,
+) => {
+  const peerId = await makeInputPeerFromBotTarget(input, context.currentUserId)
+  const messageId = normalizeInputId(input.message_id)
+  if (!messageId || !Array.isArray(input.actions)) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const chat = await ChatModel.getChatFromInputPeerUnchecked(peerId, {
+    currentUserId: context.currentUserId,
+  })
+  await AccessGuards.ensureChatAccess(chat, context.currentUserId)
+  await editMessageFn(
+    {
+      messageId: BigInt(messageId),
+      peer: peerId,
+      actions: toProtocolActions(input.actions),
+    },
+    { ...context, isBot: true },
+  )
+  return {
+    message: await encodeStoredBotMessage({
+      messageId,
+      chatId: chat.id,
+      peerId,
+      botChat: toBotChat(chat),
+    }),
+  }
+}
+
+const deleteMessage = async (
+  input: DeleteMessageParams,
+  context: BotOperationContext,
+) => {
+  const peerId = await makeInputPeerFromBotTarget(
+    input,
+    context.currentUserId,
+  )
+  const messageId = normalizeInputId(input.message_id)
+  if (!messageId) {
+    throw new InlineError(
+      InlineError.ApiError.MSG_ID_INVALID,
+    )
+  }
+  await deleteMessageFn(
+    {
+      messageIds: [BigInt(messageId)],
+      peer: peerId,
+    },
+    context,
+  )
+  return {}
+}
+
+const deleteMessages = async (
+  input: DeleteMessagesParams,
+  context: BotOperationContext,
+) => {
+  if (!Array.isArray(input.message_ids) || input.message_ids.length < 1 || input.message_ids.length > 100) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const peerId = await makeInputPeerFromBotTarget(input, context.currentUserId)
+  const messageIds = normalizeInputIds(input.message_ids)
+  const chat = await ChatModel.getChatFromInputPeerUnchecked(peerId, context)
+  await AccessGuards.ensureChatAccess(chat, context.currentUserId)
+  const existing = await MessageModel.getMessagesByIds(
+    chat.id,
+    messageIds.map(BigInt),
+  )
+  const existingIds = new Set(existing.map((message) => Number(message.messageId)))
+  const deletable = messageIds.filter((id) => existingIds.has(id))
+  if (deletable.length === 0) return {}
+  await deleteMessageFn(
+    { messageIds: deletable.map(BigInt), peer: peerId },
+    context,
+  )
+  return {}
+}
+
+const forwardMessage = async (
+  input: ForwardMessageParams,
+  context: BotOperationContext,
+) => {
+  const destinationPeer = await makeInputPeerFromBotTarget(
+    { chat_id: input.chat_id },
+    context.currentUserId,
+  )
+  const sourcePeer = await makeInputPeerFromBotTarget(
+    { chat_id: input.from_chat_id },
+    context.currentUserId,
+  )
+  const messageId = normalizeInputId(input.message_id)
+  if (!messageId) throw new InlineError(InlineError.ApiError.MSG_ID_INVALID)
+  const destination = await ChatModel.getChatFromInputPeerUnchecked(destinationPeer, context)
+  const result = await forwardMessagesFn({
+    fromPeerId: sourcePeer,
+    toPeerId: destinationPeer,
+    messageIds: [BigInt(messageId)],
+    shareForwardHeader: parseBotBoolean(input.copy) !== true,
+  }, context)
+  const forwardedMessageId = result.messageIds[0]
+  if (!forwardedMessageId) throw new InlineError(InlineError.ApiError.INTERNAL)
+  return {
+    message: await encodeStoredBotMessage({
+      messageId: forwardedMessageId,
+      chatId: destination.id,
+      peerId: destinationPeer,
+      botChat: toBotChat(destination),
+    }),
+  }
+}
+
+const forwardMessages = async (
+  input: ForwardMessagesParams,
+  context: BotOperationContext,
+) => {
+  if (!Array.isArray(input.message_ids) || input.message_ids.length < 1 || input.message_ids.length > 100) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  const destinationPeer = await makeInputPeerFromBotTarget(
+    { chat_id: input.chat_id },
+    context.currentUserId,
+  )
+  const sourcePeer = await makeInputPeerFromBotTarget(
+    { chat_id: input.from_chat_id },
+    context.currentUserId,
+  )
+  const messageIds = normalizeOrderedInputIds(input.message_ids)
+  const source = await ChatModel.getChatFromInputPeerUnchecked(sourcePeer, context)
+  await AccessGuards.ensureChatAccess(source, context.currentUserId)
+  const existing = await MessageModel.getMessagesByIds(
+    source.id,
+    messageIds.map(BigInt),
+  )
+  const existingIds = new Set(existing.map((message) => Number(message.messageId)))
+  const forwardable = messageIds.filter((id) => existingIds.has(id))
+  if (forwardable.length === 0) return { message_ids: [] }
+  const result = await forwardMessagesFn(
+    {
+      fromPeerId: sourcePeer,
+      toPeerId: destinationPeer,
+      messageIds: forwardable.map(BigInt),
+      shareForwardHeader: parseBotBoolean(input.copy) !== true,
+    },
+    context,
+  )
+  return { message_ids: result.messageIds }
+}
+
+const setPinnedState = async (
+  input: PinMessageParams | UnpinMessageParams,
+  context: BotOperationContext,
+  unpin: boolean,
+) => {
+  const peer = await makeInputPeerFromBotTarget({ chat_id: input.chat_id }, context.currentUserId)
+  const messageId = normalizeInputId(input.message_id)
+  if (!messageId) throw new InlineError(InlineError.ApiError.MSG_ID_INVALID)
+  await pinMessageFn({ peer, messageId: BigInt(messageId), unpin }, context)
+  return {}
+}
+
+const pinMessage = (input: PinMessageParams, context: BotOperationContext) =>
+  setPinnedState(input, context, false)
+
+const unpinMessage = (input: UnpinMessageParams, context: BotOperationContext) =>
+  setPinnedState(input, context, true)
+
+const getChatParticipants = async (chatIdInput: unknown, context: BotOperationContext) => {
+  const chatId = normalizeInputId(chatIdInput)
+  if (!chatId) throw new InlineError(InlineError.ApiError.CHAT_ID_INVALID)
+  return getChatParticipantsFn({ chatId }, context)
+}
+
+const getChatParticipant = async (input: GetChatParticipantParams, context: BotOperationContext) => {
+  const chatId = normalizeInputId(input.chat_id)
+  const userId = normalizeInputId(input.user_id)
+  if (!chatId) throw new InlineError(InlineError.ApiError.CHAT_ID_INVALID)
+  if (!userId) throw new InlineError(InlineError.ApiError.USER_INVALID)
+  const participants = await getChatParticipants(chatId, context)
+  const user = participants.users.find((candidate) => Number(candidate.id) === userId)
+  if (!user) throw new InlineError(InlineError.ApiError.USER_INVALID)
+  const [chat] = await db.select({ spaceId: chats.spaceId }).from(chats).where(eq(chats.id, chatId)).limit(1)
+  const member = chat?.spaceId
+    ? await MembersModel.getMemberByUserId(chat.spaceId, userId)
+    : undefined
+  return {
+    participant: {
+      user: toBotUser(user),
+      member: member
+        ? {
+            id: member.id,
+            space_id: member.spaceId,
+            user_id: member.userId,
+            role: member.role ?? undefined,
+            date: Math.floor(member.date.getTime() / 1_000),
+            can_access_public_chats: member.canAccessPublicChats ?? true,
+          }
+        : undefined,
+    },
+  }
+}
+
+const getChatParticipantCount = async (input: GetChatParticipantCountParams, context: BotOperationContext) => {
+  const participants = await getChatParticipants(input.chat_id, context)
+  return { count: participants.users.length }
+}
+
+const addThreadParticipant = async (
+  input: AddThreadParticipantParams,
+  context: BotOperationContext,
+) => {
+  const chatId = normalizeInputId(input.chat_id)
+  const userId = normalizeInputId(input.user_id)
+  if (!chatId || !userId) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  await addChatParticipantFn({ chatId, userId }, context)
+  return {}
+}
+
+const removeThreadParticipant = async (
+  input: RemoveThreadParticipantParams,
+  context: BotOperationContext,
+) => {
+  const chatId = normalizeInputId(input.chat_id)
+  const userId = normalizeInputId(input.user_id)
+  if (!chatId || !userId || userId === context.currentUserId) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  await removeChatParticipantFn({ chatId, userId }, context)
+  return {}
+}
+
+const setThreadTitle = async (input: SetThreadTitleParams, context: BotOperationContext) => {
+  const chatId = normalizeInputId(input.chat_id)
+  if (
+    !chatId ||
+    (input.title === undefined && input.emoji === undefined) ||
+    (input.title !== undefined && typeof input.title !== "string") ||
+    (input.emoji !== undefined && typeof input.emoji !== "string")
+  ) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  await updateChatInfoFn({ chatId, title: input.title, emoji: input.emoji }, context)
+  return {}
+}
+
+const sendReaction = async (
+  input: SendReactionParams,
+  context: BotOperationContext,
+) => {
+  const peerId = await makeInputPeerFromBotTarget(
+    input,
+    context.currentUserId,
+  )
+  const messageId = normalizeInputId(input.message_id)
+  if (!messageId) {
+    throw new InlineError(
+      InlineError.ApiError.MSG_ID_INVALID,
+    )
+  }
+  if (typeof input.emoji !== "string") {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+
+  const chat = await ChatModel.getChatFromInputPeerUnchecked(peerId, {
+    currentUserId: context.currentUserId,
+  })
+  await AccessGuards.ensureChatAccess(
+    chat,
+    context.currentUserId,
+  )
+  await addReactionFn(
+    {
+      messageId: BigInt(messageId),
+      peer: peerId,
+      emoji: input.emoji,
+    },
+    context,
+  )
+  return {}
+}
+
+const deleteReaction = async (
+  input: DeleteReactionParams,
+  context: BotOperationContext,
+) => {
+  const peerId = await makeInputPeerFromBotTarget(input, context.currentUserId)
+  const messageId = normalizeInputId(input.message_id)
+  if (!messageId || typeof input.emoji !== "string") {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  await deleteReactionFn({ messageId: BigInt(messageId), peer: peerId, emoji: input.emoji }, context)
+  return {}
+}
+
+const answerMessageAction = async (
+  input: AnswerMessageActionParams,
+  context: BotOperationContext,
+) => {
+  const interactionId = normalizeInputId(input.interaction_id)
+  if (!interactionId) throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  const ui = input.text === undefined
+    ? undefined
+    : MessageActionResponseUi.create({
+        kind: {
+          oneofKind: "toast",
+          toast: MessageActionToast.create({ text: input.text }),
+        },
+      })
+  await answerMessageActionFn({ interactionId: BigInt(interactionId), ui }, context)
+  return {}
+}
+
+const composeAction = (action: SendChatActionParams["action"]): UpdateComposeAction_ComposeAction => {
+  switch (action) {
+    case "typing": return UpdateComposeAction_ComposeAction.TYPING
+    case "upload_photo": return UpdateComposeAction_ComposeAction.UPLOADING_PHOTO
+    case "upload_video": return UpdateComposeAction_ComposeAction.UPLOADING_VIDEO
+    case "upload_document": return UpdateComposeAction_ComposeAction.UPLOADING_DOCUMENT
+    case "record_voice": return UpdateComposeAction_ComposeAction.RECORDING_VOICE
+    case "cancel": return UpdateComposeAction_ComposeAction.NONE
+  }
+}
+
+const sendChatAction = async (
+  input: SendChatActionParams,
+  context: BotOperationContext,
+) => {
+  const peer = await makeInputPeerFromBotTarget(input, context.currentUserId)
+  await sendComposeActionFn({ peer, action: composeAction(input.action) }, context)
+  return {}
+}
+
+const log = new Log("controllers.bot.operations")
+const logLegacyGetFile = createFloodGuardedLog({
+  write: (message, fields) => log.info(message, fields),
+  summary: "suppressed id-only getFile logs",
+})
+
+/**
+ * With chat_id and message_id, the file must be in that message: one message by primary
+ * key plus chat access. The legacy id-only form still scans for any accessible message.
+ */
+const resolveBotFile = async (input: GetFileParams, botUserId: number) => {
+  if (input.chat_id !== undefined || input.message_id !== undefined) {
+    const chatId = normalizeInputId(input.chat_id)
+    const messageId = normalizeInputId(input.message_id)
+    if (!chatId || chatId <= 0 || !messageId || messageId <= 0) {
+      throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+    }
+    const file = await resolveDownloadFile(input.file_id, botUserId, {
+      chatId: BigInt(chatId),
+      messageId: BigInt(messageId),
+    })
+    // Missing files and files outside that message or chat fail alike.
+    if (!file) throw new InlineError(InlineError.ApiError.FILE_NOT_FOUND)
+    return file
+  }
+
+  const file = await FileModel.getFileByUniqueId(input.file_id)
+  if (!file) throw new InlineError(InlineError.ApiError.FILE_NOT_FOUND)
+  if (file.userId === botUserId) return file
+  let granted = false
+  try {
+    await ensureBotFileAccess(file, botUserId)
+    granted = true
+  } finally {
+    // Shows which bots still rely on the id-only scan before it is retired.
+    logLegacyGetFile("bot getFile without a message locator", { botUserId, granted })
+  }
+  return file
+}
+
+const getFile = async (input: GetFileParams, context: BotOperationContext) => {
+  const file = await resolveBotFile(input, context.currentUserId)
+  const expiresIn = 60 * 60
+  return {
+    file: {
+      file_id: file.fileUniqueId,
+      mime_type: file.mimeType ?? undefined,
+      file_size: file.fileSize ?? undefined,
+      width: file.width ?? undefined,
+      height: file.height ?? undefined,
+      duration: file.videoDuration ?? undefined,
+      download_url: getSignedMediaFileProxyUrl(file, expiresIn) ?? undefined,
+      download_url_expires_at: Math.floor(Date.now() / 1_000) + expiresIn,
+    },
+  }
+}
+
+const uploadFile = async (
+  input: UploadFileOperationInput,
+  context: BotOperationContext,
+): Promise<UploadFileResult> => {
+  const uploaded = await uploadFileOperation(input, context)
+  return getFile({ file_id: uploaded.fileUniqueId }, context)
+}
+
+const getUpdates = (input: GetUpdatesParams, context: BotOperationContext, signal?: AbortSignal) => {
+  if (
+    (input.limit !== undefined && (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100)) ||
+    (input.timeout !== undefined && (!Number.isInteger(input.timeout) || input.timeout < 0 || input.timeout > 50))
+  ) {
+    throw new InlineError(InlineError.ApiError.BAD_REQUEST)
+  }
+  return BotUpdatesModel.getUpdates(context.currentUserId, input, signal)
+}
+
+const setWebhook = async (input: SetWebhookParams, context: BotOperationContext) => {
+  if (input.url !== "") await validateWebhookUrl(input.url)
+  return BotUpdatesModel.setWebhook(context.currentUserId, input)
+}
+
+const deleteWebhook = (input: DeleteWebhookParams, context: BotOperationContext) =>
+  BotUpdatesModel.deleteWebhook(context.currentUserId, input)
+
+const getWebhookInfo = (context: BotOperationContext) =>
+  BotUpdatesModel.getWebhookInfo(context.currentUserId)
+
+const getMyCommands = async (
+  context: BotOperationContext,
+) => ({
+  commands: (
+    await BotCommandsModel.getForBotUserId(
+      context.currentUserId,
+    )
+  ).map(toBotCommand),
+})
+
+const setMyCommands = async (
+  input: SetMyCommandsParams,
+  context: BotOperationContext,
+) => {
+  const raw = inputRecord(input)
+  const commands = normalizeBotCommandsInput(
+    raw["commands"],
+  )
+  await BotCommandsModel.replaceForBotUserId(
+    context.currentUserId,
+    commands,
+  )
+  return {}
+}
+
+const deleteMyCommands = async (
+  context: BotOperationContext,
+) => {
+  await BotCommandsModel.deleteForBotUserId(
+    context.currentUserId,
+  )
+  return {}
+}
+
+const getMySkills = async (
+  context: BotOperationContext,
+) => ({
+  skills: (await BotSkillsModel.getForBotUserId(context.currentUserId)).map(toBotSkill),
+})
+
+const setMySkills = async (
+  input: SetMySkillsParams,
+  context: BotOperationContext,
+) => {
+  const raw = inputRecord(input)
+  const skills = normalizeBotSkillsInput(raw["skills"])
+  await BotSkillsModel.replaceForBotUserId(context.currentUserId, skills)
+  return {}
+}
+
+const deleteMySkills = async (
+  context: BotOperationContext,
+) => {
+  await BotSkillsModel.deleteForBotUserId(context.currentUserId)
+  return {}
+}
+
+export const botOperationHandlers: BotOperationHandlers = {
+  getMe,
+  createAgent,
+  getAgent,
+  getMyAgents,
+  updateAgent,
+  deleteAgent,
+  getSpace,
+  sendMessage,
+  getChat,
+  getChatHistory,
+  getMessages,
+  searchMessages,
+  createThread,
+  createReplyThread,
+  editMessageText,
+  editMessageActions,
+  deleteMessage,
+  deleteMessages,
+  forwardMessage,
+  forwardMessages,
+  pinMessage,
+  unpinMessage,
+  getChatParticipant,
+  getChatParticipantCount,
+  addThreadParticipant,
+  removeThreadParticipant,
+  setThreadTitle,
+  sendReaction,
+  deleteReaction,
+  answerMessageAction,
+  sendChatAction,
+  getFile,
+  uploadFile,
+  getUpdates,
+  setWebhook,
+  deleteWebhook,
+  getWebhookInfo,
+  getMyCommands,
+  setMyCommands,
+  deleteMyCommands,
+  getMySkills,
+  setMySkills,
+  deleteMySkills,
+}

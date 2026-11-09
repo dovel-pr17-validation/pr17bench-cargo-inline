@@ -1,0 +1,2507 @@
+import AppKit
+import Foundation
+import InlineKit
+import InlineProtocol
+import Logger
+import TextProcessing
+import Translation
+
+// Known issues:
+// 1. trailing and leading new lines are not calculated properly
+
+class MessageSizeCalculator {
+  static let shared = MessageSizeCalculator()
+
+  private enum RenderStyle {
+    case bubble
+    case minimal
+  }
+
+  private let textHeightCache = NSCache<NSString, NSValue>()
+  private let minTextWidthForSingleLine = NSCache<NSString, NSValue>()
+  /// cache of last view height for row by id
+  private let lastHeightForRow = NSCache<NSString, NSValue>()
+
+  /// Using "" empty string gives a zero height which messes up our layout when somehow an empty text-only message gets
+  /// in due to a bug
+  private let emptyFallback = " "
+
+  private let log = Log.scoped("MessageSizeCalculator", enableTracing: false)
+  private let messageTextMeasurer = TextMeasurer(
+    font: MessageTextConfiguration.font,
+    extraWidth: MessageSizeCalculator.extraSafeWidth,
+    extraHeight: 1
+  )
+  private var heightForSingleLine: CGFloat?
+
+  static let safeAreaWidth: CGFloat = Theme.messageRowSafeAreaInset
+  static let extraSafeWidth = 0.0
+
+  static let maxMessageWidth: CGFloat = Theme.messageMaxWidth
+  static let minimalMaxMessageWidth: CGFloat = 600
+  static let bubbleAvatarLeadingInset = ChatLayoutMetrics.avatarLeadingInset(size: Theme.messageAvatarSize)
+  static let minimalAvatarSize: CGFloat = 30
+  static let minimalMediaMaxWidth: CGFloat = 350
+  static let minimalMediaMaxHeight: CGFloat = 300
+  static let stickerMaxSide: CGFloat = 120
+  static let minimalStickerMaxSide: CGFloat = stickerMaxSide
+  static let minimalDocumentMaxWidth: CGFloat = 420
+  static let minimalAttachmentsMaxWidth: CGFloat = 350
+  static let minimalGroupSpacing: CGFloat = 8
+  static let minimalAfterDaySeparatorGroupSpacing: CGFloat = 2
+  static let minimalHoverSideInset: CGFloat = minimalContentLeadingInset - minimalHoverContentInset
+  static let minimalHoverContentInset: CGFloat = 6
+  static let minimalInlineTimeSpacing: CGFloat = 6
+  static let minimalFollowUpTimeTopOffset: CGFloat = 1
+  static let minimalInlineTimeVerticalOffset: CGFloat = 1
+  static let minimalTextFontSize: Double = Double(ChatTypography.current.pointSize)
+  static let minimalMinTextWidth: CGFloat = 36
+  static let minimalTextOnlyMinHeight: CGFloat = 22
+  static let minimalFollowUpMinHeight: CGFloat = 22
+  static let minimalMediaVerticalInset: CGFloat = 4
+  static let minimalNameMediaSpacing: CGFloat = 4
+  static let minimalReactionTopSpacing: CGFloat = 3
+  static let minimalReactionBottomSpacing: CGFloat = 4
+  static let minimalNameAvatarOffset: CGFloat = 2
+  static let acknowledgementFooterSpacing: CGFloat = 5
+  static let acknowledgementTrailingInset: CGFloat = 6
+  static let acknowledgementStandaloneFooterHeight: CGFloat = 20
+  static var minimalContentLeadingInset: CGFloat {
+    ChatLayoutMetrics.avatarLeadingInset(size: minimalAvatarSize)
+  }
+  static var minimalNameHeight: CGFloat {
+    max(15, Theme.messageNameLabelHeight - 2)
+  }
+  static let messageActionsMinWidth: CGFloat = 180
+  static let messageActionButtonMinWidth: CGFloat = 110
+  static let messageActionRowSpacing: CGFloat = 4
+  static let bubbleMessageActionRowHeight: CGFloat = 28
+  static let minimalMessageActionRowHeight: CGFloat = 24
+  static let replyThreadSummaryHeight: CGFloat = ReplyThreadSummaryView.height(hasTitle: false)
+  private func hasBubbleColor(
+    style: RenderStyle,
+    emojiMessage: Bool,
+    isSticker: Bool,
+    isPngPhotoWithoutCaption: Bool = false
+  ) -> Bool {
+    switch style {
+    case .bubble:
+      return !emojiMessage && !isSticker && !isPngPhotoWithoutCaption
+    case .minimal:
+      return false
+    }
+  }
+
+  private func hasNonEmptyCaption(_ message: FullMessage) -> Bool {
+    guard let text = message.displayText else { return false }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+  }
+
+  private func isPNGPhotoMessage(_ message: FullMessage) -> Bool {
+    if message.photoInfo?.photo.format == .png {
+      return true
+    }
+
+    guard let file = message.file, file.fileType == .photo else { return false }
+    if file.mimeType?.lowercased().contains("png") == true {
+      return true
+    }
+    if file.fileName?.lowercased().hasSuffix(".png") == true {
+      return true
+    }
+    return false
+  }
+
+  private func primaryColor(for style: RenderStyle, usesOutgoingBubbleStyle: Bool) -> NSColor {
+    switch style {
+    case .bubble:
+      return MessageViewAppKit.textColor(usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+    case .minimal:
+      return MinimalMessageViewAppKit.textColor(outgoing: false)
+    }
+  }
+
+  private func linkColor(for style: RenderStyle, usesOutgoingBubbleStyle: Bool) -> NSColor {
+    switch style {
+    case .bubble:
+      return MessageViewAppKit.linkColor(usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+    case .minimal:
+      return MinimalMessageViewAppKit.linkColor(outgoing: false)
+    }
+  }
+
+  private func secondaryColor(for style: RenderStyle, usesOutgoingBubbleStyle: Bool) -> NSColor {
+    switch style {
+    case .bubble:
+      return MessageViewAppKit.secondaryColor(usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+    case .minimal:
+      return .secondaryLabelColor
+    }
+  }
+
+  private func richTextPalette(
+    for style: RenderStyle,
+    usesOutgoingBubbleStyle: Bool
+  ) -> ProcessEntities.Configuration.Palette {
+    .init(
+      primaryColor: primaryColor(for: style, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle),
+      linkColor: linkColor(for: style, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle),
+      secondaryColor: secondaryColor(for: style, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+    )
+  }
+
+  private func richTextStyleKey(for style: RenderStyle, usesOutgoingBubbleStyle: Bool) -> String {
+    switch style {
+    case .bubble:
+      return usesOutgoingBubbleStyle ? "bubble-outgoing" : "bubble-default"
+    case .minimal:
+      return "minimal-default"
+    }
+  }
+
+  static func minimalTextFontSize(for emojiInfo: (count: Int, isAllEmojis: Bool)) -> Double {
+    switch emojiInfo {
+    case let (count, true) where count == 1:
+      Double(ChatTypography.current.singleEmojiPointSize)
+    case let (count, true) where count <= 3:
+      Double(ChatTypography.current.threeEmojisPointSize)
+    case (_, true):
+      Double(ChatTypography.current.manyEmojisPointSize)
+    default:
+      Self.minimalTextFontSize
+    }
+  }
+
+  private func horizontalBubbleInset(for style: RenderStyle) -> CGFloat {
+    switch style {
+    case .bubble:
+      return Theme.messageBubbleContentHorizontalInset
+    case .minimal:
+      return 0
+    }
+  }
+
+  private func attachmentGroupWidth(parentAvailableWidth: CGFloat, style: RenderStyle) -> CGFloat {
+    let maxWidth = switch style {
+    case .bubble:
+      Theme.attachmentViewWidth
+    case .minimal:
+      Self.minimalAttachmentsMaxWidth
+    }
+    return min(parentAvailableWidth, maxWidth)
+  }
+
+  init() {
+    // TODO: Use message id or a fast hash for the keys instead of text
+    textHeightCache.countLimit = 10_000
+    minTextWidthForSingleLine.countLimit = 5_000
+    lastHeightForRow.countLimit = 1_000
+
+    prepareForUse()
+  }
+
+  // Call when new chat view is initialized
+  public func prepareForUse() {
+    // Re-call to pick up fresh time format
+    MessageTimeAndState.precalculateTimeWidth()
+  }
+
+  func getAvailableWidth(tableWidth width: CGFloat) -> CGFloat {
+    getAvailableWidth(tableWidth: width, style: .bubble)
+  }
+
+  func getAvailableWidth(tableWidth width: CGFloat, renderStyle: MessageRenderStyle) -> CGFloat {
+    switch renderStyle {
+    case .bubble:
+      return getAvailableWidth(tableWidth: width, style: .bubble)
+    case .minimal:
+      return getAvailableWidth(tableWidth: width, style: .minimal)
+    }
+  }
+
+  private func getAvailableWidth(tableWidth width: CGFloat, style: RenderStyle) -> CGFloat {
+    let ceiledWidth = ceil(width)
+    let avatarWidth: CGFloat = switch style {
+    case .bubble:
+      Theme.messageAvatarSize
+    case .minimal:
+      Self.minimalAvatarSize
+    }
+    let leadingSafeWidth: CGFloat = switch style {
+    case .bubble:
+      Self.bubbleAvatarLeadingInset + Theme.messageHorizontalStackSpacing + avatarWidth
+    case .minimal:
+      Self.minimalContentLeadingInset + Theme.messageHorizontalStackSpacing + avatarWidth
+    }
+    let trailingSafeWidth: CGFloat = switch style {
+    case .bubble:
+      Theme.messageSidePadding
+    case .minimal:
+      Self.minimalHoverSideInset + Self.minimalHoverContentInset
+    }
+    // Centered chats use the column as their outer limit. Full-width chats keep
+    // the earlier per-message caps so text stays readable in a wide window.
+    let reservedWidth = leadingSafeWidth + trailingSafeWidth + Self.extraSafeWidth
+    let availableWidth = max(0, ceiledWidth - reservedWidth)
+    guard !AppSettings.shared.centeredChats else { return availableWidth }
+    switch style {
+    case .bubble:
+      return min(availableWidth, Self.maxMessageWidth)
+    case .minimal:
+      return min(availableWidth, Self.minimalMaxMessageWidth)
+    }
+  }
+
+  func getTextWidthIfSingleLine(_ fullMessage: FullMessage, availableWidth: CGFloat) -> CGFloat? {
+    // Bypass single line cache for media messages (unless when we have a max width and available width > maxWidth so we
+    // know we don't need to recalc. since this function is used in message list to bypass unneccessary calcs.
+    guard !fullMessage.hasMedia else { return nil }
+
+    // let text = fullMessage.message.text ?? emptyFallback
+    let text = fullMessage.displayText ?? emptyFallback
+    let cacheKey = singleLineTextCacheKey(for: fullMessage, text: text)
+    let minTextSize = minTextWidthForSingleLine.object(forKey: cacheKey) as? CGSize
+
+    // This is just text size, we need to take bubble paddings into account as well
+    // we can probably refactor this to be more maintainable
+    if let minTextSize, minTextSize.width < availableWidth {
+      return minTextSize.width
+    }
+    return nil
+  }
+
+  private func singleLineTextCacheKey(for message: FullMessage, text: String) -> NSString {
+    let entities = message.translationEntities ?? message.message.entities
+    return NSString(string: "\(text.count)_\(text.hashValue)_\(entities?.hashValue ?? 0)")
+  }
+
+  func isSingleLine(_ fullMessage: FullMessage, availableWidth: CGFloat) -> Bool {
+    getTextWidthIfSingleLine(fullMessage, availableWidth: availableWidth) != nil
+  }
+
+  struct LayoutPlan: Equatable, Codable, Hashable {
+    var size: NSSize
+    var urlPreview: URLPreviewAttachmentLayout.Plan? = nil
+
+    /// outer spacings
+    var spacing: NSEdgeInsets
+  }
+
+  struct LayoutPlans: Equatable, Codable, Hashable {
+    /// the outer wrapper of bubble, avatar, and name, currently doesn't define width
+    var wrapper: LayoutPlan
+
+    /// name can be present or not, and it's always above bubble
+    var name: LayoutPlan?
+
+    /// avatar can be present or not, and it's to the left of the bubble
+    var avatar: LayoutPlan?
+
+    /// bubble wraps all the content elements, but it can be hidden for certain messages like stickers or emojis
+    var bubble: LayoutPlan
+
+    /// text
+    var text: LayoutPlan?
+    var richBlockContent: RichBlockLayoutPlan?
+
+    /// photo is always above text
+    var photo: LayoutPlan?
+
+    /// video is always above text, mutually exclusive with other media types
+    var video: LayoutPlan?
+
+    /// document is always above text, and it's mutually exclusive with other media types
+    var document: LayoutPlan?
+
+    /// attachments are below text
+    var attachmentItems: [LayoutPlan]
+    var attachments: LayoutPlan?
+
+    /// forward header is above reply/text
+    var forwardHeader: LayoutPlan?
+
+    /// reply is always above text
+    var reply: LayoutPlan?
+
+    /// reply thread summary is rendered near the bottom of the bubble.
+    var replyThreadSummary: LayoutPlan?
+
+    /// reactions
+    var reactions: LayoutPlan?
+
+    var actionsRows: LayoutPlan?
+
+    /// layout for each reaction
+    var reactionItems: [String: LayoutPlan]
+
+    /// reactions placement
+    var reactionsOutsideBubble: Bool
+    var reactionsOutsideBubbleTopInset: CGFloat
+    var timeInContentFlow: Bool
+    var hasAcknowledgement: Bool
+
+    /// time can be beside text or below it. it doesn't define vertical spacing.
+    var time: LayoutPlan?
+
+    /// used for determining if the message is single line for time view positioning
+    var singleLine: Bool
+    var emojiMessage: Bool
+    var fontSize: CGFloat
+    var hasBubbleColor: Bool
+
+    // computed
+    var totalHeight: CGFloat {
+      var height = wrapper.size.height
+      height += wrapper.spacing.verticalTotal
+      return height
+    }
+
+    var totalWidth: CGFloat {
+      var width = wrapper.size.width
+      width += wrapper.spacing.horizontalTotal
+      return width
+    }
+
+    var hasText: Bool { text != nil }
+    var hasPhoto: Bool { photo != nil }
+    var hasVideo: Bool { video != nil }
+    var hasAvatar: Bool { avatar != nil }
+    var hasName: Bool { name != nil }
+    var hasReply: Bool { reply != nil }
+    var hasReplyThreadSummary: Bool { replyThreadSummary != nil }
+    var hasForwardHeader: Bool { forwardHeader != nil }
+    var hasDocument: Bool { document != nil }
+    var hasReactions: Bool { reactions != nil }
+    var hasAttachments: Bool { attachments != nil }
+    var hasActionsRows: Bool { actionsRows != nil }
+    var hasTime: Bool { time != nil }
+    var bubbleTopOffset: CGFloat {
+      guard let name else { return wrapper.spacing.top }
+      return wrapper.spacing.top + name.spacing.top + name.size.height + name.spacing.bottom
+    }
+    var placesTimeAboveReactions: Bool {
+      timeInContentFlow && emojiMessage && hasReactions && !reactionsOutsideBubble && !hasAcknowledgement
+    }
+
+    private var attachmentConstraintTopology: [(URLPreviewAttachmentLayout.Mode?, UrlPreviewLargeStyle?)] {
+      attachmentItems.map { item in
+        (item.urlPreview?.mode, item.urlPreview?.largeStyle)
+      }
+    }
+
+    func hasSameRichBlockTopology(as other: LayoutPlans) -> Bool {
+      switch (richBlockContent, other.richBlockContent) {
+      case (nil, nil):
+        true
+      case let (lhs?, rhs?):
+        lhs.nodes.count == rhs.nodes.count
+          && zip(lhs.nodes, rhs.nodes).allSatisfy { left, right in
+            left.path == right.path && left.reuseKind == right.reuseKind
+          }
+      case (.some, nil), (nil, .some):
+        false
+      }
+    }
+
+    func hasSameConstraintTopology(as other: LayoutPlans) -> Bool {
+      hasText == other.hasText &&
+        hasPhoto == other.hasPhoto &&
+        hasVideo == other.hasVideo &&
+        hasAvatar == other.hasAvatar &&
+        hasName == other.hasName &&
+        hasReply == other.hasReply &&
+        hasReplyThreadSummary == other.hasReplyThreadSummary &&
+        hasForwardHeader == other.hasForwardHeader &&
+        hasDocument == other.hasDocument &&
+        hasReactions == other.hasReactions &&
+        hasAttachments == other.hasAttachments &&
+        attachmentConstraintTopology.elementsEqual(other.attachmentConstraintTopology) { lhs, rhs in
+          lhs.0 == rhs.0 && lhs.1 == rhs.1
+        } &&
+        hasActionsRows == other.hasActionsRows &&
+        hasTime == other.hasTime &&
+        timeInContentFlow == other.timeInContentFlow &&
+        hasAcknowledgement == other.hasAcknowledgement &&
+        reactionsOutsideBubble == other.reactionsOutsideBubble &&
+        placesTimeAboveReactions == other.placesTimeAboveReactions
+    }
+
+    func hasSameConstraintShape(as other: LayoutPlans) -> Bool {
+      hasSameConstraintTopology(as: other) &&
+        attachmentItems.map { $0.size.height } == other.attachmentItems.map { $0.size.height }
+    }
+
+    // used as edge inset for content view stack
+    var topMostContentTopSpacing: CGFloat {
+      if let forwardHeader {
+        forwardHeader.spacing.top
+      } else if let reply {
+        reply.spacing.top
+      } else if let video {
+        video.spacing.top
+      } else if let photo {
+        photo.spacing.top
+      } else if let document {
+        document.spacing.top
+      } else if let text {
+        text.spacing.top
+      } else {
+        0
+      }
+    }
+
+    // used as edge inset for content view stack
+    var bottomMostContentBottomSpacing: CGFloat {
+      if let reactions {
+        reactions.spacing.bottom
+      } else if let text {
+        text.spacing.bottom
+      } else if let video {
+        video.spacing.bottom
+      } else if let photo {
+        photo.spacing.bottom
+      } else if let document {
+        document.spacing.bottom
+      } else if let replyThreadSummary {
+        replyThreadSummary.spacing.bottom
+      } else {
+        0.0
+      }
+    }
+
+    var replyContentTop: CGFloat {
+      var top: CGFloat = reply?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      return top
+    }
+
+    var photoContentViewTop: CGFloat {
+      var top: CGFloat = photo?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      return top
+    }
+
+    var videoContentViewTop: CGFloat {
+      var top: CGFloat = video?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      return top
+    }
+
+    var documentContentViewTop: CGFloat {
+      var top: CGFloat = document?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      return top
+    }
+
+    var textContentViewTop: CGFloat {
+      var top: CGFloat = text?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      if let video {
+        top += video.spacing.top + video.size.height + video.spacing.bottom
+      }
+      if let photo {
+        top += photo.spacing.top + photo.size.height + photo.spacing.bottom
+      }
+      if let document {
+        top += document.spacing.top + document.size.height + document.spacing.bottom
+      }
+      return top
+    }
+
+    var replyThreadSummaryContentViewTop: CGFloat {
+      var top: CGFloat = replyThreadSummary?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      if let video {
+        top += video.spacing.top + video.size.height + video.spacing.bottom
+      }
+      if let photo {
+        top += photo.spacing.top + photo.size.height + photo.spacing.bottom
+      }
+      if let document {
+        top += document.spacing.top + document.size.height + document.spacing.bottom
+      }
+      if let text {
+        top += text.spacing.top + text.size.height + text.spacing.bottom
+      }
+      if let attachments {
+        top += attachments.spacing.top + attachments.size.height + attachments.spacing.bottom
+      }
+      return top
+    }
+
+    var timeViewTop: CGFloat {
+      var top: CGFloat = time?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      if let video {
+        top += video.spacing.top + video.size.height + video.spacing.bottom
+      }
+      if let photo {
+        top += photo.spacing.top + photo.size.height + photo.spacing.bottom
+      }
+      if let document {
+        top += document.spacing.top + document.size.height + document.spacing.bottom
+      }
+      if let text {
+        top += text.spacing.top + text.size.height + text.spacing.bottom
+      }
+      if let attachments {
+        top += attachments.spacing.top + attachments.size.height + attachments.spacing.bottom
+      }
+      if let replyThreadSummary {
+        top += replyThreadSummary.spacing.top + replyThreadSummary.size.height + replyThreadSummary.spacing.bottom
+      }
+      return top
+    }
+
+    var reactionsViewTop: CGFloat {
+      if reactionsOutsideBubble {
+        return reactionsOutsideBubbleTopInset
+      }
+      var top: CGFloat = reactions?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      if let video {
+        top += video.spacing.top + video.size.height + video.spacing.bottom
+      }
+      if let photo {
+        top += photo.spacing.top + photo.size.height + photo.spacing.bottom
+      }
+      if let document {
+        top += document.spacing.top + document.size.height + document.spacing.bottom
+      }
+      if let text {
+        top += text.spacing.top + text.size.height + text.spacing.bottom
+      }
+      if let attachments {
+        top += attachments.spacing.top + attachments.size.height + attachments.spacing.bottom
+      }
+      if let replyThreadSummary {
+        top += replyThreadSummary.spacing.top + replyThreadSummary.size.height + replyThreadSummary.spacing.bottom
+      }
+      if placesTimeAboveReactions, let time {
+        top += time.spacing.top + time.size.height + time.spacing.bottom
+      }
+      return top
+    }
+
+    var attachmentsContentViewTop: CGFloat {
+      var top: CGFloat = attachments?.spacing.top ?? 0
+      if let forwardHeader {
+        top += forwardHeader.spacing.top + forwardHeader.size.height + forwardHeader.spacing.bottom
+      }
+      if let reply {
+        top += reply.spacing.top + reply.size.height + reply.spacing.bottom
+      }
+      if let video {
+        top += video.spacing.top + video.size.height + video.spacing.bottom
+      }
+      if let photo {
+        top += photo.spacing.top + photo.size.height + photo.spacing.bottom
+      }
+      if let document {
+        top += document.spacing.top + document.size.height + document.spacing.bottom
+      }
+      if let text {
+        top += text.spacing.top + text.size.height + text.spacing.bottom
+      }
+      return top
+    }
+
+    var nameAndBubbleLeading: CGFloat {
+      Theme.messageAvatarSize + Theme.messageHorizontalStackSpacing + MessageSizeCalculator.bubbleAvatarLeadingInset
+    }
+  }
+
+  // Use a more efficient cache key
+  private func actionRows(for message: FullMessage) -> [InlineProtocol.MessageActionRow] {
+    guard let actions = message.message.actions else { return [] }
+
+    return actions.rows.compactMap { row in
+      let filtered = row.actions.filter { action in
+        !action.actionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+          !action.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+          action.action != nil
+      }
+      guard !filtered.isEmpty else { return nil }
+
+      var next = InlineProtocol.MessageActionRow()
+      next.actions = filtered
+      return next
+    }
+  }
+
+  private func actionRowsSignature(for rows: [InlineProtocol.MessageActionRow]) -> String {
+    guard !rows.isEmpty else { return "0" }
+    return rows.map { String($0.actions.count) }.joined(separator: ",")
+  }
+
+  private func minimumActionRowsWidth(
+    for rows: [InlineProtocol.MessageActionRow],
+    parentAvailableWidth: CGFloat
+  ) -> CGFloat {
+    let maxButtonsInRow = rows.map { $0.actions.count }.max() ?? 1
+    let rowBasedMinimum = CGFloat(maxButtonsInRow) * Self.messageActionButtonMinWidth
+      + CGFloat(max(maxButtonsInRow - 1, 0)) * Self.messageActionRowSpacing
+    let proposed = max(Self.messageActionsMinWidth, rowBasedMinimum)
+    return min(parentAvailableWidth, proposed)
+  }
+
+  private func replyThreadSummaryHeight(for props: MessageViewInputProps) -> CGFloat {
+    ReplyThreadSummaryView.height(hasTitle: props.replyThreadTitle?.isEmpty == false)
+  }
+
+  private func cacheKey(
+    for message: FullMessage,
+    width: CGFloat,
+    props: MessageViewInputProps,
+    actionRows: [InlineProtocol.MessageActionRow]
+  ) -> NSString {
+    let entities = message.translationEntities ?? message.message.entities
+    // Hash-based approach is faster than string concatenation
+    let hashValue =
+      "\(message.id)_\(message.displayText?.hashValue ?? 0)_\(Int(width))_\(props.toString())_\(entities?.hashValue ?? 0)_\(actionRowsSignature(for: actionRows))"
+    return NSString(string: "\(hashValue)")
+  }
+
+  private var singleLineDiff = 4.0
+
+  // MARK: - Bubble Sizing
+
+  func calculateBubbleSize(
+    for message: FullMessage,
+    with props: MessageViewInputProps,
+    tableWidth width: CGFloat,
+    richContentRendererOverride: Bool? = nil
+  ) -> (NSSize, NSSize, NSSize?, LayoutPlans) {
+    calculateBubbleSizeInternal(
+      for: message,
+      with: props,
+      tableWidth: width,
+      richContentRendererEnabled: richContentRendererOverride ?? AppSettings.shared.richContentRendererEnabled
+    )
+  }
+
+  // MARK: - Minimal Sizing
+
+  func calculateMinimalSize(
+    for message: FullMessage,
+    with props: MessageViewInputProps,
+    tableWidth width: CGFloat,
+    richContentRendererOverride: Bool? = nil
+  ) -> (NSSize, NSSize, NSSize?, LayoutPlans) {
+    calculateMinimalSizeInternal(
+      for: message,
+      with: props,
+      tableWidth: width,
+      richContentRendererEnabled: richContentRendererOverride ?? AppSettings.shared.richContentRendererEnabled
+    )
+  }
+
+  // Backward-compatible entrypoint for existing call sites.
+  func calculateSize(
+    for message: FullMessage,
+    with props: MessageViewInputProps,
+    tableWidth width: CGFloat,
+    richContentRendererOverride: Bool? = nil
+  ) -> (NSSize, NSSize, NSSize?, LayoutPlans) {
+    switch props.renderStyle {
+    case .bubble:
+      return calculateBubbleSize(
+        for: message,
+        with: props,
+        tableWidth: width,
+        richContentRendererOverride: richContentRendererOverride
+      )
+    case .minimal:
+      return calculateMinimalSize(
+        for: message,
+        with: props,
+        tableWidth: width,
+        richContentRendererOverride: richContentRendererOverride
+      )
+    }
+  }
+
+  func calculateServiceSize(
+    for message: FullMessage,
+    with _: MessageViewInputProps,
+    tableWidth width: CGFloat
+  ) -> (NSSize, NSSize, NSSize?, LayoutPlans) {
+    let (size, textSize, plan) = ServiceMessageRowLayout.calculateSize(
+      for: message,
+      tableWidth: width
+    )
+    lastHeightForRow.setObject(NSValue(size: size), forKey: NSString(string: "\(message.id)"))
+    return (size, textSize, nil, plan)
+  }
+
+  private func calculateBubbleSizeInternal(
+    for message: FullMessage,
+    with props: MessageViewInputProps,
+    tableWidth width: CGFloat,
+    richContentRendererEnabled: Bool
+  ) -> (NSSize, NSSize, NSSize?, LayoutPlans) {
+    #if DEBUG
+    let start = CFAbsoluteTimeGetCurrent()
+    #endif
+
+    let hasText = message.message.hasText
+    let text = message.displayText ?? emptyFallback
+    let entities = message.translationEntities ?? message.message.entities
+    let hasMedia = message.hasMedia
+    let hasVoice = message.message.hasVoice
+    let hasDocument = message.documentInfo != nil || hasVoice
+    let hasReply = message.message.repliedToMessageId != nil
+    let hasForwardHeader = message.message.hasForwardHeader
+    let hasReactions = message.reactions.count > 0
+    let renderableAttachments = message.attachments.filter(\.isRenderableAttachment)
+    let hasAttachments = !renderableAttachments.isEmpty
+    let hasURLPreviewAttachment = renderableAttachments.contains { $0.urlPreview != nil }
+    let hasReplyThreadSummary = props.interactionMode != .threadAnchor && message.message.hasReplyThreadSummary
+    let renderableActionRows = actionRows(for: message)
+    let hasActionRows = !renderableActionRows.isEmpty
+    let hasAcknowledgement = props.interactionMode != .threadAnchor
+      && !message.acknowledgementActors.isEmpty
+      && !message.message.isServiceMessage
+    let isOutgoing = message.message.out == true
+    let acknowledgementWidth = hasAcknowledgement ? message.acknowledgementPillWidth : 0
+    let timeWidth = isOutgoing
+      ? MessageTimeAndState.timeWidth + MessageTimeAndState.symbolWidth
+      : MessageTimeAndState.timeWidth
+    var isSingleLine = false
+    var isSticker = message.message.isSticker == true
+    var textSize: CGSize?
+    var richBlockPlan: RichBlockLayoutPlan?
+    var photoSize: CGSize?
+    var videoSize: CGSize?
+    let isTextOnly: Bool = hasText && !hasMedia && !hasDocument && !hasAttachments && !hasReplyThreadSummary
+    let emojiInfo: (count: Int, isAllEmojis: Bool) = isTextOnly ? text.emojiInfo : (0, false)
+    // TODO: remove has reply once we confirm reply embed style looks good with emojis
+    let emojiMessage =
+      !hasReply && !hasForwardHeader && !hasReplyThreadSummary && isTextOnly &&
+      emojiInfo.isAllEmojis && emojiInfo.count > 0
+    let isPngPhotoWithoutCaption = isPNGPhotoMessage(message) && !hasNonEmptyCaption(message)
+    let hasBubbleColor = hasBubbleColor(
+      style: .bubble,
+      emojiMessage: emojiMessage,
+      isSticker: isSticker,
+      isPngPhotoWithoutCaption: isPngPhotoWithoutCaption
+    )
+    let usesOutgoingBubbleStyle = isOutgoing && hasBubbleColor
+    let richTextStyleKey = richTextStyleKey(for: .bubble, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+    let bubbleContentHorizontalInset = horizontalBubbleInset(for: .bubble)
+
+    // Font size
+    let fontSize: Double = switch emojiInfo {
+      case let (count, true) where count == 1:
+        Double(ChatTypography.current.singleEmojiPointSize)
+      case let (count, true) where count <= 3:
+        Double(ChatTypography.current.threeEmojisPointSize)
+      case (_, true):
+        Double(ChatTypography.current.manyEmojisPointSize)
+      default:
+        Double(ChatTypography.current.pointSize)
+    }
+
+    // Font - use this for measuring text
+    let font = ChatTypography.current.font.withSize(fontSize)
+
+    // Attributed String
+    let attributedString: NSAttributedString
+    if let cached = CacheAttrs.shared.get(message: message, renderStyle: .bubble, styleKey: richTextStyleKey) {
+      attributedString = cached
+    } else {
+      let processed = ProcessEntities.toAttributedString(
+        text: text,
+        entities: entities,
+        configuration: .init(
+          font: font,
+          boldWeight: .semibold,
+          monospaceBaseFont: MessageTextConfiguration.monospaceBaseFont,
+          palette: richTextPalette(for: .bubble, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+        )
+      )
+      // cache processed string
+      CacheAttrs.shared.set(message: message, renderStyle: .bubble, styleKey: richTextStyleKey, value: processed)
+      attributedString = processed
+    }
+
+    // If text is empty, height is always 1 line
+    // Ref: https://inessential.com/2015/02/05/a_performance_enhancement_for_variable-h.html
+    if hasText, text.isEmpty {
+      textSize = CGSize(width: 1, height: heightForSingleLineText())
+      isSingleLine = true
+    }
+
+    // Total available before taking into account photo/video size constraints as they can impact it for the text view.
+    // Eg. with a narrow image with 200 width, even if window gives us 500, we should cap at 200.
+    let parentAvailableWidth: CGFloat = getAvailableWidth(tableWidth: width)
+    let maxMediaSide: CGFloat = 320.0
+
+    // Add file/photo/video sizes
+    if hasMedia {
+      var width: CGFloat = 0
+      var height: CGFloat = 0
+
+      if let file = message.file {
+        width = ceil(CGFloat(file.width ?? 0))
+        height = ceil(CGFloat(file.height ?? 0))
+      } else if let photoInfo = message.photoInfo {
+        let photo = photoInfo.bestPhotoSize()
+        width = ceil(CGFloat(photo?.width ?? 0))
+        height = ceil(CGFloat(photo?.height ?? 0))
+      } else if let videoInfo = message.videoInfo {
+        width = ceil(CGFloat(videoInfo.video.width ?? 0))
+        height = ceil(CGFloat(videoInfo.video.height ?? 0))
+
+        // Fallback to thumbnail size if intrinsic video dimensions are missing
+        if (width == 0 || height == 0), let thumb = videoInfo.thumbnail?.bestPhotoSize() {
+          width = ceil(CGFloat(thumb.width ?? 0))
+          height = ceil(CGFloat(thumb.height ?? 0))
+        }
+      }
+
+      if message.message.isSticker == true {
+        photoSize = calculatePhotoSize(
+          width: width,
+          height: height,
+          parentAvailableWidth: parentAvailableWidth,
+          hasCaption: hasText,
+          maxSide: Self.stickerMaxSide
+        )
+      } else if message.file?.fileType == .photo || message.photoInfo != nil {
+        photoSize = calculatePhotoSize(
+          width: width,
+          height: height,
+          parentAvailableWidth: parentAvailableWidth,
+          hasCaption: hasText,
+          maxSide: maxMediaSide
+        )
+      } else if message.videoInfo != nil {
+        videoSize = calculatePhotoSize(
+          width: width,
+          height: height,
+          parentAvailableWidth: parentAvailableWidth,
+          hasCaption: hasText,
+          maxSide: maxMediaSide
+        )
+      }
+    }
+
+    // Calculate document width first if we have a document
+    var documentWidth: CGFloat?
+    if hasDocument {
+      // Documents have minimum width but can expand up to parent available width
+      // Start with the minimum document width, but don't exceed parent available width
+      let baseWidth = if hasVoice {
+        Theme.voiceMessageViewWidth
+      } else if let documentInfo = message.documentInfo {
+        DocumentPresentationPlan.preferredWidth(for: documentInfo)
+      } else {
+        Theme.documentViewWidth
+      }
+      let documentAvailableWidth = hasVoice
+        ? max(1, parentAvailableWidth - (bubbleContentHorizontalInset * 2))
+        : parentAvailableWidth
+      documentWidth = min(documentAvailableWidth, baseWidth)
+    }
+
+    // Calculate attachments width first if we have attachments
+    var attachmentsWidth: CGFloat?
+    if hasAttachments {
+      let attachmentAvailableWidth = hasURLPreviewAttachment
+        ? max(1, parentAvailableWidth - (bubbleContentHorizontalInset * 2))
+        : parentAvailableWidth
+      attachmentsWidth = attachmentGroupWidth(
+        parentAvailableWidth: attachmentAvailableWidth,
+        style: .bubble
+      )
+    }
+
+    // What's the available width for the text
+    var availableWidth = min(parentAvailableWidth, photoSize?.width ?? videoSize?.width ?? parentAvailableWidth)
+
+    if let photoSize {
+      // if we have photo, min available width is the photo width
+      availableWidth = max(availableWidth, photoSize.width)
+    } else if let videoSize {
+      availableWidth = max(availableWidth, videoSize.width)
+    }
+
+    // When we have media that constrains the width, we need to account for bubble padding
+    // to ensure text doesn't overflow the bubble bounds
+    if hasMedia, let photoSize {
+      // Photos strictly constrain text width
+      availableWidth = photoSize.width - (bubbleContentHorizontalInset * 2)
+    } else if hasMedia, let videoSize {
+      availableWidth = videoSize.width - (bubbleContentHorizontalInset * 2)
+    } else if hasDocument {
+      // Documents don't restrict text width like photos - text can use full parent width
+      availableWidth = parentAvailableWidth - (bubbleContentHorizontalInset * 2)
+    } else if hasBubbleColor {
+      // The available width is the whole bubble, including its internal padding.
+      availableWidth = max(1, parentAvailableWidth - (bubbleContentHorizontalInset * 2))
+    }
+
+    #if DEBUG
+    log.trace("availableWidth \(availableWidth) for text \(text)")
+    #endif
+
+    if richContentRendererEnabled,
+       message.translationText == nil,
+       text.utf8.elementsEqual((message.message.text ?? "").utf8),
+       let blockContentPayload = message.message.blockContentPayload
+    {
+      let richContentInset = hasBubbleColor ? bubbleContentHorizontalInset : 0
+      let richViewportWidth = max(1, availableWidth + richContentInset * 2)
+      // A quote reply shows its quote in the reply header, so the body skips it.
+      let replyQuote = message.leadingReplyQuote
+      richBlockPlan = RichBlockLayoutPlanner.shared.plan(
+        content: replyQuote?.body ?? blockContentPayload.content,
+        contentCacheSignature: replyQuote?.bodyCacheSignature ?? blockContentPayload.cacheSignature,
+        contentByteCount: replyQuote?.bodyByteCount ?? blockContentPayload.byteCount,
+        attributedText: attributedString,
+        availableWidth: richViewportWidth,
+        contentHorizontalInset: richContentInset,
+        baseFontSize: fontSize,
+        primaryColor: primaryColor(for: .bubble, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle),
+        secondaryColor: secondaryColor(for: .bubble, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle),
+        inlineMathAttachmentsEnabled: AppSettings.shared.richTextInlineMathEnabled,
+        disclosureOverrides: RichBlockLocalStateStore.shared.disclosureOverrides(for: message.message)
+      )
+      if let richBlockPlan {
+        textSize = richBlockPlan.size
+        isSingleLine = false
+      }
+    }
+
+    let cacheKey_ = cacheKey(
+      for: message,
+      width: availableWidth,
+      props: props,
+      actionRows: renderableActionRows
+    )
+    if richBlockPlan == nil, let cachedTextSize = textHeightCache.object(forKey: cacheKey_)?.sizeValue {
+      textSize = cachedTextSize
+      #if DEBUG
+      log.trace("text size cache hit \(message.message.messageId)")
+      #endif
+
+      if hasText, abs(cachedTextSize.height - heightForSingleLineText()) < singleLineDiff {
+        isSingleLine = true
+      }
+    } else {
+      #if DEBUG
+      log.trace("text size cache miss \(message.id)")
+      #endif
+    }
+
+    // MARK: Calculate text size if caches are missed
+
+    // Shared logic
+    if richBlockPlan == nil,
+       hasText,
+       textSize == nil,
+       !emojiMessage,
+       let minTextWidth = getTextWidthIfSingleLine(message, availableWidth: availableWidth)
+    {
+      #if DEBUG
+      log.trace("single line cache hit \(message.id)")
+      #endif
+      isSingleLine = true
+      textSize = CGSize(width: minTextWidth, height: heightForSingleLineText())
+    } else {
+      // remove from single line cache. possibly logic can be improved
+      // FIXME: Optimize this line, it's hit too often with the whole text
+      minTextWidthForSingleLine.removeObject(forKey: singleLineTextCacheKey(for: message, text: text))
+    }
+
+    if hasText, textSize == nil {
+      let textSize_ = calculateSizeForAttributedString(attributedString, width: availableWidth, message: message)
+      textSize = textSize_
+
+      // Cache as single line if height is equal to single line height
+      if hasText, abs(textSize_.height - heightForSingleLineText()) < singleLineDiff {
+        isSingleLine = true
+        minTextWidthForSingleLine.setObject(
+          NSValue(size: textSize_),
+          forKey: singleLineTextCacheKey(for: message, text: text)
+        )
+      }
+    }
+
+    let textHeight = textSize?.height ?? 0.0
+    let textWidth = textSize?.width ?? 0.0
+
+    // Update document width based on content (if we have a document with text)
+    if hasDocument, !hasVoice, hasText, let currentDocumentWidth = documentWidth {
+      // Document can expand to fit text content, but has minimum and maximum bounds
+      let textWidthWithPadding = textWidth + (bubbleContentHorizontalInset * 2)
+      documentWidth = max(currentDocumentWidth, min(parentAvailableWidth, textWidthWithPadding))
+    }
+
+    // Re-evaluate if we are single line based on space left after the text width
+    if isSingleLine, textWidth > availableWidth - MessageTimeAndState.timeWidth {
+      isSingleLine = false
+    }
+
+    let textWasSingleLine = isSingleLine
+    if isSingleLine, hasAcknowledgement || hasActionRows {
+      isSingleLine = false
+    }
+
+    let canShareReactionRowWithTime = hasAcknowledgement && hasReactions
+      || (textWasSingleLine
+        && hasReactions
+        && isTextOnly
+        && !hasReply
+        && !hasForwardHeader
+        && !hasActionRows
+        && !emojiMessage)
+
+    // Reaction messages use the multiline content flow. A later measured-layout pass can still
+    // reclaim the time row when the final reaction line leaves enough trailing space.
+    if isSingleLine, hasReactions {
+      isSingleLine = false
+    }
+
+    // Force multiline mode for documents without caption text
+    if isSingleLine, hasDocument, !hasText {
+      isSingleLine = false
+    }
+
+    if isSingleLine, hasAttachments {
+      isSingleLine = false
+    }
+
+    if isSingleLine, hasReplyThreadSummary {
+      isSingleLine = false
+    }
+
+    // MARK: - Layout Plans
+
+    // we prepare our plans and after done with calculations we will use them to calculate the final size
+    // some rules:
+    // - spacing means outer spacing, so it's additive to the size of the element (it's different from insets)
+    // - for content views we add just bottom spacing to all elements, except for the first element in the group which
+    // has top as well.
+    // - we add left edge spacing to elements stacked together, except for the last element which needs right spacing as
+    // well.
+    // - we don't set width for most elements, only photo and text that can affact the width of the bubble
+
+    var wrapperPlan = LayoutPlan(size: .zero, spacing: .zero)
+    var bubblePlan = LayoutPlan(size: .zero, spacing: .zero)
+    var namePlan: LayoutPlan?
+    var avatarPlan: LayoutPlan?
+    var textPlan: LayoutPlan?
+    var photoPlan: LayoutPlan?
+    var videoPlan: LayoutPlan?
+    var documentPlan: LayoutPlan?
+    var forwardHeaderPlan: LayoutPlan?
+    var replyPlan: LayoutPlan?
+    var replyThreadSummaryPlan: LayoutPlan?
+    var reactionsPlan: LayoutPlan?
+    var reactionsLastLineWidth: CGFloat = 0
+    var actionsRowsPlan: LayoutPlan?
+    var reactionItemsPlan: [String: LayoutPlan] = [:]
+    var reactionsOutsideBubble = false
+    let reactionsOutsideBubbleTopInset: CGFloat = 3.0
+    var timePlan: LayoutPlan?
+    var attachmentsPlan: LayoutPlan?
+    var attachmentItemsPlans: [LayoutPlan] = []
+
+    // MARK: - Name
+
+    if props.firstInGroup, !isOutgoing, !props.isDM {
+      let nameHeight = Theme.messageNameLabelHeight
+      namePlan = LayoutPlan(
+        size: CGSize(width: 0, height: nameHeight),
+        spacing: .init(top: 0, left: 5.0, bottom: 0, right: 0)
+      )
+    }
+
+    // MARK: - Avatar
+
+    if props.lastInGroup, !isOutgoing, !props.isDM {
+      avatarPlan = LayoutPlan(
+        size: .init(width: Theme.messageAvatarSize, height: Theme.messageAvatarSize),
+        spacing: .init(
+          top: 0,
+          left: Self.bubbleAvatarLeadingInset,
+          bottom: 0,
+          right: Theme.messageHorizontalStackSpacing
+        )
+      )
+    }
+
+    // MARK: - Text
+
+    if hasText {
+      let textHeight = max(textHeight, heightForSingleLineText())
+      var textTopSpacing: CGFloat = 0
+      var textBottomSpacing: CGFloat = 0
+      let textSidePadding = richBlockPlan == nil && hasBubbleColor ? bubbleContentHorizontalInset : 0
+
+      // If just text
+      if !hasMedia, !hasReply, !hasForwardHeader {
+        textTopSpacing += Theme.messageTextOnlyVerticalInsets
+      }
+
+      if isSingleLine {
+        textBottomSpacing += Theme.messageTextOnlyVerticalInsets
+      } else {
+        textBottomSpacing += Theme.messageTextAndTimeSpacing
+      }
+      if richBlockPlan?.trailingTextLine != nil, hasBubbleColor {
+        textBottomSpacing += 3
+      }
+
+      // Offset added height to keep bubble height unchanged
+      textBottomSpacing -= additionalTextHeight
+
+      textPlan = LayoutPlan(
+        size: NSSize(width: ceil(textWidth), height: ceil(textHeight)),
+        spacing: NSEdgeInsets(
+          top: textTopSpacing,
+          left: textSidePadding,
+          bottom: textBottomSpacing,
+          right: textSidePadding
+        )
+      )
+    }
+
+    // MARK: - Forward Header
+
+    if hasForwardHeader {
+      forwardHeaderPlan = LayoutPlan(size: .zero, spacing: .zero)
+      forwardHeaderPlan!.size.height = Theme.messageNameLabelHeight
+      forwardHeaderPlan!.size.width = 0
+      forwardHeaderPlan!.spacing = .init(
+        top: 4.0,
+        left: bubbleContentHorizontalInset,
+        bottom: 2.0,
+        right: bubbleContentHorizontalInset
+      )
+    }
+
+    // MARK: - Reply
+
+    if hasReply {
+      replyPlan = LayoutPlan(size: .zero, spacing: .zero)
+      replyPlan!.size.height = Theme.embeddedMessageHeight
+      replyPlan!.size.width = 200
+      replyPlan!.spacing = .init(
+        top: 6.0,
+        left: bubbleContentHorizontalInset,
+        bottom: 3.0,
+        right: bubbleContentHorizontalInset
+      )
+    }
+
+    // MARK: - Photo
+
+    if let photoSize {
+      photoPlan = LayoutPlan(size: .zero, spacing: .zero)
+      photoPlan!.size = photoSize
+
+      if hasText {
+        photoPlan!.spacing = .bottom(Theme.messageTextAndPhotoSpacing)
+      } else {
+        photoPlan!.spacing = .zero
+      }
+    }
+
+    // MARK: - Video
+
+    if let videoSize {
+      videoPlan = LayoutPlan(size: .zero, spacing: .zero)
+      videoPlan!.size = videoSize
+
+      if hasText {
+        videoPlan!.spacing = .bottom(Theme.messageTextAndPhotoSpacing)
+      } else {
+        videoPlan!.spacing = .zero
+      }
+    }
+
+    // MARK: - Document
+
+    if hasDocument, let documentWidth {
+      documentPlan = LayoutPlan(size: .zero, spacing: .zero)
+      // Use the shared document width calculated above
+      let documentHeight = if hasVoice {
+        Theme.voiceMessageViewHeight
+      } else if let documentInfo = message.documentInfo {
+        DocumentPresentationPlan.preferredHeight(for: documentInfo)
+      } else {
+        Theme.documentViewHeight
+      }
+      documentPlan!.size = CGSize(width: documentWidth, height: documentHeight)
+
+      if hasText {
+        // documentPlan!.spacing = .bottom(Theme.messageTextAndPhotoSpacing)
+        documentPlan!.spacing = NSEdgeInsets(
+          top: 8,
+          left: bubbleContentHorizontalInset,
+          bottom: hasVoice ? 0 : Theme.messageTextAndPhotoSpacing,
+          right: bubbleContentHorizontalInset
+        )
+      } else {
+        documentPlan!.spacing = NSEdgeInsets(
+          top: 8,
+          left: bubbleContentHorizontalInset,
+          bottom: 8,
+          right: bubbleContentHorizontalInset
+        )
+      }
+    }
+
+    // MARK: - Attachments
+
+    if hasAttachments, let attachmentsWidth {
+      attachmentsPlan = LayoutPlan(size: .zero, spacing: .zero)
+      attachmentsPlan!.size = NSSize(width: attachmentsWidth, height: 0)
+      attachmentsPlan!.spacing = NSEdgeInsets(
+        top: hasURLPreviewAttachment ? Theme.urlPreviewGroupSpacing : Theme.messageTextAndPhotoSpacing,
+        left: bubbleContentHorizontalInset,
+        bottom: hasURLPreviewAttachment ? Theme.urlPreviewGroupBottomSpacing : 4,
+        right: bubbleContentHorizontalInset
+      )
+    }
+
+    // MARK: - Reply Thread Summary
+
+    if hasReplyThreadSummary {
+      let summaryWidth = max(200, min(parentAvailableWidth, 260))
+      replyThreadSummaryPlan = LayoutPlan(size: .zero, spacing: .zero)
+      replyThreadSummaryPlan!.size.height = replyThreadSummaryHeight(for: props)
+      replyThreadSummaryPlan!.size.width = summaryWidth
+      replyThreadSummaryPlan!.spacing = .init(
+        top: 6.0,
+        left: bubbleContentHorizontalInset,
+        bottom: 3.0,
+        right: bubbleContentHorizontalInset
+      )
+    }
+
+    // MARK: - Reactions
+
+    if hasReactions {
+      reactionsOutsideBubble = !hasText && (photoPlan != nil || videoPlan != nil)
+      let defaultReactionHorizontalInset: CGFloat = 8.0
+      let reactionLeadingInset = richBlockPlan == nil
+        ? (textPlan?.spacing.left ?? defaultReactionHorizontalInset)
+        : bubbleContentHorizontalInset
+      let reactionTrailingInset = richBlockPlan == nil
+        ? (textPlan?.spacing.right ?? defaultReactionHorizontalInset)
+        : bubbleContentHorizontalInset
+      let reactionsInsets: NSEdgeInsets = if reactionsOutsideBubble {
+        .zero
+      } else if emojiMessage {
+        NSEdgeInsets(
+          top: 2.0,
+          left: reactionLeadingInset,
+          bottom: 6.0,
+          right: reactionTrailingInset
+        )
+      } else {
+        NSEdgeInsets(
+          top: 5.0,
+          left: reactionLeadingInset,
+          bottom: 0.0,
+          right: reactionTrailingInset
+        )
+      }
+      reactionsPlan = LayoutPlan(
+        size: .zero,
+        spacing: reactionsInsets
+      )
+
+      let reactionsSpacing = 6.0
+      let acknowledgementClusterWidth = hasAcknowledgement
+        ? timeWidth + Self.acknowledgementFooterSpacing + acknowledgementWidth
+          + Self.acknowledgementTrailingInset
+        : 0
+      let reactionLineWidth = max(
+        1,
+        availableWidth - acknowledgementClusterWidth - (hasAcknowledgement ? reactionsSpacing : 0)
+      )
+      let reactionSpacing = NSEdgeInsets(
+        top: reactionsSpacing,
+        left: 0,
+        bottom: reactionsSpacing,
+        right: reactionsSpacing
+      )
+
+      // line index of reactions row
+      var reactionsCurrentLine = 0
+      var currentLineWidth: CGFloat = 0
+
+      let sortedReactions = ReactionChipOrdering.sortForLayout(message.groupedReactions)
+
+      // layout each reaction item
+      for reaction in sortedReactions {
+        let emoji = reaction.emoji
+        let reactionSize = ReactionChipMetrics.size(group: reaction)
+
+        // Check if we need to move to next line
+        if currentLineWidth + reactionSize.width + reactionsSpacing > reactionLineWidth {
+          // go to next line
+          reactionsCurrentLine += 1
+          currentLineWidth = 0
+        }
+
+        // Calculate absolute position in grid based on final line position
+        let spacing = NSEdgeInsets(
+          top: CGFloat(reactionsCurrentLine) * (reactionSize.height + reactionsSpacing), // Row offset
+          left: currentLineWidth, // Column offset
+          bottom: 0,
+          right: 0
+        )
+
+        let reactionPlan = LayoutPlan(
+          size: reactionSize,
+          spacing: spacing
+        )
+        reactionItemsPlan[emoji] = reactionPlan
+
+        // Add this reaction to current line
+        currentLineWidth += reactionSize.width + reactionsSpacing
+
+        // Update reactions container size
+        let lineWidth = reactionsOutsideBubble
+          ? max(0, currentLineWidth - reactionsSpacing)
+          : currentLineWidth
+        reactionsPlan!.size.width = max(reactionsPlan!.size.width, lineWidth)
+        reactionsPlan!.size.height = CGFloat(reactionsCurrentLine + 1) * (reactionSize.height + reactionsSpacing)
+      }
+
+      reactionsLastLineWidth = max(0, currentLineWidth - reactionsSpacing)
+    }
+
+    // MARK: - Time Size
+
+    timePlan = LayoutPlan(size: .zero, spacing: .zero)
+    timePlan!.size = CGSize(
+      width: timeWidth,
+      height: Theme.messageTimeHeight
+    )
+
+    if isSingleLine {
+      timePlan!.spacing = .init(top: 0, left: 0, bottom: 5.0, right: 9.0)
+    } else {
+      //timePlan!.spacing = .init(top: 1.0, left: 9.0, bottom: 5.0, right: 9.0)
+      timePlan!.spacing = .init(top: 1.0, left: 0.0, bottom: 5.0, right: 6.0)
+    }
+    if hasAcknowledgement {
+      timePlan!.spacing.right = acknowledgementWidth
+        + Self.acknowledgementFooterSpacing
+        + Self.acknowledgementTrailingInset
+    }
+
+    // modify isSingleLine to be false if we have media and text won't fit in a single line with time
+    if isSingleLine, let textPlan, (photoPlan != nil || videoPlan != nil) {
+      let textWidth = textPlan.size.width + textPlan.spacing.horizontalTotal
+      let timeWidth = timePlan!.size.width + timePlan!.spacing.horizontalTotal
+      let totalWidth = textWidth + timeWidth
+
+      let mediaWidth = photoPlan?.size.width ?? videoPlan?.size.width ?? 0
+      if totalWidth > mediaWidth {
+        isSingleLine = false
+      }
+    }
+
+    let reactionTimeSpacing: CGFloat = 6.0
+    var sharedReactionTimeWidth: CGFloat?
+    if
+      canShareReactionRowWithTime,
+      let reactionsPlan,
+      let timePlan,
+      !reactionsOutsideBubble {
+      sharedReactionTimeWidth = reactionsPlan.spacing.left +
+        reactionsLastLineWidth +
+        reactionTimeSpacing +
+        timePlan.size.width +
+        timePlan.spacing.right
+    }
+    let maxBubbleWidth = richBlockPlan?.size.width
+      ?? (availableWidth + (textPlan?.spacing.horizontalTotal ?? 0))
+    let timeSharesReactionRow = hasAcknowledgement && hasReactions && !reactionsOutsideBubble
+      ? true
+      : (sharedReactionTimeWidth.map { $0 <= maxBubbleWidth } ?? false)
+    let timeSharesRichFooter: Bool = if let trailing = richBlockPlan?.trailingTextLine,
+      let timePlan,
+      !trailing.isRTL,
+      !hasReactions,
+      !hasAcknowledgement,
+      !hasAttachments,
+      !hasReplyThreadSummary
+    {
+      trailing.usedWidth + 6 + timePlan.size.width + timePlan.spacing.right
+        <= (richBlockPlan?.size.width ?? availableWidth)
+    } else {
+      false
+    }
+
+    // MARK: - Bubble
+
+    var bubbleWidth: CGFloat = 0
+    var bubbleHeight: CGFloat = 0
+
+    if let textPlan {
+      bubbleHeight += textPlan.size.height
+      bubbleHeight += textPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, textPlan.size.width + textPlan.spacing.horizontalTotal)
+
+      if isSingleLine, let timePlan {
+        bubbleWidth = max(bubbleWidth, textPlan.size.width + textPlan.spacing.horizontalTotal + timePlan.size.width)
+      }
+    }
+    if let forwardHeaderPlan {
+      bubbleHeight += forwardHeaderPlan.size.height
+      bubbleHeight += forwardHeaderPlan.spacing.bottom
+      bubbleWidth = max(
+        bubbleWidth,
+        forwardHeaderPlan.size.width + forwardHeaderPlan.spacing.horizontalTotal
+      )
+    }
+    if let replyPlan {
+      bubbleHeight += replyPlan.size.height
+      bubbleHeight += replyPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, replyPlan.size.width + replyPlan.spacing.horizontalTotal)
+    }
+    if let photoPlan {
+      bubbleHeight += photoPlan.size.height
+      bubbleHeight += photoPlan.spacing.bottom
+      bubbleWidth = photoPlan.size.width
+    }
+    if let videoPlan {
+      bubbleHeight += videoPlan.size.height
+      bubbleHeight += videoPlan.spacing.bottom
+      bubbleWidth = videoPlan.size.width
+    }
+    if let documentPlan {
+      bubbleHeight += documentPlan.size.height
+      bubbleHeight += documentPlan.spacing.bottom
+      if replyPlan != nil {
+        bubbleHeight += documentPlan.spacing.top
+      }
+      bubbleWidth = max(bubbleWidth, documentPlan.size.width + documentPlan.spacing.horizontalTotal)
+    }
+    if let replyThreadSummaryPlan {
+      bubbleHeight += replyThreadSummaryPlan.spacing.top
+      bubbleHeight += replyThreadSummaryPlan.size.height
+      bubbleHeight += replyThreadSummaryPlan.spacing.bottom
+      bubbleWidth = max(
+        bubbleWidth,
+        replyThreadSummaryPlan.size.width + replyThreadSummaryPlan.spacing.horizontalTotal
+      )
+    }
+    if let reactionsPlan {
+      if !reactionsOutsideBubble {
+        bubbleHeight += reactionsPlan.spacing.top
+        bubbleHeight += reactionsPlan.size.height
+        bubbleHeight += reactionsPlan.spacing.bottom
+        bubbleWidth = max(bubbleWidth, reactionsPlan.size.width + reactionsPlan.spacing.horizontalTotal)
+      }
+    }
+    if let timePlan {
+      if !isSingleLine, hasText, !timeSharesReactionRow, !timeSharesRichFooter {
+        bubbleHeight += timePlan.size.height
+        bubbleHeight += timePlan.spacing.verticalTotal // ??? probably too much
+      }
+      if !isSingleLine, hasDocument, !hasText {
+        bubbleHeight += timePlan.size.height
+      }
+      // ensure we have enough width for the time when multiline
+      bubbleWidth = max(bubbleWidth, timePlan.size.width + timePlan.spacing.horizontalTotal)
+    }
+    if timeSharesReactionRow, let sharedReactionTimeWidth {
+      bubbleWidth = max(bubbleWidth, sharedReactionTimeWidth)
+    }
+
+    // URL previews and voice are flexible bubble content. Resolve every fixed width first,
+    // then plan each flexible child once at the final inner width.
+    if let attachmentsPlan, hasURLPreviewAttachment {
+      bubbleWidth = max(
+        bubbleWidth,
+        attachmentsPlan.size.width + attachmentsPlan.spacing.horizontalTotal
+      )
+    }
+
+    if hasVoice, var resolvedDocumentPlan = documentPlan {
+      resolvedDocumentPlan.size.width = max(
+        1,
+        bubbleWidth - resolvedDocumentPlan.spacing.horizontalTotal
+      )
+      documentPlan = resolvedDocumentPlan
+    }
+
+    if var resolvedAttachmentsPlan = attachmentsPlan, let attachmentsWidth {
+      let resolvedAttachmentsWidth = hasURLPreviewAttachment
+        ? max(1, bubbleWidth - resolvedAttachmentsPlan.spacing.horizontalTotal)
+        : attachmentsWidth
+      resolvedAttachmentsPlan.size = NSSize(width: resolvedAttachmentsWidth, height: 0)
+
+      attachmentItemsPlans = renderableAttachments.enumerated().map { index, attachment in
+        var attachmentPlan = LayoutPlan(size: .zero, spacing: .zero)
+        let isLastAttachment = index == renderableAttachments.count - 1
+
+        if attachment.externalTask != nil {
+          // TODO: Make external-task cards flexible only when their fixed-height presentation
+          // contract is reviewed with its view; stretching them here would broaden this sizing fix.
+          attachmentPlan.size = NSSize(width: attachmentsWidth, height: Theme.externalTaskViewHeight)
+        } else if attachment.urlPreview != nil {
+          let urlPreviewPlan = URLPreviewAttachmentLayout.plan(
+            for: attachment,
+            width: resolvedAttachmentsWidth
+          )
+          attachmentPlan.size = urlPreviewPlan.size
+          attachmentPlan.urlPreview = urlPreviewPlan
+        }
+
+        attachmentPlan.spacing = .bottom(isLastAttachment ? 0 : Theme.messageAttachmentsSpacing)
+        resolvedAttachmentsPlan.size.height += attachmentPlan.size.height + attachmentPlan.spacing.bottom
+        return attachmentPlan
+      }
+
+      attachmentsPlan = resolvedAttachmentsPlan
+      bubbleHeight += resolvedAttachmentsPlan.size.height
+      bubbleHeight += resolvedAttachmentsPlan.spacing.top
+      bubbleHeight += resolvedAttachmentsPlan.spacing.bottom
+      bubbleWidth = max(
+        bubbleWidth,
+        resolvedAttachmentsPlan.size.width + resolvedAttachmentsPlan.spacing.horizontalTotal
+      )
+    }
+
+    if hasActionRows {
+      let rowCount = renderableActionRows.count
+      let height = CGFloat(rowCount) * Self.bubbleMessageActionRowHeight
+        + CGFloat(max(rowCount - 1, 0)) * Self.messageActionRowSpacing
+      let minWidth = minimumActionRowsWidth(
+        for: renderableActionRows,
+        parentAvailableWidth: parentAvailableWidth
+      )
+      actionsRowsPlan = LayoutPlan(
+        size: CGSize(width: max(bubbleWidth, minWidth), height: height),
+        spacing: NSEdgeInsets(top: 4, left: 0, bottom: 0, right: 0)
+      )
+    }
+
+    bubblePlan.size = CGSize(width: bubbleWidth, height: bubbleHeight)
+    bubblePlan.spacing = .zero
+
+    // MARK: - Wrapper
+
+    var wrapperWidth: CGFloat = bubblePlan.size.width
+    var wrapperHeight: CGFloat = bubblePlan.size.height
+    var wrapperTopSpacing: CGFloat = 0
+
+    if let namePlan {
+      wrapperHeight += namePlan.size.height
+      wrapperHeight += namePlan.spacing.verticalTotal
+    }
+    if props.firstInGroup {
+      /// Remove extra bubble spacing for now
+      wrapperTopSpacing = Theme.messageGroupSpacing
+    }
+    if let avatarPlan {
+      wrapperWidth += avatarPlan.size.width
+      wrapperWidth += avatarPlan.spacing.horizontalTotal
+    }
+
+    wrapperHeight += bubblePlan.spacing.top
+    wrapperHeight += bubblePlan.spacing.bottom
+
+    if let actionsRowsPlan {
+      wrapperHeight += actionsRowsPlan.spacing.top
+      wrapperHeight += actionsRowsPlan.size.height
+      wrapperHeight += actionsRowsPlan.spacing.bottom
+      let avatarWidth = (avatarPlan?.size.width ?? 0) + (avatarPlan?.spacing.horizontalTotal ?? 0)
+      wrapperWidth = max(wrapperWidth, avatarWidth + actionsRowsPlan.size.width)
+    }
+
+    if reactionsOutsideBubble, let reactionsPlan {
+      wrapperHeight += reactionsOutsideBubbleTopInset
+      wrapperHeight += reactionsPlan.size.height
+      wrapperHeight += reactionsPlan.spacing.bottom
+      let avatarWidth = (avatarPlan?.size.width ?? 0) + (avatarPlan?.spacing.horizontalTotal ?? 0)
+      wrapperWidth = max(
+        wrapperWidth,
+        avatarWidth + reactionsPlan.size.width + reactionsPlan.spacing.horizontalTotal
+      )
+      if hasAcknowledgement, let timePlan {
+        wrapperWidth = max(
+          wrapperWidth,
+          avatarWidth
+            + reactionsPlan.size.width
+            + reactionTimeSpacing
+            + timePlan.size.width
+            + timePlan.spacing.right
+        )
+      }
+    }
+
+    wrapperPlan.size = CGSize(width: wrapperWidth, height: wrapperHeight)
+    wrapperPlan.spacing = .init(
+      top: wrapperTopSpacing + Theme.messageOuterVerticalPadding,
+      left: 0,
+      bottom: Theme.messageOuterVerticalPadding,
+      right: 0
+    )
+
+    // MARK: - Finalize Layout Plan
+
+    var plan = LayoutPlans(
+      wrapper: wrapperPlan,
+      name: namePlan,
+      avatar: avatarPlan,
+      bubble: bubblePlan,
+      text: textPlan,
+      richBlockContent: richBlockPlan,
+      photo: photoPlan,
+      video: videoPlan,
+      document: documentPlan,
+      attachmentItems: attachmentItemsPlans,
+      attachments: attachmentsPlan,
+      forwardHeader: forwardHeaderPlan,
+      reply: replyPlan,
+      replyThreadSummary: replyThreadSummaryPlan,
+      reactions: reactionsPlan,
+      actionsRows: actionsRowsPlan,
+      reactionItems: reactionItemsPlan,
+      reactionsOutsideBubble: reactionsOutsideBubble,
+      reactionsOutsideBubbleTopInset: reactionsOutsideBubble ? reactionsOutsideBubbleTopInset : 0,
+      timeInContentFlow: true,
+      hasAcknowledgement: hasAcknowledgement,
+      time: timePlan,
+      singleLine: isSingleLine,
+      emojiMessage: emojiMessage,
+      fontSize: fontSize,
+      hasBubbleColor: hasBubbleColor
+    )
+
+    // final pass
+    plan.bubble.size.height += plan.topMostContentTopSpacing
+    plan.wrapper.size.height += plan.topMostContentTopSpacing
+    if var avatar = plan.avatar {
+      let bubbleTop = (plan.name?.size.height ?? 0) + (plan.name?.spacing.verticalTotal ?? 0)
+      avatar.spacing.top = bubbleTop + max(0, plan.bubble.size.height - avatar.size.height)
+      plan.avatar = avatar
+      plan.wrapper.size.height = max(plan.wrapper.size.height, avatar.spacing.top + avatar.size.height)
+    }
+
+    // Fitting width
+    let size = NSSize(width: plan.totalWidth, height: plan.totalHeight)
+
+    if richBlockPlan == nil, let textSize {
+      textHeightCache.setObject(NSValue(size: textSize), forKey: cacheKey_)
+    }
+    lastHeightForRow.setObject(NSValue(size: size), forKey: NSString(string: "\(message.id)"))
+
+    return (size, textSize ?? NSSize.zero, photoSize, plan)
+  }
+
+  private func calculateMinimalSizeInternal(
+    for message: FullMessage,
+    with props: MessageViewInputProps,
+    tableWidth width: CGFloat,
+    richContentRendererEnabled: Bool
+  ) -> (NSSize, NSSize, NSSize?, LayoutPlans) {
+    let hasText = message.message.hasText
+    let text = message.displayText ?? emptyFallback
+    let entities = message.translationEntities ?? message.message.entities
+    let hasMedia = message.hasMedia
+    let hasVoice = message.message.hasVoice
+    let hasDocument = message.documentInfo != nil || hasVoice
+    let hasReply = message.message.repliedToMessageId != nil
+    let hasForwardHeader = message.message.hasForwardHeader
+    let hasReactions = message.reactions.count > 0
+    let renderableAttachments = message.attachments.filter(\.isRenderableAttachment)
+    let hasAttachments = !renderableAttachments.isEmpty
+    let hasReplyThreadSummary = props.interactionMode != .threadAnchor && message.message.hasReplyThreadSummary
+    let renderableActionRows = actionRows(for: message)
+    let hasActionRows = !renderableActionRows.isEmpty
+    let hasAcknowledgement = props.interactionMode != .threadAnchor
+      && !message.acknowledgementActors.isEmpty
+      && !message.message.isServiceMessage
+    let isOutgoing = message.message.out == true
+    let acknowledgementWidth = hasAcknowledgement ? message.acknowledgementPillWidth : 0
+    var textSize: CGSize?
+    var richBlockPlan: RichBlockLayoutPlan?
+    var photoSize: CGSize?
+    var videoSize: CGSize?
+
+    let isTextOnly = hasText && !hasMedia && !hasDocument && !hasAttachments && !hasReplyThreadSummary
+    let canUseEmojiTextSizing = hasText && !hasMedia && !hasDocument && !hasAttachments && !hasReply && !hasForwardHeader
+    let emojiInfo: (count: Int, isAllEmojis: Bool) = canUseEmojiTextSizing ? text.emojiInfo : (0, false)
+    let emojiMessage =
+      !hasReply && !hasForwardHeader && !hasReplyThreadSummary && isTextOnly &&
+      emojiInfo.isAllEmojis && emojiInfo.count > 0
+    let isSingleLine = false
+
+    // Font size
+    let fontSize = Self.minimalTextFontSize(for: emojiInfo)
+    let font = ChatTypography.current.font.withSize(fontSize)
+    let usesOutgoingBubbleStyle = false
+    let richTextStyleKey = richTextStyleKey(for: .minimal, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+
+    let attributedString: NSAttributedString
+    if let cached = CacheAttrs.shared.get(message: message, renderStyle: .minimal, styleKey: richTextStyleKey) {
+      attributedString = cached
+    } else {
+      let processed = ProcessEntities.toAttributedString(
+        text: text,
+        entities: entities,
+        configuration: .init(
+          font: font,
+          boldWeight: .semibold,
+          monospaceBaseFont: MessageTextConfiguration.monospaceBaseFont,
+          palette: richTextPalette(for: .minimal, usesOutgoingBubbleStyle: usesOutgoingBubbleStyle)
+        )
+      )
+      CacheAttrs.shared.set(message: message, renderStyle: .minimal, styleKey: richTextStyleKey, value: processed)
+      attributedString = processed
+    }
+
+    let parentAvailableWidth = getAvailableWidth(tableWidth: width, style: .minimal)
+    let textAvailableWidth = max(1, parentAvailableWidth)
+    var documentWidth: CGFloat?
+    var attachmentsWidth: CGFloat?
+
+    if richContentRendererEnabled,
+       message.translationText == nil,
+       text.utf8.elementsEqual((message.message.text ?? "").utf8),
+       let blockContentPayload = message.message.blockContentPayload
+    {
+      let replyQuote = message.leadingReplyQuote
+      richBlockPlan = RichBlockLayoutPlanner.shared.plan(
+        content: replyQuote?.body ?? blockContentPayload.content,
+        contentCacheSignature: replyQuote?.bodyCacheSignature ?? blockContentPayload.cacheSignature,
+        contentByteCount: replyQuote?.bodyByteCount ?? blockContentPayload.byteCount,
+        attributedText: attributedString,
+        availableWidth: textAvailableWidth,
+        baseFontSize: fontSize,
+        primaryColor: primaryColor(for: .minimal, usesOutgoingBubbleStyle: false),
+        secondaryColor: secondaryColor(for: .minimal, usesOutgoingBubbleStyle: false),
+        inlineMathAttachmentsEnabled: AppSettings.shared.richTextInlineMathEnabled,
+        disclosureOverrides: RichBlockLocalStateStore.shared.disclosureOverrides(for: message.message)
+      )
+      if let richBlockPlan {
+        textSize = richBlockPlan.size
+      }
+    }
+
+    if hasMedia {
+      var mediaIntrinsicWidth: CGFloat = 0
+      var mediaIntrinsicHeight: CGFloat = 0
+
+      if let file = message.file {
+        mediaIntrinsicWidth = ceil(CGFloat(file.width ?? 0))
+        mediaIntrinsicHeight = ceil(CGFloat(file.height ?? 0))
+      } else if let photoInfo = message.photoInfo {
+        let photo = photoInfo.bestPhotoSize()
+        mediaIntrinsicWidth = ceil(CGFloat(photo?.width ?? 0))
+        mediaIntrinsicHeight = ceil(CGFloat(photo?.height ?? 0))
+      } else if let videoInfo = message.videoInfo {
+        mediaIntrinsicWidth = ceil(CGFloat(videoInfo.video.width ?? 0))
+        mediaIntrinsicHeight = ceil(CGFloat(videoInfo.video.height ?? 0))
+
+        if (mediaIntrinsicWidth == 0 || mediaIntrinsicHeight == 0),
+           let thumb = videoInfo.thumbnail?.bestPhotoSize()
+        {
+          mediaIntrinsicWidth = ceil(CGFloat(thumb.width ?? 0))
+          mediaIntrinsicHeight = ceil(CGFloat(thumb.height ?? 0))
+        }
+      }
+
+      if message.message.isSticker == true {
+        photoSize = calculatePhotoSize(
+          width: mediaIntrinsicWidth,
+          height: mediaIntrinsicHeight,
+          parentAvailableWidth: parentAvailableWidth,
+          hasCaption: hasText,
+          style: .minimal,
+          maxSide: Self.minimalStickerMaxSide
+        )
+      } else if message.file?.fileType == .photo || message.photoInfo != nil {
+        photoSize = calculatePhotoSize(
+          width: mediaIntrinsicWidth,
+          height: mediaIntrinsicHeight,
+          parentAvailableWidth: parentAvailableWidth,
+          hasCaption: hasText,
+          style: .minimal,
+          maxSide: Self.minimalMediaMaxWidth,
+          maxHeight: Self.minimalMediaMaxHeight
+        )
+      } else if message.videoInfo != nil {
+        videoSize = calculatePhotoSize(
+          width: mediaIntrinsicWidth,
+          height: mediaIntrinsicHeight,
+          parentAvailableWidth: parentAvailableWidth,
+          hasCaption: hasText,
+          style: .minimal,
+          maxSide: Self.minimalMediaMaxWidth,
+          maxHeight: Self.minimalMediaMaxHeight
+        )
+      }
+    }
+
+    if hasDocument {
+      if hasVoice {
+        documentWidth = min(parentAvailableWidth, Theme.voiceMessageViewWidth)
+      } else if let documentInfo = message.documentInfo {
+        documentWidth = min(
+          parentAvailableWidth,
+          min(Self.minimalDocumentMaxWidth, DocumentPresentationPlan.preferredWidth(for: documentInfo))
+        )
+      } else {
+        documentWidth = min(parentAvailableWidth, Theme.documentViewWidth)
+      }
+    }
+
+    if hasAttachments {
+      attachmentsWidth = attachmentGroupWidth(
+        parentAvailableWidth: parentAvailableWidth,
+        style: .minimal
+      )
+    }
+
+    let cacheKey_ = cacheKey(
+      for: message,
+      width: textAvailableWidth,
+      props: props,
+      actionRows: renderableActionRows
+    )
+    if richBlockPlan == nil, let cachedTextSize = textHeightCache.object(forKey: cacheKey_)?.sizeValue {
+      textSize = cachedTextSize
+    }
+
+    if richBlockPlan == nil, hasText, text.isEmpty {
+      textSize = CGSize(width: 1, height: heightForSingleLineText())
+    }
+
+    if hasText, textSize == nil {
+      textSize = calculateSizeForAttributedString(attributedString, width: textAvailableWidth, message: message)
+    }
+
+    let measuredTextHeight = textSize?.height ?? 0
+    let measuredTextWidth = textSize?.width ?? 0
+
+    var wrapperPlan = LayoutPlan(size: .zero, spacing: .zero)
+    var bubblePlan = LayoutPlan(size: .zero, spacing: .zero)
+    var namePlan: LayoutPlan?
+    var avatarPlan: LayoutPlan?
+    var textPlan: LayoutPlan?
+    var photoPlan: LayoutPlan?
+    var videoPlan: LayoutPlan?
+    var documentPlan: LayoutPlan?
+    var forwardHeaderPlan: LayoutPlan?
+    var replyPlan: LayoutPlan?
+    var replyThreadSummaryPlan: LayoutPlan?
+    var reactionsPlan: LayoutPlan?
+    var actionsRowsPlan: LayoutPlan?
+    var reactionItemsPlan: [String: LayoutPlan] = [:]
+    let reactionsOutsideBubble = false
+    var timePlan: LayoutPlan?
+    var attachmentsPlan: LayoutPlan?
+    var attachmentItemsPlans: [LayoutPlan] = []
+
+    let shouldShowSenderName = props.firstInGroup
+    if shouldShowSenderName {
+      namePlan = LayoutPlan(
+        size: CGSize(width: 0, height: Self.minimalNameHeight),
+        spacing: .init(top: 0, left: 0, bottom: 2, right: 0)
+      )
+    }
+
+    if props.firstInGroup {
+      avatarPlan = LayoutPlan(
+        size: .init(width: Self.minimalAvatarSize, height: Self.minimalAvatarSize),
+        spacing: .init(
+          top: namePlan == nil ? 0 : Self.minimalNameAvatarOffset,
+          left: Self.minimalContentLeadingInset,
+          bottom: 0,
+          right: Theme.messageHorizontalStackSpacing
+        )
+      )
+    }
+
+    if hasText {
+      let textHeight = max(measuredTextHeight, heightForSingleLineText())
+      let textWidth: CGFloat = if props.isRtl {
+        textAvailableWidth
+      } else {
+        max(ceil(measuredTextWidth), Self.minimalMinTextWidth)
+      }
+      let isPlainTextOnly = !hasMedia && !hasReply && !hasForwardHeader && !hasDocument && !hasAttachments &&
+        !hasReplyThreadSummary
+      let verticalTextSpacing = isPlainTextOnly ? max(0, Self.minimalTextOnlyMinHeight - ceil(textHeight)) : 0
+      let textTopSpacing = floor(verticalTextSpacing / 2)
+      var textBottomSpacing = ceil(verticalTextSpacing / 2)
+      if !isPlainTextOnly {
+        textBottomSpacing = 2.0
+        if hasReactions || hasAttachments {
+          textBottomSpacing += 2.0
+        }
+      }
+      textBottomSpacing -= additionalTextHeight
+      textBottomSpacing = max(0, textBottomSpacing)
+
+      textPlan = LayoutPlan(
+        size: NSSize(width: textWidth, height: ceil(textHeight)),
+        spacing: NSEdgeInsets(
+          top: textTopSpacing,
+          left: 0,
+          bottom: textBottomSpacing,
+          right: 0
+        )
+      )
+    }
+
+    if hasForwardHeader {
+      forwardHeaderPlan = LayoutPlan(size: .zero, spacing: .zero)
+      forwardHeaderPlan!.size.height = Theme.messageNameLabelHeight
+      forwardHeaderPlan!.size.width = 0
+      forwardHeaderPlan!.spacing = .init(
+        top: 2.0,
+        left: 0,
+        bottom: 2.0,
+        right: 0
+      )
+    }
+
+    if hasReply {
+      replyPlan = LayoutPlan(size: .zero, spacing: .zero)
+      replyPlan!.size.height = Theme.embeddedMessageHeight
+      replyPlan!.size.width = min(260, parentAvailableWidth)
+      replyPlan!.spacing = .init(
+        top: 4.0,
+        left: 0,
+        bottom: 4.0,
+        right: 0
+      )
+    }
+
+    if let photoSize {
+      photoPlan = LayoutPlan(size: .zero, spacing: .zero)
+      photoPlan!.size = photoSize
+      let mediaTopSpacing = namePlan != nil
+        ? Self.minimalNameMediaSpacing
+        : (hasText ? 0 : Self.minimalMediaVerticalInset)
+      photoPlan!.spacing = NSEdgeInsets(
+        top: mediaTopSpacing,
+        left: 0,
+        bottom: hasText ? Theme.messageTextAndPhotoSpacing : Self.minimalMediaVerticalInset,
+        right: 0
+      )
+    }
+
+    if let videoSize {
+      videoPlan = LayoutPlan(size: .zero, spacing: .zero)
+      videoPlan!.size = videoSize
+      let mediaTopSpacing = namePlan != nil
+        ? Self.minimalNameMediaSpacing
+        : (hasText ? 0 : Self.minimalMediaVerticalInset)
+      videoPlan!.spacing = NSEdgeInsets(
+        top: mediaTopSpacing,
+        left: 0,
+        bottom: hasText ? Theme.messageTextAndPhotoSpacing : Self.minimalMediaVerticalInset,
+        right: 0
+      )
+    }
+
+    if hasDocument, let documentWidth {
+      documentPlan = LayoutPlan(size: .zero, spacing: .zero)
+      let documentHeight = if hasVoice {
+        Theme.voiceMessageMinimalViewHeight
+      } else if let documentInfo = message.documentInfo {
+        DocumentPresentationPlan.preferredHeight(for: documentInfo)
+      } else {
+        Theme.documentViewHeight
+      }
+      documentPlan!.size = CGSize(width: documentWidth, height: documentHeight)
+      documentPlan!.spacing = NSEdgeInsets(
+        top: 8,
+        left: 0,
+        bottom: hasText ? (hasVoice ? 0 : Theme.messageTextAndPhotoSpacing) : 8,
+        right: 0
+      )
+    }
+
+    if hasAttachments, let attachmentsWidth {
+      attachmentsPlan = LayoutPlan(size: .zero, spacing: .zero)
+      attachmentsPlan!.size = NSSize(width: attachmentsWidth, height: 0)
+      let hasURLPreviewAttachment = renderableAttachments.contains { $0.urlPreview != nil }
+      attachmentsPlan!.spacing = NSEdgeInsets(
+        top: hasURLPreviewAttachment ? Theme.urlPreviewGroupSpacing : Theme.messageTextAndPhotoSpacing,
+        left: 0,
+        bottom: hasURLPreviewAttachment ? Theme.urlPreviewGroupBottomSpacing : 4,
+        right: 0
+      )
+
+      attachmentItemsPlans = renderableAttachments.enumerated().map { index, attachment in
+        var attachmentPlan = LayoutPlan(size: .zero, spacing: .zero)
+        let isLastAttachment = index == renderableAttachments.count - 1
+
+        if attachment.externalTask != nil {
+          attachmentPlan.size = NSSize(width: attachmentsWidth, height: Theme.externalTaskViewHeight)
+          attachmentPlan.spacing = .bottom(isLastAttachment ? 0 : Theme.messageAttachmentsSpacing)
+        } else if attachment.urlPreview != nil {
+          let urlPreviewPlan = URLPreviewAttachmentLayout.plan(for: attachment, width: attachmentsWidth)
+          attachmentPlan.size = urlPreviewPlan.size
+          attachmentPlan.urlPreview = urlPreviewPlan
+          attachmentPlan.spacing = .bottom(isLastAttachment ? 0 : Theme.messageAttachmentsSpacing)
+        }
+
+        attachmentsPlan!.size.height += attachmentPlan.size.height
+        attachmentsPlan!.size.height += attachmentPlan.spacing.bottom
+        return attachmentPlan
+      }
+    }
+
+    if hasReplyThreadSummary {
+      replyThreadSummaryPlan = LayoutPlan(size: .zero, spacing: .zero)
+      replyThreadSummaryPlan!.size.height = replyThreadSummaryHeight(for: props)
+      replyThreadSummaryPlan!.size.width = max(200, min(260, parentAvailableWidth))
+      replyThreadSummaryPlan!.spacing = .init(
+        top: 4.0,
+        left: 0,
+        bottom: 4.0,
+        right: 0
+      )
+    }
+
+    if hasReactions {
+      reactionsPlan = LayoutPlan(
+        size: .zero,
+        spacing: NSEdgeInsets(
+          top: Self.minimalReactionTopSpacing,
+          left: 0.0,
+          bottom: Self.minimalReactionBottomSpacing,
+          right: 0.0
+        )
+      )
+
+      let reactionsSpacing: CGFloat = 6.0
+      let reactionMaxWidth = max(
+        min(parentAvailableWidth, 260),
+        max(
+          textPlan?.size.width ?? 0,
+          max(photoPlan?.size.width ?? 0, max(videoPlan?.size.width ?? 0, documentPlan?.size.width ?? 0))
+        )
+      )
+      let reactionLineWidth = max(
+        1,
+        reactionMaxWidth
+          - (hasAcknowledgement
+            ? acknowledgementWidth + Self.acknowledgementFooterSpacing
+            : 0)
+      )
+
+      var reactionsCurrentLine = 0
+      var currentLineWidth: CGFloat = 0
+
+      let sortedReactions = ReactionChipOrdering.sortForLayout(message.groupedReactions)
+      for reaction in sortedReactions {
+        let emoji = reaction.emoji
+        let reactionSize = ReactionChipMetrics.size(group: reaction)
+        if currentLineWidth + reactionSize.width + reactionsSpacing > reactionLineWidth {
+          reactionsCurrentLine += 1
+          currentLineWidth = 0
+        }
+
+        let spacing = NSEdgeInsets(
+          top: CGFloat(reactionsCurrentLine) * (reactionSize.height + reactionsSpacing),
+          left: currentLineWidth,
+          bottom: 0,
+          right: 0
+        )
+        reactionItemsPlan[emoji] = LayoutPlan(size: reactionSize, spacing: spacing)
+
+        currentLineWidth += reactionSize.width + reactionsSpacing
+        reactionsPlan!.size.width = max(reactionsPlan!.size.width, max(0, currentLineWidth - reactionsSpacing))
+        reactionsPlan!.size.height = CGFloat(reactionsCurrentLine + 1) * (reactionSize.height + reactionsSpacing)
+      }
+    }
+
+    timePlan = LayoutPlan(
+      size: CGSize(
+        width: isOutgoing ?
+          MessageTimeAndState.timeWidth + MessageTimeAndState.symbolWidth :
+          MessageTimeAndState.timeWidth,
+        height: Theme.messageTimeHeight
+      ),
+      spacing: .init(top: 0, left: Self.minimalInlineTimeSpacing, bottom: 0, right: 0)
+    )
+
+    var bubbleWidth: CGFloat = 0
+    var bubbleHeight: CGFloat = 0
+
+    if let textPlan {
+      bubbleHeight += textPlan.spacing.top
+      bubbleHeight += textPlan.size.height
+      bubbleHeight += textPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, textPlan.size.width + textPlan.spacing.horizontalTotal)
+    }
+    if let forwardHeaderPlan {
+      bubbleHeight += forwardHeaderPlan.spacing.top
+      bubbleHeight += forwardHeaderPlan.size.height
+      bubbleHeight += forwardHeaderPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, forwardHeaderPlan.size.width + forwardHeaderPlan.spacing.horizontalTotal)
+    }
+    if let replyPlan {
+      bubbleHeight += replyPlan.spacing.top
+      bubbleHeight += replyPlan.size.height
+      bubbleHeight += replyPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, replyPlan.size.width + replyPlan.spacing.horizontalTotal)
+    }
+    if let photoPlan {
+      bubbleHeight += photoPlan.spacing.top
+      bubbleHeight += photoPlan.size.height
+      bubbleHeight += photoPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, photoPlan.size.width)
+    }
+    if let videoPlan {
+      bubbleHeight += videoPlan.spacing.top
+      bubbleHeight += videoPlan.size.height
+      bubbleHeight += videoPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, videoPlan.size.width)
+    }
+    if let documentPlan {
+      bubbleHeight += documentPlan.spacing.top
+      bubbleHeight += documentPlan.size.height
+      bubbleHeight += documentPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, documentPlan.size.width + documentPlan.spacing.horizontalTotal)
+    }
+    if let attachmentsPlan {
+      bubbleHeight += attachmentsPlan.size.height
+      bubbleHeight += attachmentsPlan.spacing.top
+      bubbleHeight += attachmentsPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, attachmentsPlan.size.width + attachmentsPlan.spacing.horizontalTotal)
+    }
+    if let replyThreadSummaryPlan {
+      bubbleHeight += replyThreadSummaryPlan.spacing.top
+      bubbleHeight += replyThreadSummaryPlan.size.height
+      bubbleHeight += replyThreadSummaryPlan.spacing.bottom
+      bubbleWidth = max(
+        bubbleWidth,
+        replyThreadSummaryPlan.size.width + replyThreadSummaryPlan.spacing.horizontalTotal
+      )
+    }
+    if let reactionsPlan {
+      bubbleHeight += reactionsPlan.spacing.top
+      bubbleHeight += reactionsPlan.size.height
+      bubbleHeight += reactionsPlan.spacing.bottom
+      bubbleWidth = max(bubbleWidth, reactionsPlan.size.width + reactionsPlan.spacing.horizontalTotal)
+      if hasAcknowledgement {
+        bubbleWidth = max(
+          bubbleWidth,
+          reactionsPlan.size.width + Self.acknowledgementFooterSpacing + acknowledgementWidth
+        )
+      }
+    }
+
+    if hasAcknowledgement {
+      bubbleWidth = max(bubbleWidth, acknowledgementWidth)
+    }
+
+    if hasActionRows {
+      let rowCount = renderableActionRows.count
+      let height = CGFloat(rowCount) * Self.minimalMessageActionRowHeight
+        + CGFloat(max(rowCount - 1, 0)) * Self.messageActionRowSpacing
+      let minWidth = minimumActionRowsWidth(
+        for: renderableActionRows,
+        parentAvailableWidth: parentAvailableWidth
+      )
+      actionsRowsPlan = LayoutPlan(
+        size: CGSize(width: max(bubbleWidth, minWidth), height: height),
+        spacing: NSEdgeInsets(top: 4, left: 0, bottom: 0, right: 0)
+      )
+    }
+
+    bubblePlan.size = CGSize(width: bubbleWidth, height: bubbleHeight)
+    bubblePlan.spacing = .zero
+
+    var wrapperWidth: CGFloat = bubblePlan.size.width
+    var wrapperHeight: CGFloat = bubblePlan.size.height
+
+    if let namePlan {
+      wrapperHeight += namePlan.size.height
+      wrapperHeight += namePlan.spacing.verticalTotal
+    }
+    let reservedAvatarSlotWidth =
+      (avatarPlan?.size.width ?? Self.minimalAvatarSize) +
+      (avatarPlan?.spacing.horizontalTotal ?? (Self.minimalContentLeadingInset + Theme.messageHorizontalStackSpacing))
+    wrapperWidth += reservedAvatarSlotWidth
+
+    if let actionsRowsPlan {
+      wrapperHeight += actionsRowsPlan.spacing.top
+      wrapperHeight += actionsRowsPlan.size.height
+      wrapperHeight += actionsRowsPlan.spacing.bottom
+      let reservedAvatarSlotWidth =
+        (avatarPlan?.size.width ?? Self.minimalAvatarSize) +
+        (avatarPlan?.spacing.horizontalTotal ?? (Self.minimalContentLeadingInset + Theme.messageHorizontalStackSpacing))
+      wrapperWidth = max(wrapperWidth, reservedAvatarSlotWidth + actionsRowsPlan.size.width)
+    }
+
+    let minWrapperHeight = if avatarPlan != nil {
+      (avatarPlan?.size.height ?? Self.minimalAvatarSize) + (avatarPlan?.spacing.top ?? 0)
+    } else {
+      Self.minimalFollowUpMinHeight
+    }
+    wrapperPlan.size = CGSize(
+      width: wrapperWidth,
+      height: max(wrapperHeight, minWrapperHeight)
+    )
+    let groupTopSpacing: CGFloat = if props.firstInGroup && !props.isFirstMessage {
+      props.startsAfterDaySeparator ? Self.minimalAfterDaySeparatorGroupSpacing : Self.minimalGroupSpacing
+    } else {
+      0.0
+    }
+    wrapperPlan.spacing = .init(
+      top: groupTopSpacing + Theme.messageOuterVerticalPadding,
+      left: 0,
+      bottom: Theme.messageOuterVerticalPadding,
+      right: 0
+    )
+
+    var plan = LayoutPlans(
+      wrapper: wrapperPlan,
+      name: namePlan,
+      avatar: avatarPlan,
+      bubble: bubblePlan,
+      text: textPlan,
+      richBlockContent: richBlockPlan,
+      photo: photoPlan,
+      video: videoPlan,
+      document: documentPlan,
+      attachmentItems: attachmentItemsPlans,
+      attachments: attachmentsPlan,
+      forwardHeader: forwardHeaderPlan,
+      reply: replyPlan,
+      replyThreadSummary: replyThreadSummaryPlan,
+      reactions: reactionsPlan,
+      actionsRows: actionsRowsPlan,
+      reactionItems: reactionItemsPlan,
+      reactionsOutsideBubble: reactionsOutsideBubble,
+      reactionsOutsideBubbleTopInset: 0,
+      timeInContentFlow: false,
+      hasAcknowledgement: hasAcknowledgement,
+      time: timePlan,
+      singleLine: isSingleLine,
+      emojiMessage: emojiMessage,
+      fontSize: fontSize,
+      hasBubbleColor: false
+    )
+
+    plan.bubble.size.height += plan.topMostContentTopSpacing
+    plan.wrapper.size.height += plan.topMostContentTopSpacing
+
+    if hasAcknowledgement, !hasReactions {
+      plan.wrapper.size.height += Self.acknowledgementStandaloneFooterHeight
+    }
+    let size = NSSize(width: plan.totalWidth, height: plan.totalHeight)
+    if richBlockPlan == nil, let textSize {
+      textHeightCache.setObject(NSValue(size: textSize), forKey: cacheKey_)
+    }
+    lastHeightForRow.setObject(NSValue(size: size), forKey: NSString(string: "\(message.id)"))
+
+    return (size, textSize ?? NSSize.zero, photoSize, plan)
+  }
+
+  func cachedSize(messageStableId: Int64) -> CGSize? {
+    guard let size = lastHeightForRow.object(forKey: NSString(string: "\(messageStableId)")) as? NSSize
+    else { return nil }
+    return size
+  }
+
+  public func invalidateCache() {
+    textHeightCache.removeAllObjects()
+    minTextWidthForSingleLine.removeAllObjects()
+    lastHeightForRow.removeAllObjects()
+  }
+
+  func heightForSingleLineText() -> CGFloat {
+    if let height = heightForSingleLine {
+      return height
+    } else {
+      let text = "Ij"
+      let size = calculateSizeForText(text, width: 1_000)
+      heightForSingleLine = size.height
+      #if DEBUG
+      log.trace("heightForSingleLine \(heightForSingleLine ?? 0)")
+      #endif
+      return size.height
+    }
+  }
+
+//  private func calculateSizeForText(_ text: String, width: CGFloat, message: FullMessage? = nil) -> NSSize {
+//    textContainer.size = NSSize(width: width, height: .greatestFiniteMagnitude)
+
+//    // See if this actually helps performance or not
+//    let attributedString = if let message, let attrs = CacheAttrs.shared.get(message: message) {
+//      attrs
+//    } else {
+//      NSAttributedString(
+//        string: text, // whitespacesAndNewline
+//        attributes: [.font: MessageTextConfiguration.font]
+//      )
+//    }
+
+//  //    let attributedString = NSAttributedString(
+//  //      string: text, // whitespacesAndNewline
+//  //      attributes: [.font: MessageTextConfiguration.font]
+//  //    )
+
+//    // Use separate text storages https://github.com/lordvisionz/cocoa-string-size-performance
+//    let textStorage = NSTextStorage()
+//    textStorage.setAttributedString(attributedString)
+//    textStorage.addLayoutManager(layoutManager)
+//    defer {
+//      textStorage.removeLayoutManager(layoutManager)
+//    }
+//    layoutManager.ensureLayout(for: textContainer)
+//    // Get the glyphRange to ensure we're measuring all content
+//  //    let glyphRange = layoutManager.glyphRange(for: textContainer)
+//  //    let textRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+
+//    // Alternative
+//    let textRect = layoutManager.usedRect(for: textContainer)
+
+//    let textHeight = ceil(textRect.height)
+//    let textWidth = ceil(textRect.width) + Self.extraSafeWidth
+
+//    log.trace("calculateSizeForText \(text) width \(width) resulting in rect \(textRect)")
+
+//    return CGSize(width: textWidth, height: textHeight)
+//  }
+
+  private func calculateSizeForAttributedString(
+    _ attributedString: NSAttributedString,
+    width: CGFloat,
+    message _: FullMessage? = nil
+  ) -> NSSize {
+    let size = messageTextMeasurer.measure(attributedString, width: width)
+
+    #if DEBUG
+    log.trace("calculateSizeForText \(attributedString.string) width \(width) resulting in size \(size)")
+    #endif
+
+    return size
+  }
+
+  /// This is purely used for single height text measurements so it's safe to not use the actual font here.
+  private func calculateSizeForText(_ text: String, width: CGFloat) -> NSSize {
+    messageTextMeasurer.measure(text, width: width)
+  }
+
+  /// Fixes a bug with the text view height calculation for Chinese text that don't show last line.
+  private var additionalTextHeight: CGFloat = 1.0
+
+  func calculatePhotoSize(
+    width: CGFloat,
+    height: CGFloat,
+    parentAvailableWidth: CGFloat,
+    hasCaption: Bool,
+    style: MessageRenderStyle = .bubble,
+    maxSide: CGFloat = 320,
+    maxHeight: CGFloat? = nil
+  ) -> CGSize {
+    let minMediaSize = CGSize(width: 40.0, height: 40.0)
+    let maxAvailableWidth = max(minMediaSize.width, min(maxSide, ceil(parentAvailableWidth)))
+    let maxAvailableHeight = max(minMediaSize.height, maxHeight ?? maxAvailableWidth)
+    let maxMediaSize = CGSize(
+      width: maxAvailableWidth,
+      height: maxAvailableHeight
+    )
+
+    guard width > 0, height > 0 else {
+      return minMediaSize
+    }
+
+    let aspectRatio = CGFloat(width) / CGFloat(height)
+
+    let usesCaptionSizing = switch style {
+    case .bubble:
+      hasCaption
+    case .minimal:
+      false
+    }
+
+    let scale = min(maxMediaSize.width / width, maxMediaSize.height / height)
+    let cappedScale = usesCaptionSizing ? scale : min(1.0, scale)
+    let mediaWidth = ceil(width * cappedScale)
+    let mediaHeight = ceil(mediaWidth / aspectRatio)
+
+    if mediaHeight <= maxMediaSize.height {
+      return CGSize(width: mediaWidth, height: mediaHeight)
+    }
+
+    let heightBoundScale = usesCaptionSizing ? scale : min(1.0, scale)
+    let boundedHeight = ceil(height * heightBoundScale)
+    let boundedWidth = ceil(boundedHeight * aspectRatio)
+    return CGSize(width: boundedWidth, height: boundedHeight)
+  }
+}
+
+enum MessageTextConfiguration {
+  static let font = ChatTypography.current.font
+  static let monospaceBaseFont = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+  static let lineFragmentPadding = Theme.messageTextLineFragmentPadding
+  static let containerInset = Theme.messageTextContainerInset
+  static let useTextKit2ViewportWorkarounds: Bool = {
+    let os = ProcessInfo.processInfo.operatingSystemVersion
+    // macOS 27 beta can throw inside NSTextView's TextKit 2 viewport renderer while
+    // NSTableView installs message rows. Keep TextKit 2 enabled, but avoid our extra
+    // viewport delegate/forced-layout hooks on that OS while we isolate the AppKit crash.
+    return os.majorVersion < 27
+  }()
+
+  static func configureTextContainer(_ container: NSTextContainer) {
+    container.lineFragmentPadding = lineFragmentPadding
+  }
+
+  static func configureTextView(_ textView: NSTextView) {
+    textView.font = font
+    textView.textContainerInset = containerInset
+  }
+
+}

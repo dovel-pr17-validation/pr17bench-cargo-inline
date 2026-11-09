@@ -1,0 +1,148 @@
+import { bigint, boolean, pgTable, timestamp, unique } from "drizzle-orm/pg-core"
+import { users } from "./users"
+import { text } from "drizzle-orm/pg-core"
+import { chats } from "./chats"
+import { bigserial } from "drizzle-orm/pg-core"
+import { integer } from "drizzle-orm/pg-core"
+import { index } from "drizzle-orm/pg-core"
+import { bytea, creationDate } from "@in/server/db/schema/common"
+import type { AnyPgColumn } from "drizzle-orm/pg-core"
+import { relations } from "drizzle-orm/_relations"
+import { files } from "@in/server/db/schema/files"
+import { documents, photos, videos, voices } from "@in/server/db/schema/media"
+import { messageAttachments } from "./attachments"
+import { translations } from "@in/server/db/schema/translations"
+import { reactions } from "@in/server/db/schema/reactions"
+import { blockContents } from "@in/server/db/schema/blockContents"
+import { sql } from "drizzle-orm"
+
+export const messages = pgTable(
+  "messages",
+  {
+    globalId: bigserial("global_id", { mode: "bigint" }).primaryKey(),
+
+    // sequencial within one chat
+    messageId: integer("message_id").notNull(),
+
+    // random id, used for optimistic update and deduplication
+    randomId: bigint("random_id", { mode: "bigint" }),
+
+    /** message raw text, optional @deprecated */
+    text: text(),
+    textEncrypted: bytea("text_encrypted"),
+    textIv: bytea("text_iv"),
+    textTag: bytea("text_tag"),
+
+    /** entities */
+    entitiesEncrypted: bytea("entities_encrypted"),
+    entitiesIv: bytea("entities_iv"),
+    entitiesTag: bytea("entities_tag"),
+
+    /** interactive message actions */
+    actionsEncrypted: bytea("actions_encrypted"),
+    actionsIv: bytea("actions_iv"),
+    actionsTag: bytea("actions_tag"),
+
+    /** server-only typed system message payload */
+    systemMessageEncrypted: bytea("system_message_encrypted"),
+    systemMessageIv: bytea("system_message_iv"),
+    systemMessageTag: bytea("system_message_tag"),
+
+    /** required, chat it belongs to */
+    chatId: integer("chat_id")
+      .notNull()
+      .references((): AnyPgColumn => chats.id, {
+        onDelete: "cascade",
+      }),
+
+    /** required, chat it belongs to */
+    fromId: integer("from_id")
+      .notNull()
+      .references(() => users.id),
+
+    /** when it was edited. if null indicated it hasn't been edited */
+    editDate: timestamp("edit_date", { mode: "date", precision: 3 }),
+    /** monotonic edit revision, increments on every edit */
+    rev: integer("rev").notNull().default(0),
+
+    /** optional server-owned structural content; non-unique for future shared wrappers */
+    blockContentId: bigint("block_content_id", { mode: "bigint" }).references(() => blockContents.id, {
+      onDelete: "set null",
+    }),
+
+    date: creationDate,
+
+    /** when it was pinned; null means not pinned */
+    pinnedAt: timestamp("pinned_at", { mode: "date", precision: 3 }),
+
+    /** optional, message it is replying to */
+    replyToMsgId: integer("reply_to_msg_id"),
+
+    /** unused: briefly held a reply's quote apart from `text`; quotes now live in `text` as blockquotes */
+    replyQuoteEncrypted: bytea("reply_quote_encrypted"),
+    replyQuoteIv: bytea("reply_quote_iv"),
+    replyQuoteTag: bytea("reply_quote_tag"),
+
+    /** forward header */
+    fwdFromPeerUserId: integer("fwd_from_peer_user_id"),
+    fwdFromPeerChatId: integer("fwd_from_peer_chat_id"),
+    fwdFromMessageId: integer("fwd_from_message_id"),
+    fwdFromSenderId: integer("fwd_from_sender_id"),
+
+    /** if this message is part of a grouped message */
+    groupedId: bigint("grouped_id", { mode: "bigint" }),
+
+    /** media id, photo, video, document, etc */
+    mediaType: text("media_type", { enum: ["photo", "video", "document", "nudge", "voice"] }),
+    photoId: bigint("photo_id", { mode: "number" }).references(() => photos.id),
+    videoId: bigint("video_id", { mode: "number" }).references(() => videos.id),
+    documentId: bigint("document_id", { mode: "number" }).references(() => documents.id),
+    voiceId: bigint("voice_id", { mode: "number" }).references(() => voices.id),
+
+    // --------------------------------------------------------
+    // Deprecated fields
+    // --------------------------------------------------------
+    fileId: integer("file_id").references(() => files.id),
+
+    /** if this message is a sticker */
+    isSticker: boolean("is_sticker").default(false),
+
+    hasLink: boolean("has_link"),
+
+    /** False for historical projections that must remain visible without becoming unread. */
+    countsAsUnread: boolean("counts_as_unread").default(true).notNull(),
+  },
+  (table) => ({
+    messageIdPerChatUnique: unique("msg_id_per_chat_unique").on(table.messageId, table.chatId),
+    messageIdPerChatIndex: index("msg_id_per_chat_index").on(table.messageId, table.chatId),
+    chatIdMessageIdDescIndex: index("messages_chat_id_message_id_desc_idx").on(table.chatId, table.messageId.desc()),
+    randomIdPerSenderIndex: unique("random_id_per_sender_unique").on(table.randomId, table.fromId),
+    unreadCountIndex: index("unread_count_index").on(table.chatId, table.messageId, table.fromId),
+    blockContentIdIndex: index("messages_block_content_id_idx").on(table.blockContentId),
+    activityDateIndex: index("messages_activity_date_from_id_idx")
+      .on(table.date, table.fromId)
+      .where(sql`${table.systemMessageEncrypted} is null`),
+    /** Pinned messages per chat are read on every chat open; only pinned rows are indexed. */
+    pinnedIndex: index("messages_pinned_idx")
+      .on(table.chatId, table.pinnedAt.desc(), table.messageId.desc())
+      .where(sql`${table.pinnedAt} is not null`),
+  }),
+)
+
+export const messageRelations = relations(messages, ({ one, many }) => ({
+  from: one(users, { fields: [messages.fromId], references: [users.id] }),
+  file: one(files, { fields: [messages.fileId], references: [files.id] }),
+  reactions: many(reactions),
+  blockContent: one(blockContents, { fields: [messages.blockContentId], references: [blockContents.id] }),
+
+  photo: one(photos, { fields: [messages.photoId], references: [photos.id] }),
+  video: one(videos, { fields: [messages.videoId], references: [videos.id] }),
+  document: one(documents, { fields: [messages.documentId], references: [documents.id] }),
+  voice: one(voices, { fields: [messages.voiceId], references: [voices.id] }),
+  messageAttachments: many(messageAttachments),
+
+  translations: many(translations),
+}))
+
+export type DbMessage = typeof messages.$inferSelect
+export type DbNewMessage = typeof messages.$inferInsert

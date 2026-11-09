@@ -1,0 +1,82 @@
+name: iOS Early Testers
+
+on:
+  workflow_run:
+    workflows: [Apple Validation, CodeQL]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '43 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ios-early-testers
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+
+jobs:
+  release:
+    environment: apple
+    permissions:
+      actions: read
+      checks: read
+      contents: write # Create immutable source tags; never move an existing tag.
+      statuses: write # Record verified internal distribution and symbol upload per source SHA.
+    if: github.repository == 'inline-chat/inline' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # Always use trusted default-branch scripts, never workflow_run artifacts.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      # Selects the newest green main commit; later pushes do not cancel it.
+      - name: Select newest green main commit
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/nightly-tip-gate.py select-ios
+      - name: Build and distribute to internal Early Testers
+        id: publish
+        if: steps.gate.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ steps.gate.outputs.sha }}
+          ASC_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+          ASC_PRIVATE_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: node scripts/ci/ios-early-testers.mjs
+      - name: Report published, already current, deferred, blocked or failed
+        if: always()
+        env:
+          GATE_RESULT: ${{ steps.gate.outcome }}
+          PUBLISH_RESULT: ${{ steps.publish.outcome }}
+          SHOULD_RELEASE: ${{ steps.gate.outputs.should_release }}
+          GATE_OUTCOME: ${{ steps.gate.outputs.outcome }}
+          REASON: ${{ steps.gate.outputs.reason }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outputs.outcome }}
+          BUILD: ${{ steps.publish.outputs.build }}
+          SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          OUTCOME="$GATE_OUTCOME" DETAIL=""
+          if [[ "$GATE_RESULT" != success ]]; then
+            OUTCOME=failed REASON="candidate selection $GATE_RESULT"
+          elif [[ "$SHOULD_RELEASE" == true ]]; then
+            if [[ "$PUBLISH_RESULT" == success ]]; then
+              OUTCOME="$PUBLISH_OUTCOME" DETAIL="Build $BUILD"
+              REASON="build already available to internal Early Testers"
+              if [[ "$OUTCOME" == published ]]; then REASON="internal Early Testers verified"; fi
+            else
+              OUTCOME=failed REASON="publisher $PUBLISH_RESULT; inspect the failed step before retrying"
+            fi
+          fi
+          bash scripts/ci/release-summary.sh "iOS Early Testers" "$OUTCOME" "$REASON" "$SHA" "$DETAIL"

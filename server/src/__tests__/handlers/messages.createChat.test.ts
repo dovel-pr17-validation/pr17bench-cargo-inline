@@ -1,0 +1,744 @@
+import { describe, expect, test } from "bun:test"
+import { createChat as handler } from "../../realtime/handlers/messages.createChat"
+import { createChat } from "../../functions/messages.createChat"
+import { CreateChatInput } from "@inline-chat/protocol/core"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { testUtils, defaultTestContext, setupTestLifecycle } from "../setup"
+import { db } from "../../db"
+import * as schema from "../../db/schema"
+import { and, eq } from "drizzle-orm"
+import type { FunctionContext } from "../../functions/_types"
+import { UpdatesModel } from "@in/server/db/models/updates"
+import { BotAgentsModel } from "@in/server/db/models/botAgents"
+import { BotCapabilitiesModel } from "@in/server/db/models/botCapabilities"
+import {
+  AGENT_CONFIGURATION_CAPABILITY_KIND,
+  AGENT_CONFIGURATION_VERSION,
+  decodeAgentThreadContext,
+  encodeAgentConfigurationCatalog,
+} from "@in/server/modules/agentConfiguration"
+
+describe("messages.createChat", () => {
+  // Setup test lifecycle
+  setupTestLifecycle()
+
+  const mockHandlerContext = {
+    userId: defaultTestContext.userId,
+    sessionId: defaultTestContext.sessionId,
+    connectionId: defaultTestContext.connectionId,
+    sendRaw: () => {},
+    sendRpcReply: () => {},
+  }
+
+  const mockFunctionContext: FunctionContext = {
+    currentSessionId: defaultTestContext.sessionId,
+    currentUserId: defaultTestContext.userId,
+  }
+
+  const addSpaceMembers = async (
+    spaceId: number,
+    rows: { userId: number; role?: "owner" | "admin" | "member"; canAccessPublicChats?: boolean }[],
+  ) => {
+    await db.insert(schema.members).values(
+      rows.map((row) => ({
+        spaceId,
+        userId: row.userId,
+        role: row.role ?? "member",
+        canAccessPublicChats: row.canAccessPublicChats ?? true,
+      })),
+    )
+  }
+
+  test("should create public chat without participants", async () => {
+    // Create a space first
+    const space = await testUtils.createSpace()
+    if (!space) throw new Error("Failed to create space")
+
+    // Create a user for the test
+    const user = await testUtils.createUser()
+    if (!user) throw new Error("Failed to create user")
+    await addSpaceMembers(space.id, [{ userId: user.id }])
+
+    const input: CreateChatInput = {
+      title: "Public Chat",
+      spaceId: BigInt(space.id),
+      isPublic: true,
+      participants: [],
+    }
+
+    // Test handler
+    const handlerResult = await handler(input, {
+      ...mockHandlerContext,
+      userId: user.id,
+    })
+
+    expect(handlerResult.chat?.isPublic).toBe(true)
+    expect(handlerResult.chat?.title).toBe("Public Chat")
+    expect(handlerResult.chat?.number).toBe(1)
+
+    // Test function directly
+    const functionResult = await createChat(
+      {
+        title: "Public Chat 2",
+        spaceId: BigInt(space.id),
+        isPublic: true,
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: user.id,
+      },
+    )
+
+    expect(functionResult.chat.isPublic).toBe(true)
+    expect(functionResult.chat.title).toBe("Public Chat 2")
+    expect(functionResult.chat.number).toBe(2)
+  })
+
+  test("should create untitled public chat when title is omitted", async () => {
+    const space = await testUtils.createSpace()
+    if (!space) throw new Error("Failed to create space")
+
+    const user = await testUtils.createUser("untitled-thread-owner@example.com")
+    if (!user) throw new Error("Failed to create user")
+    await addSpaceMembers(space.id, [{ userId: user.id }])
+
+    const result = await createChat(
+      {
+        spaceId: BigInt(space.id),
+        isPublic: true,
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: user.id,
+      },
+    )
+
+    expect(result.chat.title).toBe("")
+    expect(result.chat.untitled).toBe(true)
+
+    const [saved] = await db
+      .select({ title: schema.chats.title, isUntitled: schema.chats.isUntitled })
+      .from(schema.chats)
+      .where(eq(schema.chats.id, Number(result.chat.id)))
+      .limit(1)
+
+    expect(saved?.title).toBeNull()
+    expect(saved?.isUntitled).toBe(true)
+  })
+
+  test("stores a normalized placeholder as an untitled non-unique title", async () => {
+    const space = await testUtils.createSpace()
+    if (!space) throw new Error("Failed to create space")
+
+    const user = await testUtils.createUser("placeholder-thread-owner@example.com")
+    if (!user) throw new Error("Failed to create user")
+    await addSpaceMembers(space.id, [{ userId: user.id }])
+
+    const source = "  Please   review\nthis launch checklist before tomorrow morning because it contains extra detail.  "
+    const expected = Array.from(source.trim().replace(/\s+/g, " ")).slice(0, 60).join("").trim()
+    const handlerResult = await handler(
+      {
+        placeholderTitle: source,
+        spaceId: BigInt(space.id),
+        isPublic: true,
+        participants: [],
+      },
+      {
+        ...mockHandlerContext,
+        userId: user.id,
+      },
+    )
+    const functionResult = await createChat(
+      {
+        placeholderTitle: source,
+        spaceId: BigInt(space.id),
+        isPublic: true,
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: user.id,
+      },
+    )
+
+    expect(handlerResult.chat?.title).toBe(expected)
+    expect(handlerResult.chat?.untitled).toBe(true)
+    expect(functionResult.chat.title).toBe(expected)
+    expect(functionResult.chat.untitled).toBe(true)
+
+    const saved = await db
+      .select({ title: schema.chats.title, isUntitled: schema.chats.isUntitled })
+      .from(schema.chats)
+      .where(eq(schema.chats.spaceId, space.id))
+
+    expect(saved).toHaveLength(2)
+    expect(saved).toEqual([
+      { title: expected, isUntitled: true },
+      { title: expected, isUntitled: true },
+    ])
+  })
+
+  test("rejects simultaneous explicit and placeholder titles", async () => {
+    const space = await testUtils.createSpace()
+    if (!space) throw new Error("Failed to create space")
+
+    const user = await testUtils.createUser("ambiguous-placeholder-title@example.com")
+    if (!user) throw new Error("Failed to create user")
+    await addSpaceMembers(space.id, [{ userId: user.id }])
+
+    await expect(createChat(
+      {
+        title: "Explicit title",
+        placeholderTitle: "Temporary message prefix",
+        spaceId: BigInt(space.id),
+        isPublic: true,
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: user.id,
+      },
+    )).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+  })
+
+  test("should create private chat with participants", async () => {
+    // Create a space first
+    const space = await testUtils.createSpace()
+    if (!space) throw new Error("Failed to create space")
+
+    // Create users for the test
+    const currentUser = await testUtils.createUser("current@example.com")
+    if (!currentUser) throw new Error("Failed to create current user")
+
+    const otherUser = await testUtils.createUser("other@example.com")
+    if (!otherUser) throw new Error("Failed to create other user")
+    await addSpaceMembers(space.id, [{ userId: currentUser.id }, { userId: otherUser.id }])
+
+    const input: CreateChatInput = {
+      title: "Private Chat",
+      spaceId: BigInt(space.id),
+      participants: [{ userId: BigInt(otherUser.id) }],
+      isPublic: false,
+    }
+
+    // Test handler
+    const handlerResult = await handler(input, {
+      ...mockHandlerContext,
+      userId: currentUser.id,
+    })
+
+    expect(handlerResult.chat?.isPublic).toBe(false)
+    expect(handlerResult.chat?.title).toBe("Private Chat")
+
+    // Test function directly
+    const functionResult = await createChat(
+      {
+        title: "Private Chat 2",
+        spaceId: BigInt(space.id),
+        isPublic: false,
+        participants: [{ userId: BigInt(otherUser.id) }],
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: currentUser.id,
+      },
+    )
+
+    expect(functionResult.chat.isPublic).toBe(false)
+    expect(functionResult.chat.title).toBe("Private Chat 2")
+  })
+
+  test("should create home thread with participants and creator", async () => {
+    const currentUser = await testUtils.createUser("home-owner@example.com")
+    if (!currentUser) throw new Error("Failed to create current user")
+    const otherUser = await testUtils.createUser("home-participant@example.com")
+    if (!otherUser) throw new Error("Failed to create other user")
+
+    const input: CreateChatInput = {
+      title: "Home Thread",
+      isPublic: false,
+      participants: [{ userId: BigInt(otherUser.id) }],
+    }
+
+    const handlerResult = await handler(input, {
+      ...mockHandlerContext,
+      userId: currentUser.id,
+    })
+
+    expect(handlerResult.chat?.isPublic).toBe(false)
+    expect(handlerResult.chat?.spaceId).toBeUndefined()
+    expect(handlerResult.chat?.number).toBe(1)
+
+    const [createdChat] = await db
+      .select()
+      .from(schema.chats)
+      .where(eq(schema.chats.id, Number(handlerResult.chat?.id)))
+
+    expect(createdChat?.spaceId).toBeNull()
+    expect(createdChat?.createdBy).toBe(currentUser.id)
+    expect(createdChat?.publicThread).toBe(false)
+    expect(createdChat?.threadNumber).toBe(1)
+
+    const participants = await db
+      .select()
+      .from(schema.chatParticipants)
+      .where(eq(schema.chatParticipants.chatId, createdChat!.id))
+
+    const participantIds = participants.map((p) => p.userId).sort()
+    expect(participantIds).toEqual([currentUser.id, otherUser.id].sort())
+  })
+
+  test("enqueues participant-add user updates for initial private chat participants", async () => {
+    const currentUser = await testUtils.createUser("initial-participant-owner@example.com")
+    if (!currentUser) throw new Error("Failed to create current user")
+    const otherUser = await testUtils.createUser("initial-participant-bot@example.com")
+    if (!otherUser) throw new Error("Failed to create other user")
+
+    const result = await createChat(
+      {
+        title: "Initial Participant Thread",
+        isPublic: false,
+        participants: [{ userId: BigInt(otherUser.id) }],
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: currentUser.id,
+      },
+    )
+
+    const otherUpdates = await db
+      .select()
+      .from(schema.updates)
+      .where(and(eq(schema.updates.bucket, schema.UpdateBucket.User), eq(schema.updates.entityId, otherUser.id)))
+
+    expect(otherUpdates).toHaveLength(1)
+    const update = UpdatesModel.decrypt(otherUpdates[0]!)
+    expect(update.payload.update.oneofKind).toBe("userAddedToChat")
+    if (update.payload.update.oneofKind !== "userAddedToChat") {
+      throw new Error("Expected userAddedToChat update")
+    }
+    expect(update.payload.update.userAddedToChat.chatId).toBe(result.chat.id)
+    expect(update.payload.update.userAddedToChat.participant?.userId).toBe(BigInt(otherUser.id))
+
+    const currentUserUpdates = await db
+      .select()
+      .from(schema.updates)
+      .where(and(eq(schema.updates.bucket, schema.UpdateBucket.User), eq(schema.updates.entityId, currentUser.id)))
+    expect(currentUserUpdates).toHaveLength(0)
+  })
+
+  test("allows duplicate home thread titles (not unique)", async () => {
+    const currentUser = await testUtils.createUser("home-dup-owner@example.com")
+    const otherUser = await testUtils.createUser("home-dup-participant@example.com")
+
+    await createChat(
+      {
+        title: "Same Title",
+        isPublic: false,
+        participants: [{ userId: BigInt(otherUser.id) }],
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: currentUser.id,
+      },
+    )
+
+    // Should not reject duplicates in home.
+    await expect(
+      createChat(
+        {
+          title: "Same Title",
+          isPublic: false,
+          participants: [{ userId: BigInt(otherUser.id) }],
+        },
+        {
+          ...mockFunctionContext,
+          currentUserId: currentUser.id,
+        },
+      ),
+    ).resolves.toBeTruthy()
+  })
+
+  test("rejects public home thread creation", async () => {
+    const currentUser = await testUtils.createUser("home-public-owner@example.com")
+    if (!currentUser) throw new Error("Failed to create current user")
+
+    await expect(
+      createChat(
+        {
+          title: "Home Public Thread",
+          isPublic: true,
+        },
+        {
+          ...mockFunctionContext,
+          currentUserId: currentUser.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+  })
+
+  test("rejects home thread creation without participants", async () => {
+    const currentUser = await testUtils.createUser("home-empty-owner@example.com")
+    if (!currentUser) throw new Error("Failed to create current user")
+
+    await expect(
+      createChat(
+        {
+          title: "Home Thread Missing Participants",
+          isPublic: false,
+        },
+        {
+          ...mockFunctionContext,
+          currentUserId: currentUser.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+  })
+
+  test("rejects duplicate thread names in the same space (case-insensitive)", async () => {
+    const space = await testUtils.createSpace()
+    if (!space) throw new Error("Failed to create space")
+
+    const user = await testUtils.createUser("dup-space-owner@example.com")
+    if (!user) throw new Error("Failed to create user")
+    await addSpaceMembers(space.id, [{ userId: user.id }])
+
+    await createChat(
+      {
+        title: "Design",
+        spaceId: BigInt(space.id),
+        isPublic: true,
+      },
+      {
+        ...mockFunctionContext,
+        currentUserId: user.id,
+      },
+    )
+
+    await expect(
+      createChat(
+        {
+          title: "design",
+          spaceId: BigInt(space.id),
+          isPublic: true,
+        },
+        {
+          ...mockFunctionContext,
+          currentUserId: user.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+  })
+
+  test("rejects space thread creation by a non-member", async () => {
+    const space = await testUtils.createSpace()
+    const outsider = await testUtils.createUser("space-thread-outsider@example.com")
+    if (!space || !outsider) throw new Error("Failed to create test data")
+
+    await expect(
+      createChat(
+        {
+          title: "Outsider Thread",
+          spaceId: BigInt(space.id),
+          isPublic: true,
+        },
+        {
+          ...mockFunctionContext,
+          currentUserId: outsider.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.SPACE_ID_INVALID })
+  })
+
+  test("rejects private space thread participants outside the space", async () => {
+    const space = await testUtils.createSpace()
+    const currentUser = await testUtils.createUser("space-private-owner@example.com")
+    const outsider = await testUtils.createUser("space-private-outsider@example.com")
+    if (!space || !currentUser || !outsider) throw new Error("Failed to create test data")
+
+    await addSpaceMembers(space.id, [{ userId: currentUser.id }])
+
+    await expect(
+      createChat(
+        {
+          title: "Private Space Thread",
+          spaceId: BigInt(space.id),
+          isPublic: false,
+          participants: [{ userId: BigInt(outsider.id) }],
+        },
+        {
+          ...mockFunctionContext,
+          currentUserId: currentUser.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.USER_ID_INVALID })
+  })
+
+  test("uses the exact reserved chat id when createChat claims a reservation", async () => {
+    const currentUser = await testUtils.createUser("reserved-chat-owner@example.com")
+    const otherUser = await testUtils.createUser("reserved-chat-participant@example.com")
+    const reservedChatId = 700_001
+
+    await db.insert(schema.chatIdReservations).values({
+      chatId: reservedChatId,
+      userId: currentUser.id,
+      expiresAt: new Date(Date.now() + 86_400_000),
+    })
+
+    const result = await createChat(
+      {
+        title: "Reserved Thread",
+        isPublic: false,
+        participants: [{ userId: BigInt(otherUser.id) }],
+        reservedChatId: BigInt(reservedChatId),
+      } as Parameters<typeof createChat>[0],
+      {
+        ...mockFunctionContext,
+        currentUserId: currentUser.id,
+      },
+    )
+
+    expect(result.chat.id).toBe(BigInt(reservedChatId))
+  })
+
+  test("rejects using another user's reserved chat id", async () => {
+    const reservationOwner = await testUtils.createUser("reserved-chat-other-owner@example.com")
+    const currentUser = await testUtils.createUser("reserved-chat-current@example.com")
+    const otherUser = await testUtils.createUser("reserved-chat-participant-2@example.com")
+    const reservedChatId = 700_002
+
+    await db.insert(schema.chatIdReservations).values({
+      chatId: reservedChatId,
+      userId: reservationOwner.id,
+      expiresAt: new Date(Date.now() + 86_400_000),
+    })
+
+    await expect(
+      createChat(
+        {
+          title: "Reserved Thread Wrong User",
+          isPublic: false,
+          participants: [{ userId: BigInt(otherUser.id) }],
+          reservedChatId: BigInt(reservedChatId),
+        } as Parameters<typeof createChat>[0],
+        {
+          ...mockFunctionContext,
+          currentUserId: currentUser.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+  })
+
+  test("rejects expired reserved chat ids", async () => {
+    const currentUser = await testUtils.createUser("reserved-chat-expired@example.com")
+    const otherUser = await testUtils.createUser("reserved-chat-expired-participant@example.com")
+    const reservedChatId = 700_003
+
+    await db.insert(schema.chatIdReservations).values({
+      chatId: reservedChatId,
+      userId: currentUser.id,
+      expiresAt: new Date(Date.now() - 60_000),
+    })
+
+    await expect(
+      createChat(
+        {
+          title: "Reserved Thread Expired",
+          isPublic: false,
+          participants: [{ userId: BigInt(otherUser.id) }],
+          reservedChatId: BigInt(reservedChatId),
+        } as Parameters<typeof createChat>[0],
+        {
+          ...mockFunctionContext,
+          currentUserId: currentUser.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+  })
+
+  test("rejects already claimed reserved chat ids", async () => {
+    const currentUser = await testUtils.createUser("reserved-chat-claimed@example.com")
+    const otherUser = await testUtils.createUser("reserved-chat-claimed-participant@example.com")
+    const reservedChatId = 700_004
+
+    await db.insert(schema.chatIdReservations).values({
+      chatId: reservedChatId,
+      userId: currentUser.id,
+      claimedAt: new Date(),
+      expiresAt: new Date(Date.now() + 86_400_000),
+    })
+
+    await expect(
+      createChat(
+        {
+          title: "Reserved Thread Claimed",
+          isPublic: false,
+          participants: [{ userId: BigInt(otherUser.id) }],
+          reservedChatId: BigInt(reservedChatId),
+        } as Parameters<typeof createChat>[0],
+        {
+          ...mockFunctionContext,
+          currentUserId: currentUser.id,
+        },
+      ),
+    ).rejects.toMatchObject({ code: RealtimeRpcError.Code.BAD_REQUEST })
+  })
+
+  test("creates the thread and clears an Agent that belongs to another bot", async () => {
+    const owner = await testUtils.createUser("agent-context-mismatch-owner@example.com")
+    const selectedBot = await testUtils.createUser("agent-context-selected-bot@example.com")
+    const otherBot = await testUtils.createUser("agent-context-other-bot@example.com")
+    await db
+      .update(schema.users)
+      .set({ bot: true, botCreatorId: owner.id })
+      .where(eq(schema.users.id, selectedBot.id))
+    await db
+      .update(schema.users)
+      .set({ bot: true, botCreatorId: owner.id })
+      .where(eq(schema.users.id, otherBot.id))
+    const otherAgent = await BotAgentsModel.create({ botUserId: otherBot.id, name: "Other Agent" })
+
+    const result = await createChat(
+      {
+        isPublic: false,
+        participants: [{ userId: BigInt(selectedBot.id) }],
+        agentContext: { botUserId: BigInt(selectedBot.id), agentId: otherAgent.id },
+      },
+      { ...mockFunctionContext, currentUserId: owner.id },
+    )
+
+    const [saved] = await db
+      .select({ agentContext: schema.chats.agentContext })
+      .from(schema.chats)
+      .where(eq(schema.chats.id, Number(result.chat.id)))
+      .limit(1)
+    expect(decodeAgentThreadContext(saved?.agentContext ?? null)).toEqual({
+      botUserId: BigInt(selectedBot.id),
+      agentId: undefined,
+      configuration: undefined,
+    })
+  })
+
+  test("preserves explicit settings when its catalog is unavailable", async () => {
+    const owner = await testUtils.createUser("agent-context-catalog-owner@example.com")
+    const bot = await testUtils.createUser("agent-context-catalog-bot@example.com")
+    await db
+      .update(schema.users)
+      .set({ bot: true, botCreatorId: owner.id })
+      .where(eq(schema.users.id, bot.id))
+
+    const result = await createChat(
+      {
+        isPublic: false,
+        participants: [{ userId: BigInt(bot.id) }],
+        agentContext: {
+          botUserId: BigInt(bot.id),
+          configuration: { projectId: "workspace-home", modelId: "gpt-6-astra", reasoningEffortId: "low" },
+        },
+      },
+      { ...mockFunctionContext, currentUserId: owner.id },
+    )
+
+    const [saved] = await db
+      .select({ agentContext: schema.chats.agentContext })
+      .from(schema.chats)
+      .where(eq(schema.chats.id, Number(result.chat.id)))
+      .limit(1)
+    expect(decodeAgentThreadContext(saved?.agentContext ?? null)).toEqual({
+      botUserId: BigInt(bot.id),
+      agentId: undefined,
+      configuration: { projectId: "workspace-home", modelId: "gpt-6-astra", reasoningEffortId: "low" },
+    })
+  })
+
+  test("preserves provider selections independently of a stale catalog", async () => {
+    const owner = await testUtils.createUser("agent-context-items-owner@example.com")
+    const bot = await testUtils.createUser("agent-context-items-bot@example.com")
+    await db
+      .update(schema.users)
+      .set({ bot: true, botCreatorId: owner.id })
+      .where(eq(schema.users.id, bot.id))
+    await BotCapabilitiesModel.replaceForBotUserId(bot.id, [{
+      kind: AGENT_CONFIGURATION_CAPABILITY_KIND,
+      version: AGENT_CONFIGURATION_VERSION,
+      payload: encodeAgentConfigurationCatalog({
+        projects: {
+          options: [{ id: "valid-project", label: "Valid Project", description: undefined }],
+          canSelectFolder: false,
+          defaultProjectId: undefined,
+        },
+        models: {
+          options: [{
+            id: "valid-model",
+            label: "Valid Model",
+            description: undefined,
+            reasoningEffortIds: ["low"],
+            defaultReasoningEffortId: undefined,
+          }],
+          defaultModelId: "valid-model",
+        },
+        reasoning: {
+          options: [
+            { id: "low", label: "Low", description: undefined },
+            { id: "high", label: "High", description: undefined },
+          ],
+        },
+      }),
+    }])
+
+    const result = await createChat(
+      {
+        isPublic: false,
+        participants: [{ userId: BigInt(bot.id) }],
+        agentContext: {
+          botUserId: BigInt(bot.id),
+          configuration: {
+            projectId: "stale-project",
+            modelId: "valid-model",
+            reasoningEffortId: "high",
+          },
+        },
+      },
+      { ...mockFunctionContext, currentUserId: owner.id },
+    )
+
+    const [saved] = await db
+      .select({ agentContext: schema.chats.agentContext })
+      .from(schema.chats)
+      .where(eq(schema.chats.id, Number(result.chat.id)))
+      .limit(1)
+    expect(decodeAgentThreadContext(saved?.agentContext ?? null)).toEqual({
+      botUserId: BigInt(bot.id),
+      agentId: undefined,
+      configuration: {
+        projectId: "stale-project",
+        modelId: "valid-model",
+        reasoningEffortId: "high",
+      },
+    })
+
+    const defaultModelResult = await createChat(
+      {
+        isPublic: false,
+        participants: [{ userId: BigInt(bot.id) }],
+        agentContext: {
+          botUserId: BigInt(bot.id),
+          configuration: { reasoningEffortId: "low" },
+        },
+      },
+      { ...mockFunctionContext, currentUserId: owner.id },
+    )
+    const [defaultModelChat] = await db
+      .select({ agentContext: schema.chats.agentContext })
+      .from(schema.chats)
+      .where(eq(schema.chats.id, Number(defaultModelResult.chat.id)))
+      .limit(1)
+    expect(decodeAgentThreadContext(defaultModelChat?.agentContext ?? null)).toEqual({
+      botUserId: BigInt(bot.id),
+      agentId: undefined,
+      configuration: {
+        projectId: undefined,
+        modelId: undefined,
+        reasoningEffortId: "low",
+      },
+    })
+  })
+})

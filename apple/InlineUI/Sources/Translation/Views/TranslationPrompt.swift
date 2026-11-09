@@ -1,0 +1,57 @@
+import InlineKit
+import SwiftUI
+
+/// Presented in a small popover when chat needs translation
+public struct TranslationPrompt: View {
+  var peer: Peer
+  var action: (() -> Void)? = nil
+
+  @Environment(\.dismiss) private var dismiss
+
+  public init(peer: Peer, action: (() -> Void)? = nil) {
+    self.peer = peer
+    self.action = action
+  }
+
+  public var body: some View {
+    HStack {
+      // TODO: Translate this prompt in common user languages
+      Text(
+        "Translation available"
+      )
+      .fixedSize()
+      .onTapGesture {
+        // If action is provided, call it
+        action?()
+      }
+
+      #if os(macOS)
+      // Close button
+      dismissButton
+      #endif
+    }
+    #if os(macOS)
+    .padding(.horizontal, 12)
+    .padding(.vertical, 6)
+    #else
+    .padding(.horizontal, 12)
+    .padding(.vertical, 4)
+    #endif
+  }
+
+  @ViewBuilder var dismissButton: some View {
+    Button {
+      TranslationAlertDismiss.shared.dismissForPeer(peer)
+      dismiss()
+    } label: {
+      Image(systemName: "xmark")
+        .foregroundStyle(.secondary)
+    }
+    .buttonStyle(.plain)
+    .focusable(false)
+  }
+}
+
+#Preview {
+  TranslationPrompt(peer: .user(id: 1))
+}

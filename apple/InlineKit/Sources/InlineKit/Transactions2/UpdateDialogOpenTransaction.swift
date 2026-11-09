@@ -1,0 +1,320 @@
+import Foundation
+import GRDB
+import InlineProtocol
+import Logger
+import RealtimeV2
+
+public struct UpdateDialogOpenTransaction: Transaction2 {
+  public var method: InlineProtocol.Method = .updateDialogOpen
+  public var context: Context
+  public var type: TransactionKindType = .mutation()
+
+  public struct Context: Sendable, Codable {
+    let peerId: Peer
+    let open: Bool
+    let order: String?
+    let folderId: Int64?
+    let intentId: String?
+    let requiresChatCreated: Bool?
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case context
+  }
+
+  private var log = Log.scoped("Transactions/UpdateDialogOpen")
+
+  public init(
+    peerId: Peer,
+    open: Bool,
+    order: String? = nil,
+    folderId: Int64? = nil,
+    placement: DialogOpenPlacement = .defaultValue,
+    requiresChatCreated: Bool = false
+  ) {
+    context = Context(
+      peerId: peerId,
+      open: open,
+      order: order ?? Self.initialOrder(open: open, placement: placement),
+      folderId: folderId,
+      intentId: UUID().uuidString,
+      requiresChatCreated: requiresChatCreated
+    )
+  }
+
+  public func input(from context: Context) -> InlineProtocol.RpcCall.OneOf_Input? {
+    .updateDialogOpen(.with {
+      $0.peerID = context.peerId.toInputPeer()
+      $0.open = context.open
+      if let order = context.order {
+        $0.order = order
+      }
+      if let folderId = context.folderId {
+        $0.folderID = folderId
+      }
+    })
+  }
+
+  public func optimistic() async {
+    await DialogOpenIntentTracker.shared.mark(context.intentId, peer: context.peerId)
+
+    do {
+      let snapshot = try await AppDatabase.shared.dbWriter.write { db -> DialogMutationSnapshot? in
+        let existing = try Dialog.get(peerId: context.peerId).fetchOne(db)
+        guard var dialog = try existing ?? newOptimisticDialog(db) else { return nil }
+        let baseline = dialog
+        Self.applyLocalOpenState(
+          &dialog,
+          open: context.open,
+          order: context.order,
+          folderId: context.folderId
+        )
+        try dialog.save(db, onConflict: .replace)
+        return DialogMutationSnapshot(
+          baseline: baseline,
+          optimistic: try Dialog.fetchOne(db, id: dialog.id) ?? dialog,
+          createdRow: existing == nil
+        )
+      }
+      guard let snapshot else { return }
+      await DialogMutationRollbackTracker.shared.record(
+        intentID: context.intentId,
+        peer: context.peerId,
+        kind: .open,
+        snapshot: snapshot,
+        fields: Self.rollbackFields
+      )
+    } catch {
+      log.error("Failed to optimistically update dialog open state", error: error)
+    }
+  }
+
+  public func apply(_ result: RpcResult.OneOf_Result?) async throws(TransactionExecutionError) {
+    guard case let .updateDialogOpen(response) = result else {
+      throw TransactionExecutionError.invalid
+    }
+
+    if response.deletedChat {
+      do {
+        try await AppDatabase.shared.dbWriter.write { db in
+          try Self.applyDeletedChat(peer: context.peerId, db: db)
+        }
+        await DialogMutationRollbackTracker.shared.complete(
+          intentID: context.intentId,
+          peer: context.peerId,
+          kind: .open
+        )
+        return
+      } catch {
+        log.error("Failed to apply deleted dialog open result", error: error)
+        throw TransactionExecutionError.invalid
+      }
+    }
+
+    guard response.hasChat, response.hasDialog else {
+      throw TransactionExecutionError.invalid
+    }
+
+    let isCurrentIntent = await DialogOpenIntentTracker.shared.isCurrent(context.intentId, peer: context.peerId)
+
+    do {
+      try await AppDatabase.shared.dbWriter.write { db in
+        if response.hasUser {
+          _ = try User.save(db, user: response.user)
+        }
+
+        var chat = Chat(from: response.chat)
+        try chat.saveWithValidLastMsg(db)
+
+        guard isCurrentIntent else {
+          log.trace("Skipping stale dialog open result for \(context.peerId)")
+          return
+        }
+
+        _ = try response.dialog.saveFull(db)
+        try Self.applyLocalOpenState(
+          peerId: context.peerId,
+          open: context.open,
+          order: context.order,
+          folderId: context.folderId,
+          db: db
+        )
+      }
+      await DialogMutationRollbackTracker.shared.complete(
+        intentID: context.intentId,
+        peer: context.peerId,
+        kind: .open
+      )
+    } catch {
+      log.error("Failed to apply dialog open result", error: error)
+      throw TransactionExecutionError.invalid
+    }
+  }
+
+  // Neither outcome rolls back, so the intent must stop owning its fields.
+  public func commitOutcomeUnknown() async {
+    await DialogMutationRollbackTracker.shared.complete(intentID: context.intentId, peer: context.peerId, kind: .open)
+  }
+
+  public func cancelled() async {
+    await DialogMutationRollbackTracker.shared.complete(intentID: context.intentId, peer: context.peerId, kind: .open)
+  }
+
+  public func failed(error: TransactionError2) async {
+    log.error("UpdateDialogOpen transaction failed", error: error)
+    guard let rollback = await DialogMutationRollbackTracker.shared.takeForRollback(
+      intentID: context.intentId,
+      peer: context.peerId,
+      kind: .open
+    ) else { return }
+
+    do {
+      try await AppDatabase.shared.dbWriter.write { db in
+        try rollback.apply(db)
+      }
+    } catch {
+      log.error("Failed to roll back dialog open state", error: error)
+    }
+  }
+
+  public var blockers: [TransactionBlocker] {
+    guard context.requiresChatCreated == true,
+          case let .thread(chatId) = context.peerId
+    else {
+      return []
+    }
+
+    return [.chatCreated(chatId: chatId)]
+  }
+
+  private static let rollbackFields: [DialogRollbackField] = [
+    .open, .openedDate, .order, .folderId, .pinned, .archived,
+  ]
+
+  private func newOptimisticDialog(_ db: Database) throws -> Dialog? {
+    guard context.open else { return nil }
+
+    switch context.peerId {
+    case let .user(id):
+      return Dialog(optimisticForUserId: id)
+    case let .thread(id):
+      guard let chat = try Chat.fetchOne(db, id: id) else { return nil }
+      var dialog = Dialog(optimisticForChat: chat)
+      if chat.isReplyThread {
+        dialog.chatListHidden = true
+      }
+      return dialog
+    }
+  }
+
+  static func applyLocalOpenState(
+    peerId: Peer,
+    open: Bool,
+    order: String? = nil,
+    folderId: Int64? = nil,
+    db: Database
+  ) throws {
+    guard var dialog = try Dialog.get(peerId: peerId).fetchOne(db) else { return }
+    applyLocalOpenState(&dialog, open: open, order: order, folderId: folderId)
+    try dialog.save(db, onConflict: .replace)
+  }
+
+  private static func applyLocalOpenState(
+    _ dialog: inout Dialog,
+    open: Bool,
+    order: String?,
+    folderId: Int64?
+  ) {
+    if open {
+      if dialog.open == false || dialog.order == nil {
+        dialog.order = order ?? dialog.order
+      }
+      if let folderId {
+        dialog.folderId = folderId
+        dialog.pinned = false
+      }
+      dialog.open = true
+      dialog.openedDate = Date()
+      dialog.archived = false
+    } else {
+      dialog.open = false
+      dialog.openedDate = nil
+      dialog.order = nil
+      dialog.folderId = nil
+    }
+  }
+
+  private static func applyDeletedChat(peer: Peer, db: Database) throws {
+    guard case let .thread(chatId) = peer else { return }
+
+    try Message.filter(Column("chatId") == chatId).deleteAll(db)
+    try Dialog.filter(Column("peerThreadId") == chatId).deleteAll(db)
+    try Chat.filter(Column("id") == chatId).deleteAll(db)
+    try deleteChatSyncBucket(db, chatId: chatId)
+
+    Task.detached {
+      NotificationCenter.default.post(
+        name: Notification.Name("chatDeletedNotification"),
+        object: nil,
+        userInfo: ["chatId": chatId]
+      )
+    }
+  }
+
+  private static func initialOrder(
+    open: Bool,
+    placement: DialogOpenPlacement
+  ) -> String? {
+    guard open else { return nil }
+
+    return (try? AppDatabase.shared.reader.read { db in
+      try Dialog.sidebarOrder(db, placement: placement)
+    }) ?? fallbackOrder(placement: placement)
+  }
+
+  private static func fallbackOrder(placement: DialogOpenPlacement) -> String {
+    switch placement {
+    case .top:
+      FractionalIndex.before(nil)
+    case .bottom:
+      FractionalIndex.after(nil)
+    }
+  }
+}
+
+public extension Transaction2 where Self == UpdateDialogOpenTransaction {
+  static func updateDialogOpen(
+    peerId: Peer,
+    open: Bool,
+    order: String? = nil,
+    folderId: Int64? = nil,
+    placement: DialogOpenPlacement = .defaultValue,
+    requiresChatCreated: Bool = false
+  ) -> UpdateDialogOpenTransaction {
+    UpdateDialogOpenTransaction(
+      peerId: peerId,
+      open: open,
+      order: order,
+      folderId: folderId,
+      placement: placement,
+      requiresChatCreated: requiresChatCreated
+    )
+  }
+}
+
+private actor DialogOpenIntentTracker {
+  static let shared = DialogOpenIntentTracker()
+
+  private var latestIntentByPeer: [Peer: String] = [:]
+
+  func mark(_ intentId: String?, peer: Peer) {
+    guard let intentId else { return }
+    latestIntentByPeer[peer] = intentId
+  }
+
+  func isCurrent(_ intentId: String?, peer: Peer) -> Bool {
+    guard let intentId else { return true }
+    guard let latestIntent = latestIntentByPeer[peer] else { return true }
+    return latestIntent == intentId
+  }
+}

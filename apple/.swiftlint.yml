@@ -1,0 +1,71 @@
+# SwiftLint <https://realm.github.io/SwiftLint/>
+#
+check_for_updates: false
+
+included:
+  - InlineIOS
+  - InlineIOSUI
+  - InlineKit
+  - InlineMac
+  - InlineMacUI
+  - InlineNotificationExtension
+  - InlineShareExtension
+  - InlineUI
+
+excluded:
+  - build
+  - DerivedData
+  - Carthage
+  - Pods
+  - InlineIOSUI/.build
+  - InlineKit/.build
+  - InlineMacUI/.build
+  - InlineUI/.build
+  - InlineKit/Sources/InlineProtocol
+  - InlineUI/Sources/EmojiAutocomplete/EmojiAutocompleteData.generated.swift
+
+disabled_rules:
+  - cyclomatic_complexity
+  - file_length
+  - function_body_length
+  - line_length
+  - nesting
+  - no_fallthrough_only
+  - todo
+  - trailing_comma
+  - trailing_newline
+  - type_body_length
+
+identifier_name:
+  min_length: 1
+  allowed_symbols: ["_"]
+  # TODO: Fix existing uppercase local variable names, then make this an error.
+  validates_start_with_lowercase: warning
+  excluded:
+    - Core.*
+
+type_name:
+  min_length: 2
+  allowed_symbols: ["_"]
+  excluded:
+    - iOS_.*
+
+function_parameter_count:
+  warning: 6
+
+# TODO: Replace existing force casts with checked casts, then make this an error.
+force_cast:
+  severity: warning
+
+# TODO: Replace existing force tries with explicit error handling, then make this an error.
+force_try:
+  severity: warning
+
+# TODO: Fix existing shorthand operator violations, then make this an error.
+shorthand_operator:
+  severity: warning
+
+large_tuple:
+  warning: 3
+
+reporter: "xcode"

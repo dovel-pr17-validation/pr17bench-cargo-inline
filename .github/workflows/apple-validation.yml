@@ -1,0 +1,166 @@
+name: Apple Validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-validation-${{ github.ref }}
+  # Publishers need a completed main qualification; keep the active run and
+  # let later main pushes replace only the pending run. PR feedback stays fresh.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Select Apple validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      selected: ${{ steps.plan.outputs.selected }}
+      run: ${{ steps.plan.outputs.run }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: plan
+        run: node scripts/ci/validation-gates.mjs select-apple
+
+  contracts:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: Apple source, scripts, and Swift protocol
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - run: bun install --frozen-lockfile
+      - name: Verify host and source contracts
+        run: |
+          test "$(sw_vers -productVersion | cut -d. -f1)" -ge 27
+          xcodebuild -version
+          xcrun swift --version
+          bash scripts/apple/run-ci-checks.sh --lint-only
+      - name: Test Apple build and release scripts
+        run: bun test scripts/apple scripts/macos
+      - name: Verify generated Swift protocol
+        run: |
+          cd scripts
+          bun run proto:generate-swift
+          cd ..
+          git diff --exit-code -- apple/InlineKit/Sources/InlineProtocol
+          test -z "$(git ls-files --others --exclude-standard apple/InlineKit/Sources/InlineProtocol)"
+
+  swift-main:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: Swift packages (main)
+    runs-on: xcode-27
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-xcode27-${{ hashFiles('apple/**/Package.resolved') }}
+      - name: Build and test four main packages
+        env:
+          APPLE_CI_SKIP_SOURCE_CHECKS: '1'
+          APPLE_CI_REPORT_DIR: ${{ runner.temp }}/swift-main-reports
+        run: bash scripts/apple/run-ci-checks.sh InlineKit InlineUI InlineIOSUI InlineMacUI
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: swift-main-reports
+          path: ${{ runner.temp }}/swift-main-reports/
+          retention-days: 7
+
+  swift-utilities:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: Swift packages (utilities)
+    runs-on: xcode-27
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-xcode27-${{ hashFiles('apple/**/Package.resolved') }}
+      - name: Verify macOS 27 host
+        run: test "$(sw_vers -productVersion | cut -d. -f1)" -ge 27
+      - name: Build and test nine utility packages
+        env:
+          APPLE_CI_SKIP_SOURCE_CHECKS: '1'
+          APPLE_CI_REPORT_DIR: ${{ runner.temp }}/swift-utility-reports
+        run: bash scripts/apple/run-ci-checks.sh InlineRealtimeCore InlineMacSidebarModel InlineThumbnailing InlineSyntaxHighlighting InlineMacScripting InlineMath MemojiKit InlineDevCompanion InlineMessageLayout
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: swift-utility-reports
+          path: ${{ runner.temp }}/swift-utility-reports/
+          retention-days: 7
+
+  macos-app:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: macOS app Debug and Release
+    runs-on: xcode-27
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build unsigned macOS app
+        env:
+          APPLE_CI_REPORT_DIR: ${{ runner.temp }}/macos-app-reports
+        run: bash scripts/apple/build-ci-app.sh macos
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: macos-app-build-logs
+          path: ${{ runner.temp }}/macos-app-reports/
+          retention-days: 7
+
+  ios-app:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    name: iOS device app Debug and Release
+    runs-on: xcode-27
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build unsigned generic iOS device app
+        env:
+          APPLE_CI_REPORT_DIR: ${{ runner.temp }}/ios-app-reports
+        run: bash scripts/apple/build-ci-app.sh ios
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: ios-app-build-logs
+          path: ${{ runner.temp }}/ios-app-reports/
+          retention-days: 7
+
+  required:
+    name: Apple validation required
+    if: ${{ always() }}
+    needs: [changes, contracts, swift-main, swift-utilities, macos-app, ios-app]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require every selected job to pass
+        env:
+          RESULTS_JSON: ${{ toJSON(needs) }}
+          SELECTED_JOBS: ${{ needs.changes.outputs.selected }}
+        run: node scripts/ci/validation-gates.mjs apple

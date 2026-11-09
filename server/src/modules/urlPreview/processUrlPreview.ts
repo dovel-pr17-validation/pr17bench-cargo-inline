@@ -1,0 +1,1430 @@
+import {
+  extractPreviewRoutes,
+  extractPreviewUrls,
+  fetchAuthenticatedUrlPreview,
+  fetchBinary,
+  fetchUrlPreview,
+  isFigmaUrl,
+  isPreviewAuthorImageUrl,
+  isXStatusUrl,
+  isYouTubeUrl,
+  normalizePreviewUrl,
+  resolvePreviewLayout,
+  type PreviewRoute,
+  type AuthenticatedPreviewResult,
+  type UrlPreviewResult,
+  type PreviewDiagnostic,
+} from "@inline-chat/url-preview"
+import {
+  MessageEntity_Type,
+  type BlockContent,
+  type InputPeer,
+  type MessageAttachment,
+  type MessageEntities,
+  type Update,
+} from "@inline-chat/protocol/core"
+import { db } from "@in/server/db"
+import { refreshAttachmentMembership } from "@in/server/modules/message/attachmentMembership"
+import { MessageModel, type ProcessedMessageAttachment } from "@in/server/db/models/messages"
+import { UpdatesModel, type UpdateSeqAndDate } from "@in/server/db/models/updates"
+import {
+  chats,
+  messageAttachments,
+  messages,
+  urlPreview,
+  type DbChat,
+  type DbMessage,
+  type DbUrlPreviewCache,
+} from "@in/server/db/schema"
+import { UpdateBucket } from "@in/server/db/schema/updates"
+import { decryptMessage, encryptMessage } from "@in/server/modules/encryption/encryptMessage"
+import { uploadPhoto } from "@in/server/modules/files/uploadPhoto"
+import { getUpdateGroupFromInputPeer, type UpdateGroup } from "@in/server/modules/updates"
+import {
+  getCachedPreviewPhotoId,
+  getFreshPreviewCache,
+  touchPreviewCache,
+  upsertPreviewCache,
+  previewImageRetryMs,
+} from "@in/server/modules/urlPreview/cache"
+import { resolvePreviewAuthCandidates } from "@in/server/modules/urlPreview/auth"
+import { isSpaceUrlPreviewExcluded } from "@in/server/modules/urlPreview/exclusions"
+import {
+  encodeMessageAttachment,
+  encodeMessageAttachmentUpdate,
+} from "@in/server/realtime/encoders/encodeMessageAttachment"
+import { RealtimeUpdates } from "@in/server/realtime/message"
+import { connectionManager } from "@in/server/ws/connections"
+import { toArrayBufferBackedBytes } from "@in/server/utils/arrayBuffer"
+import { Log } from "@in/server/utils/log"
+import {
+  getMessageAttachmentTitleContext,
+  maybeScheduleThreadTitleGeneration,
+  type ThreadTitleAttachmentContext,
+} from "@in/server/modules/threadTitles"
+import { and, eq } from "drizzle-orm"
+import sharp from "sharp"
+
+const log = new Log("modules.urlPreview")
+
+type ProcessUrlPreviewInput = {
+  message: DbMessage
+  previewUrl?: string
+  previewRoute?: PreviewRoute
+  chat?: DbChat
+  chatId: number
+  spaceId?: number | null
+  currentUserId: number
+  inputPeer: InputPeer
+  previewUrlCount?: number
+  messageText?: string
+  messageEntities?: MessageEntities
+  titleAttachments?: ThreadTitleAttachmentContext[]
+}
+
+type InsertPreviewOutput = {
+  attachmentId: number
+  update: UpdateSeqAndDate
+}
+
+export type ResolvedUrlPreview = {
+  metadata: UrlPreviewResult & Pick<AuthenticatedPreviewResult, "providerResourceType">
+  photoId: number | null
+  authorPhotoId: number | null
+}
+
+export type ResolveUrlPreviewInput = {
+  url: string
+  chatId?: number | undefined
+  spaceId?: number | null
+  currentUserId: number
+}
+
+type PreviewMediaKind = NonNullable<UrlPreviewResult["media"]>["kind"] | "video"
+
+type PreviewAttachmentSource = {
+  url: Buffer | null
+  urlIv: Buffer | null
+  urlTag: Buffer | null
+  siteName: string | null
+  provider: string
+  mediaType: UrlPreviewResult["mediaType"] | null
+  title: Buffer | null
+  titleIv: Buffer | null
+  titleTag: Buffer | null
+  description: Buffer | null
+  descriptionIv: Buffer | null
+  descriptionTag: Buffer | null
+  author: Buffer | null
+  authorIv: Buffer | null
+  authorTag: Buffer | null
+  mediaKind: PreviewMediaKind | null
+  photoId: number | null
+  authorPhotoId: number | null
+  videoId: number | null
+  documentId: number | null
+  externalUrl: Buffer | null
+  externalUrlIv: Buffer | null
+  externalUrlTag: Buffer | null
+  externalMimeType: string | null
+  externalWidth: number | null
+  externalHeight: number | null
+  externalDuration: number | null
+  embedUrl: Buffer | null
+  embedUrlIv: Buffer | null
+  embedUrlTag: Buffer | null
+  embedType: string | null
+  embedWidth: number | null
+  embedHeight: number | null
+  embedDuration: number | null
+  hasLargeMedia: boolean | null
+  showLargeMedia: boolean | null
+  cacheId: number | null
+  duration: number | null
+}
+
+const maxDescriptionLength = 420
+const previousMaxDescriptionLength = 220
+// Existing X note-tweet cache rows can contain only the 280-character compatibility body without an ellipsis.
+const xNoteTweetFallbackFetchedAt = new Date("2026-07-09T13:50:00.000Z")
+// Existing X article rows can contain only the shortened article URL instead of the article metadata.
+const xArticleFallbackFetchedAt = new Date("2026-08-04T19:30:00.000Z")
+// Retry older image-less rows once so they can use fallback metadata added by this fix.
+const previewImageFallbackFetchedAt = new Date("2026-07-13T11:00:00.000Z")
+const xCompatibilityDescriptionMinLength = 260
+const xCompatibilityDescriptionMaxLength = 280
+const maxTitleLength = 180
+const maxSiteNameLength = 80
+const urlPreviewCandidatePolicy = {
+  maxUrls: 5,
+  // TEXT_URL stores a hidden target behind labeled text, such as Markdown `[docs](https://example.com)`.
+  // Raw URL text is scanned separately and remains eligible when this flag is false.
+  includeTextUrlTargets: false,
+} as const
+const maxImageBytes = 5 * 1024 * 1024
+const maxImagePixels = 16_000_000
+const maxImageWidth = 800
+const maxImageHeight = 450
+const maxImageCandidates = 3
+const jpegQuality = 82
+const maxConcurrentPreviewJobs = 8
+const maxQueuedPreviewJobs = 256
+const previewImageTypes = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/mjpeg",
+  "multipart/x-mixed-replace",
+]
+
+let activePreviewJobs = 0
+const queuedPreviewJobs: Array<() => void> = []
+
+export function getPreviewUrlFromMessage(text: string, entities?: MessageEntities | null): string | null {
+  return getPreviewUrlsFromMessage(text, entities)[0] ?? null
+}
+
+export function getPreviewUrlsFromMessage(text: string, entities?: MessageEntities | null): string[] {
+  return extractPreviewUrls(previewCandidateText(text, entities), collectEntityUrls(text, entities), {
+    limit: urlPreviewCandidatePolicy.maxUrls,
+  })
+}
+
+export function getPreviewRoutesFromMessage(
+  text: string,
+  entities?: MessageEntities | null,
+  blockContent?: BlockContent | null,
+): PreviewRoute[] {
+  const disclosures = disclosureTextRanges(blockContent)
+  return extractPreviewRoutes(
+    previewCandidateText(text, entities, disclosures),
+    collectEntityUrls(text, entities, disclosures),
+    { limit: urlPreviewCandidatePolicy.maxUrls },
+  )
+}
+
+/**
+ * Resolves generic preview metadata without creating a message attachment.
+ * Authenticated provider results intentionally bypass the shared URL cache so
+ * private metadata cannot cross user or chat boundaries.
+ */
+export async function resolveUrlPreview(input: ResolveUrlPreviewInput): Promise<ResolvedUrlPreview | null> {
+  const previewRoute = extractPreviewRoutes(input.url, [], { limit: 1 })[0]
+  if (!previewRoute) {
+    return null
+  }
+  // New-thread Compose has no authorized space context and supports personal Notion only.
+  if (input.chatId === undefined) {
+    if (previewRoute.kind !== "authenticated" || previewRoute.parsedUrl.provider !== "notion") return null
+  } else if (await isSpaceUrlPreviewExcluded({ spaceId: input.spaceId, url: previewRouteUrl(previewRoute) })) {
+    return null
+  }
+
+  const releaseSlot = await acquireStandalonePreviewSlot(previewRoute)
+  if (!releaseSlot) {
+    return null
+  }
+
+  try {
+    if (previewRoute.kind === "authenticated") {
+      const authCandidates = await resolvePreviewAuthCandidates({
+        provider: previewRoute.parsedUrl.provider,
+        currentUserId: input.currentUserId,
+        chatId: input.chatId,
+      })
+      for (const auth of authCandidates) {
+        const metadata = await fetchAuthenticatedUrlPreview(previewRoute.parsedUrl, auth, {
+          maxDescriptionLength,
+          maxTitleLength,
+          maxSiteNameLength,
+        })
+        if (metadata) {
+          return hydrateResolvedPreview(metadata, input.currentUserId)
+        }
+      }
+      return null
+    }
+
+    const cached = await getFreshPreviewCache(previewRoute.url).catch(() => null)
+    if (cached && !shouldRefetchCachedPreview(cached, previewRoute.url)) {
+      void touchPreviewCache(cached.id).catch(() => undefined)
+      return resolvedPreviewFromCache(cached, previewRoute.url)
+    }
+
+    const metadata = await fetchUrlPreview(previewRoute.url, {
+      maxDescriptionLength,
+      maxTitleLength,
+      maxSiteNameLength,
+      onDiagnostic: previewDiagnostics(previewRoute.url, { chatId: input.chatId }),
+    }).catch(() => null)
+    if (!metadata) {
+      return cached ? resolvedPreviewFromCache(cached, previewRoute.url) : null
+    }
+
+    const resolved = await hydrateResolvedPreview(metadata, input.currentUserId)
+    if (cached && shouldKeepCachedAuthorImageFallback(cached, resolved.photoId, resolved.authorPhotoId)) {
+      return resolvedPreviewFromCache(cached, previewRoute.url)
+    }
+
+    void upsertPreviewCache({
+      metadata: resolved.metadata,
+      photoId: resolved.photoId,
+      authorPhotoId: resolved.authorPhotoId,
+    }).catch(() => undefined)
+    return withResolvedLayout(resolved, previewRoute.url)
+  } catch (error) {
+    log.warn("Failed to resolve URL preview", {
+      error,
+      host: previewLogHost(previewRouteUrl(previewRoute)),
+      chatId: input.chatId,
+    })
+    return null
+  } finally {
+    releaseSlot()
+  }
+}
+
+export async function processUrlPreviews(
+  input: Omit<ProcessUrlPreviewInput, "previewUrl" | "previewRoute"> & {
+    previewUrls?: string[]
+    previewRoutes?: PreviewRoute[]
+  },
+): Promise<void> {
+  const routes = (input.previewRoutes ?? input.previewUrls?.map(generalPreviewRoute) ?? []).slice(
+    0,
+    urlPreviewCandidatePolicy.maxUrls,
+  )
+  const previewUrlCount = routes.length
+  for (const previewRoute of routes) {
+    await processUrlPreview({ ...input, previewRoute, previewUrlCount })
+  }
+
+  await maybeScheduleTitleGenerationAfterPreviews(input)
+}
+
+export async function processUrlPreview(input: ProcessUrlPreviewInput): Promise<void> {
+  const previewRoute = input.previewRoute ?? (input.previewUrl ? generalPreviewRoute(input.previewUrl) : null)
+  if (!previewRoute) {
+    return
+  }
+
+  if (await isSpaceUrlPreviewExcluded({ spaceId: input.spaceId, url: previewRouteUrl(previewRoute) })) {
+    return
+  }
+
+  const releaseSlot = await acquirePreviewSlot(input)
+  if (!releaseSlot) {
+    return
+  }
+
+  try {
+    if (previewRoute.kind === "authenticated") {
+      await processAuthenticatedUrlPreview(input, previewRoute)
+      return
+    }
+
+    const cached = await getFreshPreviewCache(previewRoute.url).catch((error) => {
+      log.warn("Failed to read URL preview cache", {
+        error,
+        messageId: input.message.messageId,
+        chatId: input.chatId,
+      })
+      return null
+    })
+    if (cached && !shouldRefetchCachedPreview(cached, previewRoute.url)) {
+      await insertCachedPreviewAttachment(input, previewRoute, cached)
+      return
+    }
+
+    const metadata = await fetchUrlPreview(previewRoute.url, {
+      maxDescriptionLength,
+      maxTitleLength,
+      maxSiteNameLength,
+      onDiagnostic: previewDiagnostics(previewRoute.url, { chatId: input.chatId, messageId: input.message.messageId }),
+    }).catch(() => null)
+    if (!metadata) {
+      if (cached) {
+        await insertCachedPreviewAttachment(input, previewRoute, cached)
+      }
+      return
+    }
+
+    // TODO: Generate and cache poster thumbnails for direct video previews once capture can be safely bounded.
+    const resolvedImage = await resolvePreviewImage(metadata, input.currentUserId)
+    const resolvedMetadata = resolvedImage.metadata
+    const photoId = resolvedImage.photoId
+    const authorPhotoId = metadata.authorPhotoUrl
+      ? await getOrSavePreviewImage(metadata.authorPhotoUrl, input.currentUserId)
+      : null
+    if (cached && shouldKeepCachedAuthorImageFallback(cached, photoId, authorPhotoId)) {
+      await insertCachedPreviewAttachment(input, previewRoute, cached)
+      return
+    }
+
+    const cache = await upsertPreviewCache({ metadata: resolvedMetadata, photoId, authorPhotoId }).catch((error) => {
+      log.warn("Failed to write URL preview cache", {
+        error,
+        host: previewLogHost(resolvedMetadata.url),
+        messageId: input.message.messageId,
+        chatId: input.chatId,
+      })
+      return null
+    })
+    const inserted = await insertPreviewAttachment(
+      input.message,
+      input.chatId,
+      previewSourceForMessage(
+        previewSourceFromMetadata(resolvedMetadata, photoId, authorPhotoId, cache?.id ?? null),
+        previewRouteUrl(previewRoute),
+        input.previewUrlCount,
+      ),
+    )
+    await pushInsertedPreviewAttachment(input, inserted)
+  } catch (error) {
+    log.warn("Failed to process URL preview", {
+      error,
+      host: previewLogHost(previewRouteUrl(previewRoute)),
+      messageId: input.message.messageId,
+      chatId: input.chatId,
+    })
+  } finally {
+    releaseSlot()
+  }
+}
+
+async function insertCachedPreviewAttachment(
+  input: ProcessUrlPreviewInput,
+  previewRoute: PreviewRoute & { kind: "general" },
+  cached: DbUrlPreviewCache,
+): Promise<void> {
+  const inserted = await insertPreviewAttachment(
+    input.message,
+    input.chatId,
+    previewSourceForMessage(previewSourceFromCache(cached), previewRouteUrl(previewRoute), input.previewUrlCount),
+  )
+  await touchPreviewCache(cached.id).catch((error) => {
+    log.warn("Failed to touch URL preview cache", {
+      error,
+      cacheId: cached.id,
+      messageId: input.message.messageId,
+      chatId: input.chatId,
+    })
+  })
+  await pushInsertedPreviewAttachment(input, inserted)
+}
+
+function shouldRefetchCachedPreview(cache: DbUrlPreviewCache, url: string): boolean {
+  const normalized = normalizePreviewUrl(url)
+  if (!normalized) {
+    return false
+  }
+
+  // Retry a missing poster without discarding the cached text card: a failed
+  // refresh can still attach that card while the origin is unavailable.
+  if (
+    cache.photoId == null && cache.imageUrl != null &&
+    (cache.fetchedAt < previewImageFallbackFetchedAt || Date.now() - cache.fetchedAt.getTime() >= previewImageRetryMs)
+  ) {
+    return true
+  }
+
+  if (isXStatusUrl(normalized)) {
+    return (
+      isStaleXPreviewCache(cache) ||
+      cachedPrimaryImageIsAuthorImage(cache) ||
+      cachedDescriptionLooksTruncated(cache) ||
+      cachedDescriptionIsXArticlePlaceholder(cache)
+    )
+  }
+
+  if (isYouTubeUrl(normalized)) {
+    return cachedImageUrlNeedsYouTubeRefresh(cache) || cachedPrimaryImageIsAuthorImage(cache)
+  }
+
+  if (isFigmaUrl(normalized)) {
+    return isStaleFigmaPreviewCache(cache)
+  }
+
+  return false
+}
+
+function isStaleFigmaPreviewCache(cache: DbUrlPreviewCache): boolean {
+  return cache.provider !== "figma" || cache.mediaKind === "embed" || cache.mediaType === "video"
+}
+
+function cachedImageUrlNeedsYouTubeRefresh(cache: DbUrlPreviewCache): boolean {
+  const imageUrl = decryptCacheValue(cache.imageUrl, cache.imageUrlIv, cache.imageUrlTag)
+  if (!imageUrl) {
+    return false
+  }
+
+  return isLetterboxedYouTubeThumbnailUrl(imageUrl)
+}
+
+function isLetterboxedYouTubeThumbnailUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value)
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "")
+    if (host !== "i.ytimg.com" && host !== "img.youtube.com") {
+      return false
+    }
+
+    const parts = parsed.pathname.split("/").filter(Boolean)
+    const fileName = parts[parts.length - 1]?.toLowerCase()
+    return fileName === "default.jpg" || fileName === "hqdefault.jpg" || fileName === "sddefault.jpg"
+  } catch {
+    return false
+  }
+}
+
+function isStaleXPreviewCache(cache: DbUrlPreviewCache): boolean {
+  return (
+    cache.author == null &&
+    cache.mediaKind == null &&
+    cache.externalUrl == null &&
+    cache.embedUrl == null &&
+    cache.videoId == null &&
+    cache.documentId == null
+  )
+}
+
+function cachedPrimaryImageIsAuthorImage(cache: DbUrlPreviewCache): boolean {
+  const url = decryptCacheValue(cache.url, cache.urlIv, cache.urlTag)
+  const imageUrl = decryptCacheValue(cache.imageUrl, cache.imageUrlIv, cache.imageUrlTag)
+  return !!url && !!imageUrl && isPreviewAuthorImageUrl(url, imageUrl)
+}
+
+function cachedDescriptionLooksTruncated(cache: DbUrlPreviewCache): boolean {
+  const description = decryptCacheValue(cache.description, cache.descriptionIv, cache.descriptionTag)?.trimEnd()
+  if (!description) {
+    return false
+  }
+
+  return (
+    (description.length <= previousMaxDescriptionLength &&
+      (description.endsWith("…") || description.endsWith("..."))) ||
+    (cache.fetchedAt < xNoteTweetFallbackFetchedAt &&
+      description.length >= xCompatibilityDescriptionMinLength &&
+      description.length <= xCompatibilityDescriptionMaxLength)
+  )
+}
+
+function cachedDescriptionIsXArticlePlaceholder(cache: DbUrlPreviewCache): boolean {
+  if (cache.mediaType === "article" || cache.fetchedAt >= xArticleFallbackFetchedAt) {
+    return false
+  }
+
+  const description = decryptCacheValue(cache.description, cache.descriptionIv, cache.descriptionTag)?.trim()
+  return description != null && /^https:\/\/t\.co\/[a-z0-9]+$/i.test(description)
+}
+
+function shouldKeepCachedAuthorImageFallback(
+  cache: DbUrlPreviewCache,
+  photoId: number | null,
+  authorPhotoId: number | null,
+): boolean {
+  return photoId == null && authorPhotoId == null && cachedPrimaryImageIsAuthorImage(cache)
+}
+
+function generalPreviewRoute(url: string): PreviewRoute {
+  return { kind: "general", url }
+}
+
+async function processAuthenticatedUrlPreview(
+  input: ProcessUrlPreviewInput,
+  previewRoute: PreviewRoute & { kind: "authenticated" },
+): Promise<void> {
+  const authCandidates = await resolvePreviewAuthCandidates({
+    provider: previewRoute.parsedUrl.provider,
+    currentUserId: input.currentUserId,
+    chatId: input.chatId,
+  })
+  if (authCandidates.length === 0) {
+    return
+  }
+
+  let metadata: Awaited<ReturnType<typeof fetchAuthenticatedUrlPreview>> = null
+  for (const auth of authCandidates) {
+    metadata = await fetchAuthenticatedUrlPreview(previewRoute.parsedUrl, auth, {
+      maxDescriptionLength,
+      maxTitleLength,
+      maxSiteNameLength,
+    })
+    if (metadata) break
+  }
+  if (!metadata) {
+    return
+  }
+
+  const resolvedImage = await resolvePreviewImage(metadata, input.currentUserId)
+  const resolvedMetadata = resolvedImage.metadata
+  const photoId = resolvedImage.photoId
+  const authorPhotoId = metadata.authorPhotoUrl
+    ? await getOrSavePreviewImage(metadata.authorPhotoUrl, input.currentUserId)
+    : null
+  const inserted = await insertPreviewAttachment(
+    input.message,
+    input.chatId,
+    previewSourceForMessage(
+      previewSourceFromMetadata(resolvedMetadata, photoId, authorPhotoId, null),
+      previewRouteUrl(previewRoute),
+      input.previewUrlCount,
+    ),
+  )
+  await pushInsertedPreviewAttachment(input, inserted)
+}
+
+async function hydrateResolvedPreview(
+  metadata: UrlPreviewResult & Pick<AuthenticatedPreviewResult, "providerResourceType">,
+  currentUserId: number,
+): Promise<ResolvedUrlPreview> {
+  const resolvedImage = await resolvePreviewImage(metadata, currentUserId)
+  const authorPhotoId = metadata.authorPhotoUrl
+    ? await getOrSavePreviewImage(metadata.authorPhotoUrl, currentUserId)
+    : null
+
+  return {
+    metadata: resolvedImage.metadata,
+    photoId: resolvedImage.photoId,
+    authorPhotoId,
+  }
+}
+
+function resolvedPreviewFromCache(cache: DbUrlPreviewCache, requestedUrl: string): ResolvedUrlPreview {
+  const source = previewSourceFromCache(cache)
+  const url = decryptCacheValue(source.url, source.urlIv, source.urlTag) ?? requestedUrl
+  const imageUrl = decryptCacheValue(cache.imageUrl, cache.imageUrlIv, cache.imageUrlTag)
+  const externalUrl = decryptCacheValue(source.externalUrl, source.externalUrlIv, source.externalUrlTag)
+  const embedUrl = decryptCacheValue(source.embedUrl, source.embedUrlIv, source.embedUrlTag)
+  const media = cachedPreviewMedia(source, imageUrl, externalUrl, embedUrl)
+  const metadata: UrlPreviewResult = {
+    url,
+    finalUrl: url,
+    siteName: source.siteName ?? undefined,
+    title: decryptCacheValue(source.title, source.titleIv, source.titleTag) ?? undefined,
+    description: decryptCacheValue(source.description, source.descriptionIv, source.descriptionTag) ?? undefined,
+    imageUrl: imageUrl ?? undefined,
+    duration: source.duration ?? undefined,
+    mediaType: source.mediaType ?? undefined,
+    provider: source.provider,
+    author: decryptCacheValue(source.author, source.authorIv, source.authorTag) ?? undefined,
+    media,
+    layout:
+      source.hasLargeMedia == null && source.showLargeMedia == null
+        ? undefined
+        : {
+            hasLargeMedia: source.hasLargeMedia ?? false,
+            showLargeMedia: source.showLargeMedia ?? false,
+          },
+  }
+
+  return withResolvedLayout(
+    {
+      metadata,
+      photoId: source.photoId,
+      authorPhotoId: source.authorPhotoId,
+    },
+    requestedUrl,
+  )
+}
+
+function cachedPreviewMedia(
+  source: PreviewAttachmentSource,
+  imageUrl: string | null,
+  externalUrl: string | null,
+  embedUrl: string | null,
+): UrlPreviewResult["media"] {
+  switch (source.mediaKind) {
+    case "photo":
+      return imageUrl ? { kind: "photo", url: imageUrl } : undefined
+    case "external_video":
+      return externalUrl
+        ? {
+            kind: "external_video",
+            url: externalUrl,
+            mimeType: source.externalMimeType ?? undefined,
+            width: source.externalWidth ?? undefined,
+            height: source.externalHeight ?? undefined,
+            duration: source.externalDuration ?? undefined,
+          }
+        : undefined
+    case "embed":
+      return embedUrl
+        ? {
+            kind: "embed",
+            url: embedUrl,
+            embedType: source.embedType ?? undefined,
+            width: source.embedWidth ?? undefined,
+            height: source.embedHeight ?? undefined,
+            duration: source.embedDuration ?? undefined,
+          }
+        : undefined
+    default:
+      return undefined
+  }
+}
+
+function withResolvedLayout(resolved: ResolvedUrlPreview, requestedUrl: string): ResolvedUrlPreview {
+  const mediaKind = resolved.metadata.media?.kind ?? (resolved.photoId ? "photo" : null)
+  const layout = resolvePreviewLayout({
+    url: requestedUrl,
+    finalUrl: resolved.metadata.finalUrl,
+    provider: resolved.metadata.provider,
+    mediaType: resolved.metadata.mediaType,
+    mediaKind,
+    hasCardContent: resolved.metadata.description != null,
+    hasPhoto: resolved.photoId != null,
+    hasLargeMedia: resolved.metadata.layout?.hasLargeMedia,
+    showLargeMedia: resolved.metadata.layout?.showLargeMedia,
+    urlCount: 1,
+  })
+
+  return {
+    ...resolved,
+    metadata: {
+      ...resolved.metadata,
+      layout:
+        layout.hasLargeMedia == null && layout.showLargeMedia == null
+          ? undefined
+          : {
+              hasLargeMedia: layout.hasLargeMedia ?? false,
+              showLargeMedia: layout.showLargeMedia ?? false,
+            },
+    },
+  }
+}
+
+function previewRouteUrl(route: PreviewRoute): string {
+  return route.kind === "general" ? route.url : route.parsedUrl.normalizedUrl
+}
+
+function previewLogHost(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.toLowerCase()
+  } catch {
+    return undefined
+  }
+}
+
+function previewDiagnostics(
+  url: string,
+  context: { chatId?: number; messageId?: number } = {},
+): (diagnostic: PreviewDiagnostic) => void {
+  const host = previewLogHost(url)
+  return (diagnostic) => {
+    const attributes = { host, ...context, ...diagnostic }
+    if (diagnostic.outcome === "error") log.warn("URL preview fetch failed", attributes)
+    else log.info("URL preview fetch completed", attributes)
+  }
+}
+
+type TextRange = { start: number; end: number }
+
+/** Disclosures hold progress and tool output, not links the sender is sharing. */
+function disclosureTextRanges(blockContent?: BlockContent | null): TextRange[] {
+  const ranges: TextRange[] = []
+  const visit = (value: unknown, inDisclosure: boolean): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, inDisclosure)
+      return
+    }
+    if (typeof value !== "object" || value === null || ArrayBuffer.isView(value)) return
+    const fields = value as Record<string, unknown>
+    if (inDisclosure && typeof fields["offset"] === "bigint" && typeof fields["length"] === "bigint") {
+      const start = Number(fields["offset"])
+      ranges.push({ start, end: start + Number(fields["length"]) })
+    }
+    const nested = inDisclosure || fields["oneofKind"] === "disclosure"
+    for (const field of Object.values(fields)) visit(field, nested)
+  }
+  visit(blockContent?.blocks, false)
+  return ranges
+}
+
+function collectEntityUrls(
+  text: string,
+  entities?: MessageEntities | null,
+  excludedRanges: readonly TextRange[] = [],
+): string[] {
+  if (!entities?.entities.length) {
+    return []
+  }
+
+  const urls: string[] = []
+  for (const entity of entities.entities) {
+    if (
+      urlPreviewCandidatePolicy.includeTextUrlTargets &&
+      entity.type === MessageEntity_Type.TEXT_URL &&
+      entity.entity.oneofKind === "textUrl"
+    ) {
+      urls.push(entity.entity.textUrl.url)
+      continue
+    }
+
+    if (entity.type === MessageEntity_Type.URL) {
+      const start = Number(entity.offset)
+      const end = start + Number(entity.length)
+      if (
+        Number.isSafeInteger(start) &&
+        Number.isSafeInteger(end) &&
+        start >= 0 &&
+        end > start &&
+        !excludedRanges.some((range) => start < range.end && range.start < end)
+      ) {
+        urls.push(text.slice(start, end))
+      }
+    }
+  }
+
+  return urls
+}
+
+function previewCandidateText(
+  text: string,
+  entities?: MessageEntities | null,
+  excludedRanges: readonly TextRange[] = [],
+): string {
+  const entityRanges = (entities?.entities ?? [])
+    .filter((entity) => entity.type === MessageEntity_Type.CODE || entity.type === MessageEntity_Type.PRE)
+    .flatMap((entity) => {
+      const start = Number(entity.offset)
+      const end = start + Number(entity.length)
+      return Number.isSafeInteger(start) &&
+        Number.isSafeInteger(end) &&
+        start >= 0 &&
+        end > start &&
+        start < text.length
+        ? [{ start, end: Math.min(end, text.length) }]
+        : []
+    })
+  const ranges = [...entityRanges, ...excludedRanges]
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+
+  if (ranges.length === 0) return text
+
+  let result = ""
+  let cursor = 0
+  for (const range of ranges) {
+    if (range.end <= cursor) continue
+    const start = Math.max(range.start, cursor)
+    result += text.slice(cursor, start)
+    result += " ".repeat(range.end - start)
+    cursor = range.end
+  }
+  return result + text.slice(cursor)
+}
+
+async function maybeScheduleTitleGenerationAfterPreviews(
+  input: Omit<ProcessUrlPreviewInput, "previewUrl" | "previewRoute">,
+): Promise<void> {
+  if (!input.chat) {
+    return
+  }
+
+  let attachments: ThreadTitleAttachmentContext[] = input.titleAttachments ?? []
+  try {
+    const previewAttachments = await getMessageAttachmentTitleContext(input.message.globalId)
+    attachments = [...attachments, ...previewAttachments]
+  } catch (error) {
+    log.warn("Failed to load URL preview context for thread title generation", {
+      error,
+      chatId: input.chatId,
+      messageId: input.message.messageId,
+    })
+  }
+
+  maybeScheduleThreadTitleGeneration({
+    chat: input.chat,
+    message: input.message,
+    text: input.messageText,
+    entities: input.messageEntities,
+    attachments,
+    currentUserId: input.currentUserId,
+  })
+}
+
+// Previous previews may advance rev while this batch is running. Fence edits to
+// the URL source itself so all previews from unchanged text can still publish.
+function samePreviewSource(current: DbMessage, source: DbMessage): boolean {
+  const sameBytes = (left: Buffer | null, right: Buffer | null) =>
+    left === null ? right === null : right !== null && left.equals(right)
+  return (
+    current.text === source.text &&
+    sameBytes(current.textEncrypted, source.textEncrypted) &&
+    sameBytes(current.textIv, source.textIv) &&
+    sameBytes(current.textTag, source.textTag) &&
+    sameBytes(current.entitiesEncrypted, source.entitiesEncrypted) &&
+    sameBytes(current.entitiesIv, source.entitiesIv) &&
+    sameBytes(current.entitiesTag, source.entitiesTag)
+  )
+}
+
+async function insertPreviewAttachment(
+  message: DbMessage,
+  chatId: number,
+  source: PreviewAttachmentSource,
+): Promise<InsertPreviewOutput> {
+  return await db.transaction(async (tx) => {
+    const [chat] = await tx.select().from(chats).where(eq(chats.id, chatId)).for("update").limit(1)
+    if (!chat) {
+      throw new Error("Chat not found while inserting URL preview")
+    }
+
+    const [currentMessage] = await tx
+      .select()
+      .from(messages)
+      .where(and(eq(messages.globalId, message.globalId), eq(messages.chatId, chatId)))
+      .limit(1)
+    if (!currentMessage || !samePreviewSource(currentMessage, message)) {
+      throw new Error("URL preview parent changed")
+    }
+
+    const [preview] = await tx
+      .insert(urlPreview)
+      .values({
+        url: source.url,
+        urlIv: source.urlIv,
+        urlTag: source.urlTag,
+        siteName: source.siteName,
+        provider: source.provider,
+        mediaType: source.mediaType,
+        title: source.title,
+        titleIv: source.titleIv,
+        titleTag: source.titleTag,
+        description: source.description,
+        descriptionIv: source.descriptionIv,
+        descriptionTag: source.descriptionTag,
+        author: source.author,
+        authorIv: source.authorIv,
+        authorTag: source.authorTag,
+        mediaKind: source.mediaKind,
+        photoId: source.photoId,
+        authorPhotoId: source.authorPhotoId,
+        videoId: source.videoId,
+        documentId: source.documentId,
+        externalUrl: source.externalUrl,
+        externalUrlIv: source.externalUrlIv,
+        externalUrlTag: source.externalUrlTag,
+        externalMimeType: source.externalMimeType,
+        externalWidth: source.externalWidth,
+        externalHeight: source.externalHeight,
+        externalDuration: source.externalDuration,
+        embedUrl: source.embedUrl,
+        embedUrlIv: source.embedUrlIv,
+        embedUrlTag: source.embedUrlTag,
+        embedType: source.embedType,
+        embedWidth: source.embedWidth,
+        embedHeight: source.embedHeight,
+        embedDuration: source.embedDuration,
+        hasLargeMedia: source.hasLargeMedia,
+        showLargeMedia: source.showLargeMedia,
+        ...(source.cacheId !== null ? { cacheId: source.cacheId } : {}),
+        duration: source.duration,
+        date: new Date(),
+      })
+      .returning()
+
+    if (!preview) {
+      throw new Error("URL preview insert returned no row")
+    }
+
+    const [attachment] = await tx
+      .insert(messageAttachments)
+      .values({
+        messageId: message.globalId,
+        urlPreviewId: BigInt(preview.id),
+        externalTaskId: null,
+      })
+      .returning()
+
+    if (!attachment) {
+      throw new Error("Message attachment insert returned no row")
+    }
+
+    await refreshAttachmentMembership(tx, currentMessage)
+
+    const update = await UpdatesModel.insertUpdate(tx, {
+      update: {
+        oneofKind: "messageAttachment",
+        messageAttachment: {
+          chatId: BigInt(chatId),
+          msgId: BigInt(message.messageId),
+          attachmentId: BigInt(attachment.id),
+        },
+      },
+      bucket: UpdateBucket.Chat,
+      entity: chat,
+    })
+
+    await tx
+      .update(chats)
+      .set({
+        updateSeq: update.seq,
+        lastUpdateDate: update.date,
+      })
+      .where(eq(chats.id, chatId))
+
+    return { attachmentId: attachment.id, update }
+  })
+}
+
+function previewSourceFromCache(cache: DbUrlPreviewCache): PreviewAttachmentSource {
+  const source: PreviewAttachmentSource = {
+    url: cache.url,
+    urlIv: cache.urlIv,
+    urlTag: cache.urlTag,
+    siteName: cache.siteName,
+    provider: cache.provider,
+    mediaType: cache.mediaType,
+    title: cache.title,
+    titleIv: cache.titleIv,
+    titleTag: cache.titleTag,
+    description: cache.description,
+    descriptionIv: cache.descriptionIv,
+    descriptionTag: cache.descriptionTag,
+    author: cache.author,
+    authorIv: cache.authorIv,
+    authorTag: cache.authorTag,
+    mediaKind: cache.mediaKind,
+    photoId: cache.photoId,
+    authorPhotoId: cache.authorPhotoId,
+    videoId: cache.videoId,
+    documentId: cache.documentId,
+    externalUrl: cache.externalUrl,
+    externalUrlIv: cache.externalUrlIv,
+    externalUrlTag: cache.externalUrlTag,
+    externalMimeType: cache.externalMimeType,
+    externalWidth: cache.externalWidth,
+    externalHeight: cache.externalHeight,
+    externalDuration: cache.externalDuration,
+    embedUrl: cache.embedUrl,
+    embedUrlIv: cache.embedUrlIv,
+    embedUrlTag: cache.embedUrlTag,
+    embedType: cache.embedType,
+    embedWidth: cache.embedWidth,
+    embedHeight: cache.embedHeight,
+    embedDuration: cache.embedDuration,
+    hasLargeMedia: cache.hasLargeMedia,
+    showLargeMedia: cache.showLargeMedia,
+    cacheId: cache.id,
+    duration: cache.duration,
+  }
+
+  return sourceWithSeparatedCachedAuthorPhoto(source, cache)
+}
+
+function sourceWithSeparatedCachedAuthorPhoto(
+  source: PreviewAttachmentSource,
+  cache: DbUrlPreviewCache,
+): PreviewAttachmentSource {
+  if (source.photoId == null || source.authorPhotoId != null) {
+    return source
+  }
+
+  const url = decryptCacheValue(cache.url, cache.urlIv, cache.urlTag)
+  const imageUrl = decryptCacheValue(cache.imageUrl, cache.imageUrlIv, cache.imageUrlTag)
+  if (!url || !imageUrl || !isPreviewAuthorImageUrl(url, imageUrl)) {
+    return source
+  }
+
+  const keepLargeMedia = source.mediaKind != null && source.mediaKind !== "photo"
+  return {
+    ...source,
+    photoId: null,
+    authorPhotoId: source.photoId,
+    mediaKind: source.mediaKind === "photo" ? null : source.mediaKind,
+    hasLargeMedia: keepLargeMedia ? source.hasLargeMedia : null,
+    showLargeMedia: keepLargeMedia ? source.showLargeMedia : null,
+  }
+}
+
+function decryptCacheValue(value: Buffer | null, iv: Buffer | null, authTag: Buffer | null): string | null {
+  if (!value || !iv || !authTag) {
+    return null
+  }
+
+  return decryptMessage({ encrypted: value, iv, authTag })
+}
+
+function previewSourceForMessage(
+  source: PreviewAttachmentSource,
+  url: string,
+  previewUrlCount: number | undefined,
+): PreviewAttachmentSource {
+  const layout = resolvePreviewLayout({
+    url,
+    provider: source.provider,
+    mediaType: source.mediaType,
+    mediaKind: source.mediaKind,
+    hasCardContent: source.description != null,
+    hasPhoto: source.photoId != null,
+    hasLargeMedia: source.hasLargeMedia,
+    showLargeMedia: source.showLargeMedia,
+    urlCount: previewUrlCount ?? 1,
+  })
+
+  return {
+    ...source,
+    hasLargeMedia: layout.hasLargeMedia,
+    showLargeMedia: layout.showLargeMedia,
+  }
+}
+
+function previewSourceFromMetadata(
+  metadata: UrlPreviewResult,
+  photoId: number | null,
+  authorPhotoId: number | null,
+  cacheId: number | null,
+): PreviewAttachmentSource {
+  const urlEncrypted = encryptMessage(metadata.url)
+  const titleEncrypted = metadata.title ? encryptMessage(metadata.title) : null
+  const descriptionEncrypted = metadata.description ? encryptMessage(metadata.description) : null
+  const authorEncrypted = metadata.author ? encryptMessage(metadata.author) : null
+  const externalUrl = metadata.media?.kind === "external_video" ? normalizePreviewUrl(metadata.media.url) : null
+  const embedUrl = metadata.media?.kind === "embed" ? normalizePreviewUrl(metadata.media.url) : null
+  const externalUrlEncrypted = externalUrl ? encryptMessage(externalUrl) : null
+  const embedUrlEncrypted = embedUrl ? encryptMessage(embedUrl) : null
+  const mediaKind = previewMediaKind(metadata, { photoId, externalUrl, embedUrl })
+
+  return {
+    url: urlEncrypted.encrypted,
+    urlIv: urlEncrypted.iv,
+    urlTag: urlEncrypted.authTag,
+    siteName: metadata.siteName ?? null,
+    provider: metadata.provider,
+    mediaType: metadata.mediaType ?? null,
+    title: titleEncrypted?.encrypted ?? null,
+    titleIv: titleEncrypted?.iv ?? null,
+    titleTag: titleEncrypted?.authTag ?? null,
+    description: descriptionEncrypted?.encrypted ?? null,
+    descriptionIv: descriptionEncrypted?.iv ?? null,
+    descriptionTag: descriptionEncrypted?.authTag ?? null,
+    author: authorEncrypted?.encrypted ?? null,
+    authorIv: authorEncrypted?.iv ?? null,
+    authorTag: authorEncrypted?.authTag ?? null,
+    mediaKind,
+    photoId,
+    authorPhotoId,
+    videoId: null,
+    documentId: null,
+    externalUrl: externalUrlEncrypted?.encrypted ?? null,
+    externalUrlIv: externalUrlEncrypted?.iv ?? null,
+    externalUrlTag: externalUrlEncrypted?.authTag ?? null,
+    externalMimeType: metadata.media?.kind === "external_video" ? metadata.media.mimeType ?? null : null,
+    externalWidth: metadata.media?.kind === "external_video" ? metadata.media.width ?? null : null,
+    externalHeight: metadata.media?.kind === "external_video" ? metadata.media.height ?? null : null,
+    externalDuration: metadata.media?.kind === "external_video" ? metadata.media.duration ?? null : null,
+    embedUrl: embedUrlEncrypted?.encrypted ?? null,
+    embedUrlIv: embedUrlEncrypted?.iv ?? null,
+    embedUrlTag: embedUrlEncrypted?.authTag ?? null,
+    embedType: metadata.media?.kind === "embed" ? metadata.media.embedType ?? null : null,
+    embedWidth: metadata.media?.kind === "embed" ? metadata.media.width ?? null : null,
+    embedHeight: metadata.media?.kind === "embed" ? metadata.media.height ?? null : null,
+    embedDuration: metadata.media?.kind === "embed" ? metadata.media.duration ?? null : null,
+    hasLargeMedia: metadata.layout?.hasLargeMedia ?? null,
+    showLargeMedia: metadata.layout?.showLargeMedia ?? null,
+    cacheId,
+    duration: metadata.duration ?? null,
+  }
+}
+
+function previewMediaKind(
+  metadata: UrlPreviewResult,
+  media: { photoId: number | null; externalUrl: string | null; embedUrl: string | null },
+): PreviewAttachmentSource["mediaKind"] {
+  switch (metadata.media?.kind) {
+    case "photo":
+      return media.photoId ? "photo" : null
+    case "external_video":
+      return media.externalUrl ? "external_video" : null
+    case "embed":
+      return media.embedUrl ? "embed" : null
+    case "document":
+      return null
+    default:
+      return null
+  }
+}
+
+async function loadProcessedAttachment(attachmentId: number): Promise<ProcessedMessageAttachment | null> {
+  const attachment = await db._query.messageAttachments.findFirst({
+    where: eq(messageAttachments.id, attachmentId),
+    with: {
+      externalTask: true,
+      linkEmbed: {
+        with: {
+          photo: {
+            with: {
+              photoSizes: {
+                with: {
+                  file: true,
+                },
+              },
+            },
+          },
+          authorPhoto: {
+            with: {
+              photoSizes: {
+                with: {
+                  file: true,
+                },
+              },
+            },
+          },
+          video: {
+            with: {
+              file: true,
+              photo: {
+                with: {
+                  photoSizes: {
+                    with: {
+                      file: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          document: {
+            with: {
+              file: true,
+              photo: {
+                with: {
+                  photoSizes: {
+                    with: {
+                      file: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+
+  if (!attachment) {
+    return null
+  }
+
+  return MessageModel.processAttachments([attachment])[0] ?? null
+}
+
+async function getOrSavePreviewImage(url: string, currentUserId: number): Promise<number | null> {
+  const cachedPhotoId = await getCachedPreviewPhotoId(url).catch((error) => {
+    log.warn("Failed to read URL preview image cache", { error, host: previewLogHost(url) })
+    return null
+  })
+  if (cachedPhotoId) {
+    return cachedPhotoId
+  }
+
+  return downloadAndSavePreviewImage(url, currentUserId)
+}
+
+async function resolvePreviewImage(
+  metadata: UrlPreviewResult,
+  currentUserId: number,
+): Promise<{ metadata: UrlPreviewResult; photoId: number | null }> {
+  const candidates = Array.from(
+    new Set(
+      [metadata.imageUrl, ...(metadata.fallbackImageUrls ?? [])].filter(
+        (candidate): candidate is string => !!candidate,
+      ),
+    ),
+  ).slice(0, maxImageCandidates)
+
+  for (const candidate of candidates) {
+    const photoId = await getOrSavePreviewImage(candidate, currentUserId)
+    if (!photoId) {
+      continue
+    }
+
+    if (candidate === metadata.imageUrl) {
+      return { metadata, photoId }
+    }
+
+    const media =
+      metadata.media?.kind === "photo" && metadata.media.url === metadata.imageUrl
+        ? { ...metadata.media, url: candidate }
+        : metadata.media
+    return {
+      metadata: { ...metadata, imageUrl: candidate, media },
+      photoId,
+    }
+  }
+
+  return { metadata, photoId: null }
+}
+
+async function downloadAndSavePreviewImage(url: string, currentUserId: number): Promise<number | null> {
+  try {
+    const image = await fetchBinary(url, {
+      maxBytes: maxImageBytes,
+      allowedContentTypes: previewImageTypes,
+      onDiagnostic: previewDiagnostics(url),
+    })
+    if (!image) {
+      return null
+    }
+
+    const buffer = await resizePreviewImage(Buffer.from(image.bytes))
+
+    const file = new File([toArrayBufferBackedBytes(buffer)], `url_preview_${Date.now()}.jpg`, {
+      type: "image/jpeg",
+    })
+    const result = await uploadPhoto(file, { userId: currentUserId })
+    return Number(result.photoId)
+  } catch (error) {
+    log.warn("Failed to store URL preview image", {
+      host: previewLogHost(url),
+      errorType: error instanceof Error ? error.name : "UnknownError",
+    })
+    return null
+  }
+}
+
+async function pushInsertedPreviewAttachment(
+  input: ProcessUrlPreviewInput,
+  inserted: InsertPreviewOutput,
+): Promise<void> {
+  const attachment = await loadProcessedAttachment(inserted.attachmentId)
+  if (!attachment) {
+    log.warn("URL preview attachment was inserted but could not be loaded", {
+      attachmentId: inserted.attachmentId,
+      messageId: input.message.messageId,
+      chatId: input.chatId,
+    })
+    return
+  }
+
+  const protoAttachment = encodeMessageAttachment(attachment)
+  if (!protoAttachment) {
+    return
+  }
+
+  await pushAttachmentUpdate({
+    attachment: protoAttachment,
+    message: input.message,
+    chatId: input.chatId,
+    inputPeer: input.inputPeer,
+    currentUserId: input.currentUserId,
+    update: inserted.update,
+  })
+}
+
+async function resizePreviewImage(source: Buffer): Promise<Buffer> {
+  return await sharp(source, {
+    animated: false,
+    limitInputPixels: maxImagePixels,
+  })
+    .rotate()
+    .resize({
+      width: maxImageWidth,
+      height: maxImageHeight,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .flatten({ background: "#ffffff" })
+    .jpeg({ quality: jpegQuality, mozjpeg: true })
+    .toBuffer()
+}
+
+async function pushAttachmentUpdate(input: {
+  attachment: MessageAttachment
+  message: DbMessage
+  chatId: number
+  inputPeer: InputPeer
+  currentUserId: number
+  update: UpdateSeqAndDate
+}) {
+  const updateGroup = await getUpdateGroupFromInputPeer(input.inputPeer, { currentUserId: input.currentUserId })
+  const updateForUser = (userId: number): Update => {
+    const encodingForInputPeer: InputPeer =
+      updateGroup.type === "dmUsers" && userId !== input.currentUserId
+        ? { type: { oneofKind: "user", user: { userId: BigInt(input.currentUserId) } } }
+        : input.inputPeer
+
+    return encodeMessageAttachmentUpdate({
+      messageId: BigInt(input.message.messageId),
+      chatId: BigInt(input.chatId),
+      encodingForUserId: userId,
+      encodingForPeer: { inputPeer: encodingForInputPeer },
+      attachment: input.attachment,
+      seq: input.update.seq,
+      date: input.update.date,
+    })
+  }
+
+  publishToUpdateGroup(updateGroup, updateForUser)
+}
+
+function publishToUpdateGroup(updateGroup: UpdateGroup, updateForUser: (userId: number) => Update) {
+  if (updateGroup.type === "spaceUsers") {
+    const userIds = connectionManager.getSpaceUserIds(updateGroup.spaceId)
+    userIds.forEach((userId) => RealtimeUpdates.pushToUser(userId, [updateForUser(userId)]))
+    return
+  }
+
+  updateGroup.userIds.forEach((userId) => {
+    RealtimeUpdates.pushToUser(userId, [updateForUser(userId)])
+  })
+}
+
+async function acquirePreviewSlot(input: ProcessUrlPreviewInput): Promise<(() => void) | null> {
+  if (activePreviewJobs < maxConcurrentPreviewJobs) {
+    activePreviewJobs += 1
+    return releasePreviewSlot
+  }
+
+  if (queuedPreviewJobs.length >= maxQueuedPreviewJobs) {
+    log.warn("Dropping URL preview because the preview queue is full", {
+      host: previewLogHost(input.previewRoute ? previewRouteUrl(input.previewRoute) : input.previewUrl ?? ""),
+      messageId: input.message.messageId,
+      chatId: input.chatId,
+      activePreviewJobs,
+      queuedPreviewJobs: queuedPreviewJobs.length,
+    })
+    return null
+  }
+
+  await new Promise<void>((resolve) => {
+    queuedPreviewJobs.push(resolve)
+  })
+
+  return releasePreviewSlot
+}
+
+async function acquireStandalonePreviewSlot(previewRoute: PreviewRoute): Promise<(() => void) | null> {
+  if (activePreviewJobs < maxConcurrentPreviewJobs) {
+    activePreviewJobs += 1
+    return releasePreviewSlot
+  }
+
+  if (queuedPreviewJobs.length >= maxQueuedPreviewJobs) {
+    log.warn("Dropping URL preview resolution because the preview queue is full", {
+      host: previewLogHost(previewRouteUrl(previewRoute)),
+      activePreviewJobs,
+      queuedPreviewJobs: queuedPreviewJobs.length,
+    })
+    return null
+  }
+
+  await new Promise<void>((resolve) => {
+    queuedPreviewJobs.push(resolve)
+  })
+
+  return releasePreviewSlot
+}
+
+function releasePreviewSlot() {
+  const nextJob = queuedPreviewJobs.shift()
+  if (nextJob) {
+    nextJob()
+    return
+  }
+
+  activePreviewJobs = Math.max(0, activePreviewJobs - 1)
+}

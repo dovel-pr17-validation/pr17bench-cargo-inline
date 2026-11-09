@@ -1,0 +1,2417 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "" : {
+
+    },
+    " " : {
+
+    },
+    "(You)" : {
+
+    },
+    "@" : {
+      "comment" : "Fixed prefix shown before an editable bot username.\nFixed prefix shown before the editable profile username."
+    },
+    "@%@" : {
+
+    },
+    "@dena" : {
+
+    },
+    "@mo" : {
+
+    },
+    "/" : {
+
+    },
+    "%@" : {
+
+    },
+    "%@ (%@)" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ (%2$@)"
+          }
+        }
+      }
+    },
+    "%@ (%lld of %lld)" : {
+      "comment" : "Disambiguates repeated VoiceOver rich-text actions",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ (%2$lld of %3$lld)"
+          }
+        }
+      }
+    },
+    "%@ %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ %2$@"
+          }
+        }
+      }
+    },
+    "%@ Settings" : {
+
+    },
+    "%@:" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@: "
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@: "
+          }
+        }
+      }
+    },
+    "%@: " : {
+
+    },
+    "%@: %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@: %2$@"
+          }
+        }
+      }
+    },
+    "%lld" : {
+
+    },
+    "%lld %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld %2$@"
+          }
+        }
+      }
+    },
+    "%lld %@ of %@ are participants of this chat. New members will have access by default." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld %2$@ of %3$@ are participants of this chat. New members will have access by default."
+          }
+        }
+      }
+    },
+    "%lld people" : {
+
+    },
+    "%lld seconds remaining" : {
+
+    },
+    "%lld unread messages" : {
+
+    },
+    "%lld/%lld people selected" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld/%2$lld people selected"
+          }
+        }
+      }
+    },
+    "+1 555 555 5555" : {
+      "comment" : "Phone number placeholder",
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "+1 555 555 5555"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "+1 555 555 5555"
+          }
+        }
+      }
+    },
+    "👋 Default" : {
+
+    },
+    "👋🏻 Light" : {
+
+    },
+    "👋🏼 Medium-Light" : {
+
+    },
+    "👋🏽 Medium" : {
+
+    },
+    "👋🏾 Medium-Dark" : {
+
+    },
+    "👋🏿 Dark" : {
+
+    },
+    "🔍" : {
+
+    },
+    "🫙" : {
+
+    },
+    "1 person" : {
+
+    },
+    "A name-only Skilled Agent is valid. Harnesses receive a minimal identity instruction when these fields are empty." : {
+
+    },
+    "About" : {
+
+    },
+    "Access" : {
+
+    },
+    "Access invite code" : {
+
+    },
+    "Access Token" : {
+
+    },
+    "Account" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "حساب"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "帳戶"
+          }
+        }
+      }
+    },
+    "Actions" : {
+
+    },
+    "Active foreground fetches" : {
+
+    },
+    "Active Sessions" : {
+
+    },
+    "Add" : {
+
+    },
+    "Add a caption..." : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "یک توضیح اضافه کنید..."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "添加標題..."
+          }
+        }
+      }
+    },
+    "Add Participant" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "افزودن شرکت‌کننده"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "添加參與者"
+          }
+        }
+      }
+    },
+    "Add profile photo" : {
+
+    },
+    "Add to Open Chats" : {
+
+    },
+    "Agent" : {
+
+    },
+    "Agent Settings" : {
+
+    },
+    "All" : {
+
+    },
+    "All Chats" : {
+
+    },
+    "Allow other people to find you by username in global search." : {
+
+    },
+    "Allow people you chat with to see your local time." : {
+
+    },
+    "And the bubbles share one light." : {
+
+    },
+    "Any message to you" : {
+
+    },
+    "App Settings" : {
+
+    },
+    "Appear in Global Search" : {
+
+    },
+    "Appearance" : {
+
+    },
+    "Apple Sign-In couldn’t finish" : {
+
+    },
+    "Archive" : {
+
+    },
+    "Archive Chat?" : {
+
+    },
+    "Archived chats" : {
+
+    },
+    "Archived Chats" : {
+
+    },
+    "Are you sure you want to logout? This will clear your local data and return you to the welcome screen." : {
+
+    },
+    "Are you sure you want to remove %@ from the chat?" : {
+
+    },
+    "Auto" : {
+
+    },
+    "Auto-Download" : {
+
+    },
+    "Autocomplete suggestions available" : {
+
+    },
+    "Back" : {
+
+    },
+    "Bio" : {
+
+    },
+    "Bot Name" : {
+
+    },
+    "Bot usernames must end with “bot”." : {
+
+    },
+    "Bots" : {
+
+    },
+    "Bucket fetch failures" : {
+
+    },
+    "Bucket fetch follow-ups" : {
+
+    },
+    "Bucket fetch TOO_LONG" : {
+
+    },
+    "Bucket fetches" : {
+
+    },
+    "Bucket updates applied" : {
+
+    },
+    "Bucket updates skipped" : {
+
+    },
+    "Buckets" : {
+
+    },
+    "Buckets tracked" : {
+
+    },
+    "Buffer recoveries" : {
+
+    },
+    "By continuing, you acknowledge that you understand and agree to the [Terms of Service](https://inline.chat/legal/terms) and [Privacy Policy](https://inline.chat/legal/privacy)." : {
+
+    },
+    "Cancel" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لغو"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "取消"
+          }
+        }
+      }
+    },
+    "Cancel Download" : {
+
+    },
+    "Cannot Open Document" : {
+
+    },
+    "Cannot preview document" : {
+
+    },
+    "Change Profile Photo" : {
+
+    },
+    "Chat" : {
+
+    },
+    "Chat Info" : {
+
+    },
+    "Chat info sections" : {
+
+    },
+    "Chat List" : {
+
+    },
+    "Chat List Options" : {
+
+    },
+    "Chat title" : {
+
+    },
+    "Chat Title" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "عنوان چت"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "聊天標題"
+          }
+        }
+      }
+    },
+    "Chat Type" : {
+
+    },
+    "Chat unavailable" : {
+
+    },
+    "Chats" : {
+
+    },
+    "Chats unavailable" : {
+
+    },
+    "Check" : {
+
+    },
+    "Check your connection and try again." : {
+
+    },
+    "Checked item" : {
+
+    },
+    "Checking..." : {
+      "comment" : "Checking invite code button loading state"
+    },
+    "Choose a short name and an optional emoji. You can change both later." : {
+
+    },
+    "Choose a username" : {
+
+    },
+    "Choose agent" : {
+
+    },
+    "Choose chat emoji" : {
+
+    },
+    "Choose Photo…" : {
+
+    },
+    "Choose where Inline should create issues for this space." : {
+
+    },
+    "Choose where Inline should create tasks for this space." : {
+
+    },
+    "Choose which direction to swipe a message when replying." : {
+
+    },
+    "Choose your sign in method" : {
+
+    },
+    "Clear" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "پاک کردن"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "清除"
+          }
+        }
+      }
+    },
+    "Clear all chats in this space" : {
+
+    },
+    "Clear Cache" : {
+
+    },
+    "Clear Search" : {
+
+    },
+    "Clear Share Suggestions?" : {
+
+    },
+    "Clear Shared Data" : {
+
+    },
+    "Clears the people and conversations Inline donated to iOS. Chats and messages are not deleted." : {
+
+    },
+    "Close" : {
+
+    },
+    "Close Search" : {
+
+    },
+    "Code sent to %@" : {
+      "comment" : "Code sent confirmation"
+    },
+    "Code sent to %@." : {
+      "comment" : "Code sent confirmation",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "کد به %@ ارسال شد."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "驗證碼已發送至 %@。"
+          }
+        }
+      }
+    },
+    "Collapsed" : {
+      "comment" : "Collapsed disclosure accessibility state"
+    },
+    "Collapses pinned chats" : {
+
+    },
+    "Community" : {
+
+    },
+    "Community space" : {
+
+    },
+    "Compact nested decorations, checked states, and a separator within the measured bubble." : {
+
+    },
+    "Compact table" : {
+
+    },
+    "Compact text" : {
+
+    },
+    "Connect" : {
+
+    },
+    "Connected" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "متصل"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已連接"
+          }
+        }
+      }
+    },
+    "Connecting..." : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "در حال اتصال..."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "連接中..."
+          }
+        }
+      }
+    },
+    "Connectors" : {
+
+    },
+    "Contact" : {
+
+    },
+    "Continue" : {
+      "comment" : "Continue button",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ادامه"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "繼續"
+          }
+        }
+      }
+    },
+    "Continue in your browser" : {
+
+    },
+    "Continue with Apple" : {
+
+    },
+    "Continue with Email" : {
+      "comment" : "Continue with email button",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ادامه با ایمیل"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "繼續使用電子郵件"
+          }
+        }
+      }
+    },
+    "Continue with Google" : {
+
+    },
+    "Continue with phone" : {
+      "comment" : "Phone sign in title"
+    },
+    "Continue with Phone" : {
+
+    },
+    "Continue with Phone Number" : {
+      "comment" : "Continue with phone number button",
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ادامه با شماره تلفن"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "繼續使用電話號碼"
+          }
+        }
+      }
+    },
+    "Control how you receive notifications" : {
+
+    },
+    "Copy" : {
+
+    },
+    "Copy as Markdown" : {
+
+    },
+    "Copy code" : {
+      "comment" : "VoiceOver action for inline code"
+    },
+    "Copy code: %@" : {
+      "comment" : "VoiceOver action for labeled inline code"
+    },
+    "Copy Deep Link" : {
+
+    },
+    "Copy email" : {
+      "comment" : "VoiceOver action for an email address"
+    },
+    "Copy email: %@" : {
+      "comment" : "VoiceOver action for a labeled email address"
+    },
+    "Copy Entire Chat" : {
+
+    },
+    "Copy Latest %lld Messages" : {
+
+    },
+    "Copy LaTeX" : {
+      "comment" : "VoiceOver action for rendered math"
+    },
+    "Copy Link" : {
+
+    },
+    "Copy number" : {
+      "comment" : "VoiceOver action for a phone number"
+    },
+    "Copy number: %@" : {
+      "comment" : "VoiceOver action for a labeled phone number"
+    },
+    "Copy Token" : {
+
+    },
+    "Could not check availability. Try again" : {
+
+    },
+    "Could Not Load Sessions" : {
+
+    },
+    "Could Not Save Profile" : {
+
+    },
+    "Couldn’t Clear Share Suggestions" : {
+
+    },
+    "Couldn’t Complete Action" : {
+
+    },
+    "Couldn’t join space" : {
+
+    },
+    "Couldn’t load suggestions. Type to retry." : {
+
+    },
+    "Couldn’t Reset Local Data" : {
+
+    },
+    "Create" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ایجاد"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "創建"
+          }
+        }
+      }
+    },
+    "Create a bot for integrations and automated workflows." : {
+
+    },
+    "Create a Skilled Agent people can @mention in chats where this bot has access." : {
+
+    },
+    "Create Bot" : {
+
+    },
+    "Create Chat" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ایجاد چت"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "創建聊天"
+          }
+        }
+      }
+    },
+    "Create New Space" : {
+
+    },
+    "Create Space" : {
+
+    },
+    "Create User Group" : {
+
+    },
+    "Creating Account..." : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "در حال ایجاد حساب..."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在創建帳戶..."
+          }
+        }
+      }
+    },
+    "Creating Bot…" : {
+
+    },
+    "Creating Space" : {
+
+    },
+    "Creating..." : {
+
+    },
+    "Current" : {
+
+    },
+    "Current: %@" : {
+
+    },
+    "Cycle Realtime Connection" : {
+
+    },
+    "Data & Storage" : {
+
+    },
+    "Debug" : {
+
+    },
+    "Default" : {
+
+    },
+    "Default Team" : {
+
+    },
+    "Delete" : {
+
+    },
+    "Delete Bot" : {
+
+    },
+    "Delete Bot?" : {
+
+    },
+    "Delete History" : {
+
+    },
+    "Delete history for everyone?" : {
+
+    },
+    "Delete History..." : {
+
+    },
+    "Delete reply threads" : {
+
+    },
+    "Delete Skilled Agent" : {
+
+    },
+    "Delete Skilled Agent?" : {
+
+    },
+    "Delete Skilled Agent…" : {
+
+    },
+    "Delete Space" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "حذف فضا"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "刪除空間"
+          }
+        }
+      }
+    },
+    "Delete User Group" : {
+
+    },
+    "Delete User Group?" : {
+
+    },
+    "Deletion is only allowed when no private thread grants access through this group. If a thread uses it, nothing changes and Inline will show an error." : {
+
+    },
+    "Dense body sizing, header styling, row rules, and wrapping." : {
+
+    },
+    "Description" : {
+
+    },
+    "Description (optional)" : {
+
+    },
+    "Direct Participants" : {
+
+    },
+    "Direct updates applied" : {
+
+    },
+    "Disable Sounds" : {
+
+    },
+    "Discard Changes" : {
+
+    },
+    "Discard Changes?" : {
+
+    },
+    "Disclosures + activity icons" : {
+
+    },
+    "Disconnect" : {
+
+    },
+    "Discovery rounds pending" : {
+
+    },
+    "Discovery targets pending" : {
+
+    },
+    "Discovery targets queued" : {
+
+    },
+    "Dismiss" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "關閉"
+          }
+        }
+      }
+    },
+    "Docs" : {
+
+    },
+    "Done" : {
+
+    },
+    "Double tap to change profile photo" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "دو بار ضربه بزنید تا عکس پروفایل را تغییر دهید"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "雙擊以更改個人資料照片"
+          }
+        }
+      }
+    },
+    "Download" : {
+
+    },
+    "Download message documents over encrypted realtime. Requires a V3 session and server support. Other media still use CDN. Turn off to retry failed downloads using CDN." : {
+
+    },
+    "Duplicate updates skipped" : {
+
+    },
+    "Edit" : {
+      "comment" : "Edit button",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ویرایش"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "編輯"
+          }
+        }
+      }
+    },
+    "Edit chat info" : {
+
+    },
+    "Edit profile photo" : {
+
+    },
+    "Edit Skilled Agent" : {
+
+    },
+    "Email" : {
+
+    },
+    "Emoji" : {
+
+    },
+    "Emoji (optional)" : {
+
+    },
+    "Enabled" : {
+
+    },
+    "Enter access invite code" : {
+      "comment" : "Access invite code input title"
+    },
+    "Enter confirmation code" : {
+      "comment" : "Code input title",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "کد را وارد کنید"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸入驗證碼"
+          }
+        }
+      }
+    },
+    "Enter the 6-digit code." : {
+
+    },
+    "Enter the 8-character access invite code." : {
+      "comment" : "Access invite code validation error"
+    },
+    "Enter your email" : {
+      "comment" : "Email input label",
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ایمیل خود را وارد کنید"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸入您的電子郵件"
+          }
+        }
+      }
+    },
+    "Enter your phone number" : {
+      "comment" : "Phone number input label",
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "شماره تلفن خود را وارد کنید"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸入您的電話號碼"
+          }
+        }
+      }
+    },
+    "Error Clearing Cache" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "untranslated",
+            "value" : ""
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "清除快取錯誤"
+          }
+        }
+      }
+    },
+    "Error Clearing Data" : {
+
+    },
+    "Everyone in %@" : {
+
+    },
+    "Everyone in this space will be able to access this chat. If the space is public, its members and content may be internet-accessible." : {
+
+    },
+    "example.com or example.com/path" : {
+
+    },
+    "Existing messages keep their text, but future mentions will no longer activate this specialization." : {
+
+    },
+    "Expand each activity; the first title shows progress and respects Reduce Motion." : {
+
+    },
+    "Expanded" : {
+      "comment" : "Expanded disclosure accessibility state"
+    },
+    "Expands pinned chats" : {
+
+    },
+    "Experimental" : {
+
+    },
+    "Files" : {
+
+    },
+    "Find" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "untranslated",
+            "value" : ""
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "找到"
+          }
+        }
+      }
+    },
+    "Find Inline chats matching ${search}" : {
+
+    },
+    "Find Photo" : {
+
+    },
+    "Find unread chats" : {
+
+    },
+    "Finding Photo…" : {
+
+    },
+    "Finishing Apple Sign-In…" : {
+
+    },
+    "First-frame thread summary placement and multi-row button styling." : {
+
+    },
+    "Follow" : {
+
+    },
+    "Follows the parent chat’s settings, or your global settings for a top-level chat." : {
+
+    },
+    "Forward" : {
+
+    },
+    "Fractions, matrices, horizontal overflow, and unsupported-source fallback. Copy LaTeX is available to accessibility." : {
+
+    },
+    "From X…" : {
+
+    },
+    "General" : {
+
+    },
+    "Get Messages" : {
+
+    },
+    "Get messages in ${chat}" : {
+
+    },
+    "Get started" : {
+
+    },
+    "Get Started" : {
+
+    },
+    "Get unread Inline conversations" : {
+
+    },
+    "GitHub" : {
+
+    },
+    "Group Access" : {
+
+    },
+    "Groups" : {
+
+    },
+    "Groups appear in @ mentions and can be granted access to private threads." : {
+
+    },
+    "Guides and setup" : {
+
+    },
+    "Handle (optional)" : {
+
+    },
+    "Hard" : {
+
+    },
+    "Harness" : {
+
+    },
+    "Help" : {
+
+    },
+    "Hide Token" : {
+
+    },
+    "Home" : {
+
+    },
+    "Horizontal scrolling stress case; drag sideways inside the table." : {
+
+    },
+    "How much should be copied?" : {
+
+    },
+    "Identity" : {
+
+    },
+    "Image placeholders + album" : {
+
+    },
+    "Incoming and outgoing width, tail, text, and inline timestamp." : {
+
+    },
+    "Info" : {
+
+    },
+    "Inline %@ (%@)" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Inline %1$@ (%2$@)"
+          }
+        }
+      }
+    },
+    "Inline couldn’t open its local data. Your saved data won’t be reset automatically." : {
+
+    },
+    "Inline is finishing account recovery. Reopen Inline if this continues." : {
+
+    },
+    "Inline is finishing opening your account." : {
+
+    },
+    "Inline is still opening your local data. Your saved data won’t be reset." : {
+
+    },
+    "Inline is taking longer to open" : {
+
+    },
+    "Inline Team" : {
+
+    },
+    "Instructions (optional)" : {
+
+    },
+    "Integration Options" : {
+
+    },
+    "Invite Member" : {
+
+    },
+    "Invite People" : {
+
+    },
+    "Invite to Inline" : {
+
+    },
+    "iOS may take a moment to refresh the share sheet." : {
+
+    },
+    "It's an all new way to chat with your team." : {
+      "comment" : "Welcome subheading",
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "این یک روش کاملاً جدید برای چت با تیم شماست."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "這是一種與團隊聊天的新方式。"
+          }
+        }
+      }
+    },
+    "Item %@" : {
+
+    },
+    "Join Town Hall" : {
+
+    },
+    "Keep Editing" : {
+
+    },
+    "Keep last %lld days" : {
+
+    },
+    "Keep this token private. Rotating it immediately revokes the previous token." : {
+
+    },
+    "Key" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "untranslated",
+            "value" : ""
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "untranslated",
+            "value" : ""
+          }
+        }
+      }
+    },
+    "Language & Translation" : {
+
+    },
+    "Last active %@" : {
+
+    },
+    "Last bucket fetch" : {
+
+    },
+    "Last bucket fetch failure" : {
+
+    },
+    "Last direct apply" : {
+
+    },
+    "Last resort before reinstalling Inline. Clears this device’s database, sync state, pending actions, and downloads, then reloads your account from the server." : {
+
+    },
+    "Last sync date" : {
+
+    },
+    "Leave Space" : {
+
+    },
+    "Legal" : {
+
+    },
+    "Linear" : {
+
+    },
+    "Links" : {
+
+    },
+    "List item" : {
+
+    },
+    "Loading" : {
+      "comment" : "Image accessibility loading state"
+    },
+    "Loading agent settings" : {
+
+    },
+    "Loading bots…" : {
+
+    },
+    "Loading chats..." : {
+
+    },
+    "Loading exclusions..." : {
+
+    },
+    "Loading groups..." : {
+
+    },
+    "Loading profile photo" : {
+
+    },
+    "Loading sessions…" : {
+
+    },
+    "Loading Settings" : {
+
+    },
+    "Loading Skilled Agents…" : {
+
+    },
+    "Loading skills…" : {
+
+    },
+    "Loading suggestions" : {
+
+    },
+    "Logout" : {
+
+    },
+    "Make Chat Public" : {
+
+    },
+    "Make Private" : {
+
+    },
+    "Make Public" : {
+
+    },
+    "Mark as Read" : {
+
+    },
+    "Mark as Unread" : {
+
+    },
+    "Mark Read" : {
+
+    },
+    "Mark Unread" : {
+
+    },
+    "Marked unread" : {
+
+    },
+    "Maximum width, footer placement, and grouped reaction geometry." : {
+
+    },
+    "Media" : {
+
+    },
+    "Members" : {
+
+    },
+    "Mentions" : {
+
+    },
+    "Mentions and nudges still notify you" : {
+
+    },
+    "Mentions, direct messages, and replies to you. Recommended." : {
+
+    },
+    "Message" : {
+
+    },
+    "Message List 2 Lab" : {
+
+    },
+    "Message Mo" : {
+
+    },
+    "Message View 2" : {
+
+    },
+    "Messages" : {
+
+    },
+    "Microphone" : {
+
+    },
+    "More" : {
+
+    },
+    "Multiline + reactions" : {
+
+    },
+    "Name" : {
+
+    },
+    "name@example.com" : {
+      "comment" : "Email placeholder",
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "name@example.com"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "name@example.com"
+          }
+        }
+      }
+    },
+    "Native display math" : {
+
+    },
+    "Native File Downloads" : {
+
+    },
+    "New Group Chat" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "چت گروهی جدید"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新群聊"
+          }
+        }
+      }
+    },
+    "New Home" : {
+
+    },
+    "New Home is now the standard experience for everyone." : {
+
+    },
+    "New Skilled Agent" : {
+
+    },
+    "New Thread" : {
+
+    },
+    "Next" : {
+
+    },
+    "No Active Sessions" : {
+
+    },
+    "No Archived Chats Yet" : {
+
+    },
+    "No Bots Yet" : {
+
+    },
+    "No chats or spaces yet" : {
+
+    },
+    "No exclusions" : {
+
+    },
+    "No files found in this chat." : {
+
+    },
+    "No groups available" : {
+
+    },
+    "No links found in this chat." : {
+
+    },
+    "No media found in this chat." : {
+
+    },
+    "No notifications" : {
+
+    },
+    "No Settings" : {
+
+    },
+    "No signed-in devices or clients were returned." : {
+
+    },
+    "No Spaces" : {
+
+    },
+    "No Spaces Yet" : {
+
+    },
+    "No sync stats yet" : {
+
+    },
+    "No user groups yet" : {
+
+    },
+    "No voice memos found in this chat." : {
+
+    },
+    "No X photo selected" : {
+
+    },
+    "None" : {
+
+    },
+    "Notifications" : {
+
+    },
+    "Notify Me For" : {
+
+    },
+    "Notion" : {
+
+    },
+    "Notion Source" : {
+
+    },
+    "of %lld" : {
+
+    },
+    "OK" : {
+
+    },
+    "On %@" : {
+
+    },
+    "Only mentions" : {
+
+    },
+    "Only selected members" : {
+
+    },
+    "Only selected participants can access this private chat." : {
+
+    },
+    "Open" : {
+
+    },
+    "Open ${chat}" : {
+
+    },
+    "Open Chat" : {
+
+    },
+    "Open chat info" : {
+
+    },
+    "Open chat info for %@" : {
+
+    },
+    "Open Chats" : {
+
+    },
+    "Open group mention" : {
+      "comment" : "VoiceOver action for a rich-text group mention"
+    },
+    "Open group mention: %@" : {
+      "comment" : "VoiceOver action for a labeled rich-text group mention"
+    },
+    "Open link" : {
+      "comment" : "VoiceOver action for a rich-text link"
+    },
+    "Open link: %@" : {
+      "comment" : "VoiceOver action for a labeled rich-text link"
+    },
+    "Open Links In App" : {
+
+    },
+    "Open mention" : {
+      "comment" : "VoiceOver action for a rich-text user mention"
+    },
+    "Open mention: %@" : {
+      "comment" : "VoiceOver action for a labeled rich-text user mention"
+    },
+    "Open thread" : {
+      "comment" : "VoiceOver action for a rich-text thread link"
+    },
+    "Open thread: %@" : {
+      "comment" : "VoiceOver action for a labeled rich-text thread link"
+    },
+    "Options" : {
+
+    },
+    "or" : {
+
+    },
+    "Overrides for this chat" : {
+
+    },
+    "Overrides inherited notification settings for this chat." : {
+
+    },
+    "Participants" : {
+
+    },
+    "Pending and unavailable media keep their dimensions. The album scrolls horizontally without network requests." : {
+
+    },
+    "People" : {
+
+    },
+    "People without access to public chats will lose access to this thread." : {
+
+    },
+    "Persian paragraphs, nested quotes, and trailing checklist markers." : {
+
+    },
+    "Phone" : {
+
+    },
+    "Phone heading scale, list indentation, selectable code, line numbers, and horizontal scrolling." : {
+
+    },
+    "Phone number" : {
+
+    },
+    "Phone number must be at least %d digits." : {
+      "comment" : "Phone number validation error",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "شماره تلفن باید حداقل %d رقم باشد."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "電話號碼必須至少包含 %d 位數字。"
+          }
+        }
+      }
+    },
+    "Photo from X" : {
+
+    },
+    "Pick a preferred device" : {
+
+    },
+    "Pin" : {
+
+    },
+    "Pinned" : {
+
+    },
+    "Playgrounds" : {
+
+    },
+    "Please search a username or start a new chat or message                               , or create a new space by clicking the + button" : {
+
+    },
+    "Please search for a username to start a DM or create a space." : {
+
+    },
+    "Please try again." : {
+      "comment" : "Error message for code verification",
+      "extractionState" : "stale",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لطفاً دوباره تلاش کنید."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請再試一次。"
+          }
+        }
+      }
+    },
+    "Preferred Skin Tone" : {
+
+    },
+    "Privacy" : {
+
+    },
+    "Privacy Policy" : {
+
+    },
+    "Private" : {
+
+    },
+    "Production renderer catalog" : {
+
+    },
+    "Profile" : {
+
+    },
+    "Public" : {
+
+    },
+    "Quotes + checklists" : {
+
+    },
+    "Range" : {
+
+    },
+    "Read" : {
+
+    },
+    "Read messages in ${conversation}" : {
+
+    },
+    "Receive all notifications" : {
+
+    },
+    "Recording" : {
+
+    },
+    "Recovery" : {
+
+    },
+    "Refresh" : {
+
+    },
+    "Refresh Bots" : {
+
+    },
+    "Refresh Sessions" : {
+
+    },
+    "Refreshing settings…" : {
+
+    },
+    "Remove" : {
+
+    },
+    "Remove %@ from this thread? Members may still have access through direct participants, parent access, or another group." : {
+
+    },
+    "Remove Group Access" : {
+
+    },
+    "Remove Participant" : {
+
+    },
+    "Removes downloaded photos, videos, voice messages, and files from this device. Chats and messages stay available." : {
+
+    },
+    "Reply + forward" : {
+
+    },
+    "Reply ${text} to ${message}" : {
+
+    },
+    "Reply ${text} to ${target}" : {
+
+    },
+    "Reply thread + actions" : {
+
+    },
+    "Reset All Local Data?" : {
+
+    },
+    "Reset Local Data" : {
+
+    },
+    "Resources" : {
+
+    },
+    "Retained reply preview and forward header in one bubble." : {
+
+    },
+    "Retry" : {
+
+    },
+    "Retry Loading Image" : {
+      "comment" : "Image viewer failed download retry button"
+    },
+    "Reveal Token" : {
+
+    },
+    "Rich hierarchy + code" : {
+
+    },
+    "Rotate Token" : {
+
+    },
+    "Rotate Token?" : {
+
+    },
+    "Rotate Token…" : {
+
+    },
+    "Row %lld, column %lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Row %1$lld, column %2$lld"
+          }
+        }
+      }
+    },
+    "RTL hierarchy" : {
+
+    },
+    "Save" : {
+
+    },
+    "Save ${text} to Saved Messages" : {
+
+    },
+    "Save a Note" : {
+
+    },
+    "Save Photo" : {
+
+    },
+    "Save Video" : {
+
+    },
+    "Saving Photo…" : {
+
+    },
+    "Saving..." : {
+
+    },
+    "Saving…" : {
+
+    },
+    "Scenarios" : {
+
+    },
+    "Search" : {
+
+    },
+    "Search chats, messages, and people" : {
+
+    },
+    "Search countries..." : {
+
+    },
+    "Search for chats and people" : {
+
+    },
+    "Search for people" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "جستجو برای افراد"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "搜尋人"
+          }
+        }
+      }
+    },
+    "Search for people or groups" : {
+
+    },
+    "Search in users by username, first name, last name" : {
+
+    },
+    "Search members" : {
+
+    },
+    "Search messages and chats, or find Inline users by @username to start a conversation." : {
+
+    },
+    "Search unavailable" : {
+
+    },
+    "Select a Chat" : {
+
+    },
+    "Select a Notion source" : {
+
+    },
+    "Select a space" : {
+
+    },
+    "Select a team" : {
+
+    },
+    "Select Country" : {
+
+    },
+    "Select Participants" : {
+
+    },
+    "Select Space" : {
+
+    },
+    "Send ${message} to ${chat}" : {
+
+    },
+    "Send ${text} to ${conversation}" : {
+
+    },
+    "Send command" : {
+      "comment" : "VoiceOver action for a bot command"
+    },
+    "Send command: %@" : {
+      "comment" : "VoiceOver action for a labeled bot command"
+    },
+    "Send Message" : {
+
+    },
+    "Send without notification" : {
+
+    },
+    "Sending Code..." : {
+      "comment" : "Sending code button loading state",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "در حال ارسال کد..."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在發送驗證碼..."
+          }
+        }
+      }
+    },
+    "seq %lld | date %lld | fetching %@ | pending %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "seq %1$lld | date %2$lld | fetching %3$@ | pending %4$@"
+          }
+        }
+      }
+    },
+    "Set up profile" : {
+
+    },
+    "Settings" : {
+
+    },
+    "Settings…" : {
+
+    },
+    "Share" : {
+
+    },
+    "Share Sheet" : {
+
+    },
+    "Share Suggestions Cleared" : {
+
+    },
+    "Share Time Zone" : {
+
+    },
+    "Shared Data" : {
+
+    },
+    "Shorten Supported Links" : {
+
+    },
+    "Show in Chat" : {
+
+    },
+    "Sign in with email" : {
+      "comment" : "Email sign in title"
+    },
+    "Sign Out" : {
+
+    },
+    "Sign out any device or client you do not recognize. Use Logout below to sign out this device." : {
+
+    },
+    "Sign Out Session?" : {
+
+    },
+    "Signed-In Devices" : {
+
+    },
+    "Skill" : {
+
+    },
+    "Skilled Agents" : {
+
+    },
+    "Skilled Agents reuse this bot’s harness, credentials, memory, skills, and chat access. Instructions and skill keys are visible only to bot managers and the harness." : {
+
+    },
+    "Soft" : {
+
+    },
+    "Soft fades gradually into the chat. Hard uses a clearer, separated toolbar background." : {
+
+    },
+    "Something went wrong. Please try again." : {
+
+    },
+    "Sound" : {
+
+    },
+    "Space" : {
+
+    },
+    "Space emoji" : {
+
+    },
+    "Space name" : {
+
+    },
+    "Spaces" : {
+
+    },
+    "Start a chat" : {
+
+    },
+    "State fetch in flight" : {
+
+    },
+    "State fetch queued" : {
+
+    },
+    "Status" : {
+
+    },
+    "Step %lld of 4" : {
+
+    },
+    "Sticker" : {
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "برچسب"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "貼圖"
+          }
+        }
+      }
+    },
+    "Stops and reopens the real connection owner, then waits for authenticated open." : {
+
+    },
+    "Storage" : {
+
+    },
+    "Stress" : {
+
+    },
+    "Swipe to Reply" : {
+
+    },
+    "Sync" : {
+
+    },
+    "Sync Engine" : {
+
+    },
+    "Synthetic, render-only fixtures for checking common combinations without sending messages." : {
+
+    },
+    "System default" : {
+
+    },
+    "Terms of Service" : {
+
+    },
+    "The current token will stop working immediately. Existing integrations must be updated with the new token." : {
+
+    },
+    "The document is not available for preview. Please try downloading it again." : {
+
+    },
+    "The interface for multiplayer work" : {
+
+    },
+    "The new theme looks great." : {
+
+    },
+    "The request took too long. Please try again." : {
+
+    },
+    "Themes" : {
+
+    },
+    "This agent has no settings for this chat." : {
+
+    },
+    "This chat has more messages than the default transcript." : {
+
+    },
+    "This chat will move to Archived Chats. You can find it from the ••• menu." : {
+
+    },
+    "This is your current username" : {
+
+    },
+    "This removes every message interaction Inline donated to iOS for share-sheet suggestions." : {
+
+    },
+    "This revokes the bot token. Existing messages remain in history." : {
+
+    },
+    "This signs that device or client out of your account." : {
+
+    },
+    "This will clear all shared data used by the share extension. The data will be regenerated when needed." : {
+
+    },
+    "Thread Visibility" : {
+
+    },
+    "Today" : {
+
+    },
+    "Too many tries. Please try again after a few minutes." : {
+
+    },
+    "Toolbar Background" : {
+
+    },
+    "Translate" : {
+
+    },
+    "Try Again" : {
+      "comment" : "Retry code verification button"
+    },
+    "Turn supported pasted links into compact text links. Use Undo or Backspace to restore the URL." : {
+
+    },
+    "Type" : {
+
+    },
+    "Type a name, username, or group name to find someone to add." : {
+
+    },
+    "Type a username to find someone to add. eg. dena, mo" : {
+
+    },
+    "Type to find existing chats or search for people to start new conversations" : {
+
+    },
+    "Unarchive" : {
+
+    },
+    "Unavailable" : {
+      "comment" : "Image accessibility unavailable state"
+    },
+    "Unavailable: %@" : {
+
+    },
+    "Unchecked item" : {
+
+    },
+    "Undo Photo Change" : {
+
+    },
+    "Unfollow" : {
+
+    },
+    "Unknown User" : {
+
+    },
+    "Unlock this device, then try opening your saved account again." : {
+
+    },
+    "Unpin" : {
+
+    },
+    "Unread" : {
+
+    },
+    "Unread Badges" : {
+
+    },
+    "Unread Chats" : {
+
+    },
+    "Updates on X" : {
+
+    },
+    "Updating %@" : {
+
+    },
+    "URL Previews" : {
+
+    },
+    "Use Photo" : {
+
+    },
+    "Use the Open, All Chats, and Search tabs." : {
+
+    },
+    "User Groups" : {
+
+    },
+    "Username" : {
+
+    },
+    "Username is available" : {
+
+    },
+    "Username is not available" : {
+
+    },
+    "username_bot" : {
+
+    },
+    "Usernames must be at least 2 characters" : {
+
+    },
+    "Uses the experimental iOS message renderer. Reopen the chat after changing this setting." : {
+
+    },
+    "Verifying..." : {
+      "comment" : "Verifying code button loading state",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "در حال تأیید..."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在驗證..."
+          }
+        }
+      }
+    },
+    "Version" : {
+
+    },
+    "View" : {
+
+    },
+    "Voice" : {
+
+    },
+    "Voice memo" : {
+
+    },
+    "Website" : {
+
+    },
+    "Welcome to Inline" : {
+      "comment" : "Welcome to Inline",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "به اینلاین خوش آمدید"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "歡迎使用 Inline"
+          }
+        }
+      }
+    },
+    "What’s New" : {
+
+    },
+    "When off, links open in your default browser or the matching app." : {
+
+    },
+    "Wide 10-column table" : {
+
+    },
+    "X profile photo preview" : {
+
+    },
+    "X username" : {
+
+    },
+    "xxxxxx" : {
+      "comment" : "Code input placeholder",
+      "localizations" : {
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "xxxxxx"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "xxxxxx"
+          }
+        }
+      }
+    },
+    "Yesterday" : {
+
+    },
+    "You may not have access to this chat, or it may no longer exist." : {
+
+    },
+    "Your access invite code is separate from the verification code sent to your email or phone." : {
+      "comment" : "Distinguishes an access invite from contact verification"
+    },
+    "Your Apple Account is verified. Enter an Inline invite code to create your account." : {
+
+    },
+    "Your archived chats will appear here" : {
+
+    },
+    "Your Bots" : {
+
+    },
+    "Your Email" : {
+      "comment" : "Email input placeholder"
+    },
+    "Your Inline account and server data will not be deleted. Pending offline actions and drafts on this device will be discarded." : {
+
+    },
+    "Your spaces will appear here" : {
+
+    },
+    "Your unsaved account changes will be lost." : {
+
+    }
+  },
+  "version" : "1.0"
+}

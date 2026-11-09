@@ -1,0 +1,209 @@
+import { eq } from "drizzle-orm"
+import { db } from "@in/server/db"
+import { members, users, type DbUser } from "@in/server/db/schema"
+import { InlineError } from "@in/server/types/errors"
+import { InviteCodesModel, isDevInviteCode, isValidInviteCode, normalizeInviteCode } from "@in/server/db/models/inviteCodes"
+import { BotAlerts } from "@in/server/modules/bot-events/alerts"
+import { getServerConfig, type SignupMode } from "@in/server/modules/serverConfig"
+
+type Database = any
+
+export const areInviteCodesRequired = async (): Promise<boolean> => {
+  return (await getSignupMode()) === "invite_only"
+}
+
+export const getSignupMode = async (): Promise<SignupMode> =>
+  (await getServerConfig("auth.signup_mode")).value
+
+export const assertNewSignupAllowed = async (user: DbUser | undefined): Promise<void> => {
+  if (!user && (await getSignupMode()) === "disabled") {
+    throw new InlineError(InlineError.ApiError.SIGNUPS_DISABLED)
+  }
+}
+
+export const isLoginUser = (user: DbUser | undefined): boolean => {
+  return Boolean(user && (user.pendingSetup !== true || user.emailVerified === true || user.phoneVerified === true))
+}
+
+export const isSignupComplete = (user: Pick<DbUser, "pendingSetup">): boolean => user.pendingSetup !== true
+
+export const isInviteCodeRequired = async (user: DbUser | undefined): Promise<boolean> => {
+  if (!(await areInviteCodesRequired())) {
+    return false
+  }
+
+  if (!user) {
+    return true
+  }
+
+  if (isLoginUser(user)) {
+    return false
+  }
+
+  return !(await hasSpaceMembership(user.id, db))
+}
+
+export const getOrCreateUserByEmailForSignup = async (
+  email: string,
+  inviteCode?: string,
+  database: Database = db,
+): Promise<{ user: DbUser; created: boolean }> => {
+  const signupMode = await getSignupMode()
+  const operation = async (tx: Database) => {
+    const codesRequired = signupMode === "invite_only"
+    const user = (await tx.select().from(users).where(eq(users.email, email)).limit(1))[0]
+
+    if (user?.deleted === true) {
+      throw new InlineError(InlineError.ApiError.USER_DEACTIVATED)
+    }
+
+    if (!user) {
+      if (signupMode === "disabled") {
+        throw new InlineError(InlineError.ApiError.SIGNUPS_DISABLED)
+      }
+      const code = codesRequired ? getInviteCode(inviteCode) : undefined
+
+      const created = (
+        await tx
+          .insert(users)
+          .values({
+            email,
+            emailVerified: true,
+            pendingSetup: true,
+          })
+          .returning()
+      )[0]
+
+      if (!created) {
+        throw new InlineError(InlineError.ApiError.INTERNAL)
+      }
+
+      if (code) {
+        await redeemInviteCode(tx, code, created.id)
+      }
+      return { user: created, created: true }
+    }
+
+    const inviteRequired = codesRequired && !isLoginUser(user) && !(await hasSpaceMembership(user.id, tx))
+    if (inviteRequired) {
+      const code = getInviteCode(inviteCode)
+      await redeemInviteCode(tx, code, user.id)
+    }
+
+    const updated = (
+      await tx
+        .update(users)
+        .set({
+          emailVerified: true,
+        })
+        .where(eq(users.id, user.id))
+        .returning()
+    )[0]
+
+    return { user: updated ?? user, created: false }
+  }
+  return database === db ? db.transaction(operation) : operation(database)
+}
+
+export const getOrCreateUserByPhoneForSignup = async (
+  phoneNumber: string,
+  inviteCode?: string,
+  database: Database = db,
+): Promise<{ user: DbUser; created: boolean }> => {
+  const signupMode = await getSignupMode()
+  const operation = async (tx: Database) => {
+    const codesRequired = signupMode === "invite_only"
+    const user = (await tx.select().from(users).where(eq(users.phoneNumber, phoneNumber)).limit(1))[0]
+
+    if (user?.deleted === true) {
+      throw new InlineError(InlineError.ApiError.USER_DEACTIVATED)
+    }
+
+    if (!user) {
+      if (signupMode === "disabled") {
+        throw new InlineError(InlineError.ApiError.SIGNUPS_DISABLED)
+      }
+      const code = codesRequired ? getInviteCode(inviteCode) : undefined
+
+      const created = (
+        await tx
+          .insert(users)
+          .values({
+            phoneNumber,
+            phoneVerified: true,
+            pendingSetup: true,
+          })
+          .returning()
+      )[0]
+
+      if (!created) {
+        throw new InlineError(InlineError.ApiError.INTERNAL)
+      }
+
+      if (code) {
+        await redeemInviteCode(tx, code, created.id)
+      }
+      return { user: created, created: true }
+    }
+
+    const inviteRequired = codesRequired && !isLoginUser(user) && !(await hasSpaceMembership(user.id, tx))
+    if (inviteRequired) {
+      const code = getInviteCode(inviteCode)
+      await redeemInviteCode(tx, code, user.id)
+    }
+
+    const updated = (
+      await tx
+        .update(users)
+        .set({
+          phoneVerified: true,
+        })
+        .where(eq(users.id, user.id))
+        .returning()
+    )[0]
+
+    return { user: updated ?? user, created: false }
+  }
+  return database === db ? db.transaction(operation) : operation(database)
+}
+
+const hasSpaceMembership = async (userId: number, database: Database): Promise<boolean> => {
+  const row = (await database.select({ id: members.id }).from(members).where(eq(members.userId, userId)).limit(1))[0]
+  return Boolean(row)
+}
+
+const getInviteCode = (inviteCode?: string): string => {
+  if (!inviteCode?.trim()) {
+    throw new InlineError(InlineError.ApiError.INVITE_CODE_REQUIRED)
+  }
+
+  if (!isValidInviteCode(inviteCode)) {
+    throw new InlineError(InlineError.ApiError.INVITE_CODE_INVALID)
+  }
+
+  return normalizeInviteCode(inviteCode)
+}
+
+const redeemInviteCode = async (database: Database, inviteCode: string, userId: number) => {
+  if (isDevInviteCode(inviteCode)) {
+    return
+  }
+
+  const redeemed = await InviteCodesModel.redeem({
+    code: normalizeInviteCode(inviteCode),
+    userId,
+    tx: database,
+  })
+
+  if (!redeemed) {
+    const existing = await InviteCodesModel.getByCode({ code: inviteCode, tx: database })
+    if (existing?.redeemedAt) {
+      BotAlerts.inviteCodeTaken({
+        source: "signup-redeem",
+      })
+    }
+    throw new InlineError(
+      existing?.redeemedAt ? InlineError.ApiError.INVITE_CODE_TAKEN : InlineError.ApiError.INVITE_CODE_NOT_FOUND,
+    )
+  }
+}

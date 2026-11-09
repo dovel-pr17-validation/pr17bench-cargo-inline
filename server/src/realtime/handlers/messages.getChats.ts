@@ -1,0 +1,24 @@
+import { getChats } from "@in/server/functions/messages.getChats"
+import type { FunctionContext } from "@in/server/functions/_types"
+import type { HandlerContext } from "@in/server/realtime/types"
+import { RealtimeRpcError } from "@in/server/realtime/errors"
+import { Log } from "@in/server/utils/log"
+import type { GetChatsInput } from "@inline-chat/protocol/core"
+
+const log = new Log("handlers.messages.getChats")
+
+export const handleGetChats = async (input: GetChatsInput, context: HandlerContext) => {
+  try {
+    const functionContext: FunctionContext = {
+      currentUserId: context.userId,
+      currentSessionId: context.sessionId,
+      currentConnectionId: context.connectionId,
+      isBot: context.isBot,
+      signal: context.signal,
+    }
+    return await getChats(input, functionContext)
+  } catch (error) {
+    log.error("Failed to get chats", { error })
+    throw RealtimeRpcError.InternalError()
+  }
+}

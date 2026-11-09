@@ -1,0 +1,1298 @@
+import { describe, it, expect, spyOn } from "bun:test"
+import { Sync } from "@in/server/modules/updates/sync"
+import { UpdateBucket, updates } from "@in/server/db/schema/updates"
+import { setupTestLifecycle, testUtils } from "../setup"
+import { db } from "@in/server/db"
+import type { ServerUpdate } from "@in/server/protocol/server"
+import { encodeDateStrict } from "@in/server/realtime/encoders/helpers"
+import { UpdatesModel } from "@in/server/db/models/updates"
+import type { Peer } from "@inline-chat/protocol/core"
+import { Functions } from "@in/server/functions"
+import { GetUpdatesResult_ResultType, UrlPreview_MediaType } from "@inline-chat/protocol/core"
+import { Encoders } from "@in/server/realtime/encoders/encoders"
+import { MembersModel } from "@in/server/db/models/members"
+import {
+  chatParticipantGroups,
+  dialogs,
+  externalTasks,
+  messageAttachments,
+  messages,
+  userGroups,
+  users as usersTable,
+  urlPreview,
+} from "@in/server/db/schema"
+import { encryptMessage } from "@in/server/modules/encryption/encryptMessage"
+import { and, eq } from "drizzle-orm"
+
+const insertServerUpdate = async (params: {
+  bucket: UpdateBucket
+  entityId: number
+  seq: number
+  payload: ServerUpdate["update"]
+}) => {
+  const now = new Date()
+  const serverUpdate: ServerUpdate = {
+    seq: params.seq,
+    date: encodeDateStrict(now),
+    update: params.payload,
+  }
+  const record = UpdatesModel.build(serverUpdate)
+  await db.insert(updates).values({
+    bucket: params.bucket,
+    entityId: params.entityId,
+    seq: params.seq,
+    payload: record.encrypted,
+    date: now,
+  })
+}
+
+const createExternalTaskAttachmentFixtures = async (label: string, count: number) => {
+  const { space, users } = await testUtils.createSpaceWithMembers(`Attachment Batch ${label}`, [
+    `attachment-batch-${label}@sync.com`,
+  ])
+  const user = users[0]
+  if (!space || !user) {
+    throw new Error("Failed to create attachment batch fixtures")
+  }
+
+  const { chat, msg } = await testUtils.createThreadWithDialogAndMessage({
+    spaceId: space.id,
+    user,
+    isPublic: false,
+  })
+  const externalTaskInputs = Array.from({ length: count }, (_, index) => {
+    const encryptedTitle = encryptMessage(`Batch task ${label}-${index}`)
+    return {
+      application: "linear",
+      taskId: `batch-${label}-${index}`,
+      status: "todo" as const,
+      assignedUserId: BigInt(user.id),
+      title: encryptedTitle.encrypted,
+      titleIv: encryptedTitle.iv,
+      titleTag: encryptedTitle.authTag,
+    }
+  })
+  const createdExternalTasks = await db
+    .insert(externalTasks)
+    .values(externalTaskInputs)
+    .returning()
+  if (createdExternalTasks.length !== count) {
+    throw new Error("Failed to create external task fixtures")
+  }
+
+  const attachments = await db
+    .insert(messageAttachments)
+    .values(createdExternalTasks.map((externalTask) => ({
+      messageId: msg.globalId,
+      externalTaskId: BigInt(externalTask.id),
+    })))
+    .returning()
+  if (attachments.length !== count) {
+    throw new Error("Failed to create attachment batch fixtures")
+  }
+  const expectedTitleByTaskId = new Map(
+    externalTaskInputs.map((input, index) => [input.taskId, `Batch task ${label}-${index}`]),
+  )
+  const titleByExternalTaskId = new Map(
+    createdExternalTasks.flatMap((externalTask) => {
+      const title = expectedTitleByTaskId.get(externalTask.taskId)
+      return title ? [[externalTask.id, title] as const] : []
+    }),
+  )
+  const expectedTitleByAttachmentId = new Map(
+    attachments.flatMap((attachment) => {
+      const title = attachment.externalTaskId == null
+        ? undefined
+        : titleByExternalTaskId.get(Number(attachment.externalTaskId))
+      return title ? [[attachment.id, title] as const] : []
+    }),
+  )
+
+  return { attachments, chat, expectedTitleByAttachmentId, msg, user }
+}
+
+const createExternalTaskAttachmentFixture = async (label: string) => {
+  const fixture = await createExternalTaskAttachmentFixtures(label, 1)
+  const attachment = fixture.attachments[0]
+  if (!attachment) throw new Error("Failed to create attachment fixture")
+  return { ...fixture, attachment }
+}
+
+describe("Sync core flow", () => {
+  setupTestLifecycle()
+
+  it("processes chat participant deletions end-to-end", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Sync Chat", ["a@sync.com", "b@sync.com"])
+    const userA = users[0]
+    const userB = users[1]
+    if (!space || !userA || !userB) {
+      throw new Error("Failed to set up private thread test")
+    }
+    const chat = await testUtils.createChat(space.id, "Private Thread", "thread", false)
+    if (!chat) {
+      throw new Error("Failed to create private thread")
+    }
+    await testUtils.addParticipant(chat.id, userA.id)
+    await testUtils.addParticipant(chat.id, userB.id)
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.Chat,
+      entityId: chat.id,
+      seq: 1,
+      payload: {
+        oneofKind: "participantDelete",
+        participantDelete: {
+          chatId: BigInt(chat.id),
+          userId: BigInt(userB.id),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: userA.id,
+    })
+
+    expect(inflated).toHaveLength(1)
+    const [firstUpdate] = inflated
+    expect(firstUpdate?.seq).toBe(1)
+    if (!firstUpdate || firstUpdate.update.oneofKind !== "participantDelete") {
+      throw new Error("Expected participantDelete update")
+    }
+    expect(firstUpdate.update.participantDelete.userId).toBe(BigInt(userB.id))
+  })
+
+  it("processes chat participant additions end-to-end", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Sync Add Chat", ["add-a@sync.com", "add-b@sync.com"])
+    const userA = users[0]
+    const userB = users[1]
+    if (!space || !userA || !userB) {
+      throw new Error("Failed to set up private thread test")
+    }
+    const chat = await testUtils.createChat(space.id, "Private Thread Add", "thread", false)
+    if (!chat) {
+      throw new Error("Failed to create private thread")
+    }
+    await testUtils.addParticipant(chat.id, userA.id)
+    await testUtils.addParticipant(chat.id, userB.id)
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.Chat,
+      entityId: chat.id,
+      seq: 1,
+      payload: {
+        oneofKind: "participantAdd",
+        participantAdd: {
+          chatId: BigInt(chat.id),
+          participant: {
+            userId: BigInt(userB.id),
+            date: 1n,
+          },
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: userA.id,
+    })
+
+    expect(inflated).toHaveLength(1)
+    const [firstUpdate] = inflated
+    expect(firstUpdate?.seq).toBe(1)
+    if (!firstUpdate || firstUpdate.update.oneofKind !== "participantAdd") {
+      throw new Error("Expected participantAdd update")
+    }
+    expect(firstUpdate.update.participantAdd.participant?.userId).toBe(BigInt(userB.id))
+  })
+
+  it("inflates new chat updates from chat bucket", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("New Chat Sync", ["newchat@sync.com"])
+    const user = users[0]
+    if (!space || !user) {
+      throw new Error("Failed to create new chat fixtures")
+    }
+
+    const chat = await testUtils.createChat(space.id, "New Chat", "thread", true)
+    if (!chat) {
+      throw new Error("Failed to create chat")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.Chat,
+      entityId: chat.id,
+      seq: 1,
+      payload: {
+        oneofKind: "newChat",
+        newChat: {
+          chatId: BigInt(chat.id),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: user.id,
+    })
+
+    expect(inflated).toHaveLength(1)
+    const [firstUpdate] = inflated
+    if (!firstUpdate || firstUpdate.update.oneofKind !== "newChat") {
+      throw new Error("Expected newChat update")
+    }
+    const newChat = firstUpdate.update.newChat.chat
+    if (!newChat) {
+      throw new Error("Expected chat payload in newChat update")
+    }
+    expect(newChat.id).toBe(BigInt(chat.id))
+  })
+
+  it("inflates persisted message attachment updates from chat bucket", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Attachment Sync", ["attachment@sync.com"])
+    const user = users[0]
+    if (!space || !user) {
+      throw new Error("Failed to create attachment sync fixtures")
+    }
+
+    const chat = await testUtils.createChat(space.id, "Attachment Thread", "thread", false)
+    if (!chat) {
+      throw new Error("Failed to create chat")
+    }
+    await testUtils.addParticipant(chat.id, user.id)
+
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+    await Functions.messages.sendMessage(
+      {
+        peerId: { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } },
+        message: "hello",
+        skipLinkProcessing: true,
+      },
+      testUtils.functionContext({ userId: user.id }),
+    )
+
+    const [message] = await db
+      .select()
+      .from(messages)
+      .where(and(eq(messages.chatId, chat.id), eq(messages.messageId, 1)))
+      .limit(1)
+    if (!message) {
+      throw new Error("Failed to create message")
+    }
+
+    const encryptedUrl = encryptMessage("https://example.com/article")
+    const encryptedTitle = encryptMessage("Example article")
+    const encryptedDescription = encryptMessage("A short link preview")
+    const encryptedAuthor = encryptMessage("Inline")
+    const encryptedEmbedUrl = encryptMessage("https://example.com/embed/article")
+    const [preview] = await db
+      .insert(urlPreview)
+      .values({
+        url: encryptedUrl.encrypted,
+        urlIv: encryptedUrl.iv,
+        urlTag: encryptedUrl.authTag,
+        siteName: "Example",
+        provider: "generic",
+        mediaType: "video",
+        mediaKind: "embed",
+        title: encryptedTitle.encrypted,
+        titleIv: encryptedTitle.iv,
+        titleTag: encryptedTitle.authTag,
+        description: encryptedDescription.encrypted,
+        descriptionIv: encryptedDescription.iv,
+        descriptionTag: encryptedDescription.authTag,
+        author: encryptedAuthor.encrypted,
+        authorIv: encryptedAuthor.iv,
+        authorTag: encryptedAuthor.authTag,
+        embedUrl: encryptedEmbedUrl.encrypted,
+        embedUrlIv: encryptedEmbedUrl.iv,
+        embedUrlTag: encryptedEmbedUrl.authTag,
+        embedType: "iframe",
+        embedWidth: 640,
+        embedHeight: 360,
+        embedDuration: 42,
+        hasLargeMedia: true,
+        showLargeMedia: true,
+        date: new Date(),
+      })
+      .returning()
+    if (!preview) {
+      throw new Error("Failed to create preview")
+    }
+
+    const [attachment] = await db
+      .insert(messageAttachments)
+      .values({
+        messageId: message.globalId,
+        urlPreviewId: BigInt(preview.id),
+      })
+      .returning()
+    if (!attachment) {
+      throw new Error("Failed to create attachment")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.Chat,
+      entityId: chat.id,
+      seq: 2,
+      payload: {
+        oneofKind: "messageAttachment",
+        messageAttachment: {
+          chatId: BigInt(chat.id),
+          msgId: 1n,
+          attachmentId: BigInt(attachment.id),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+      seqStart: 1,
+      limit: 10,
+    })
+
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: user.id,
+    })
+
+    expect(inflated).toHaveLength(1)
+    const [firstUpdate] = inflated
+    expect(firstUpdate?.seq).toBe(2)
+    if (!firstUpdate || firstUpdate.update.oneofKind !== "messageAttachment") {
+      throw new Error("Expected messageAttachment update")
+    }
+
+    const attachmentUpdate = firstUpdate.update.messageAttachment
+    expect(attachmentUpdate.messageId).toBe(1n)
+    const protoAttachment = attachmentUpdate.attachment
+    if (!protoAttachment) {
+      throw new Error("Expected attachment payload")
+    }
+    expect(protoAttachment.attachment.oneofKind).toBe("urlPreview")
+    if (protoAttachment.attachment.oneofKind !== "urlPreview") {
+      throw new Error("Expected urlPreview attachment")
+    }
+    expect(protoAttachment.attachment.urlPreview.title).toBe("Example article")
+    expect(protoAttachment.attachment.urlPreview.description).toBe("A short link preview")
+    expect(protoAttachment.attachment.urlPreview.author).toBe("Inline")
+    expect(protoAttachment.attachment.urlPreview.mediaType).toBe(UrlPreview_MediaType.VIDEO)
+    expect(protoAttachment.attachment.urlPreview.media?.media.oneofKind).toBe("embed")
+    if (protoAttachment.attachment.urlPreview.media?.media.oneofKind !== "embed") {
+      throw new Error("Expected embed media")
+    }
+    expect(protoAttachment.attachment.urlPreview.media.media.embed.url).toBe("https://example.com/embed/article")
+    expect(protoAttachment.attachment.urlPreview.media.media.embed.type).toBe("iframe")
+    expect(protoAttachment.attachment.urlPreview.media.media.embed.w).toBe(640)
+    expect(protoAttachment.attachment.urlPreview.media.media.embed.h).toBe(360)
+    expect(protoAttachment.attachment.urlPreview.media.media.embed.duration).toBe(42)
+    expect(protoAttachment.attachment.urlPreview.layout?.hasLargeMedia).toBe(true)
+    expect(protoAttachment.attachment.urlPreview.layout?.showLargeMedia).toBe(true)
+  })
+
+  for (const updateCount of [1, 10, 100]) {
+    it(`batches ${updateCount} attachment update${updateCount === 1 ? "" : "s"} into one relational query`, async () => {
+      const { attachments, chat, expectedTitleByAttachmentId, user } =
+        await createExternalTaskAttachmentFixtures(String(updateCount), updateCount)
+
+      for (const [index, attachment] of attachments.entries()) {
+        await insertServerUpdate({
+          bucket: UpdateBucket.Chat,
+          entityId: chat.id,
+          seq: index + 1,
+          payload: {
+            oneofKind: "messageAttachment",
+            messageAttachment: {
+              chatId: BigInt(chat.id),
+              msgId: 1n,
+              attachmentId: BigInt(attachment.id),
+            },
+          },
+        })
+      }
+
+      const { updates: dbUpdates } = await Sync.getUpdates({
+        bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+        seqStart: 0,
+        limit: updateCount,
+      })
+      const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+      const findMany = spyOn(db._query.messageAttachments, "findMany")
+
+      try {
+        const { updates: inflated } = await Sync.processChatUpdates({
+          chatId: chat.id,
+          peerId: peer,
+          updates: dbUpdates,
+          userId: user.id,
+        })
+
+        expect(findMany).toHaveBeenCalledTimes(1)
+        expect(inflated).toHaveLength(updateCount)
+        for (const [index, update] of inflated.entries()) {
+          if (update.update.oneofKind !== "messageAttachment") {
+            throw new Error("Expected messageAttachment update")
+          }
+          expect(update.update.messageAttachment.attachment?.attachment.oneofKind).toBe("externalTask")
+          if (update.update.messageAttachment.attachment?.attachment.oneofKind !== "externalTask") {
+            throw new Error("Expected externalTask attachment")
+          }
+          const attachmentId = Number(update.update.messageAttachment.attachment.id)
+          const expectedAttachment = attachments[index]
+          const expectedTitle = expectedTitleByAttachmentId.get(attachmentId)
+          if (!expectedAttachment || expectedTitle === undefined) throw new Error("Missing expected attachment fixture")
+          expect(attachmentId).toBe(expectedAttachment.id)
+          expect(update.update.messageAttachment.attachment.attachment.externalTask.title).toBe(expectedTitle)
+        }
+      } finally {
+        findMany.mockRestore()
+      }
+    })
+  }
+
+  it("preserves duplicate attachment updates and missing attachment placeholders in replay order", async () => {
+    const { attachment, chat, user } = await createExternalTaskAttachmentFixture("duplicates")
+    const missingAttachmentId = BigInt(attachment.id + 1_000_000)
+    const attachmentIds = [BigInt(attachment.id), missingAttachmentId, BigInt(attachment.id)]
+
+    for (const [index, attachmentId] of attachmentIds.entries()) {
+      await insertServerUpdate({
+        bucket: UpdateBucket.Chat,
+        entityId: chat.id,
+        seq: index + 1,
+        payload: {
+          oneofKind: "messageAttachment",
+          messageAttachment: {
+            chatId: BigInt(chat.id),
+            msgId: 1n,
+            attachmentId,
+          },
+        },
+      })
+    }
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+      seqStart: 0,
+      limit: attachmentIds.length,
+    })
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: user.id,
+    })
+
+    expect(inflated.map((update) => update.seq)).toEqual([1, 2, 3])
+    const replayedAttachments = inflated.map((update) => {
+      if (update.update.oneofKind !== "messageAttachment" || !update.update.messageAttachment.attachment) {
+        throw new Error("Expected messageAttachment payload")
+      }
+      return update.update.messageAttachment.attachment
+    })
+    expect(replayedAttachments.map((item) => item.id)).toEqual(attachmentIds)
+    expect(replayedAttachments.map((item) => item.attachment.oneofKind)).toEqual([
+      "externalTask",
+      undefined,
+      "externalTask",
+    ])
+  })
+
+  it("does not query attachment ids carried by a different chat payload", async () => {
+    const source = await createExternalTaskAttachmentFixture("payload-source")
+    const foreign = await createExternalTaskAttachmentFixture("payload-foreign")
+    await insertServerUpdate({
+      bucket: UpdateBucket.Chat,
+      entityId: source.chat.id,
+      seq: 1,
+      payload: {
+        oneofKind: "messageAttachment",
+        messageAttachment: {
+          chatId: BigInt(foreign.chat.id),
+          msgId: 1n,
+          attachmentId: BigInt(foreign.attachment.id),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: source.chat.id },
+      seqStart: 0,
+      limit: 10,
+    })
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(source.chat.id) } } }
+    const findMany = spyOn(db._query.messageAttachments, "findMany")
+
+    try {
+      const { updates: inflated } = await Sync.processChatUpdates({
+        chatId: source.chat.id,
+        peerId: peer,
+        updates: dbUpdates,
+        userId: source.user.id,
+      })
+
+      expect(findMany).toHaveBeenCalledTimes(0)
+      expect(inflated.map((update) => update.update.oneofKind)).toEqual(["chatSkipPts"])
+    } finally {
+      findMany.mockRestore()
+    }
+  })
+
+  it("isolates cross-chat, cross-message, orphaned, malformed, and corrupt attachment references", async () => {
+    const source = await createExternalTaskAttachmentFixtures("identity-source", 3)
+    const foreign = await createExternalTaskAttachmentFixture("identity-foreign")
+    const [firstAttachment, secondAttachment, corruptAttachment] = source.attachments
+    if (!firstAttachment || !secondAttachment || !corruptAttachment) {
+      throw new Error("Failed to create identity attachments")
+    }
+
+    await db.insert(messages).values({
+      chatId: source.chat.id,
+      messageId: 2,
+      fromId: source.user.id,
+      text: "second message",
+    })
+    const [orphanedAttachment] = await db.insert(messageAttachments).values({ messageId: null }).returning()
+    if (!orphanedAttachment) throw new Error("Failed to create orphaned attachment")
+    if (corruptAttachment.externalTaskId == null) throw new Error("Failed to create corrupt attachment fixture")
+    await db
+      .update(externalTasks)
+      .set({ title: Buffer.from([0]) })
+      .where(eq(externalTasks.id, Number(corruptAttachment.externalTaskId)))
+
+    const references = [
+      { attachmentId: BigInt(firstAttachment.id), msgId: 1n },
+      { attachmentId: BigInt(foreign.attachment.id), msgId: 1n },
+      { attachmentId: BigInt(firstAttachment.id), msgId: 2n },
+      { attachmentId: BigInt(orphanedAttachment.id), msgId: 1n },
+      { attachmentId: 0n, msgId: 1n },
+      { attachmentId: BigInt(corruptAttachment.id), msgId: 1n },
+      { attachmentId: BigInt(secondAttachment.id), msgId: 1n },
+    ]
+    for (const [index, reference] of references.entries()) {
+      await insertServerUpdate({
+        bucket: UpdateBucket.Chat,
+        entityId: source.chat.id,
+        seq: index + 1,
+        payload: {
+          oneofKind: "messageAttachment",
+          messageAttachment: {
+            chatId: BigInt(source.chat.id),
+            msgId: reference.msgId,
+            attachmentId: reference.attachmentId,
+          },
+        },
+      })
+    }
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: source.chat.id },
+      seqStart: 0,
+      limit: references.length,
+    })
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(source.chat.id) } } }
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: source.chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: source.user.id,
+    })
+
+    expect(inflated.map((update) => update.update.oneofKind)).toEqual([
+      "messageAttachment",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "messageAttachment",
+    ])
+    const deliveredTitles = inflated.flatMap((update) => {
+      if (
+        update.update.oneofKind !== "messageAttachment" ||
+        update.update.messageAttachment.attachment?.attachment.oneofKind !== "externalTask"
+      ) {
+        return []
+      }
+      return [update.update.messageAttachment.attachment.attachment.externalTask.title]
+    })
+    const firstTitle = source.expectedTitleByAttachmentId.get(firstAttachment.id)
+    const secondTitle = source.expectedTitleByAttachmentId.get(secondAttachment.id)
+    if (firstTitle === undefined || secondTitle === undefined) throw new Error("Missing expected titles")
+    expect(deliveredTitles).toEqual([firstTitle, secondTitle])
+    expect(deliveredTitles).not.toContain(foreign.expectedTitleByAttachmentId.get(foreign.attachment.id))
+  })
+
+  it("accounts malformed participant additions without redirecting the chat bucket", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Malformed Participant Sync", [
+      "malformed-participant-a@sync.com",
+      "malformed-participant-b@sync.com",
+    ])
+    const [userA, userB] = users
+    if (!space || !userA || !userB) throw new Error("Failed to create malformed participant fixtures")
+    const chat = await testUtils.createChat(space.id, "Malformed Participant Thread", "thread", false)
+    const otherChat = await testUtils.createChat(space.id, "Other Participant Thread", "thread", false)
+    if (!chat || !otherChat) throw new Error("Failed to create malformed participant chats")
+    await testUtils.addParticipant(chat.id, userA.id)
+
+    const deletedUser = await testUtils.createUser("malformed-participant-deleted@sync.com")
+    await testUtils.addParticipant(chat.id, deletedUser.id)
+    await db.update(usersTable).set({ deleted: true }).where(eq(usersTable.id, deletedUser.id))
+
+    const { space: foreignSpace, users: foreignUsers } = await testUtils.createSpaceWithMembers(
+      "Malformed Foreign Group",
+      ["malformed-participant-group-owner@sync.com"],
+    )
+    const foreignOwner = foreignUsers[0]
+    if (!foreignSpace || !foreignOwner) throw new Error("Failed to create malformed foreign group fixtures")
+    const [foreignGroup] = await db
+      .insert(userGroups)
+      .values({
+        spaceId: foreignSpace.id,
+        name: "Foreign Group",
+        createdBy: foreignOwner.id,
+      })
+      .returning()
+    if (!foreignGroup) throw new Error("Failed to create malformed foreign group")
+    await db.insert(chatParticipantGroups).values({ chatId: chat.id, groupId: foreignGroup.id })
+
+    const payloads: ServerUpdate["update"][] = [
+      {
+        oneofKind: "participantAdd",
+        participantAdd: {
+          chatId: BigInt(otherChat.id),
+          participant: { userId: BigInt(userB.id), date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantAdd",
+        participantAdd: {
+          chatId: BigInt(chat.id),
+          participant: { userId: 0n, date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantAdd",
+        participantAdd: {
+          chatId: BigInt(chat.id),
+          participant: { userId: BigInt(userB.id), date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantAdd",
+        participantAdd: {
+          chatId: BigInt(chat.id),
+          participant: { userId: 9_999_999n, date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantAdd",
+        participantAdd: {
+          chatId: BigInt(chat.id),
+          participant: { userId: BigInt(deletedUser.id), date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantGroupAdd",
+        participantGroupAdd: {
+          chatId: BigInt(otherChat.id),
+          groupParticipant: { groupId: 1n, date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantGroupAdd",
+        participantGroupAdd: {
+          chatId: BigInt(chat.id),
+          groupParticipant: { groupId: 0n, date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantGroupAdd",
+        participantGroupAdd: {
+          chatId: BigInt(chat.id),
+          groupParticipant: { groupId: 9_999_999n, date: 1n },
+        },
+      },
+      {
+        oneofKind: "participantGroupAdd",
+        participantGroupAdd: {
+          chatId: BigInt(chat.id),
+          groupParticipant: { groupId: BigInt(foreignGroup.id), date: 1n },
+        },
+      },
+    ]
+    for (const [index, payload] of payloads.entries()) {
+      await insertServerUpdate({
+        bucket: UpdateBucket.Chat,
+        entityId: chat.id,
+        seq: index + 1,
+        payload,
+      })
+    }
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+      seqStart: 0,
+      limit: payloads.length,
+    })
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: userA.id,
+    })
+
+    expect(inflated.map((update) => update.update.oneofKind)).toEqual([
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+      "chatSkipPts",
+    ])
+  })
+
+  it("inflates delete chat updates from chat bucket", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Delete Chat Sync", ["delete@sync.com"])
+    const user = users[0]
+    if (!space || !user) {
+      throw new Error("Failed to create delete chat fixtures")
+    }
+
+    const chat = await testUtils.createChat(space.id, "Delete Chat", "thread", true)
+    if (!chat) {
+      throw new Error("Failed to create chat")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.Chat,
+      entityId: chat.id,
+      seq: 1,
+      payload: {
+        oneofKind: "deleteChat",
+        deleteChat: {
+          chatId: BigInt(chat.id),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Chat, chatId: chat.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const peer: Peer = { type: { oneofKind: "chat", chat: { chatId: BigInt(chat.id) } } }
+    const { updates: inflated } = await Sync.processChatUpdates({
+      chatId: chat.id,
+      peerId: peer,
+      updates: dbUpdates,
+      userId: user.id,
+    })
+
+    expect(inflated).toHaveLength(1)
+    const [firstUpdate] = inflated
+    if (!firstUpdate || firstUpdate.update.oneofKind !== "deleteChat") {
+      throw new Error("Expected deleteChat update")
+    }
+    const peerType = firstUpdate.update.deleteChat.peerId?.type
+    if (!peerType || peerType.oneofKind !== "chat") {
+      throw new Error("Expected chat peer in deleteChat update")
+    }
+    expect(peerType.chat.chatId).toBe(BigInt(chat.id))
+  })
+
+  it("inflates user bucket updates for chat participant removal", async () => {
+    const { users } = await testUtils.createSpaceWithMembers("User Sync", ["user@sync.com"])
+    const user = users[0]
+    if (!user) {
+      throw new Error("Failed to create user")
+    }
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userChatParticipantDelete",
+        userChatParticipantDelete: {
+          chatId: 42n,
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const updates = Sync.inflateUserUpdates(dbUpdates)
+    expect(updates).toHaveLength(1)
+    const [userUpdate] = updates
+    if (!userUpdate || userUpdate.update.oneofKind !== "participantDelete") {
+      throw new Error("Expected participantDelete from user bucket")
+    }
+    expect(userUpdate.update.participantDelete.chatId).toBe(42n)
+  })
+
+  it("inflates user bucket updates for chat participant add", async () => {
+    const { users } = await testUtils.createSpaceWithMembers("User Sync Add", ["user-add@sync.com"])
+    const user = users[0]
+    if (!user) {
+      throw new Error("Failed to create user")
+    }
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userChatParticipantAdd",
+        userChatParticipantAdd: {
+          chatId: 42n,
+          participant: {
+            userId: BigInt(user.id),
+            date: 1n,
+          },
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const updates = Sync.inflateUserUpdates(dbUpdates)
+    expect(updates).toHaveLength(1)
+    const [userUpdate] = updates
+    if (!userUpdate || userUpdate.update.oneofKind !== "participantAdd") {
+      throw new Error("Expected participantAdd from user bucket")
+    }
+    expect(userUpdate.update.participantAdd.chatId).toBe(42n)
+    expect(userUpdate.update.participantAdd.participant?.userId).toBe(BigInt(user.id))
+  })
+
+  it("inflates personal history-collapse boundaries from the user bucket", async () => {
+    const user = await testUtils.createUser("collapse-history-sync@example.com")
+    const peerId: Peer = {
+      type: { oneofKind: "chat", chat: { chatId: 42n } },
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userDialogCollapsedMaxId",
+        userDialogCollapsedMaxId: {
+          peerId,
+          maxId: 17n,
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const inflated = Sync.inflateUserUpdates(dbUpdates)
+    expect(inflated).toHaveLength(1)
+    const [update] = inflated
+    if (!update || update.update.oneofKind !== "dialogCollapsedMaxId") {
+      throw new Error("Expected dialogCollapsedMaxId from user bucket")
+    }
+    expect(update.update.dialogCollapsedMaxId.peerId).toEqual(peerId)
+    expect(update.update.dialogCollapsedMaxId.maxId).toBe(17n)
+  })
+
+  it("inflates user bucket updates for current-user chat permissions", async () => {
+    const user = await testUtils.createUser("chat-permissions-sync@example.com")
+    if (!user) {
+      throw new Error("Failed to create chat permissions user")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userChatPermissions",
+        userChatPermissions: {
+          chatId: 42n,
+          permissions: { canUpdateInfo: true },
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const updates = Sync.inflateUserUpdates(dbUpdates)
+    expect(updates).toHaveLength(1)
+    const [userUpdate] = updates
+    if (!userUpdate || userUpdate.update.oneofKind !== "chatPermissions") {
+      throw new Error("Expected chatPermissions from user bucket")
+    }
+    expect(userUpdate.update.chatPermissions.chatId).toBe(42n)
+    expect(userUpdate.update.chatPermissions.permissions?.canUpdateInfo).toBe(true)
+  })
+
+  it("inflates user bucket chatOpen updates", async () => {
+    const user = await testUtils.createUser("chat-open-sync@example.com")
+    const chat = await testUtils.createChat(null, "Chat List Thread", "thread", false, user.id)
+    if (!chat) {
+      throw new Error("Failed to create chat")
+    }
+
+    await testUtils.addParticipant(chat.id, user.id)
+
+    const [dialog] = await db
+      .insert(dialogs)
+      .values({
+        userId: user.id,
+        chatId: chat.id,
+        spaceId: null,
+      })
+      .returning()
+
+    if (!dialog) {
+      throw new Error("Failed to create dialog")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userChatOpen",
+        userChatOpen: {
+          chat: Encoders.chat(chat, { encodingForUserId: user.id }),
+          dialog: Encoders.dialog(dialog, { unreadCount: 0 }),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const updates = Sync.inflateUserUpdates(dbUpdates)
+    expect(updates).toHaveLength(1)
+    const [userUpdate] = updates
+    if (!userUpdate || userUpdate.update.oneofKind !== "chatOpen") {
+      throw new Error("Expected chatOpen from user bucket")
+    }
+    expect(userUpdate.update.chatOpen.chat?.id).toBe(BigInt(chat.id))
+    expect(userUpdate.update.chatOpen.dialog?.chatId).toBe(BigInt(chat.id))
+    expect(userUpdate.update.chatOpen.dialog?.chatListHidden).toBeUndefined()
+  })
+
+  it("inflates space bucket updates for member removal", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Space Sync", ["space@sync.com"])
+    const user = users[0]
+    if (!space || !user) {
+      throw new Error("Failed to create space sync fixtures")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.Space,
+      entityId: space.id,
+      seq: 1,
+      payload: {
+        oneofKind: "spaceRemoveMember",
+        spaceRemoveMember: {
+          spaceId: BigInt(space.id),
+          userId: BigInt(user.id),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Space, spaceId: space.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const updates = Sync.inflateSpaceUpdates(dbUpdates)
+    expect(updates).toHaveLength(1)
+    const [spaceUpdate] = updates
+    if (!spaceUpdate || spaceUpdate.update.oneofKind !== "spaceMemberDelete") {
+      throw new Error("Expected spaceMemberDelete update")
+    }
+    expect(spaceUpdate.update.spaceMemberDelete.userId).toBe(BigInt(user.id))
+  })
+
+  it("inflates space bucket updates for member addition", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Space Member Add Sync", ["add@sync.com"])
+    const user = users[0]
+    if (!space || !user) {
+      throw new Error("Failed to create member add fixtures")
+    }
+
+    const member = await MembersModel.getMemberByUserId(space.id, user.id)
+    if (!member) {
+      throw new Error("Failed to load member")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.Space,
+      entityId: space.id,
+      seq: 1,
+      payload: {
+        oneofKind: "spaceMemberAdd",
+        spaceMemberAdd: {
+          member: Encoders.member(member),
+          user: Encoders.user({ user, min: false }),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.Space, spaceId: space.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const updates = Sync.inflateSpaceUpdates(dbUpdates)
+    expect(updates).toHaveLength(1)
+    const [spaceUpdate] = updates
+    if (!spaceUpdate || spaceUpdate.update.oneofKind !== "spaceMemberAdd") {
+      throw new Error("Expected spaceMemberAdd update")
+    }
+    const memberPayload = spaceUpdate.update.spaceMemberAdd.member
+    if (!memberPayload) {
+      throw new Error("Expected member payload in spaceMemberAdd update")
+    }
+    expect(memberPayload.userId).toBe(BigInt(user.id))
+  })
+
+  it("inflates user bucket updates for join space", async () => {
+    const { space, users } = await testUtils.createSpaceWithMembers("Join Space Sync", ["join@sync.com"])
+    const user = users[0]
+    if (!space || !user) {
+      throw new Error("Failed to create join space fixtures")
+    }
+
+    const member = await MembersModel.getMemberByUserId(space.id, user.id)
+    if (!member) {
+      throw new Error("Failed to load member")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userJoinSpace",
+        userJoinSpace: {
+          space: Encoders.space(space, { encodingForUserId: user.id }),
+          member: Encoders.member(member),
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 0,
+      limit: 10,
+    })
+
+    const updates = Sync.inflateUserUpdates(dbUpdates)
+    expect(updates).toHaveLength(1)
+    const [userUpdate] = updates
+    if (!userUpdate || userUpdate.update.oneofKind !== "joinSpace") {
+      throw new Error("Expected joinSpace update")
+    }
+    const spacePayload = userUpdate.update.joinSpace.space
+    if (!spacePayload) {
+      throw new Error("Expected space payload in joinSpace update")
+    }
+    expect(spacePayload.id).toBe(BigInt(space.id))
+  })
+
+  it("respects sequence offsets when fetching updates", async () => {
+    const { users } = await testUtils.createSpaceWithMembers("Seq Sync", ["seq@sync.com"])
+    const user = users[0]
+    if (!user) {
+      throw new Error("Failed to create seq user")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userChatParticipantDelete",
+        userChatParticipantDelete: {
+          chatId: 1n,
+        },
+      },
+    })
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 2,
+      payload: {
+        oneofKind: "userChatParticipantDelete",
+        userChatParticipantDelete: {
+          chatId: 2n,
+        },
+      },
+    })
+
+    const { updates: dbUpdates } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 1,
+      limit: 10,
+    })
+
+    expect(dbUpdates).toHaveLength(1)
+    const [secondUpdate] = dbUpdates
+    expect(secondUpdate?.seq).toBe(2)
+  })
+
+  it("respects seqEnd when fetching updates", async () => {
+    const { users } = await testUtils.createSpaceWithMembers("Seq End Sync", ["seqend@sync.com"])
+    const user = users[0]
+    if (!user) {
+      throw new Error("Failed to create seqEnd user")
+    }
+
+    for (let seq = 1; seq <= 5; seq += 1) {
+      await insertServerUpdate({
+        bucket: UpdateBucket.User,
+        entityId: user.id,
+        seq,
+        payload: {
+          oneofKind: "userChatParticipantDelete",
+          userChatParticipantDelete: {
+            chatId: BigInt(seq),
+          },
+        },
+      })
+    }
+
+    const { updates: dbUpdates, latestSeq } = await Sync.getUpdates({
+      bucket: { type: UpdateBucket.User, userId: user.id },
+      seqStart: 0,
+      seqEnd: 3,
+      limit: 10,
+    })
+
+    expect(dbUpdates).toHaveLength(3)
+    expect(dbUpdates[2]?.seq).toBe(3)
+    expect(latestSeq).toBe(3)
+  })
+
+  it("returns metadata when fetching updates via Functions", async () => {
+    const { users } = await testUtils.createSpaceWithMembers("Metadata Sync", ["meta@sync.com"])
+    const user = users[0]
+    if (!user) {
+      throw new Error("Failed to create metadata user")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 1,
+      payload: {
+        oneofKind: "userChatParticipantDelete",
+        userChatParticipantDelete: {
+          chatId: 99n,
+        },
+      },
+    })
+
+    const result = await Functions.updates.getUpdates(
+      {
+        bucket: { type: { oneofKind: "user", user: {} } },
+        startSeq: 0n,
+        seqEnd: 0n,
+        totalLimit: 10,
+        limit: 0,
+      },
+      testUtils.functionContext({ userId: user.id }),
+    )
+
+    expect(result.seq).toBe(1n)
+    expect(result.final).toBe(true)
+    expect(result.resultType).toBe(GetUpdatesResult_ResultType.SLICE)
+    expect(result.updates).toHaveLength(1)
+  })
+
+  it("returns TOO_LONG when the server replay ceiling is exceeded", async () => {
+    const { users } = await testUtils.createSpaceWithMembers("Too Long Sync", ["toolong@sync.com"])
+    const user = users[0]
+    if (!user) {
+      throw new Error("Failed to create too-long user")
+    }
+
+    await insertServerUpdate({
+      bucket: UpdateBucket.User,
+      entityId: user.id,
+      seq: 10_001,
+      payload: {
+        oneofKind: "userChatParticipantDelete",
+        userChatParticipantDelete: {
+          chatId: 100n,
+        },
+      },
+    })
+
+    const result = await Functions.updates.getUpdates(
+      {
+        bucket: { type: { oneofKind: "user", user: {} } },
+        startSeq: 0n,
+        seqEnd: 0n,
+        totalLimit: 2,
+        limit: 0,
+      },
+      testUtils.functionContext({ userId: user.id }),
+    )
+
+    expect(result.resultType).toBe(GetUpdatesResult_ResultType.TOO_LONG)
+    expect(result.updates).toHaveLength(0)
+    expect(result.final).toBe(false)
+  })
+})

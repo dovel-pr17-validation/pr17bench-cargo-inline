@@ -1,0 +1,109 @@
+import Foundation
+import GRDB
+import InlineProtocol
+import Logger
+
+public struct Translation: FetchableRecord, Identifiable, Codable, Hashable, PersistableRecord, TableRecord, Sendable,
+  Equatable
+{
+  public var id: Int64?
+  public var messageId: Int64
+  public var chatId: Int64
+  public var translation: String
+  public var entities: MessageEntities?
+  public var language: String
+  public var date: Date
+  /// Source message edit revision used for stale checks.
+  public var msgRev: Int64
+
+  public enum Columns {
+    static let id = Column(CodingKeys.id)
+    static let messageId = Column(CodingKeys.messageId)
+    static let chatId = Column(CodingKeys.chatId)
+    static let translation = Column(CodingKeys.translation)
+    static let entities = Column(CodingKeys.entities)
+    static let language = Column(CodingKeys.language)
+    static let date = Column(CodingKeys.date)
+    static let msgRev = Column(CodingKeys.msgRev)
+  }
+
+  public static let message = belongsTo(
+    Message.self,
+    using: ForeignKey(["chatId", "messageId"], to: ["chatId", "messageId"])
+  )
+  public var message: QueryInterfaceRequest<Message> {
+    request(for: Translation.message)
+  }
+
+  public static let chat = belongsTo(Chat.self)
+  public var chat: QueryInterfaceRequest<Chat> {
+    request(for: Translation.chat)
+  }
+
+  public init(
+    id: Int64? = nil,
+    messageId: Int64,
+    chatId: Int64,
+    translation: String,
+    entities: MessageEntities?,
+    language: String,
+    date: Date,
+    msgRev: Int64
+  ) {
+    self.id = id
+    self.messageId = messageId
+    self.chatId = chatId
+    self.translation = translation
+    self.entities = entities
+    self.language = language
+    self.date = date
+    self.msgRev = msgRev
+  }
+
+  public init(from: InlineProtocol.MessageTranslation, chatId: Int64) {
+    self.init(
+      messageId: from.messageID,
+      chatId: chatId,
+      translation: from.translation,
+      entities: from.entities,
+      language: from.language,
+      date: Date(timeIntervalSince1970: TimeInterval(from.date)),
+      msgRev: from.msgRev
+    )
+  }
+}
+
+// MARK: - DB Helpers
+
+public extension Translation {
+  static func save(
+    _ db: Database,
+    protocolTranslation: InlineProtocol.MessageTranslation,
+    chatId: Int64,
+    publishChanges: Bool = false
+  ) throws -> Translation? {
+    let translation = Translation(from: protocolTranslation, chatId: chatId)
+    let hasMessage = try Message
+      .filter(Column("messageId") == translation.messageId)
+      .filter(Column("chatId") == translation.chatId)
+      .fetchCount(db) > 0
+
+    guard hasMessage else { return nil }
+
+    try translation.save(db, onConflict: .replace)
+    return translation
+  }
+
+  static func getTranslations(
+    _ db: Database,
+    messageIds: [Int64],
+    chatId: Int64,
+    language: String
+  ) throws -> [Translation] {
+    try Translation
+      .filter(messageIds.contains(Column("messageId")))
+      .filter(Column("chatId") == chatId)
+      .filter(Column("language") == language)
+      .fetchAll(db)
+  }
+}

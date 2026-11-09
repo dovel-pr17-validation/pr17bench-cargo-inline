@@ -1,0 +1,170 @@
+import AppKit
+import InlineKit
+
+final class CommandCompletionMenuItem: NSTableCellView {
+  private let containerView = NSView()
+  private let avatarSize: CGFloat = 22
+  private let avatarLeading: CGFloat = 8
+  private let avatarTextSpacing: CGFloat = 7
+  private var avatarView = ChatIconSwiftUIBridge(.user(.preview), size: 22)
+  private let appIconView = NSImageView()
+  private let commandLabel = NSTextField()
+  private let descriptionLabel = NSTextField()
+  private let botLabel = NSTextField()
+
+  private var _isSelected = false
+
+  var isSelected: Bool {
+    get { _isSelected }
+    set {
+      guard _isSelected != newValue else { return }
+      _isSelected = newValue
+      setAccessibilitySelected(newValue)
+      updateAppearance()
+    }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    setupView()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func setupView() {
+    containerView.wantsLayer = true
+    containerView.layer?.cornerRadius = 8
+    containerView.layer?.cornerCurve = .continuous
+    containerView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(containerView)
+
+    avatarView.translatesAutoresizingMaskIntoConstraints = false
+    containerView.addSubview(avatarView)
+
+    appIconView.image = NSApp.applicationIconImage
+    appIconView.imageScaling = .scaleProportionallyUpOrDown
+    appIconView.wantsLayer = true
+    appIconView.layer?.cornerRadius = 5
+    appIconView.layer?.masksToBounds = true
+    appIconView.translatesAutoresizingMaskIntoConstraints = false
+    appIconView.isHidden = true
+    containerView.addSubview(appIconView)
+
+    commandLabel.isBordered = false
+    commandLabel.isEditable = false
+    commandLabel.backgroundColor = .clear
+    commandLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+    commandLabel.lineBreakMode = .byTruncatingTail
+    commandLabel.translatesAutoresizingMaskIntoConstraints = false
+    containerView.addSubview(commandLabel)
+
+    descriptionLabel.isBordered = false
+    descriptionLabel.isEditable = false
+    descriptionLabel.backgroundColor = .clear
+    descriptionLabel.font = .systemFont(ofSize: 10, weight: .regular)
+    descriptionLabel.lineBreakMode = .byTruncatingTail
+    descriptionLabel.translatesAutoresizingMaskIntoConstraints = false
+    containerView.addSubview(descriptionLabel)
+
+    botLabel.isBordered = false
+    botLabel.isEditable = false
+    botLabel.backgroundColor = .clear
+    botLabel.font = .systemFont(ofSize: 10, weight: .medium)
+    botLabel.alignment = .right
+    botLabel.lineBreakMode = .byTruncatingTail
+    botLabel.translatesAutoresizingMaskIntoConstraints = false
+    containerView.addSubview(botLabel)
+
+    NSLayoutConstraint.activate([
+      containerView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+      containerView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+      containerView.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+      containerView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+
+      avatarView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor, constant: avatarLeading),
+      avatarView.centerYAnchor.constraint(equalTo: containerView.centerYAnchor),
+      avatarView.widthAnchor.constraint(equalToConstant: avatarSize),
+      avatarView.heightAnchor.constraint(equalToConstant: avatarSize),
+
+      appIconView.leadingAnchor.constraint(equalTo: avatarView.leadingAnchor),
+      appIconView.trailingAnchor.constraint(equalTo: avatarView.trailingAnchor),
+      appIconView.topAnchor.constraint(equalTo: avatarView.topAnchor),
+      appIconView.bottomAnchor.constraint(equalTo: avatarView.bottomAnchor),
+
+      commandLabel.leadingAnchor.constraint(equalTo: avatarView.trailingAnchor, constant: avatarTextSpacing),
+      commandLabel.topAnchor.constraint(equalTo: containerView.topAnchor, constant: 4),
+
+      botLabel.leadingAnchor.constraint(greaterThanOrEqualTo: commandLabel.trailingAnchor, constant: 8),
+      botLabel.trailingAnchor.constraint(equalTo: containerView.trailingAnchor, constant: -8),
+      botLabel.centerYAnchor.constraint(equalTo: commandLabel.centerYAnchor),
+
+      descriptionLabel.leadingAnchor.constraint(equalTo: commandLabel.leadingAnchor),
+      descriptionLabel.trailingAnchor.constraint(equalTo: containerView.trailingAnchor, constant: -8),
+      descriptionLabel.topAnchor.constraint(equalTo: commandLabel.bottomAnchor, constant: 0),
+      descriptionLabel.bottomAnchor.constraint(equalTo: containerView.bottomAnchor, constant: -4),
+    ])
+
+    commandLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+    botLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+    updateAppearance()
+  }
+
+  func configure(with suggestion: ComposeCommandSuggestion) {
+    switch suggestion {
+    case let .bot(command):
+      avatarView.update(peerType: .user(command.botUserInfo))
+      avatarView.isHidden = false
+      appIconView.isHidden = true
+      commandLabel.stringValue = "/\(command.command)"
+      descriptionLabel.stringValue = command.description
+
+      if command.isAmbiguous, let botLabelText = command.botLabel {
+        botLabel.stringValue = botLabelText
+        botLabel.isHidden = false
+      } else {
+        botLabel.stringValue = ""
+        botLabel.isHidden = true
+      }
+
+    case let .inline(command):
+      avatarView.isHidden = true
+      appIconView.isHidden = false
+      commandLabel.stringValue = "/\(command.command)"
+      descriptionLabel.stringValue = command.description
+      botLabel.stringValue = ""
+      botLabel.isHidden = true
+    }
+    setAccessibilityLabel(
+      [commandLabel.stringValue, descriptionLabel.stringValue, botLabel.stringValue]
+        .filter { !$0.isEmpty }
+        .joined(separator: ", ")
+    )
+  }
+
+  private func updateAppearance() {
+    if isSelected {
+      containerView.layer?.backgroundColor = NSColor.selectedContentBackgroundColor
+        .resolvedColor(with: effectiveAppearance)
+        .cgColor
+      commandLabel.textColor = .alternateSelectedControlTextColor
+      descriptionLabel.textColor = NSColor.alternateSelectedControlTextColor.withAlphaComponent(0.9)
+      botLabel.textColor = NSColor.alternateSelectedControlTextColor.withAlphaComponent(0.9)
+    } else {
+      containerView.layer?.backgroundColor = NSColor.clear.cgColor
+      commandLabel.textColor = .labelColor
+      descriptionLabel.textColor = .secondaryLabelColor
+      botLabel.textColor = .tertiaryLabelColor
+    }
+  }
+
+  override func draw(_ dirtyRect: NSRect) {}
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    updateAppearance()
+  }
+}

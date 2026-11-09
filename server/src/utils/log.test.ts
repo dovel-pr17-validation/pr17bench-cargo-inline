@@ -1,0 +1,249 @@
+import { describe, expect, it, spyOn } from "bun:test"
+import * as Sentry from "@sentry/bun"
+import { beforeSendLog, Log, LogLevel, redactString, redactValue } from "./log"
+
+describe("log levels", () => {
+  it("constructs the shared logger with the configured default level", () => {
+    expect(Reflect.get(Log.shared, "logLevel")).toBe(Reflect.get(Log, "logLevel"))
+  })
+
+  it("requires explicit trace enablement for verbose diagnostics", () => {
+    const previousDebug = process.env["DEBUG"]
+    const traceSpy = spyOn(console, "trace").mockImplementation(() => {})
+    process.env["DEBUG"] = "1"
+    try {
+      new Log("InlineProtocol.V3", LogLevel.DEBUG).trace("hidden")
+      expect(traceSpy).not.toHaveBeenCalled()
+
+      new Log("InlineProtocol.V3", LogLevel.TRACE).trace("visible")
+      expect(traceSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      traceSpy.mockRestore()
+      if (previousDebug === undefined) Reflect.deleteProperty(process.env, "DEBUG")
+      else process.env["DEBUG"] = previousDebug
+    }
+  })
+})
+
+describe("local content traces", () => {
+  it("requires explicit development trace mode and never exports to Sentry", () => {
+    const previousMode = process.env["NODE_ENV"]
+    const previousDebug = process.env["DEBUG"]
+    process.env["DEBUG"] = "1"
+    const consoleSpy = spyOn(console, "debug").mockImplementation(() => {})
+    const sentrySpy = spyOn(Sentry.logger, "trace").mockImplementation(() => {})
+    try {
+      for (const mode of ["production", "test"] as const) {
+        process.env["NODE_ENV"] = mode
+        new Log("privacy", LogLevel.TRACE).traceContent("private synthetic prompt")
+      }
+      expect(consoleSpy).not.toHaveBeenCalled()
+      process.env["NODE_ENV"] = "development"
+      new Log("privacy", LogLevel.DEBUG).traceContent("private synthetic prompt")
+      expect(consoleSpy).not.toHaveBeenCalled()
+      new Log("privacy", LogLevel.TRACE).traceContent("private synthetic prompt")
+      expect(consoleSpy).toHaveBeenCalledTimes(1)
+      expect(JSON.stringify(consoleSpy.mock.calls)).toContain("private synthetic prompt")
+      expect(sentrySpy).not.toHaveBeenCalled()
+    } finally {
+      consoleSpy.mockRestore(); sentrySpy.mockRestore()
+      for (const [name, value] of [["NODE_ENV", previousMode], ["DEBUG", previousDebug]]) {
+        if (value === undefined) Reflect.deleteProperty(process.env, name!)
+        else process.env[name!] = value
+      }
+    }
+  })
+})
+
+describe("log redaction", () => {
+  it("redacts opaque v1 path tokens and relative query values at both sinks", () => {
+    const previousDebug = process.env["DEBUG"]
+    process.env["DEBUG"] = "1"
+    const consoleSpy = spyOn(console, "warn").mockImplementation(() => {})
+    const sentrySpy = spyOn(Sentry.logger, "warn").mockImplementation(() => {})
+    try {
+      const path = "/v1/opaque-synthetic-credential/logout?code=synthetic-code&text=synthetic-content"
+      new Log("privacy", LogLevel.WARN).warn(path, { path })
+      for (const calls of [consoleSpy.mock.calls, sentrySpy.mock.calls]) {
+        expect(calls.length).toBeGreaterThan(0)
+        const text = JSON.stringify(calls)
+        for (const secret of ["opaque-synthetic-credential", "synthetic-code", "synthetic-content"]) expect(text).not.toContain(secret)
+        expect(text).toContain("logout")
+      }
+    } finally {
+      consoleSpy.mockRestore(); sentrySpy.mockRestore()
+      if (previousDebug === undefined) Reflect.deleteProperty(process.env, "DEBUG")
+      else process.env["DEBUG"] = previousDebug
+    }
+  })
+  it("bounds deep, cyclic, binary and accessor metadata without exposing its contents", () => {
+    const privateValue = "private-synthetic-payload"
+    let nested: unknown = { payload: privateValue }
+    for (let i = 0; i < 10; i++) nested = { nested }
+    const cyclic: Record<string, unknown> = { nested, bytes: Buffer.from(privateValue) }
+    cyclic["self"] = cyclic
+    Object.defineProperty(cyclic, "getter", { enumerable: true, get() { throw new Error(privateValue) } })
+    const output = JSON.stringify(redactValue(cyclic))
+    expect(output).not.toContain(privateValue)
+    expect(output).toContain("<truncated>")
+    expect(output).toContain("<circular>")
+    expect(output).toContain("<binary>")
+    expect(output).toContain("<accessor>")
+  })
+
+  it("removes filenames and URL credentials at console and Sentry sinks", () => {
+    const previousDebug = process.env["DEBUG"]
+    process.env["DEBUG"] = "1"
+    const consoleSpy = spyOn(console, "warn").mockImplementation(() => {})
+    const sentrySpy = spyOn(Sentry.logger, "warn").mockImplementation(() => {})
+    try {
+      const metadata = { fileName: "private-filename.pdf", url: "https://host.test/private?sig=signed-secret" }
+      new Log("redaction-test", LogLevel.WARN).warn("Failed https://host.test/private?sig=signed-secret", metadata)
+      for (const calls of [consoleSpy.mock.calls, sentrySpy.mock.calls]) {
+        const output = JSON.stringify(calls)
+        expect(output).not.toContain("private-filename")
+        expect(output).not.toContain("signed-secret")
+        expect(output).toContain("redacted")
+      }
+      let nested: unknown = { token: "deep-secret" }
+      for (let i = 0; i < 10; i++) nested = { nested }
+      const sentry = beforeSendLog({ level: "warn", message: "safe", attributes: { nested } })
+      expect(JSON.stringify(sentry)).not.toContain("deep-secret")
+    } finally {
+      consoleSpy.mockRestore()
+      sentrySpy.mockRestore()
+      if (previousDebug === undefined) Reflect.deleteProperty(process.env, "DEBUG")
+      else process.env["DEBUG"] = previousDebug
+    }
+  })
+
+  it("keeps hosts, paths and structural query params useful", () => {
+    expect(redactString("Running on http://0.0.0.0:8000")).toBe("Running on http://0.0.0.0:8000")
+    expect(redactString("GET https://u:p@api.test/v1/getChats?chatId=5&limit=50&text=hi&sid=s#f"))
+      .toBe("GET https://<redacted>@api.test/v1/getChats?chatId=5&limit=50&text=<redacted>&sid=<redacted>")
+    expect(redactValue({ photoUrl: "https://cdn.test/a.png?sig=s", url: "opaque" }))
+      .toEqual({ photoUrl: "https://cdn.test/a.png?sig=<redacted>", url: "<redacted>" })
+  })
+
+  it("does not let malformed diagnostics break redaction or expose a raw fallback", () => {
+    expect(redactValue(new Date(NaN))).toBe("<unserializable>")
+    const error = new Error("safe")
+    Object.defineProperty(error, "message", { get() { throw new Error("private-diagnostic") } })
+    expect(redactValue(error)).toBe("<unserializable>")
+  })
+
+  it("redacts bearer and path tokens in strings", () => {
+    const rawToken = "123:INabcdefghijklmnopqrstuvwxyz"
+    const encodedToken = "123%3AINabcdefghijklmnopqrstuvwxyz"
+    const input = `Authorization: Bearer ${rawToken} path=/bot${rawToken}/sendMessage encoded=/bot${encodedToken}/getMe get=/${rawToken}/getMe getEncoded=/${encodedToken}/getMe`
+
+    const output = redactString(input)
+
+    expect(output).toContain("Bearer <redacted>")
+    expect(output).toContain("bot<redacted>")
+    expect(output).toContain("/<redacted>/getMe")
+    expect(output).not.toContain(rawToken)
+    expect(output).not.toContain(encodedToken)
+  })
+
+  it("redacts contact details embedded in error strings", () => {
+    const output = redactString(
+      "Provider rejected person@example.com, encoded person%40example.com, and +1 (555) 555-0123",
+    )
+
+    expect(output).toBe(
+      "Provider rejected <redacted>, encoded <redacted>, and <redacted>",
+    )
+  })
+
+  it("redacts error message, stack, and nested cause", () => {
+    const token = "123:INabcdefghijklmnopqrstuvwxyz"
+    const encoded = "123%3AINabcdefghijklmnopqrstuvwxyz"
+
+    const cause = new Error(`cause /bot${token}/deleteMessage`)
+    ;(cause as any).stack = `Error: cause /bot${token}/deleteMessage\n    at cause (x.ts:1:1)`
+
+    const error = new Error(`top /bot${encoded}/sendMessage Authorization: Bearer ${token}`)
+    error.name = "person@example.com"
+    ;(error as any).stack = `Error: top /bot${token}/sendMessage Authorization: Bearer ${token}\n    at top (y.ts:1:1)`
+    ;(error as any).cause = cause
+
+    const redacted = redactValue(error) as Error
+    const redactedCause = (redacted as any).cause as Error
+
+    expect(redacted).toBeInstanceOf(Error)
+    expect(redacted).not.toBe(error)
+    expect(redacted.name).toBe("<redacted>")
+    expect(redacted.message).toContain("bot<redacted>")
+    expect(redacted.message).toContain("Bearer <redacted>")
+    expect(redacted.message).not.toContain(token)
+    expect(redacted.message).not.toContain(encoded)
+
+    expect(typeof redacted.stack).toBe("string")
+    expect(redacted.stack!).toContain("bot<redacted>")
+    expect(redacted.stack!).toContain("Bearer <redacted>")
+    expect(redacted.stack!).not.toContain(token)
+
+    expect(redactedCause.message).toContain("bot<redacted>")
+    expect(redactedCause.message).not.toContain(token)
+    expect(redactedCause.stack!).toContain("bot<redacted>")
+    expect(redactedCause.stack!).not.toContain(token)
+    expect(Bun.inspect(redacted)).toContain("at top (y.ts:1:1)")
+    expect(Bun.inspect(redacted)).not.toContain("src/utils/log.ts")
+
+    const withoutCause = redactValue(new Error("plain failure")) as Error
+    expect("cause" in withoutCause).toBe(false)
+  })
+
+  it("redacts sensitive keys in metadata objects", () => {
+    const token = "123:INabcdefghijklmnopqrstuvwxyz"
+    const input = {
+      authorization: `Bearer ${token}`,
+      token,
+      email: "user@example.com",
+      phoneNumber: "+15555550123",
+      nested: {
+        request: `/bot${token}/getMe`,
+      },
+    }
+
+    const redacted = redactValue(input) as {
+      authorization: string
+      token: string
+      email: string
+      phoneNumber: string
+      nested: { request: string }
+    }
+
+    expect(redacted.authorization).toBe("<redacted>")
+    expect(redacted.token).toBe("<redacted>")
+    expect(redacted.email).toBe("<redacted>")
+    expect(redacted.phoneNumber).toBe("<redacted>")
+    expect(redacted.nested.request).toContain("bot<redacted>")
+    expect(redacted.nested.request).not.toContain(token)
+  })
+
+  it("scrubs sensitive Sentry log attributes", () => {
+    const log = beforeSendLog({
+      level: "warn",
+      message: "Failed /123:INabcdefghijklmnopqrstuvwxyz/getMe",
+      attributes: {
+        "logger.scope": "test",
+        "user.id": "123",
+        "user.email": "user@example.com",
+        "user.name": "Inline User",
+        token: "123:INabcdefghijklmnopqrstuvwxyz",
+        phoneNumber: "+15555550123",
+      },
+    })
+
+    expect(log).not.toBeNull()
+    expect(log?.message).toBe("Failed /<redacted>/getMe")
+    expect(log?.attributes?.["logger.scope"]).toBe("test")
+    expect(log?.attributes?.["user.id"]).toBe("123")
+    expect(log?.attributes?.["user.email"]).toBeUndefined()
+    expect(log?.attributes?.["user.name"]).toBeUndefined()
+    expect(log?.attributes?.token).toBe("<redacted>")
+    expect(log?.attributes?.phoneNumber).toBe("<redacted>")
+  })
+})

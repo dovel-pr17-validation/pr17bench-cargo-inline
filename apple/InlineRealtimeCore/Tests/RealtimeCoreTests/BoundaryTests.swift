@@ -1,0 +1,118 @@
+import Testing
+
+@testable import RealtimeCore
+
+@Suite struct BoundaryTests {
+  @Test func resultAfterDeadlineCannotBecomeSuccessfulApply() throws {
+    var s = Scenario()
+    try s.open()
+    let marker = try operation(s.queue(1))
+    let rpc = try attempt(s.send(.databaseFinished(marker, .done)))
+    let late = s.send(.response(rpc, .result("late")), at: 101)
+    #expect(dbWork(late) == [.settle(TransactionID(1), .executionUnknown)])
+  }
+
+  @Test func responseAtDeadlineWinsIfDeliveredBeforeTimeout() throws {
+    var s = Scenario()
+    try s.open()
+    let marker = try operation(s.queue(1))
+    let rpc = try attempt(s.send(.databaseFinished(marker, .done)))
+    #expect(
+      dbWork(s.send(.response(rpc, .result("on-time")), at: 100)) == [
+        .applyTransaction(TransactionID(1), "on-time")
+      ])
+  }
+
+  @Test func timeoutAtDeadlineWinsIfDeliveredBeforeResponse() throws {
+    var s = Scenario()
+    try s.open()
+    let marker = try operation(s.queue(1))
+    let rpc = try attempt(s.send(.databaseFinished(marker, .done)))
+    #expect(dbWork(s.send(.timeout, at: 100)) == [.settle(TransactionID(1), .executionUnknown)])
+    #expect(dbWork(s.send(.response(rpc, .result("late")))).isEmpty)
+  }
+
+  @Test func busyTransactionQueueCannotStarveSync() throws {
+    var s = Scenario(capacity: 1)
+    try s.open()
+    let first = try operation(s.queue(1))
+    try s.queue(2)
+    let load = try operation(s.send(.catchUp(BucketID(1), through: 2)))
+    s.send(.databaseFinished(load, .bucketState(position(0))))
+    let rpc = try attempt(s.send(.databaseFinished(first, .done)))
+    let result = s.send(.response(rpc, .result("ok")))
+    #expect(transmissions(result) == [.fetch(BucketID(1), from: 0, through: 2)])
+  }
+
+  @Test func mismatchedDatabaseResultRetiresIOAndDrainsWithoutInventingACallback() throws {
+    var s = Scenario()
+    let connection = try s.open()
+    let marker = try operation(s.queue(1))
+    let failed = s.send(.databaseFinished(marker, .committed(position(9))))
+    #expect(failed.contains(.event(.databaseContractViolation(marker))))
+    #expect(transmissions(failed).isEmpty)
+    #expect(s.core.outstandingDatabaseOperations == 0)
+    #expect(!s.core.active)
+    #expect(s.core.outcome(for: TransactionID(1)) == nil)
+    #expect(s.send(.disconnected(connection)).contains(.event(.drained)))
+    #expect(transmissions(s.send(.databaseFinished(marker, .done))).isEmpty)
+    try s.open(generation: 2)
+    #expect(s.core.active)
+  }
+
+  @Test func cancelDuringApplyWaitsForActualOutcome() throws {
+    var s = Scenario()
+    try s.open()
+    let marker = try operation(s.queue(1))
+    let rpc = try attempt(s.send(.databaseFinished(marker, .done)))
+    let apply = try operation(s.send(.response(rpc, .result("ok"))))
+    #expect(dbWork(s.send(.cancel(TransactionID(1)))).isEmpty)
+    let cleanup = try operation(s.send(.databaseFinished(apply, .done)))
+    s.send(.databaseFinished(cleanup, .done))
+    #expect(s.core.outcome(for: TransactionID(1)) == .applied)
+  }
+
+  @Test func directTimeoutHasCorrelatedCompletion() throws {
+    var s = Scenario()
+    try s.open()
+    let rpc = try attempt(s.send(.call("query")))
+    #expect(s.send(.timeout, at: 100).contains(.event(.directFinished(rpc, nil))))
+  }
+  @Test func shutdownDoesNotEquateServerReplyWithSendTaskCompletion() throws {
+    var s = Scenario()
+    let connection = try s.open()
+    let rpc = try attempt(s.send(.call("query")))
+    s.send(.response(rpc, .result("ok")))
+    s.send(.stop)
+    #expect(!s.send(.disconnected(connection)).contains(.event(.drained)))
+    #expect(s.core.outstandingSends == 1)
+    #expect(s.send(.sendFinished(rpc)).contains(.event(.drained)))
+    #expect(s.core.outstandingSends == 0)
+  }
+
+  @Test func invalidStartCannotDiscardEffectsFromAnExpiredSession() throws {
+    var s = Scenario()
+    let connection = try s.open()
+    let marker = try operation(s.queue(1))
+    _ = try attempt(s.send(.databaseFinished(marker, .done)))
+    let expired = s.send(.start(generation: 1), at: 1_000_000)
+    #expect(expired.contains(.close(connection)))
+    #expect(dbWork(expired).contains(.settle(TransactionID(1), .executionUnknown)))
+    #expect(expired.contains(.event(.blocked("account generation must increase"))))
+  }
+
+  @Test func bucketKindIsPartOfIdentity() throws {
+    var s = Scenario()
+    try s.open()
+    let chat = BucketID(1, kind: .chat)
+    let space = BucketID(1, kind: .space)
+    s.send(.snapshot(chat, position(10), generation: 1))
+    s.send(.snapshot(space, .zero, generation: 1))
+    #expect(
+      transmissions(s.send(.catchUp(space, through: 1))) == [.fetch(space, from: 0, through: 1)])
+    #expect(s.core.cursor(for: chat) == 10)
+    #expect(s.core.cursor(for: space) == 0)
+    #expect(chat != space)
+  }
+
+}

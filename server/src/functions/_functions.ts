@@ -1,0 +1,215 @@
+import { openGridThread, setGridTranscription, listGridTranscripts } from "./gridTranscription"
+import { deleteMessage } from "@in/server/functions/messages.deleteMessage"
+import { deleteMessageAttachment } from "@in/server/functions/messages.deleteMessageAttachment"
+import { clearChatHistory } from "@in/server/functions/messages.clearChatHistory"
+import { sendMessage } from "@in/server/functions/messages.sendMessage"
+import { getChatHistory } from "@in/server/functions/messages.getChatHistory"
+import { getChatTranscript } from "@in/server/functions/messages.getChatTranscript"
+import { getChat } from "@in/server/functions/messages.getChat"
+import { getMessages } from "@in/server/functions/messages.getMessages"
+import { getThreadReferences, getThreadSubthreads } from "@in/server/functions/messages.getThreadReferences"
+import { searchMessages } from "@in/server/functions/messages.searchMessages"
+import { addReaction } from "./messages.addReaction"
+import { deleteReaction } from "./messages.deleteReaction"
+import { editMessage } from "./messages.editMessage"
+import { createChat } from "./messages.createChat"
+import { getSpaceMembers } from "./space.getSpaceMembers"
+import { getSpace } from "./space.getSpace"
+import { deleteChat } from "./messages.deleteChat"
+import { inviteToSpace } from "./space.inviteToSpace"
+import { joinPublicSpace } from "./space.joinPublicSpace"
+import { joinSpaceByInviteToken } from "./space.joinByInviteToken"
+import { getSpaceInviteLink, setSpaceInviteLinkEnabled } from "./space.inviteLinks"
+import { updateMemberAccess } from "./space.updateMemberAccess"
+import { getSpaceSettings, toggleSpaceGrid } from "./space.settings"
+import {
+  addSpaceUrlPreviewExclusion,
+  getSpaceUrlPreviewExclusions,
+  removeSpaceUrlPreviewExclusion,
+} from "./space.urlPreviewExclusions"
+import { createUserGroup, deleteUserGroup, getUserGroups, updateUserGroup } from "@in/server/modules/userGroups"
+import { getChatParticipants } from "./messages.getChatParticipants"
+import { removeChatParticipant } from "./messages.removeChatParticipant"
+import { addChatParticipant } from "./messages.addChatParticipant"
+import { updateChatVisibility } from "./messages.updateChatVisibility"
+import { updateChatInfo } from "./messages.updateChatInfo"
+import { moveThread } from "./messages.moveThread"
+import { pinMessage } from "./messages.pinMessage"
+import { unpinAllMessages } from "./messages.unpinAllMessages"
+import { updateDialogNotificationSettings } from "./messages.updateDialogNotificationSettings"
+import { updateDialogFollowMode } from "./messages.updateDialogFollowMode"
+import { updateDialogTranslation } from "./messages.updateDialogTranslation"
+import { collapseHistory } from "./messages.collapseHistory"
+import { getUserSettings } from "./user.getUserSettings"
+import { updateUserSettings } from "./user.updateUserSettings"
+import { createBot } from "./createBot"
+import { listBots } from "./bot.listBots"
+import { deleteBot } from "./bot.deleteBot"
+import { getBotCommands } from "./bot.getCommands"
+import { setBotCommands } from "./bot.setCommands"
+import { getPeerBotCommands } from "./bot.getPeerCommands"
+import { getBotSkills } from "./bot.getSkills"
+import { getBotConfigurationCatalog } from "./bot.getConfigurationCatalog"
+import { getPeerBots } from "./bot.getPeerBots"
+import { getMyBotCapabilities } from "./bot.getMyCapabilities"
+import { setMyBotCapabilities } from "./bot.setMyCapabilities"
+import { requestBotChatSettings } from "./bot.requestChatSettings"
+import { invokeBotChatSettingsItem } from "./bot.invokeChatSettingsItem"
+import { answerBotChatSettings } from "./bot.answerChatSettings"
+import { revealBotToken } from "./bot.revealToken"
+import { rotateBotToken } from "./bot.rotateToken"
+import { updateBotProfile } from "./bot.updateProfile"
+import { setBotAvatar } from "./bot.setAvatar"
+import { clearBotAvatar } from "./bot.clearAvatar"
+import { getBotPresence } from "./bot.getPresence"
+import {
+  createBotAgent,
+  deleteBotAgent,
+  getBotAgent,
+  listBotAgents,
+  updateBotAgent,
+} from "./bot.agents"
+import { setBotPresenceStateFn } from "./bot.setPresenceState"
+import { deleteMember } from "@in/server/functions/space.deleteMember"
+import { getUpdatesState } from "./updates.getUpdatesState"
+import { getUpdates } from "./updates.getUpdates"
+import { forwardMessages } from "./messages.forwardMessages"
+import { createSubthread } from "./messages.createSubthread"
+import { showInChatList } from "./messages.showInChatList"
+import { updateDialogOpen } from "./messages.updateDialogOpen"
+import { updateDialogOrder } from "./messages.updateDialogOrder"
+import { createDialogFolder, deleteDialogFolder, updateDialogFolder } from "./messages.dialogFolders"
+import { reserveChatIds } from "./messages.reserveChatIds"
+import { invokeMessageAction } from "./messages.invokeMessageAction"
+import { answerMessageAction } from "./messages.answerMessageAction"
+import {
+  createGridRoom,
+  deleteGridRoom,
+  getGrid,
+  getGridHome,
+  joinGridRoom,
+  moveGridCallHere,
+  leaveGridRoom,
+  prepareGridConnection,
+  setGridAvatarMicrophoneEnabled,
+  setGridRoomLocked,
+  setGridRoomTitle,
+} from "./grid"
+
+export const Functions = {
+  messages: {
+    deleteMessage: deleteMessage,
+    deleteMessageAttachment: deleteMessageAttachment,
+    clearChatHistory: clearChatHistory,
+    sendMessage: sendMessage,
+    getChatHistory: getChatHistory,
+    getChatTranscript: getChatTranscript,
+    getMessages: getMessages,
+    getThreadReferences: getThreadReferences,
+    getThreadSubthreads: getThreadSubthreads,
+    searchMessages: searchMessages,
+    getChat: getChat,
+    addReaction: addReaction,
+    deleteReaction: deleteReaction,
+    editMessage: editMessage,
+    createChat: createChat,
+    deleteChat: deleteChat,
+    getChatParticipants: getChatParticipants,
+    addChatParticipant: addChatParticipant,
+    removeChatParticipant: removeChatParticipant,
+    updateChatVisibility: updateChatVisibility,
+    updateChatInfo: updateChatInfo,
+    moveThread: moveThread,
+    pinMessage: pinMessage,
+    unpinAllMessages: unpinAllMessages,
+    updateDialogNotificationSettings: updateDialogNotificationSettings,
+    updateDialogFollowMode: updateDialogFollowMode,
+    updateDialogTranslation,
+    collapseHistory,
+    forwardMessages: forwardMessages,
+    createSubthread: createSubthread,
+    showInChatList: showInChatList,
+    updateDialogOpen: updateDialogOpen,
+    updateDialogOrder: updateDialogOrder,
+    createDialogFolder,
+    updateDialogFolder,
+    deleteDialogFolder,
+    reserveChatIds: reserveChatIds,
+    invokeMessageAction: invokeMessageAction,
+    answerMessageAction: answerMessageAction,
+    // until we make tests pass
+    //markAsUnread: markAsUnread,
+  },
+  spaces: {
+    getSpace,
+    getSpaceMembers: getSpaceMembers,
+    inviteToSpace: inviteToSpace,
+    joinPublicSpace,
+    joinSpaceByInviteToken,
+    getInviteLink: getSpaceInviteLink,
+    setInviteLinkEnabled: setSpaceInviteLinkEnabled,
+    deleteMember: deleteMember,
+    updateMemberAccess: updateMemberAccess,
+    getSettings: getSpaceSettings,
+    toggleGrid: toggleSpaceGrid,
+    getUrlPreviewExclusions: getSpaceUrlPreviewExclusions,
+    addUrlPreviewExclusion: addSpaceUrlPreviewExclusion,
+    removeUrlPreviewExclusion: removeSpaceUrlPreviewExclusion,
+    getUserGroups: getUserGroups,
+    createUserGroup: createUserGroup,
+    updateUserGroup: updateUserGroup,
+    deleteUserGroup: deleteUserGroup,
+  },
+  user: {
+    getUserSettings: getUserSettings,
+    updateUserSettings: updateUserSettings,
+  },
+  bot: {
+    createBot: createBot,
+    listBots: listBots,
+    deleteBot: deleteBot,
+    getCommands: getBotCommands,
+    setCommands: setBotCommands,
+    getPeerCommands: getPeerBotCommands,
+    getSkills: getBotSkills,
+    getConfigurationCatalog: getBotConfigurationCatalog,
+    getPeerBots,
+    getMyCapabilities: getMyBotCapabilities,
+    setMyCapabilities: setMyBotCapabilities,
+    requestChatSettings: requestBotChatSettings,
+    invokeChatSettingsItem: invokeBotChatSettingsItem,
+    answerChatSettings: answerBotChatSettings,
+    revealBotToken: revealBotToken,
+    rotateBotToken: rotateBotToken,
+    updateBotProfile: updateBotProfile,
+    setBotAvatar: setBotAvatar,
+    clearBotAvatar: clearBotAvatar,
+    getPresence: getBotPresence,
+    createAgent: createBotAgent,
+    deleteAgent: deleteBotAgent,
+    getAgent: getBotAgent,
+    listAgents: listBotAgents,
+    updateAgent: updateBotAgent,
+    setPresenceState: setBotPresenceStateFn,
+  },
+  updates: {
+    getUpdatesState: getUpdatesState,
+    getUpdates: getUpdates,
+  },
+  grid: {
+    openThread: openGridThread,
+    setTranscription: setGridTranscription,
+    listTranscripts: listGridTranscripts,
+    get: getGrid,
+    getHome: getGridHome,
+    createRoom: createGridRoom,
+    joinRoom: joinGridRoom,
+    moveCallHere: moveGridCallHere,
+    leaveRoom: leaveGridRoom,
+    setRoomTitle: setGridRoomTitle,
+    setRoomLocked: setGridRoomLocked,
+    deleteRoom: deleteGridRoom,
+    prepareConnection: prepareGridConnection,
+    setAvatarMicrophoneEnabled: setGridAvatarMicrophoneEnabled,
+  },
+}

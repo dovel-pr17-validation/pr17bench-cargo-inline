@@ -1,0 +1,197 @@
+import InlineKit
+import InlineUI
+import SwiftUI
+
+enum ThreadIconSymbol {
+  static func name(isReplyThread: Bool) -> String {
+    isReplyThread ? "arrow.turn.down.right" : "bubble.middle.bottom.fill"
+  }
+}
+
+struct ChatIcon: View {
+  enum PeerType: Equatable {
+    case chat(Chat)
+    case user(UserInfo)
+
+    static func == (lhs: PeerType, rhs: PeerType) -> Bool {
+      switch (lhs, rhs) {
+      case let (.chat(lhsChat), .chat(rhsChat)):
+        return lhsChat.id == rhsChat.id
+          && lhsChat.title == rhsChat.title
+          && lhsChat.emoji == rhsChat.emoji
+          && lhsChat.parentChatId == rhsChat.parentChatId
+          && lhsChat.parentMessageId == rhsChat.parentMessageId
+
+      case let (.user(lhsUserInfo), .user(rhsUserInfo)):
+        return lhsUserInfo.user.id == rhsUserInfo.user.id
+          && userNameSignature(lhsUserInfo.user) == userNameSignature(rhsUserInfo.user)
+          && profilePhotoId(lhsUserInfo) == profilePhotoId(rhsUserInfo)
+          && lhsUserInfo.user.profileLocalPath == rhsUserInfo.user.profileLocalPath
+
+      default:
+        return false
+      }
+    }
+
+    private static func userNameSignature(_ user: User) -> UserNameSignature {
+      UserNameSignature(
+        firstName: user.firstName,
+        lastName: user.lastName,
+        username: user.username,
+        phoneNumber: user.phoneNumber,
+        email: user.email
+      )
+    }
+
+    private static func profilePhotoId(_ userInfo: UserInfo) -> String? {
+      userInfo.stableAvatarIdentity
+    }
+
+    private struct UserNameSignature: Hashable {
+      let firstName: String?
+      let lastName: String?
+      let username: String?
+      let phoneNumber: String?
+      let email: String?
+    }
+  }
+
+  var peer: PeerType
+  var size: CGFloat = 34
+  var backgroundOpacity: Double = 1.0
+
+  var body: some View {
+    switch peer {
+    case let .chat(thread):
+      SidebarThreadIcon(
+        emoji: thread.emoji,
+        isReplyThread: thread.isReplyThread,
+        size: size,
+        shape: .circle
+      )
+
+      // raw icon
+//        HStack {
+//          Image(systemName: "bubble.fill")
+//            .resizable()
+//            .scaledToFit()
+//            .frame(width: size - 6.0, height: size - 6.0)
+//            .fixedSize()
+//        }
+//        .frame(width: size, height: size)
+//        .fixedSize()
+
+    case let .user(userInfo):
+      UserAvatar(userInfo: userInfo, size: size, backgroundOpacity: backgroundOpacity)
+    }
+  }
+}
+
+// MARK: - Previews
+
+#if DEBUG
+#Preview("Chat Icons") {
+  let size: CGFloat = 60
+
+  return ScrollView {
+    LazyVGrid(columns: [GridItem(.adaptive(minimum: size + 20))], spacing: 20) {
+      // Chat with emoji
+      ChatIcon(
+        peer: .chat(Chat(
+          id: 1,
+          date: Date(),
+          type: .thread,
+          title: "Team Chat",
+          spaceId: nil,
+          peerUserId: nil,
+          lastMsgId: nil,
+          emoji: "👥"
+        )),
+        size: size
+      )
+
+      // Chat without emoji
+      ChatIcon(
+        peer: .chat(Chat(
+          id: 2,
+          date: Date(),
+          type: .thread,
+          title: "Project Discussion",
+          spaceId: nil,
+          peerUserId: nil,
+          lastMsgId: nil,
+          emoji: nil
+        )),
+        size: size
+      )
+
+      // User avatar
+      ChatIcon(
+        peer: .user(UserInfo.preview),
+        size: size
+      )
+
+      // More chat examples with different emojis
+      ChatIcon(
+        peer: .chat(Chat(
+          id: 3,
+          date: Date(),
+          type: .thread,
+          title: "Design Team",
+          spaceId: nil,
+          peerUserId: nil,
+          lastMsgId: nil,
+          emoji: "🎨"
+        )),
+        size: size
+      )
+
+      ChatIcon(
+        peer: .chat(Chat(
+          id: 4,
+          date: Date(),
+          type: .thread,
+          title: "Engineering",
+          spaceId: nil,
+          peerUserId: nil,
+          lastMsgId: nil,
+          emoji: "⚙️"
+        )),
+        size: size
+      )
+    }
+    .padding()
+  }
+  .frame(width: 400, height: 400)
+}
+
+#Preview("Different Sizes") {
+  let sizes: [CGFloat] = [24, 32, 40, 48, 60]
+
+  return ScrollView {
+    LazyVGrid(columns: [GridItem(.adaptive(minimum: 80))], spacing: 20) {
+      ForEach(sizes, id: \.self) { size in
+        VStack {
+          ChatIcon(
+            peer: .chat(Chat(
+              id: 1,
+              date: Date(),
+              type: .thread,
+              title: "Team Chat",
+              spaceId: nil,
+              peerUserId: nil,
+              lastMsgId: nil,
+              emoji: "👥"
+            )),
+            size: size
+          )
+          Text("\(Int(size))pt")
+            .font(.caption)
+        }
+      }
+    }
+    .padding()
+  }
+  .frame(width: 400, height: 400)
+}
+#endif

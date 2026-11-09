@@ -1,0 +1,115 @@
+{
+  "name": "@inline-chat/protocol",
+  "version": "0.0.13",
+  "private": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inline-chat/inline.git",
+    "directory": "packages/protocol"
+  },
+  "type": "module",
+  "files": [
+    "dist/core.d.ts",
+    "dist/core.js",
+    "dist/client.d.ts",
+    "dist/client.js",
+    "dist/server.d.ts",
+    "dist/server.js",
+    "dist/carrier.d.ts",
+    "dist/carrier.js",
+    "dist/schema.d.ts",
+    "dist/schema.js",
+    "dist/vectors.d.ts",
+    "dist/vectors.js",
+    "dist/uploads.d.ts",
+    "dist/uploads.js",
+    "dist/downloads.d.ts",
+    "dist/downloads.js",
+    "dist/transfers.d.ts",
+    "dist/transfers.js",
+    "dist/index.d.ts",
+    "dist/index.js",
+    "vectors/inline-protocol-v1.json",
+    "trust-roots",
+    "docs",
+    "dist/secure",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "default": "./dist/core.js"
+    },
+    "./secure": {
+      "types": "./dist/secure/index.d.ts",
+      "default": "./dist/secure/index.js"
+    },
+    "./secure/node": {
+      "types": "./dist/secure/node.d.ts",
+      "default": "./dist/secure/node.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./carrier": {
+      "types": "./dist/carrier.d.ts",
+      "default": "./dist/carrier.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    },
+    "./vectors": {
+      "types": "./dist/vectors.d.ts",
+      "default": "./dist/vectors.js"
+    },
+    "./uploads": {
+      "types": "./dist/uploads.d.ts",
+      "default": "./dist/uploads.js"
+    },
+    "./downloads": {
+      "types": "./dist/downloads.d.ts",
+      "default": "./dist/downloads.js"
+    },
+    "./transfers": {
+      "types": "./dist/transfers.d.ts",
+      "default": "./dist/transfers.js"
+    },
+    "./vectors/inline-protocol-v1.json": "./vectors/inline-protocol-v1.json",
+    "./trust-roots/inline-protocol-production.json": "./trust-roots/inline-protocol-production.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "bun run build && bun run typecheck && bun run lint && bun run test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "bunx oxlint --ignore-path ../../.oxlintignore src",
+    "test": "bun test",
+    "generate:vectors": "bun scripts/generate-vectors.ts",
+    "prepack": "bun run build",
+    "release:preflight": "npm publish --dry-run --access public"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^1.3.0",
+    "@noble/hashes": "^1.8.0",
+    "@protobuf-ts/runtime": "^2.11.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "typescript": "^5.8.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
